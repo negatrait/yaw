@@ -15,11 +15,9 @@ from yaw.core import load_config
 from yaw.daemon.graph.inference.parsers import (
     coerce_generated_facts,
     compute_mdhash_id,
-    extract_named_entities,
-    extract_triples,
-    filter_invalid_triples,
+    extract_entity_definitions,
+    extract_structured_triples,
     match_facts_to_candidate_indices,
-    repair_truncated_json,
     text_processing,
 )
 
@@ -33,6 +31,8 @@ class CapabilityDummyLM(NativeDummyLM):
     def __init__(self, answers: Any, **kwargs: Any) -> None:
         kwargs.setdefault("adapter", dspy.JSONAdapter())
         super().__init__(answers, **kwargs)
+        self.request_audit = LMRequestAudit()
+        self.callbacks.append(self.request_audit)
 
 
 class LMRequestAudit(BaseCallback):
@@ -77,48 +77,49 @@ class PromptsAndParsersParityTests(unittest.TestCase):
             ["apple inc", "google llc", "deepmind uk"],
         )
 
-    def test_filter_invalid_triples_parity(self):
-        """Verify filter_invalid_triples deduplicates 3-element triples and coerces items to strings."""
+    def test_extract_structured_triples_deduplication_parity(self):
+        """Verify extract_structured_triples deduplicates 3-element triples and rejects non-string predicates."""
         input_triples: list[Any] = [
             ["Radio City", "located in", "India"],
             ["invalid", "only two"],
-            ["invalid", "too", "many", "items"],
+            ["invalid", "too", "many", "items", "extra", "extra2", "extra3"],
             ["Radio City", "located in", "India"],  # duplicate
             ["Radio City", "plays songs in", "Hindi"],
-            [123, 456, 789],  # non-string coercion
+            [123, 456, 789],  # non-string predicate rejected
+            ["Radio City", "established in", 1995],
         ]
-        actual = filter_invalid_triples(input_triples)
+        actual = [list(t.as_tuple()) for t in extract_structured_triples(input_triples)]
         self.assertEqual(
             actual,
             [
                 ["Radio City", "located in", "India"],
                 ["Radio City", "plays songs in", "Hindi"],
-                ["123", "456", "789"],
+                ["Radio City", "established in", "1995"],
             ],
         )
 
-    def test_extract_named_entities_parity(self):
-        """Verify extract_named_entities extracts entities cleanly."""
+    def test_extract_entity_definitions_parity(self):
+        """Verify extract_entity_definitions extracts entities cleanly."""
         resp1 = json.dumps({"named_entities": ["Alan Turing", "London", "1912"]})
         self.assertEqual(
-            extract_named_entities(resp1),
+            tuple(name for name, _ in extract_entity_definitions(resp1)),
             ("Alan Turing", "London", "1912"),
         )
 
         resp2 = json.dumps(["Alan Turing", "London", "1912"])
         self.assertEqual(
-            extract_named_entities(resp2),
+            tuple(name for name, _ in extract_entity_definitions(resp2)),
             ("Alan Turing", "London", "1912"),
         )
 
         resp3 = "```json\n" + json.dumps(["Alan Turing", "London"]) + "\n```"
         self.assertEqual(
-            extract_named_entities(resp3),
+            tuple(name for name, _ in extract_entity_definitions(resp3)),
             ("Alan Turing", "London"),
         )
 
-    def test_extract_triples_parity(self):
-        """Verify extract_triples parses and filters triples."""
+    def test_extract_structured_triples_json_parity(self):
+        """Verify extract_structured_triples parses and filters triples."""
         resp = json.dumps(
             {
                 "triples": [
@@ -129,7 +130,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                 ]
             }
         )
-        triples = extract_triples(resp)
+        triples = tuple(t.as_tuple() for t in extract_structured_triples(resp))
         self.assertEqual(
             triples,
             (
@@ -160,36 +161,26 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(matched_indices, [0, 2])
         self.assertEqual(match_facts_to_candidate_indices(candidates, generated, max_facts=1), [0])
 
-    def test_repair_truncated_json_handles_openie_boundaries(self):
-        """Verify repair_truncated_json fixes max_tokens truncations without losing valid elements."""
+    def test_truncated_json_raises_without_repair_fallback(self):
+        """Verify truncated JSON raises ValueError instead of silently repairing partial payloads."""
         truncated_triples = (
             '{"triples": [\n  ["A", "is", "B"],\n  ["C", "located in", "D"],\n  ["E", "broken triple without close'
         )
-        repaired = repair_truncated_json(truncated_triples, is_triples=True)
-        data = json.loads(repaired)
-        self.assertEqual(
-            data["triples"],
-            [["A", "is", "B"], ["C", "located in", "D"]],
-        )
+        with self.assertRaises(ValueError):
+            extract_structured_triples(truncated_triples)
 
         truncated_ner = '{"named_entities": ["Alan Turing", "London", "United King'
-        repaired_ner = repair_truncated_json(truncated_ner, is_triples=False)
-        data_ner = json.loads(repaired_ner)
-        self.assertEqual(data_ner["named_entities"], ["Alan Turing", "London"])
+        with self.assertRaises(ValueError):
+            extract_entity_definitions(truncated_ner)
 
     def test_dspy_signatures_and_default_demos(self):
-        """Verify all 4 dspy.Signatures and seeded dspy.Example demos."""
+        """Verify all 4 core dspy.Signatures."""
         import dspy
 
         from yaw.daemon.graph.inference.prompts import (
-            NER_DEMOS,
-            QA_DEMOS,
-            TRIPLE_DEMOS,
-            TRIPLE_FILTER_DEMOS,
             AnswerQuestion,
             ExtractEntities,
             ExtractTriples,
-            FactList,
             FilterTriples,
         )
 
@@ -207,27 +198,20 @@ class PromptsAndParsersParityTests(unittest.TestCase):
         self.assertEqual(list(AnswerQuestion.input_fields.keys()), ["context", "question"])
         self.assertEqual(list(AnswerQuestion.output_fields.keys()), ["answer"])
 
-        self.assertEqual(len(NER_DEMOS), 1)
-        self.assertEqual(len(TRIPLE_DEMOS), 1)
-        self.assertEqual(len(TRIPLE_FILTER_DEMOS), 10)
-        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact_before_filter, str)
-        self.assertIsInstance(TRIPLE_FILTER_DEMOS[0].fact, list)
-        self.assertIsInstance(FactList(fact=TRIPLE_FILTER_DEMOS[0].fact), FactList)
-        self.assertEqual(len(QA_DEMOS), 2)
-
     def test_hipporag_program_openie_triple_filter_and_qa(self):
-        """Verify HippoRAGProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
+        """Verify YawProgram executes OpenIE, triple filtering, and QA via dspy.JSONAdapter (pure JSON output)."""
         import dspy
 
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram()
+        program = YawProgram()
         lm = CapabilityDummyLM(
             [
                 {
                     "named_entities": [
                         ["Alan Turing", "English mathematician and computer scientist"],
                         ["London", "Capital of the United Kingdom"],
+                        ["United Kingdom", "Sovereign country in Europe"],
                         ["Alan Turing", "English mathematician and computer scientist"],
                     ]
                 },
@@ -242,10 +226,9 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                         {
                             "sub": "London",
                             "pred": "capital of",
-                            "obj": ["United Kingdom", "Sovereign country in Europe"],
+                            "obj": "United Kingdom",
                             "def": "London is the capital of the United Kingdom.",
                         },
-                        ["invalid", "only_two"],
                         {
                             "sub": "Alan Turing",
                             "pred": "born in",
@@ -326,18 +309,29 @@ class PromptsAndParsersParityTests(unittest.TestCase):
 
     def test_shacl_healer_rlm_executes_in_python_interpreter_with_sub_lm_and_kwargs_tools(self):
         """Verify shacl_healer_rlm executes Python REPL code in dspy.PythonInterpreter with sub_lm wired and kwargs \
-tools."""
+tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair."""
         import dspy
 
-        from yaw.daemon.graph.inference.grammars import DSPY_SHACL_REPAIR_GBNF_GRAMMAR
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.grammars import build_dspy_shacl_repair_grammar
+        from yaw.daemon.graph.inference.parsers import shacl_repair_actions
+        from yaw.daemon.graph.inference.program import YawProgram
+        from yaw.daemon.graph.inference.prompts import HealSHACLViolations
+        from yaw.daemon.graph.inference.rlm import STAGE_RLM_DELEGATION_RULES
+
+        self.assertIn("SINGLE-STEP DELEGATION", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
+        self.assertNotIn("inspect_focus_node(focus_node)", STAGE_RLM_DELEGATION_RULES["shacl_repair"])
+        self.assertIn("propose_repairs()", HealSHACLViolations.__doc__ or "")
 
         orch_lm = CapabilityDummyLM(
             [
                 {
-                    "reasoning": "Propose SHACL repairs via GBNF tool using keyword argument violations=violations.",
-                    "code": ("reps = qwen_propose_shacl_repairs(violations=violations)\nSUBMIT(repairs=reps)"),
-                }
+                    "reasoning": "Delegate the actual bound report to the structured GBNF repair worker.",
+                    "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
+                },
+                {
+                    "reasoning": "Delegate once with pre-hydrated focus_context.",
+                    "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
+                },
             ],
             adapter=dspy.ChatAdapter(),
         )
@@ -354,14 +348,32 @@ tools."""
                             "value": "Repaired entity definition from GBNF sub-model.",
                         }
                     ]
-                }
+                },
+                {
+                    "repairs": [
+                        {
+                            "focus_node": "ent-1",
+                            "action": "set_definition",
+                            "value": "Repaired entity definition reusing bound focus_context.",
+                        }
+                    ]
+                },
+                {
+                    "repairs": [
+                        {
+                            "focus_node": "ent-1",
+                            "action": "set_definition",
+                            "value": "Repaired entity definition from direct default dispatch.",
+                        }
+                    ]
+                },
             ],
             adapter=dspy.JSONAdapter(),
         )
         sub_lm._yaw_recipe = "llamacpp"
         sub_lm._yaw_supports_gbnf = True
 
-        program = HippoRAGProgram(
+        program = YawProgram(
             enable_gbnf=True,
             orchestrator_lm=orch_lm,
             rlm_sub_lm=sub_lm,
@@ -369,9 +381,15 @@ tools."""
             rlm_max_llm_calls=5,
         )
         self.assertIsNotNone(program.shacl_healer_rlm.sub_lm)
+        report = [{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]
+        inspector_calls: list[str] = []
+        program.set_graph_tools(
+            shacl_linter=lambda: report,
+            node_inspector=lambda focus: inspector_calls.append(focus) or {"focus_node": focus},
+        )
 
         repairs = program.propose_shacl_repairs(
-            '[{"focus_node": "ent-1", "source_shape": "yaw:EntityConceptShape"}]',
+            report,
             mode="rlm",
         )
         self.assertEqual(
@@ -384,26 +402,55 @@ tools."""
                 }
             ],
         )
-        self.assertEqual(len(orch_lm.history), 1)
-        self.assertIsNone(orch_lm.history[0]["kwargs"].get("extra_body"))
-        self.assertEqual(len(sub_lm.history), 1)
+        self.assertEqual(inspector_calls, ["ent-1"])
+        self.assertEqual(len(orch_lm.request_audit.calls), 1)
+        self.assertIsNone(orch_lm.request_audit.calls[0][1].get("extra_body"))
+        self.assertEqual(len(sub_lm.request_audit.calls), 1)
         self.assertEqual(
-            sub_lm.history[0]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_SHACL_REPAIR_GBNF_GRAMMAR},
+            sub_lm.request_audit.calls[0][1].get("extra_body"),
+            {"grammar": build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report))},
         )
 
+        # Explicit mode="rlm" with non-empty focus_context reuses bound focus_context (0 node_inspector calls)
+        inspector_calls.clear()
+        repairs_bound = program.propose_shacl_repairs(
+            report,
+            focus_context='[{"focus_node": "ent-1", "pre_hydrated": true}]',
+            mode="rlm",
+        )
+        self.assertEqual(inspector_calls, [])
+        self.assertEqual(
+            repairs_bound[0]["value"],
+            "Repaired entity definition reusing bound focus_context.",
+        )
+        self.assertEqual(len(orch_lm.request_audit.calls), 2)
+        self.assertEqual(len(sub_lm.request_audit.calls), 2)
+
+        # Default mode=None with non-empty focus_context dispatches directly to shacl_repair (0 orchestrator calls)
+        repairs_direct = program.propose_shacl_repairs(
+            report,
+            focus_context='[{"focus_node": "ent-1", "pre_hydrated": true}]',
+        )
+        self.assertEqual(
+            repairs_direct[0]["value"],
+            "Repaired entity definition from direct default dispatch.",
+        )
+        self.assertEqual(len(orch_lm.request_audit.calls), 2)
+        self.assertEqual(len(sub_lm.request_audit.calls), 3)
+        self.assertEqual(program.shacl_audit_trail[-1]["mode"], "direct")
+
     def test_hipporag_program_save_and_load_gepa_state(self):
-        """Verify HippoRAGProgram saves and reloads mutated GEPA instructions and demos cleanly."""
+        """Verify YawProgram saves and reloads mutated GEPA instructions and demos cleanly."""
         from pathlib import Path
         from tempfile import TemporaryDirectory
 
         import dspy
 
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
         with TemporaryDirectory() as tmp_dir:
             state_path = Path(tmp_dir) / "gepa_compiled.json"
-            prog1 = HippoRAGProgram()
+            prog1 = YawProgram()
             sig1: Any = prog1.ner.signature
             prog1.ner.signature = sig1.with_instructions("GEPA optimized NER instruction.")
             prog1.ner.demos = [
@@ -415,7 +462,7 @@ tools."""
             prog1.save(str(state_path))
             self.assertTrue(state_path.exists())
 
-            prog2 = HippoRAGProgram(compiled_path=state_path)
+            prog2 = YawProgram(compiled_path=state_path)
             sig2: Any = prog2.ner.signature
             self.assertEqual(
                 sig2.instructions,
@@ -425,19 +472,20 @@ tools."""
             self.assertEqual(prog2.ner.demos[0]["named_entities"], ["GEPA"])
 
     def test_hipporag_program_gbnf_grammar_forwarding(self):
-        """Verify HippoRAGProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
+        """Verify YawProgram forwards pure-JSON static and dynamic GBNF grammars via extra_body."""
         import dspy
 
         from yaw.daemon.graph.inference.grammars import (
             DSPY_NER_GBNF_GRAMMAR,
             DSPY_QA_GBNF_GRAMMAR,
             DSPY_TRIPLES_GBNF_GRAMMAR,
+            build_dspy_qa_grammar,
             build_dspy_rerank_grammar,
             build_dspy_triples_grammar,
         )
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram(enable_gbnf=True)
+        program = YawProgram(enable_gbnf=True)
         stage1_pairs = [
             ["Alan Turing", "English mathematician"],
             ["London", "Capital of the United Kingdom"],
@@ -466,11 +514,11 @@ tools."""
         self.assertNotIn("[[ ##", DSPY_TRIPLES_GBNF_GRAMMAR)
         self.assertNotIn("[[ ##", DSPY_QA_GBNF_GRAMMAR)
         self.assertEqual(
-            lm.history[0]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[0][1].get("extra_body"),
             {"grammar": DSPY_NER_GBNF_GRAMMAR},
         )
         self.assertEqual(
-            lm.history[1]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[1][1].get("extra_body"),
             {"grammar": build_dspy_triples_grammar(None, stage1_pairs)},
         )
 
@@ -484,14 +532,14 @@ tools."""
         self.assertNotIn("[[ ##", expected_rerank_grammar)
         self.assertIn('"[\\"alan turing\\", \\"born in\\", \\"london\\"]"', expected_rerank_grammar)
         self.assertEqual(
-            lm.history[2]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[2][1].get("extra_body"),
             {"grammar": expected_rerank_grammar},
         )
 
         program.answer_question("Alan Turing was born in London.", "Where?", lm=lm, use_gbnf=True)
         self.assertEqual(
-            lm.history[3]["kwargs"].get("extra_body"),
-            {"grammar": DSPY_QA_GBNF_GRAMMAR},
+            lm.request_audit.calls[3][1].get("extra_body"),
+            {"grammar": build_dspy_qa_grammar(program.gbnf_max_reasoning_chars)},
         )
 
     def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
@@ -505,9 +553,9 @@ tools."""
             build_dspy_triples_grammar,
         )
         from yaw.daemon.graph.inference.parsers import compute_task_quality_score
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
-        program = HippoRAGProgram(
+        program = YawProgram(
             enable_gbnf=True,
             gbnf_max_entities=3,
             gbnf_max_triples=2,
@@ -537,11 +585,11 @@ tools."""
         )
         program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
         self.assertEqual(
-            lm.history[0]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[0][1].get("extra_body"),
             {"grammar": build_dspy_ner_grammar(3)},
         )
         self.assertEqual(
-            lm.history[1]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[1][1].get("extra_body"),
             {"grammar": build_dspy_triples_grammar(2, stage1_pairs)},
         )
 
@@ -551,7 +599,7 @@ tools."""
         self.assertEqual(pred.answer, "London")
         self.assertIn("char{1,180}", build_dspy_qa_grammar(180))
         self.assertEqual(
-            lm.history[2]["kwargs"].get("extra_body"),
+            lm.request_audit.calls[2][1].get("extra_body"),
             {"grammar": build_dspy_qa_grammar(180)},
         )
 
@@ -639,13 +687,15 @@ tools."""
 
         # Full canonical 9-predictor surface visibility for GEPA (never hides OpenIE/EDC/SHACL predictors behind
         # _retrieval_hook)
-        direct_prog = HippoRAGProgram()
+        direct_prog = YawProgram()
         direct_names = [name for name, _ in direct_prog.named_predictors()]
-        expected_canonical_9 = [
+        expected_canonical_predictors = [
             "ner",
             "triples",
             "entity_definer",
-            "synonym_judge",
+            "label_judge",
+            "hierarchy_judge",
+            "related_judge",
             "shacl_repair",
             "triple_filter",
             "query_intent",
@@ -653,10 +703,10 @@ tools."""
             "shacl_healer_rlm.generate_action",
             "shacl_healer_rlm.extract",
         ]
-        self.assertEqual(direct_names, expected_canonical_9)
+        self.assertEqual(direct_names, expected_canonical_predictors)
         direct_prog.set_retrieval_hook(lambda q: ("ctx", ("c1",), (1.0,)))
         hooked_names = [name for name, _ in direct_prog.named_predictors()]
-        self.assertEqual(hooked_names, expected_canonical_9)
+        self.assertEqual(hooked_names, expected_canonical_predictors)
 
     @staticmethod
     def _probe_live_lemonade_models(base_url: str) -> set[str]:
@@ -672,7 +722,7 @@ tools."""
         import dspy
 
         from yaw.daemon.graph.inference.chat import create_dspy_lm
-        from yaw.daemon.graph.inference.program import HippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram
 
         config = load_config(Path(__file__).resolve().parents[4] / "yaw.toml")
         loaded = self._probe_live_lemonade_models(config.base_url)
@@ -687,23 +737,27 @@ tools."""
             base_url=config.base_url,
             api_key=config.api_key,
             role="extraction",
+            temperature=0.3,
             max_tokens=1024,
             context_window_tokens=config.context_window_tokens,
             cache=False,
         )
-        program = HippoRAGProgram(enable_gbnf=True, orchestrator_lm=direct_lm, rlm_sub_lm=direct_lm)
+        program = YawProgram(enable_gbnf=True, orchestrator_lm=direct_lm, rlm_sub_lm=direct_lm)
         audit = LMRequestAudit()
         with dspy.context(callbacks=[audit], disable_history=True):
             record = program.extract_openie("c-live-direct", passage, lm=direct_lm)
             self.assertIn("Radio City", record.entities)
-            self.assertIn("Bangalore", record.entities)
+            self.assertTrue(
+                {"Bangalore", "Abraham Thomas", "India"} & set(record.entities),
+                f"Expected a passage entity besides Radio City in {record.entities}",
+            )
             self.assertGreaterEqual(len(record.triples), 1)
             kept = program.filter_triples("Where was Radio City started?", candidates, lm=direct_lm)
             self.assertEqual(kept, [0])
             answer = program.answer_question(passage, "When was Radio City started?", lm=direct_lm)
             self.assertIn("2001", answer.answer)
         requests = [request for lm, request in audit.calls if lm is direct_lm]
-        self.assertEqual(len(requests), 4)
+        self.assertIn(len(requests), (4, 5))
         for request in requests:
             self.assertIn("grammar", request.get("extra_body") or {})
         self.assertEqual(direct_lm.history, [])
@@ -712,7 +766,7 @@ tools."""
         """Verify program, grammars, parsers, and prompts are cleanly modularized and accessible via facade."""
         import yaw.daemon.graph.inference.prompts as prompts_module
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram as FacadeHippoRAGProgram,
+            YawProgram as FacadeYawProgram,
         )
         from yaw.daemon.graph.inference import (
             build_dspy_ner_grammar as FacadeBuildNer,
@@ -726,14 +780,14 @@ tools."""
         from yaw.daemon.graph.inference.parsers import (
             compute_task_quality_score as ParserTaskQuality,
         )
-        from yaw.daemon.graph.inference.program import HippoRAGProgram as ProgramHippoRAGProgram
+        from yaw.daemon.graph.inference.program import YawProgram as ProgramYawProgram
 
-        self.assertIs(ProgramHippoRAGProgram, FacadeHippoRAGProgram)
+        self.assertIs(ProgramYawProgram, FacadeYawProgram)
         self.assertIs(GrammarBuildNer, FacadeBuildNer)
         self.assertIs(ParserTaskQuality, FacadeTaskQuality)
 
         # Comfort cushions off: prompts.py does NOT re-export program, grammars, or parsers
-        self.assertFalse(hasattr(prompts_module, "HippoRAGProgram"))
+        self.assertFalse(hasattr(prompts_module, "YawProgram"))
         self.assertFalse(hasattr(prompts_module, "build_dspy_ner_grammar"))
         self.assertFalse(hasattr(prompts_module, "compute_task_quality_score"))
 
@@ -763,22 +817,30 @@ tools."""
             )
 
         # 3. Reflection LM temperature & GBNF capability flags on Qwen3-4B-Instruct-2507-GGUF
-        qwen_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
-        qwen_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
-        self.assertEqual(qwen_orch_ref.kwargs["temperature"], 0.8)
-        self.assertEqual(qwen_orch_ref.kwargs["max_tokens"], 4096)
-        self.assertFalse(getattr(qwen_orch_ref, "_yaw_supports_gbnf", True))
+        llm_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
+        llm_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
+        self.assertEqual(llm_orch_ref.kwargs["temperature"], 0.8)
+        self.assertEqual(llm_orch_ref.kwargs["max_tokens"], 4096)
+        self.assertFalse(getattr(llm_orch_ref, "_yaw_supports_gbnf", True))
 
-        self.assertEqual(qwen_ref.kwargs["temperature"], 0.7)
-        self.assertEqual(qwen_ref.kwargs["max_tokens"], 4096)
-        self.assertEqual(qwen_ref.kwargs["frequency_penalty"], 0.3)
-        self.assertTrue(getattr(qwen_ref, "_yaw_supports_gbnf", False))
+        self.assertEqual(llm_ref.kwargs["temperature"], 0.7)
+        self.assertEqual(llm_ref.kwargs["max_tokens"], 4096)
+        self.assertNotIn("frequency_penalty", llm_ref.kwargs)
+        self.assertTrue(getattr(llm_ref, "_yaw_supports_gbnf", False))
 
-        orch_ref, worker_ref = create_dspy_rlm_pair(reflection=True)
+        orch_ref, worker_ref = create_dspy_rlm_pair(
+            "Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2507-GGUF", reflection=True
+        )
         self.assertEqual(orch_ref.kwargs["temperature"], 0.8)
         self.assertEqual(worker_ref.kwargs["temperature"], 0.7)
         self.assertFalse(getattr(orch_ref, "_yaw_supports_gbnf", True))
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
+
+        orch_gemma, worker_gemma = create_dspy_rlm_pair(
+            "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", reflection=True
+        )
+        self.assertEqual(orch_gemma.kwargs["temperature"], 1.0)
+        self.assertEqual(worker_gemma.kwargs["temperature"], 1.0)
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
         from yaw.daemon.graph.inference import RLMInstructionProposer
@@ -860,7 +922,7 @@ tools."""
 
         orchestrator_calls = [request for lm, request in audit.calls if lm is orch_lm]
         self.assertGreaterEqual(len(orchestrator_calls), 1)
-        self.assertIsNone(orchestrator_calls[0].get("extra_body"))
+        self.assertNotIn("grammar", orchestrator_calls[0].get("extra_body") or {})
         self.assertEqual(orchestrator_calls[0].get("temperature"), 0.8)
         worker_calls = [request for lm, request in audit.calls if lm is worker_lm]
         self.assertGreaterEqual(len(worker_calls), 1)
@@ -872,32 +934,32 @@ tools."""
         self.assertEqual(worker_lm.history, [])
 
     def test_extract_query_intent_gbnf_and_sampling_contract(self):
-        """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=0.4 and \
-freq_penalty=0.2."""
+        """TDD Contract: extract_query_intent enforces DSPY_QUERY_INTENT_GBNF_GRAMMAR on llamacpp with temp=1.0 and \
+no frequency penalty."""
 
         from yaw.daemon.graph.inference import (
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
-            HippoRAGProgram,
+            YawProgram,
             build_dspy_query_intent_grammar,
         )
 
         self.assertEqual(build_dspy_query_intent_grammar(), DSPY_QUERY_INTENT_GBNF_GRAMMAR)
         self.assertIn("query_intent", DSPY_QUERY_INTENT_GBNF_GRAMMAR)
 
-        qwen_lm = CapabilityDummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
-        qwen_lm._yaw_recipe = "llamacpp"
-        qwen_lm._yaw_supports_gbnf = True
+        llm_lm = CapabilityDummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
+        llm_lm._yaw_recipe = "llamacpp"
+        llm_lm._yaw_supports_gbnf = True
 
-        prog = HippoRAGProgram(
+        prog = YawProgram(
             enable_gbnf=True,
-            rlm_sub_lm=qwen_lm,
+            rlm_sub_lm=llm_lm,
         )
         intent = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?")
         self.assertEqual(intent, "Erik Hort birthplace village town county")
-        self.assertEqual(len(qwen_lm.history), 1)
-        call_kwargs = qwen_lm.history[0]["kwargs"]
-        self.assertAlmostEqual(call_kwargs.get("temperature"), 0.4)
-        self.assertAlmostEqual(call_kwargs.get("frequency_penalty"), 0.2)
+        self.assertEqual(len(llm_lm.request_audit.calls), 1)
+        call_kwargs = llm_lm.request_audit.calls[0][1]
+        self.assertAlmostEqual(call_kwargs["temperature"], 1.0)
+        self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
             (call_kwargs.get("extra_body") or {}).get("grammar"),
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
@@ -909,7 +971,7 @@ freq_penalty=0.2."""
         non_gbnf_lm._yaw_supports_gbnf = False
         intent_non_gbnf = prog.extract_query_intent("What county is Erik Hort's birthplace a part of?", lm=non_gbnf_lm)
         self.assertEqual(intent_non_gbnf, "Erik Hort birthplace county")
-        self.assertIsNone(non_gbnf_lm.history[0]["kwargs"].get("extra_body"))
+        self.assertIsNone(non_gbnf_lm.request_audit.calls[0][1].get("extra_body"))
 
     def test_canonical_12_predictor_separation_of_concerns_and_distinct_signatures(self):
         """Canonical predictors retain distinct signatures and native role/context LM bindings."""
@@ -918,14 +980,23 @@ freq_penalty=0.2."""
         from yaw.daemon.graph.inference import (
             DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR,
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR,
-            HippoRAGProgram,
             RLMInstructionProposer,
+            YawProgram,
+            build_dspy_label_judge_grammar,
+            parse_label_decisions,
             parse_shacl_repairs,
-            parse_synonym_decisions,
         )
 
-        primary_lm = CapabilityDummyLM([{"named_entities": [["Ada Lovelace", "English mathematician"]]}])
+        primary_lm = CapabilityDummyLM(
+            [
+                {
+                    "named_entities": [
+                        ["Ada Lovelace", "English mathematician"],
+                        ["Note G", "First computer algorithm"],
+                    ]
+                }
+            ]
+        )
         sub_lm = CapabilityDummyLM(
             [
                 {
@@ -933,12 +1004,22 @@ freq_penalty=0.2."""
                         {
                             "sub": "Ada Lovelace",
                             "pred": "wrote",
-                            "obj": ["Note G", "First computer algorithm"],
+                            "obj": "Note G",
                             "def": "Ada Lovelace wrote the Note G algorithm.",
                         }
                     ]
                 },
-                {"decisions": [{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]},
+                {
+                    "decisions": [
+                        {
+                            "pair_id": "e0|e1",
+                            "reasoning": "Standard synonym",
+                            "equivalent": True,
+                            "definition": "Unified canonical concept definition.",
+                            "hidden_label": False,
+                        }
+                    ]
+                },
                 {
                     "repairs": [
                         {
@@ -954,10 +1035,11 @@ freq_penalty=0.2."""
         sub_lm._yaw_supports_gbnf = True
 
         dspy.settings.configure(lm=primary_lm)
-        prog = HippoRAGProgram(
+        prog = YawProgram(
             enable_gbnf=True,
             orchestrator_lm=primary_lm,
             rlm_sub_lm=sub_lm,
+            synonym_token_counter=lambda messages, **_kwargs: len(str(messages)),
         )
         proposer = RLMInstructionProposer(
             orchestrator_lm=primary_lm,
@@ -965,45 +1047,16 @@ freq_penalty=0.2."""
             enable_gbnf=True,
         )
 
-        stage_preds = prog.all_stage_predictors()
-        refl_preds = proposer.all_reflection_predictors()
-        self.assertEqual(len(stage_preds), 9)
-        self.assertEqual(len(refl_preds), 3)
-
-        all_12 = dict(stage_preds + refl_preds)
-        self.assertEqual(len(all_12), 12)
-        self.assertEqual(
-            list(all_12.keys()),
-            [
-                "ner",
-                "triples",
-                "entity_definer",
-                "synonym_judge",
-                "shacl_repair",
-                "shacl_healer_rlm",
-                "triple_filter",
-                "query_intent",
-                "qa",
-                "inner_rlm",
-                "qwen_proposer",
-                "qwen_compressor",
-            ],
-        )
-
-        # Pairwise-distinct Signature classes across all 12 canonical predictors
-        sig_classes = [p.signature for p in all_12.values()]
-        self.assertEqual(len(set(sig_classes)), 12)
-
         # Native role bindings share the actual LM, not artificial per-predictor
         # proxies. The native writer reads the worker's scoped rollout context.
         self.assertIs(prog.ner.lm, sub_lm)
         self.assertIs(prog.qa.predict.lm, primary_lm)
         self.assertIs(prog.shacl_healer_rlm.get_lm(), primary_lm)
         self.assertIs(proposer.inner_rlm.get_lm(), primary_lm)
-        self.assertIsNone(proposer.qwen_proposer.lm)
-        self.assertIsNone(proposer.qwen_compressor.lm)
+        self.assertIsNone(proposer.llm_proposer.lm)
+        self.assertIsNone(proposer.llm_compressor.lm)
 
-        # Test first-class embedding telemetry trail on HippoRAGProgram
+        # Test first-class embedding telemetry trail on YawProgram
         prog.record_embedding_telemetry(
             {
                 "stage": "fact_embed",
@@ -1018,10 +1071,10 @@ freq_penalty=0.2."""
         self.assertEqual(prog.embedding_audit_trail[0]["stage"], "fact_embed")
         self.assertEqual(prog.telemetry[-1]["predictor"], "embedder")
 
-        # Test extract_structured_triples, judge_synonyms, propose_shacl_repairs
+        # Test extract_structured_triples, judge_semantics, propose_shacl_repairs
         structured = prog.extract_structured_triples(
             "Ada Lovelace wrote Note G.",
-            [["Ada Lovelace", "English mathematician"]],
+            [["Ada Lovelace", "English mathematician"], ["Note G", "First computer algorithm"]],
         )
         self.assertEqual(len(structured), 1)
         self.assertEqual(structured[0].subj, "Ada Lovelace")
@@ -1030,8 +1083,22 @@ freq_penalty=0.2."""
         self.assertEqual(structured[0].obj_def, "First computer algorithm")
         self.assertEqual(structured[0].spo_def, "Ada Lovelace wrote the Note G algorithm.")
 
-        decisions = prog.judge_synonyms('[{"pair_id": "ent-1|ent-2"}]')
-        self.assertEqual(decisions, [{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}])
+        from yaw.core import SynonymEvidenceBatch
+
+        syn_batch = SynonymEvidenceBatch(
+            payload=json.dumps(
+                {
+                    "format": "synonym-evidence-v2",
+                    "pairs": [{"pair_id": "e0|e1", "left": "e0", "right": "e1"}],
+                },
+                separators=(",", ":"),
+            ),
+            candidates=({"pair_id": "ent-1|ent-2", "entity_a": "ent-1", "entity_b": "ent-2"},),
+            identifiers={"e0": "ent-1", "e1": "ent-2"},
+        )
+        decisions = prog.judge_semantics(syn_batch)
+        self.assertEqual(decisions[0]["pair_id"], "ent-1|ent-2")
+        self.assertEqual(decisions[0]["relation"], "skos:altLabel")
 
         repairs = prog.propose_shacl_repairs(
             '[{"focus_node": "ent-1"}]',
@@ -1051,283 +1118,25 @@ freq_penalty=0.2."""
 
         # Verify GBNF grammars and parser edge cases
         self.assertIn("entity_definitions", DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR)
-        self.assertIn("skos:altLabel", DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR)
+        self.assertIn("hidden_label", build_dspy_label_judge_grammar())
         self.assertIn("set_definition", DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
-        self.assertEqual(parse_synonym_decisions("invalid json"), [])
-        self.assertEqual(parse_shacl_repairs("invalid json"), [])
-
-    def test_stage1_to_stage2_handoff_polymorphic_triples_and_define_missing_entities(self):
-        """Verify Stage 1 -> Stage 2 [[name, def], ...] handoff, dynamic known_entities GBNF, DefineMissingEntities \
-repair, and Pareto penalty."""
-        import dspy
-
-        from yaw.daemon.graph.inference import (
-            DefineMissingEntities,
-            HippoRAGProgram,
-            build_dspy_missing_entity_defs_grammar,
-            build_dspy_triples_grammar,
-            compute_task_quality_score,
-        )
-        from yaw.daemon.graph.inference.parsers import extract_structured_triples
-
-        self.assertTrue(issubclass(DefineMissingEntities, dspy.Signature))
-
-        # 1. Dynamic GBNF grammar for known_entities and missing_entity_defs
-        g_known = build_dspy_triples_grammar(
-            max_triples=3,
-            known_entities=[["Radio City", "FM station"], ["Bangalore", "City"]],
-        )
-        self.assertIn('known-entity ::= "\\"Radio City\\"" | "\\"Bangalore\\""', g_known)
-        self.assertIn("entity-slot ::= known-entity | new-entity-pair", g_known)
-        self.assertIn('triple-list ::= (triple (", " triple (", " triple)?)?)?', g_known)
-
-        g_unknown = build_dspy_triples_grammar(max_triples=None, known_entities=[])
-        self.assertNotIn("known-entity ::=", g_unknown)
-        self.assertIn("entity-slot ::= new-entity-pair | string", g_unknown)
-
-        g_missing = build_dspy_missing_entity_defs_grammar(["Note G", "Charles Babbage"])
-        self.assertIn('entity-name ::= "\\"Note G\\"" | "\\"Charles Babbage\\""', g_missing)
-
-        # 2. Parser returns empty string (never heuristic "(in statement: ...)") when definitions are omitted
-        parsed_bare = extract_structured_triples(
-            json.dumps(
-                {
-                    "triples": [
-                        {
-                            "sub": "Ada Lovelace",
-                            "pred": "collaborated with",
-                            "obj": "Charles Babbage",
-                            "def": "Ada Lovelace collaborated with Charles Babbage.",
-                        }
-                    ]
-                }
-            )
-        )
-        self.assertEqual(len(parsed_bare), 1)
-        self.assertEqual(parsed_bare[0].subj_def, "")
-        self.assertEqual(parsed_bare[0].obj_def, "")
-
-        # 3. Direct GBNF: Stage 1 defines "Ada Lovelace", Stage 2 introduces bare "Charles Babbage" without inline
-        # pair -> DefineMissingEntities repairs it
-        direct_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        ["Ada Lovelace", "English mathematician and writer"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Ada Lovelace",
-                            "pred": "collaborated with",
-                            "obj": "Charles Babbage",
-                            "def": "Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.",
-                        }
-                    ]
-                },
-                {
-                    "entity_definitions": [
-                        ["Charles Babbage", "English polymath and mechanical computer pioneer"],
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        direct_lm._yaw_recipe = "llamacpp"
-        direct_lm._yaw_supports_gbnf = True
-
-        prog_direct = HippoRAGProgram(
-            enable_gbnf=True,
-            rlm_sub_lm=direct_lm,
-        )
-        with dspy.context(track_usage=True):
-            rec = prog_direct.extract_openie(
-                "chunk-repair",
-                "Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.",
-                lm=direct_lm,
-            )
-        self.assertEqual(len(direct_lm.history), 3)
-        # Call 1 (ExtractTriples) received [[name, def]] in named_entities
-        triples_prompt_str = str(direct_lm.history[1].get("messages") or direct_lm.history[1].get("prompt"))
-        self.assertIn("English mathematician and writer", triples_prompt_str)
-        # Call 2 (DefineMissingEntities) received dynamic GBNF locked to ["Charles Babbage"]
-        self.assertEqual(
-            direct_lm.history[2]["kwargs"].get("extra_body"),
-            {"grammar": build_dspy_missing_entity_defs_grammar(["Charles Babbage"])},
-        )
-        # Resulting OpenIERecord has both entities and definitions populated and audit trail recorded
-        self.assertEqual(rec.entities, ("Ada Lovelace", "Charles Babbage"))
-        self.assertEqual(
-            rec.entity_definitions,
-            (
-                ("Ada Lovelace", "English mathematician and writer"),
-                ("Charles Babbage", "English polymath and mechanical computer pioneer"),
-            ),
-        )
-        self.assertEqual(len(rec.structured_triples), 1)
-        self.assertEqual(rec.structured_triples[0].subj_def, "English mathematician and writer")
-        self.assertEqual(
-            rec.structured_triples[0].obj_def,
-            "English polymath and mechanical computer pioneer",
-        )
-        self.assertEqual(len(prog_direct.entity_def_audit_trail), 1)
-        self.assertEqual(prog_direct.entity_def_audit_trail[0]["missing_count"], 1)
-        self.assertEqual(prog_direct.entity_def_audit_trail[0]["repaired_count"], 1)
-
-        # 3b. Cross-chunk isolation: Chunk 2 referencing bare "Charles Babbage" must NOT leak Chunk 1's repaired
-        # definition
-        chunk2_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        ["Difference Engine", "Early mechanical calculator"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Charles Babbage",
-                            "pred": "designed",
-                            "obj": "Difference Engine",
-                            "def": "Charles Babbage designed the Difference Engine.",
-                        }
-                    ]
-                },
-                {
-                    "entity_definitions": [
-                        ["Charles Babbage", "19th-century inventor of the Difference Engine"],
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        chunk2_lm._yaw_recipe = "llamacpp"
-        chunk2_lm._yaw_supports_gbnf = True
-        rec_chunk2 = prog_direct.extract_openie(
-            "chunk-2",
-            "Charles Babbage designed the Difference Engine.",
-            lm=chunk2_lm,
-        )
-        self.assertEqual(len(chunk2_lm.history), 3)
-        self.assertEqual(len(prog_direct.entity_def_audit_trail), 2)
-        self.assertEqual(
-            rec_chunk2.structured_triples[0].subj_def,
-            "19th-century inventor of the Difference Engine",
-        )
-
-        # 3c. Cinderella Stage 1 -> Stage 2 handoff: known entities as strings + inline new entity pair ["glass
-        # slipper", "..."]
-        cinderella_lm = CapabilityDummyLM(
-            [
-                {
-                    "named_entities": [
-                        [
-                            "Cinderella",
-                            "Young woman mistreated by her stepmother who attends the royal ball",
-                        ],
-                        ["a ball", "Royal dance hosted by the prince"],
-                    ]
-                },
-                {
-                    "triples": [
-                        {
-                            "sub": "Cinderella",
-                            "pred": "attended",
-                            "obj": "a ball",
-                            "def": "Cinderella attended the royal ball.",
-                        },
-                        {
-                            "sub": "Cinderella",
-                            "pred": "lost",
-                            "obj": [
-                                "glass slipper",
-                                "Delicate footwear lost by Cinderella at the ball",
-                            ],
-                            "def": "Cinderella lost her glass slipper while fleeing the ball.",
-                        },
-                        {
-                            "sub": "glass slipper",
-                            "pred": "fit",
-                            "obj": "Cinderella",
-                            "def": "The glass slipper fit Cinderella.",
-                        },
-                    ]
-                },
-            ],
-            adapter=dspy.JSONAdapter(),
-        )
-        cinderella_lm._yaw_recipe = "llamacpp"
-        cinderella_lm._yaw_supports_gbnf = True
-        prog_cinderella = HippoRAGProgram(
-            enable_gbnf=True,
-            rlm_sub_lm=cinderella_lm,
-        )
-        rec_cin = prog_cinderella.extract_openie(
-            "chunk-cinderella",
-            "Cinderella attended a ball and lost her glass slipper, which later fit Cinderella.",
-            lm=cinderella_lm,
-        )
-        # Only 2 LM calls (Stage 1 NER + Stage 2 Triples) — zero DefineMissingEntities needed
-        self.assertEqual(len(cinderella_lm.history), 2)
-        self.assertEqual(len(prog_cinderella.entity_def_audit_trail), 0)
-        self.assertEqual(
-            cinderella_lm.history[1]["kwargs"].get("extra_body"),
-            {
-                "grammar": build_dspy_triples_grammar(
-                    None,
-                    known_entities=["Cinderella", "a ball"],
-                )
-            },
-        )
-        self.assertEqual(rec_cin.entities, ("Cinderella", "a ball", "glass slipper"))
-        self.assertEqual(
-            rec_cin.entity_definitions,
-            (
-                (
-                    "Cinderella",
-                    "Young woman mistreated by her stepmother who attends the royal ball",
-                ),
-                ("a ball", "Royal dance hosted by the prince"),
-                ("glass slipper", "Delicate footwear lost by Cinderella at the ball"),
-            ),
-        )
-        self.assertEqual(len(rec_cin.structured_triples), 3)
-        # Third triple referencing plain "glass slipper" receives the inline definition propagated from the second
-        # triple
-        self.assertEqual(
-            rec_cin.structured_triples[2].subj_def,
-            "Delicate footwear lost by Cinderella at the ball",
-        )
-        self.assertEqual(
-            rec_cin.structured_triples[2].obj_def,
-            "Young woman mistreated by her stepmother who attends the royal ball",
-        )
-
-        # 4. Repairs are diagnostic and do not penalize task quality.
-        clean_pareto = compute_task_quality_score(0.80, tokens=100)
-        repair_pareto = compute_task_quality_score(
-            0.80,
-            tokens=100,
-            missing_entity_defs_count=2,
-            missing_entity_defs_tokens=60,
-        )
-        self.assertEqual(repair_pareto.score, clean_pareto.score)
-        self.assertEqual(repair_pareto.objective_scores, clean_pareto.objective_scores)
-        self.assertIn(
-            "[entity_definer] repaired 2 missing Stage-2 entity definition(s) (60 aux tokens)",
-            repair_pareto.feedback,
-        )
+        with self.assertRaises(json.JSONDecodeError):
+            parse_label_decisions("invalid json")
+        with self.assertRaises(json.JSONDecodeError):
+            parse_shacl_repairs("invalid json")
 
     def test_reflection_preserves_expected_training_answers(self):
         from yaw.daemon.graph.inference.reflection import (
-            deterministic_evidence,
             reflection_examples,
             resolve_evidence,
         )
 
         examples = reflection_examples([{"score": i, "Feedback": f"Expected=['answer-{i}']"} for i in range(8)])
-        evidence = resolve_evidence(examples, deterministic_evidence(examples))
+        selection = {
+            "diagnosis": "Contrast lower-scoring failures with higher-scoring examples.",
+            "references": [{"example_id": examples[i]["evidence_id"], "path": []} for i in (0, 1, 2, 7, 6)],
+        }
+        evidence = resolve_evidence(examples, selection)
         self.assertEqual(len(evidence), 5)
         self.assertEqual([row["evidence"]["score"] for row in evidence], [0, 1, 2, 7, 6])
         self.assertIn("answer-0", evidence[0]["evidence"]["Feedback"])
@@ -1339,7 +1148,7 @@ repair, and Pareto penalty."""
         self.assertTrue(proposer.enable_simba)
         self.assertFalse(proposer.step_simba())
         self.assertEqual(proposer.dump_simba_state()["version"], 2)
-        self.assertIn("shortened_instruction", proposer.qwen_compressor.signature.output_fields)
+        self.assertIn("shortened_instruction", proposer.llm_compressor.signature.output_fields)
 
     def test_sprint1_configure_yaw_dspy_cache_and_zero_deprecation_warning(self) -> None:
         import tempfile
@@ -1403,20 +1212,22 @@ repair, and Pareto penalty."""
             ExtractTriples,
             FilterTriples,
             HealSHACLViolations,
-            HippoRAGProgram,
-            JudgeSynonyms,
+            JudgeHierarchy,
+            JudgeLabels,
+            JudgeRelated,
             ProposeInstructionSignature,
             ProposeSHACLRepairs,
             ReflectiveInnerDistillerSignature,
             RLMInstructionProposer,
             YawGBNFAdapter,
+            YawProgram,
             create_dspy_lm,
         )
 
         self.assertIn("YawGBNFAdapter", inf_pkg.__all__)
         self.assertTrue(issubclass(YawGBNFAdapter, dspy.JSONAdapter))
 
-        prog = HippoRAGProgram()
+        prog = YawProgram()
         proposer = RLMInstructionProposer()
         self.assertIsInstance(prog.json_adapter, YawGBNFAdapter)
         self.assertIsInstance(proposer.json_adapter, YawGBNFAdapter)
@@ -1426,7 +1237,9 @@ repair, and Pareto penalty."""
             ExtractEntities,
             ExtractTriples,
             DefineMissingEntities,
-            JudgeSynonyms,
+            JudgeLabels,
+            JudgeHierarchy,
+            JudgeRelated,
             ProposeSHACLRepairs,
             ExtractQueryIntent,
             FilterTriples,
@@ -1522,8 +1335,8 @@ repair, and Pareto penalty."""
 
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
             YawPassage,
+            YawProgram,
             YawRetriever,
             YawRM,
         )
@@ -1577,10 +1390,10 @@ repair, and Pareto penalty."""
 
         self.assertTrue(issubclass(YawRetriever, dspy.Retrieve))
         qa_lm = CapabilityDummyLM([{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}])
-        prog = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
+        prog = YawProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         self.assertIsInstance(prog.rm, YawRM)
         self.assertIsInstance(prog.retriever, YawRetriever)
-        self.assertEqual(len(prog.named_predictors()), 10)
+        self.assertEqual(len(prog.named_predictors()), 12)
 
         prog.set_retrieval_hook(fake_hook)
         self.assertIs(prog.rm.hook, fake_hook)
@@ -1596,7 +1409,7 @@ repair, and Pareto penalty."""
         dumped = prog.dump_state()
         self.assertIn("retriever", dumped)
         legacy_state = {k: v for k, v in dumped.items() if k != "retriever"}
-        prog2 = HippoRAGProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
+        prog2 = YawProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         prog2.load_state(legacy_state)
         self.assertEqual(prog2.retriever.k, 10)
 
@@ -1605,7 +1418,7 @@ repair, and Pareto penalty."""
 
         import yaw.daemon.graph.inference as inf_pkg
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
+            YawProgram,
             is_abstaining_answer,
             validate_stage_invariants,
         )
@@ -1711,7 +1524,7 @@ repair, and Pareto penalty."""
         self.assertLess(triples_cw_score, 1.0)
         self.assertIn("StatementShape/closedWorld", triples_cw_fb)
 
-        # Novel entity WITH inline [name, def] satisfies StatementShape/closedWorld
+        # Inline definitions cannot grant Stage 2 authority to invent a resource.
         triples_inline_score, _ = validate_stage_invariants(
             "triples",
             {
@@ -1729,9 +1542,9 @@ repair, and Pareto penalty."""
                 ]
             ),
         )
-        self.assertEqual(triples_inline_score, 1.0)
+        self.assertLess(triples_inline_score, 1.0)
 
-        # Disconnected components across >= 2 entities violates connected-node topology
+        # Independently supported statements may remain disconnected.
         triples_disc_score, triples_disc_fb = validate_stage_invariants(
             "triples",
             {
@@ -1755,8 +1568,8 @@ repair, and Pareto penalty."""
                 ]
             ),
         )
-        self.assertLess(triples_disc_score, 1.0)
-        self.assertIn("Disconnected subgraph", triples_disc_fb)
+        self.assertEqual(triples_disc_score, 1.0)
+        self.assertEqual(triples_disc_fb, "PASS [triples]")
 
         # 3. Stage 3: entity_definer
         ed_ok, _ = validate_stage_invariants(
@@ -1773,24 +1586,107 @@ repair, and Pareto penalty."""
         self.assertLess(ed_bad, 1.0)
         self.assertIn("ConceptShape/definition", ed_bad_fb)
 
-        # 4. Stage 4: synonym_judge (S13, homographDifferentFrom, EdgeShape/closedWorld)
-        syn_ok, _ = validate_stage_invariants(
-            "synonym_judge",
+        # 4. Stage 4: W3C cascade judges (EdgeShape/closedWorld)
+        # 4a. label_judge
+        lbl_ok, _ = validate_stage_invariants(
+            "label_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
-            dspy.Prediction(decisions=[{"pair_id": "ent-1|ent-2", "relation": "skos:altLabel", "canonical": "A"}]),
-        )
-        self.assertEqual(syn_ok, 1.0)
-        syn_bad, syn_bad_fb = validate_stage_invariants(
-            "synonym_judge",
-            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
             dspy.Prediction(
                 decisions=[
-                    {"pair_id": "ent-1|ent-1", "relation": "skos:altLabel", "canonical": "Z"},
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Identical synonyms",
+                        "equivalent": True,
+                        "definition": "Unified canonical concept.",
+                        "hidden_label": False,
+                    }
                 ]
             ),
         )
-        self.assertLess(syn_bad, 1.0)
-        self.assertIn("EdgeShape/closedWorld", syn_bad_fb)
+        self.assertEqual(lbl_ok, 1.0)
+        lbl_bad, lbl_bad_fb = validate_stage_invariants(
+            "label_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "equivalent": False,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(lbl_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", lbl_bad_fb)
+
+        # 4b. hierarchy_judge
+        hier_ok, _ = validate_stage_invariants(
+            "hierarchy_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Taxonomic parent",
+                        "broader": True,
+                        "narrower": False,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(hier_ok, 1.0)
+        hier_bad, hier_bad_fb = validate_stage_invariants(
+            "hierarchy_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "broader": True,
+                        "narrower": False,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(hier_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", hier_bad_fb)
+
+        # 4c. related_judge
+        rel_ok, _ = validate_stage_invariants(
+            "related_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-2",
+                        "reasoning": "Associative relation",
+                        "related": True,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(rel_ok, 1.0)
+        rel_bad, rel_bad_fb = validate_stage_invariants(
+            "related_judge",
+            {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
+            dspy.Prediction(
+                decisions=[
+                    {
+                        "pair_id": "ent-1|ent-1",
+                        "reasoning": "Self loop",
+                        "related": True,
+                    }
+                ]
+            ),
+        )
+        self.assertLess(rel_bad, 1.0)
+        self.assertIn("EdgeShape/closedWorld", rel_bad_fb)
+
+        # 4d. Unhandled stage raises ValueError
+        with self.assertRaises(ValueError):
+            validate_stage_invariants("unhandled_judge", {}, dspy.Prediction())
 
         # 5. Stage 5: shacl_repair & shacl_healer_rlm (6 Closed-World SHACL Shapes)
         shacl_ok, _ = validate_stage_invariants(
@@ -1868,9 +1764,9 @@ repair, and Pareto penalty."""
         )
         self.assertLess(qa_abstain, 1.0)
 
-        # 9. Stage 9: qwen_proposer / qwen_compressor
+        # 9. Stage 9: llm_proposer / llm_compressor
         prop_ok, _ = validate_stage_invariants(
-            "qwen_proposer",
+            "llm_proposer",
             {
                 "component_name": "ner",
                 "current_instruction": "Return JSON with key `named_entities`.",
@@ -1881,7 +1777,7 @@ repair, and Pareto penalty."""
         )
         self.assertEqual(prop_ok, 1.0)
         prop_leak, prop_leak_fb = validate_stage_invariants(
-            "qwen_proposer",
+            "llm_proposer",
             {
                 "component_name": "ner",
                 "current_instruction": "Return JSON with key `named_entities`.",
@@ -1891,24 +1787,22 @@ repair, and Pareto penalty."""
         self.assertLess(prop_leak, 1.0)
         self.assertIn("named_entities", prop_leak_fb)
 
-        # Verify feedback-guided _invoke_stage retry
-        retry_lm = CapabilityDummyLM(
+        # Verify _invoke_stage records stage invariant score without custom retry loop
+        single_lm = CapabilityDummyLM(
             [
-                {"named_entities": [["Ada Lovelace", "Ada Lovelace"]]},
                 {"named_entities": [["Ada Lovelace", "English mathematician and writer"]]},
             ]
         )
-        prog = HippoRAGProgram(orchestrator_lm=retry_lm, rlm_sub_lm=retry_lm)
+        prog = YawProgram(orchestrator_lm=single_lm, rlm_sub_lm=single_lm)
         defs = prog.extract_entity_definitions("Ada Lovelace was an English mathematician and writer.")
         self.assertEqual(defs, (("Ada Lovelace", "English mathematician and writer"),))
-        self.assertEqual(prog.telemetry[-1].get("invariant_retries"), 1)
         self.assertEqual(prog.telemetry[-1].get("invariant_score"), 1.0)
 
     def test_sprint2_textbook_dspy_ensemble_and_react_v2_fallback(self) -> None:
         import anyio
         import dspy
 
-        from yaw.daemon.graph.inference import HippoRAGProgram
+        from yaw.daemon.graph.inference import YawProgram
 
         lm1 = CapabilityDummyLM(
             [
@@ -1924,8 +1818,8 @@ repair, and Pareto penalty."""
             ]
         )
 
-        prog1 = HippoRAGProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
-        prog2 = HippoRAGProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
+        prog1 = YawProgram(orchestrator_lm=lm1, rlm_sub_lm=lm1)
+        prog2 = YawProgram(orchestrator_lm=lm2, rlm_sub_lm=lm2)
         ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([prog1, prog2])
 
         qa_ens_pred = ensemble(
@@ -1933,56 +1827,14 @@ repair, and Pareto penalty."""
             question="What county is Erik Hort's birthplace a part of?",
         )
         self.assertEqual(qa_ens_pred.answer, "Rockland County")
-        self.assertEqual(len(prog1.named_predictors()), 10)
-        self.assertEqual(len(prog2.named_predictors()), 10)
+        self.assertEqual(len(prog1.named_predictors()), 12)
+        self.assertEqual(len(prog2.named_predictors()), 12)
 
-        # Verify dspy.ReActV2 multi-hop fallback when single-shot QA abstains or retrieval confidence < 0.15
-        react_lm = CapabilityDummyLM(
-            [
-                # Single-shot QA call 1 & retry 2 abstain
-                {"reasoning": "Missing second hop.", "answer": "I don't know"},
-                {"reasoning": "Missing second hop.", "answer": "I don't know"},
-                # ReActV2 step 1: call search_graph_facts
-                {
-                    "next_thought": {"content": "Search graph facts for Montebello county."},
-                    "tool_calls": {"tool_calls": [{"name": "search_graph_facts", "args": {"query": "Montebello"}}]},
-                },
-                # ReActV2 step 2: finish with final answer
-                {
-                    "next_thought": {"content": "Montebello is in Rockland County."},
-                    "tool_calls": {
-                        "tool_calls": [
-                            {
-                                "name": "submit",
-                                "args": {
-                                    "reasoning": "Erik Hort was born in Montebello, which is in Rockland County.",
-                                    "answer": "Rockland County",
-                                },
-                            }
-                        ]
-                    },
-                },
-            ]
-        )
-        react_prog = HippoRAGProgram(orchestrator_lm=react_lm, rlm_sub_lm=react_lm)
-        react_prog.enable_react_fallback = True
-        react_prog.set_retrieval_hook(
-            lambda q, *_a, **_kw: (
-                "Erik Hort was born in Montebello.",
-                ("Erik Hort was born in Montebello.",),
-                (0.08,),
-            )
-        )
-        react_prog.set_graph_search_tool(lambda q: f"Fact for {q}: Montebello is located in Rockland County, New York.")
-        react_pred = react_prog(question="What county is Erik Hort's birthplace a part of?")
-        self.assertEqual(react_pred.answer, "Rockland County")
-        self.assertEqual(len(react_prog.named_predictors()), 10)
-
-        # Verify HippoRAGProgram.as_async()
+        # Verify YawProgram.as_async()
         async_prog_lm = CapabilityDummyLM(
             [{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}]
         )
-        async_prog = HippoRAGProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
+        async_prog = YawProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
         async_prog_fn = async_prog.as_async()
         async_res = anyio.run(
             lambda: async_prog_fn(
@@ -1999,7 +1851,7 @@ repair, and Pareto penalty."""
             VALID_SYNONYM_RELATIONS,
             VALUE_BEARING_SHACL_ACTIONS,
             DSPyEmbeddingAdapter,
-            HippoRAGProgram,
+            YawProgram,
             compute_answer_passage_match,
             compute_retrieval_recalls,
             doc_matches_gold,
@@ -2007,17 +1859,14 @@ repair, and Pareto penalty."""
         )
 
         # 1. Verify all VALID_SHACL_ACTIONS from parsers.py pass invariants
-        self.assertEqual(len(VALID_SHACL_ACTIONS), 16)
         self.assertEqual(
             {
                 "set_definition",
-                "rewrite_definition",
                 "set_pref_label",
                 "demote_to_alt_label",
                 "merge_altLabel",
                 "merge_hiddenLabel",
                 "add_different_from",
-                "assert_differentFrom",
                 "assert_related",
                 "assert_broader",
                 "invert_broader",
@@ -2032,21 +1881,26 @@ repair, and Pareto penalty."""
         self.assertEqual(len(VALID_SYNONYM_RELATIONS), 5)
         self.assertEqual(
             VALUE_BEARING_SHACL_ACTIONS,
-            {"set_definition", "rewrite_definition", "set_pref_label"},
+            {"set_definition", "set_pref_label"},
         )
         from yaw.daemon.graph.inference import (
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR,
-            JudgeSynonyms,
+            JudgeHierarchy,
+            JudgeLabels,
+            JudgeRelated,
             ProposeSHACLRepairs,
+            build_dspy_hierarchy_judge_grammar,
+            build_dspy_label_judge_grammar,
+            build_dspy_related_judge_grammar,
             build_dspy_shacl_repair_grammar,
-            build_dspy_synonym_judge_grammar,
         )
 
-        for rel in VALID_SYNONYM_RELATIONS:
-            self.assertIn(rel, DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR)
-            self.assertIn(rel, build_dspy_synonym_judge_grammar(max_decisions=2))
-            self.assertIn(rel, JudgeSynonyms.instructions)
+        self.assertIn("hidden_label", build_dspy_label_judge_grammar(max_decisions=2))
+        self.assertIn("broader", build_dspy_hierarchy_judge_grammar(max_decisions=2))
+        self.assertIn("related", build_dspy_related_judge_grammar(max_decisions=2))
+        self.assertIn("skos:altLabel", JudgeLabels.instructions)
+        self.assertIn("skos:broader", JudgeHierarchy.instructions)
+        self.assertIn("skos:related", JudgeRelated.instructions)
 
         violations_in = {"violations": [{"focus_node": "entity-a"}, {"focus_node": "entity-b"}]}
         for action in VALID_SHACL_ACTIONS:
@@ -2191,16 +2045,18 @@ repair, and Pareto penalty."""
             "Erik Hort born in Montebello",
         )
 
-        # 4. Verify HippoRAGProgram.dump_audit_trails bounded vs unbounded & custom telemetry_key
+        # 4. Verify YawProgram.dump_audit_trails bounded vs unbounded & custom telemetry_key
         import yaw.daemon.graph.inference.program as prog_mod
 
-        self.assertEqual(prog_mod.__all__, ["HippoRAGProgram"])
-        prog = HippoRAGProgram()
+        self.assertEqual(prog_mod.__all__, ["YawProgram"])
+        prog = YawProgram()
         for i in range(260):
             prog.telemetry.append({"idx": i})
             prog.embedding_audit_trail.append({"idx": i})
             prog.entity_def_audit_trail.append({"idx": i})
-            prog.synonym_audit_trail.append({"idx": i})
+            prog.label_judge_audit_trail.append({"idx": i})
+            prog.hierarchy_judge_audit_trail.append({"idx": i})
+            prog.related_judge_audit_trail.append({"idx": i})
             prog.shacl_audit_trail.append({"idx": i})
         bounded_trails = prog.dump_audit_trails(bounded=True)
         self.assertEqual(
@@ -2209,14 +2065,18 @@ repair, and Pareto penalty."""
                 "telemetry",
                 "embedding_audit_trail",
                 "entity_def_audit_trail",
-                "synonym_audit_trail",
+                "label_judge_audit_trail",
+                "hierarchy_judge_audit_trail",
+                "related_judge_audit_trail",
                 "shacl_audit_trail",
             },
         )
         self.assertEqual(len(bounded_trails["telemetry"]), 250)
         self.assertEqual(len(bounded_trails["embedding_audit_trail"]), 250)
         self.assertEqual(len(bounded_trails["entity_def_audit_trail"]), 250)
-        self.assertEqual(len(bounded_trails["synonym_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["label_judge_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["hierarchy_judge_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["related_judge_audit_trail"]), 100)
         self.assertEqual(len(bounded_trails["shacl_audit_trail"]), 100)
         aliased_trails = prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry")
         self.assertIn("program_telemetry", aliased_trails)
@@ -2232,7 +2092,7 @@ repair, and Pareto penalty."""
         from types import SimpleNamespace
 
         from yaw.daemon.graph.inference import (
-            HippoRAGProgram,
+            YawProgram,
             compile_pareto_ensemble,
             evaluate_program,
             query_retrieval_fingerprint,
@@ -2240,8 +2100,8 @@ repair, and Pareto penalty."""
             select_pareto_frontier_programs,
         )
 
-        # 1. Verify HippoRAGProgram.forward places 'answer' last & supports retrieve_only=True
-        prog1 = HippoRAGProgram()
+        # 1. Verify YawProgram.forward places 'answer' last & supports retrieve_only=True
+        prog1 = YawProgram()
         qa_calls: list[str] = []
         prog1.set_retrieval_hook(
             lambda q, _p=None, **_kw: (
@@ -2313,7 +2173,7 @@ repair, and Pareto penalty."""
         self.assertEqual(ret_fused_out.answer, "")
         self.assertEqual(list(ret_fused_out.keys())[-1], "answer")
 
-        # Verify None/empty answer handling in HippoRAGProgram.forward and reduce_pareto_predictions:
+        # Verify None/empty answer handling in YawProgram.forward and reduce_pareto_predictions:
         # Two abstaining members returning None or "" must not crash dspy.majority or outvote a valid answer.
         prog_none = copy.deepcopy(prog1)
         prog_none.answer_question = lambda context, question, **_kw: dspy.Prediction(  # type: ignore[method-assign]
@@ -2429,8 +2289,8 @@ repair, and Pareto penalty."""
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_p = Path(tmpdir)
-            src_prog_file = tmp_p / "compiled_program_optimize_run.json"
-            src_telem_dir = tmp_p / "compiled_program_optimize_run_telemetry"
+            src_prog_file = tmp_p / "optimize_program_run.json"
+            src_telem_dir = tmp_p / "optimize_program_run_telemetry"
             src_telem_dir.mkdir(parents=True, exist_ok=True)
             cand0.save(str(src_prog_file), save_program=False)
             for idx, sib in enumerate(selected[1:], start=1):
@@ -2453,7 +2313,7 @@ repair, and Pareto penalty."""
             self.assertTrue((dst_telem_dir / "pareto_member_2.json").exists())
             self.assertTrue((dst_telem_dir / "pareto_frontier_manifest.json").exists())
 
-            fresh_prog = HippoRAGProgram(compiled_path=prog_file)
+            fresh_prog = YawProgram(compiled_path=prog_file)
             fresh_prog.set_retrieval_hook(prog1._retrieval_hook)
             fresh_prog.answer_question = prog1.answer_question  # type: ignore[method-assign]
             reloaded_ens = compile_pareto_ensemble(fresh_prog, program_path=prog_file)

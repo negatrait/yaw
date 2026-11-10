@@ -1,5 +1,6 @@
 """Single-owner persistent daemon runtime with FileLock, 32-slot bounded queue, and crash-resilient CocoIndex sync."""
 
+import asyncio
 import contextlib
 import hashlib
 import importlib.metadata
@@ -15,52 +16,68 @@ import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar
 
+import cocoindex as coco
 import filelock
 
 from yaw.core import (
-    ChunkPointer,
     DaemonStatus,
+    FatalGraphPublicationError,
     HydratedPassage,
     IndexStats,
-    SyncDelta,
     YawConfig,
     YawRuntimeError,
     configure_logging,
+    parse_dataset_list,
+    resolve_coco_state_root,
     write_text_atomic,
 )
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
-    HippoRAGProgram,
+    YawProgram,
     check_benchmark_integrity,
     compute_qa_em_f1,
     compute_retrieval_recalls,
     create_dspy_rlm_pair,
     evaluate_benchmark_gate,
 )
-from yaw.daemon.ingestion import (
-    BENCHMARK_JSON_BLACKLIST,
-    BENCHMARK_JSON_WHITELIST,
-    DATASET_ALIASES,
-    DATASET_REGISTRY,
-    DEFAULT_PARITY_DATASETS,
-    MONKEYPATCHED_HIPPORAG_BASELINES,
-    PAPER_BASELINES,
-    CorpusIngestor,
-    build_benchmark_slice,
-    load_dataset_files,
-    resolve_dataset_name,
-    resolve_dataset_source_files,
-    sync_source_files_for_docs,
+from yaw.daemon.graph.inference.components import (
+    EMBEDDING_ENDPOINT,
+    OPENIE_ENDPOINT,
+    EmbeddingEndpoint,
+    OpenIEEndpoint,
 )
+from yaw.daemon.graph.planner import GraphPlanSettings
+from yaw.daemon.graph.storage.db import GRAPH_DB
+from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
+from yaw.daemon.graph.storage.rows import validate_graph_state
+from yaw.daemon.indexing import (
+    INDEXING_ERROR_SINK,
+    RELOAD_SIGNAL_HANDLER,
+    RELOAD_SIGNAL_ROOT,
+    InferenceIdentity,
+    SyncOutcome,
+    acquire_coco_environment,
+    bind_native_indexing,
+    close_coco_environment,
+    graph_plan_fingerprints,
+    indexing_app_main,
+)
+from yaw.daemon.ingestion import (
+    DEFAULT_PARITY_DATASETS,
+    DatasetBundle,
+    build_benchmark_slice,
+    resolve_dataset_bundle,
+)
+from yaw.daemon.ingestion.source_targets import SOURCE_DB, SOURCE_ROOT, SourceSettings
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
-_PENDING_DELTA_META_KEY = "pending_sync_delta"
 _CONFIG_FP_META_KEY = "config_fingerprint"
 
 if os.name == "nt":
@@ -111,23 +128,6 @@ class _WorkItem:
     progress_callback: Callable[[str], None] | None = None
 
 
-def _serialize_sync_delta(delta: SyncDelta) -> str:
-    return json.dumps(
-        {
-            "added_chunks": [[asdict(ptr), text] for ptr, text in delta.added_chunks],
-            "deleted_chunk_ids": list(delta.deleted_chunk_ids),
-        },
-        ensure_ascii=False,
-    )
-
-
-def _deserialize_sync_delta(raw: str) -> SyncDelta:
-    data = json.loads(raw)
-    added = tuple((ChunkPointer(**ptr_dict), str(text)) for ptr_dict, text in data.get("added_chunks", ()))
-    deleted = tuple(str(cid) for cid in data.get("deleted_chunk_ids", ()))
-    return SyncDelta(added_chunks=added, deleted_chunk_ids=deleted)
-
-
 def validate_query_input(text: str) -> str:
     """Validate and trim a query/question input (non-empty, <= 1024 UTF-8 bytes)."""
     if not isinstance(text, str):
@@ -150,7 +150,7 @@ class YawRuntime:
         self,
         config: YawConfig,
         *,
-        program: HippoRAGProgram | None = None,
+        program: YawProgram | None = None,
         embedder: DSPyEmbeddingAdapter | None = None,
         auto_poll: bool = False,
     ) -> None:
@@ -168,14 +168,19 @@ class YawRuntime:
         self._stop_event = threading.Event()
         self._has_started = False
         self._worker_thread: threading.Thread | None = None
-        self._poller_thread: threading.Thread | None = None
         self._win32_stop_handle: int | None = None
         self._win32_waiter_thread: threading.Thread | None = None
 
-        self._pending_sync_future: Future[SyncDelta] | None = None
+        self._pending_sync_future: Future[SyncOutcome] | None = None
         self._pending_scan_id: str | None = None
 
-        self.ingestor: CorpusIngestor | None = None
+        self._coco_env: coco.Environment | None = None
+        self._coco_app: coco.App[..., Any] | None = None
+        self._live_thread: threading.Thread | None = None
+        self._live_error: BaseException | None = None
+        self._last_indexing_error: BaseException | None = None
+        self._openie_endpoint: OpenIEEndpoint | None = None
+        self._embedding_endpoint: EmbeddingEndpoint | None = None
         self.engine: YawGraphEngine | None = None
 
         self._stats = IndexStats(config_fingerprint=self.config.config_fingerprint())
@@ -223,53 +228,179 @@ class YawRuntime:
         """Block until the runtime is signaled to stop or timeout expires."""
         return self._stop_event.wait(timeout=timeout)
 
-    def _open_components(self) -> None:
+    def _on_reload_signal(self, raw: str) -> None:
+        assert self.config.workspace_root is not None
+        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
+        signal_file = yaw_dir / "reload.signal"
+        result_file = yaw_dir / "reload.result"
+        if not raw.strip():
+            return
+        req_id: Any = None
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("Reload signal payload must be a JSON object")
+            req_id = data.get("req_id")
+            prog_path = data.get("program_path")
+            if not prog_path:
+                return
+            future = self._submit_program_reload(prog_path)
+
+            def publish_result(completed: Future[dict[str, Any]]) -> None:
+                try:
+                    res = completed.result()
+                    res["req_id"] = req_id
+                except Exception as exc:
+                    res = {"reloaded": False, "req_id": req_id, "error": str(exc), "pid": os.getpid()}
+                write_text_atomic(result_file, json.dumps(res, indent=2))
+
+            future.add_done_callback(publish_result)
+        except Exception as exc:
+            err_payload = {
+                "reloaded": False,
+                "req_id": req_id,
+                "error": str(exc),
+                "pid": os.getpid(),
+            }
+            write_text_atomic(result_file, json.dumps(err_payload, indent=2))
+        finally:
+            with contextlib.suppress(OSError):
+                signal_file.unlink(missing_ok=True)
+
+    def _record_indexing_error(self, exc: BaseException) -> None:
+        with self._state_lock:
+            if self._last_indexing_error is None:
+                self._last_indexing_error = exc
+
+    def _pop_indexing_error(self) -> BaseException | None:
+        with self._state_lock:
+            err = self._last_indexing_error
+            self._last_indexing_error = None
+            return err
+
+    def _close_coco_app(self) -> None:
+        if self._coco_env is not None:
+            if self.config.state_dir is not None:
+                close_coco_environment(self.config.state_dir)
+            self._coco_env = None
+            self._coco_app = None
+
+    def _build_coco_app(self) -> None:
+        assert self.engine is not None
         assert self.config.corpus_root is not None
         assert self.config.state_dir is not None
-        assert self.config.db_path is not None
+        assert self.config.workspace_root is not None
+        self._close_coco_app()
 
-        if self._custom_program is not None:
-            program = self._custom_program
-            if self.config.compiled_program_path and Path(self.config.compiled_program_path).exists():
-                program.load(str(self.config.compiled_program_path))
-        else:
-            program = HippoRAGProgram.from_config(self.config)
+        program = self.engine.program
+        embedder = self.engine.embedder
+        prog_id, emb_id, syn_id, shacl_id = graph_plan_fingerprints(program, embedder)
+        lm = getattr(program, "orchestrator_lm", None) or getattr(program, "rlm_sub_lm", None)
 
-        embedder = (
-            self._custom_embedder
-            if self._custom_embedder is not None
-            else DSPyEmbeddingAdapter.from_config(self.config)
-        )
+        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
+        yaw_dir.mkdir(parents=True, exist_ok=True)
 
-        assert self.config.max_context_chars is not None
-        self.engine = YawGraphEngine(
-            db_path=self.config.db_path,
-            workspace_root=self.config.corpus_root,
-            program=program,
-            embedder=embedder,
-            linking_top_k=self.config.linking_top_k,
-            retrieval_top_k=self.config.retrieval_top_k,
-            damping=self.config.damping,
-            synonymy_threshold=self.config.synonymy_threshold,
-            synonymy_top_k=self.config.synonymy_top_k,
-            embed_batch_size=self.config.embed_batch_size,
-            max_context_chars=self.config.max_context_chars,
-            max_ast_expansion_hops=self.config.max_ast_expansion_hops,
-            ast_context_hops=self.config.ast_context_hops,
-        )
-        self.engine.config = self.config
-        self.ingestor = CorpusIngestor(
-            corpus_root=self.config.corpus_root,
-            state_dir=self.config.state_dir,
-            included_patterns=self.config.included_patterns,
-            excluded_patterns=self.config.excluded_patterns,
-            json_keys_whitelist=self.config.json_keys_whitelist,
-            json_keys_blacklist=self.config.json_keys_blacklist,
+        self._embedding_endpoint = EmbeddingEndpoint(embedder, asyncio.Semaphore(4))
+        self._openie_endpoint = OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1))
+
+        state_dir = resolve_coco_state_root(self.config.state_dir)
+        shared = acquire_coco_environment(state_dir)
+        self._coco_env = shared.environment
+
+        context = shared.context
+        context.provide(SOURCE_DB, self.engine.managed_conn)
+        context.provide(GRAPH_DB, self.engine.managed_conn)
+        context.provide(VALIDATE_SQLITE, validate_graph_state)
+        context.provide(SOURCE_ROOT, Path(self.config.corpus_root).resolve())
+        context.provide(EMBEDDING_ENDPOINT, self._embedding_endpoint)
+        context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
+        context.provide(RELOAD_SIGNAL_ROOT, yaw_dir)
+        context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
+        context.provide(INDEXING_ERROR_SINK, self._record_indexing_error)
+
+        src_settings = SourceSettings(
+            included_patterns=tuple(self.config.included_patterns),
+            excluded_patterns=tuple(self.config.excluded_patterns),
+            json_keys_whitelist=tuple(self.config.json_keys_whitelist),
+            json_keys_blacklist=tuple(self.config.json_keys_blacklist),
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap,
             min_chunk_size=self.config.min_chunk_size,
-            on_delta=self._apply_delta,
         )
+        graph_settings = GraphPlanSettings(
+            corpus_root=Path(self.config.corpus_root).resolve(),
+            program_identity=prog_id,
+            embedding_identity=emb_id,
+            synonym_identity=syn_id,
+            shacl_identity=shacl_id,
+            candidate_dense_threshold=self.config.candidate_dense_threshold,
+            candidate_lexical_threshold=self.config.candidate_lexical_threshold,
+            auto_merge_threshold=self.config.auto_merge_threshold,
+            synonym_batch_size=self.config.synonym_batch_size,
+            ast_context_hops=self.config.ast_context_hops,
+            context_window_tokens=self.config.context_window_tokens,
+            max_output_tokens=self.config.max_output_tokens,
+            chunk_size=self.config.chunk_size,
+            chunk_overlap=self.config.chunk_overlap,
+            min_chunk_size=self.config.min_chunk_size,
+        )
+        app = shared.apps.get("yaw_indexing")
+        if app is None:
+            app = coco.App(
+                coco.AppConfig(name="yaw_indexing", environment=self._coco_env, max_inflight_components=4),
+                indexing_app_main,
+                src_settings,
+                InferenceIdentity(program=prog_id, embedding=emb_id),
+                graph_settings,
+                self.auto_poll,
+            )
+            shared.apps["yaw_indexing"] = app
+        self._coco_app = app
+
+    def _create_bound_engine(
+        self,
+        cfg: YawConfig,
+        *,
+        workspace_root: Path | None = None,
+        compiled_program_override: Path | str | None = None,
+    ) -> tuple[YawProgram, DSPyEmbeddingAdapter, YawGraphEngine]:
+        assert cfg.corpus_root is not None
+        assert cfg.db_path is not None
+        assert cfg.max_context_chars is not None
+
+        program = self._custom_program if self._custom_program is not None else YawProgram.from_config(cfg)
+        comp_path = compiled_program_override or cfg.compiled_program_path
+        if comp_path and Path(comp_path).exists() and hasattr(program, "load"):
+            program.load(str(comp_path))
+
+        embedder = self._custom_embedder if self._custom_embedder is not None else DSPyEmbeddingAdapter.from_config(cfg)
+        engine = bind_native_indexing(
+            YawGraphEngine(
+                db_path=cfg.db_path,
+                workspace_root=workspace_root if workspace_root is not None else cfg.corpus_root,
+                program=program,
+                embedder=embedder,
+                linking_top_k=cfg.linking_top_k,
+                retrieval_top_k=cfg.retrieval_top_k,
+                damping=cfg.damping,
+                candidate_dense_threshold=cfg.candidate_dense_threshold,
+                candidate_lexical_threshold=cfg.candidate_lexical_threshold,
+                auto_merge_threshold=cfg.auto_merge_threshold,
+                synonym_batch_size=cfg.synonym_batch_size,
+                embed_batch_size=cfg.embed_batch_size,
+                max_context_chars=cfg.max_context_chars,
+                max_ast_expansion_hops=cfg.max_ast_expansion_hops,
+                ast_context_hops=cfg.ast_context_hops,
+            ),
+            state_root=cfg.state_dir,
+        )
+        return program, embedder, engine
+
+    def _open_components(self) -> None:
+        assert self.config.state_dir is not None
+        _, _, self.engine = self._create_bound_engine(self.config)
+        self.engine.config = self.config
+        self._build_coco_app()
         fp = self.config.config_fingerprint()
         self.engine.set_meta(_CONFIG_FP_META_KEY, fp)
         stats = self.engine.get_stats(fp)
@@ -277,14 +408,82 @@ class YawRuntime:
             self._stats = stats
 
     def _close_components(self) -> None:
-        if self.ingestor is not None:
-            with contextlib.suppress(OSError, RuntimeError):
-                self.ingestor.close()
-            self.ingestor = None
-        if self.engine is not None:
-            with contextlib.suppress(OSError, sqlite3.Error, RuntimeError):
-                self.engine.close()
+        try:
+            with contextlib.ExitStack() as cleanup:
+                if self.engine is not None:
+                    cleanup.callback(self.engine.close)
+                if self._coco_env is not None:
+                    cleanup.callback(self._close_coco_app)
+                cleanup.callback(self._stop_live_update)
+        finally:
+            self._coco_env = None
+            self._coco_app = None
+            self._openie_endpoint = None
+            self._embedding_endpoint = None
             self.engine = None
+
+    def _start_live_update(self) -> None:
+        """Host the native live update; CocoIndex owns filesystem and inference work."""
+        if not self.auto_poll or self._stop_event.is_set() or self._live_thread is not None:
+            return
+        if self._coco_app is None:
+            self._build_coco_app()
+        app = self._coco_app
+        if app is None:
+            raise YawRuntimeError("NOT_READY", "CocoIndex app is not initialized.")
+        ready: Future[None] = Future()
+
+        async def run() -> None:
+            self._pop_indexing_error()
+            handle = app.update(live=True)
+            async for event in handle.watch():
+                err = self._pop_indexing_error()
+                if err is not None:
+                    raise err
+                if event.stats.total.num_errors:
+                    raise YawRuntimeError("CONSISTENCY_ERROR", "CocoIndex live update reported component errors.")
+                if event.stats.total.num_in_progress == 0:
+                    self._refresh_published_state()
+                if event.status == coco.UpdateStatus.READY and not ready.done():
+                    ready.set_result(None)
+
+        def serve() -> None:
+            try:
+                asyncio.run(run())
+            except BaseException as exc:
+                self._live_error = exc
+                if not ready.done():
+                    ready.set_exception(exc)
+                self._update_state(sync_state="error", last_error=str(exc)[:300])
+                self.request_stop()
+            finally:
+                if not ready.done():
+                    ready.set_exception(RuntimeError("Live update ended before readiness"))
+
+        self._live_thread = threading.Thread(target=serve, name="yaw-cocoindex-live", daemon=True)
+        self._live_thread.start()
+        ready.result()
+
+    def _stop_live_update(self) -> None:
+        """Transition the native app to catch-up and drain before resource changes."""
+        thread = self._live_thread
+        if thread is None:
+            return
+        app = self._coco_app
+        try:
+            if thread.is_alive() and app is not None:
+
+                async def drain() -> None:
+                    await app.update().result()
+
+                asyncio.run(drain())
+        finally:
+            thread.join()
+            self._live_thread = None
+        if self._live_error is not None:
+            error = self._live_error
+            self._live_error = None
+            raise error
 
     def _update_state(self, **kwargs: Any) -> None:
         with self._state_lock:
@@ -301,13 +500,8 @@ class YawRuntime:
     def _persist_status_file(self, snapshot: dict[str, Any]) -> None:
         if self.config.status_path is None:
             return
-        status_path = Path(self.config.status_path)
-        for _ in range(5):
-            try:
-                write_text_atomic(status_path, json.dumps(snapshot, indent=2))
-                break
-            except OSError:
-                time.sleep(0.01)
+        with contextlib.suppress(OSError):
+            write_text_atomic(self.config.status_path, json.dumps(snapshot, indent=2))
 
     def _start_win32_stop_event(self) -> None:
         if os.name != "nt" or self.config.lock_path is None:
@@ -354,7 +548,7 @@ class YawRuntime:
     def start(self, *, sync_on_start: bool = True) -> None:
         """Acquire exclusive yaw.db.lock, open CocoIndex + YawGraphEngine, and start worker thread."""
         with self._state_lock:
-            if self._status.lifecycle in ("starting", "ready", "degraded"):
+            if self._status.lifecycle in ("starting", "ready"):
                 return
 
         try:
@@ -392,8 +586,7 @@ class YawRuntime:
             )
             self._worker_thread.start()
 
-            has_pending = self.engine is not None and self.engine.get_meta(_PENDING_DELTA_META_KEY) is not None
-            if (sync_on_start or has_pending) and not self._stop_event.is_set():
+            if sync_on_start and not self._stop_event.is_set():
                 try:
                     self.sync_now()
                 except YawRuntimeError as err:
@@ -405,26 +598,21 @@ class YawRuntime:
             if self._stop_event.is_set():
                 self.stop()
                 return
-
-            if self.auto_poll and self.config.poll_interval_seconds > 0 and not self._stop_event.is_set():
-                self._poller_thread = threading.Thread(
-                    target=self._poll_loop,
-                    name="yaw-runtime-poller",
-                    daemon=True,
-                )
-                self._poller_thread.start()
+            self._start_live_update()
         except Exception:
             self._close_win32_stop_event()
             if self.config.lock_path is not None:
                 with self._active_lock:
                     self._active_instances.pop(self.config.lock_path.resolve(), None)
-            self._close_components()
-            if self._file_lock.is_locked:
-                self._file_lock.release()
+            try:
+                self._close_components()
+            finally:
+                if self._file_lock.is_locked:
+                    self._file_lock.release()
             raise
 
     def stop(self) -> None:
-        """Gracefully stop poller and worker threads, close databases, and release yaw.db.lock."""
+        """Gracefully stop live CocoIndex stream and worker thread, close databases, and release yaw.db.lock."""
         self._stop_event.set()
         if self.config.lock_path is not None:
             with self._active_lock:
@@ -450,10 +638,6 @@ class YawRuntime:
         self._stop_event.set()
         self._close_win32_stop_event()
 
-        if self._poller_thread is not None and self._poller_thread.is_alive():
-            self._poller_thread.join(timeout=2.0)
-        self._poller_thread = None
-
         # Cancel queued items that have not started yet
         while True:
             try:
@@ -469,19 +653,24 @@ class YawRuntime:
         if self._worker_thread is not None and self._worker_thread.is_alive():
             with contextlib.suppress(queue.Full):
                 self._queue.put_nowait(None)
-            self._worker_thread.join(timeout=5.0)
+            # An in-flight provider call cannot be cancelled by abandoning its
+            # worker. Keep SQLite and CocoIndex alive until the operation exits
+            # under its configured provider timeout/retry policy.
+            self._worker_thread.join()
         self._worker_thread = None
 
-        self._close_components()
-        self._update_state(
-            lifecycle="stopped",
-            provider_ready=False,
-            sync_state="idle",
-            active_op=None,
-            pid=None,
-        )
-        if self._file_lock.is_locked:
-            self._file_lock.release()
+        try:
+            self._close_components()
+        finally:
+            self._update_state(
+                lifecycle="stopped",
+                provider_ready=False,
+                sync_state="idle",
+                active_op=None,
+                pid=None,
+            )
+            if self._file_lock.is_locked:
+                self._file_lock.release()
 
     def close(self) -> None:
         """Alias for stop()."""
@@ -547,47 +736,6 @@ class YawRuntime:
         self._update_state()
         return fut
 
-    def _poll_loop(self) -> None:
-        poll_interval = max(0.05, float(self.config.poll_interval_seconds))
-        last_sync_check = time.monotonic()
-        assert self.config.workspace_root is not None
-        yaw_dir = (self.config.workspace_root / ".yaw").resolve()
-        signal_file = yaw_dir / "reload.signal"
-        result_file = yaw_dir / "reload.result"
-
-        while not self._stop_event.is_set():
-            if signal_file.exists():
-                with contextlib.suppress(Exception):
-                    raw = signal_file.read_text(encoding="utf-8")
-                    data = json.loads(raw) if raw.strip() else {}
-                    prog_path = data.get("program_path")
-                    req_id = data.get("req_id")
-                    if prog_path:
-                        try:
-                            res = self.reload_program(prog_path)
-                            res["req_id"] = req_id
-                            result_file.write_text(json.dumps(res, indent=2), encoding="utf-8")
-                        except Exception as exc:
-                            err_payload = {
-                                "reloaded": False,
-                                "req_id": req_id,
-                                "error": str(exc),
-                                "pid": os.getpid(),
-                            }
-                            result_file.write_text(json.dumps(err_payload, indent=2), encoding="utf-8")
-                        finally:
-                            with contextlib.suppress(OSError):
-                                signal_file.unlink(missing_ok=True)
-
-            now = time.monotonic()
-            if now - last_sync_check >= poll_interval:
-                last_sync_check = now
-                with contextlib.suppress(YawRuntimeError):
-                    self.request_sync()
-
-            if self._stop_event.wait(0.2):
-                break
-
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -610,33 +758,52 @@ class YawRuntime:
                 item.progress_callback("started")
 
             try:
+                self._stop_live_update()
                 result = item.fn()
+                self._start_live_update()
             except YawRuntimeError as err:
+                if self.auto_poll:
+                    self.request_stop()
                 if err.code == "MODEL_ERROR":
                     self._update_state(
-                        lifecycle="degraded",
+                        lifecycle="ready",
                         provider_ready=False,
                         sync_state="error" if item.op_name == "sync" else "idle",
                         active_op=None,
                         last_error=err.message[:300],
                     )
                 else:
-                    self._update_state(active_op=None, sync_state="idle")
+                    self._update_state(
+                        active_op=None,
+                        sync_state="error" if item.op_name == "sync" else "idle",
+                        last_error=err.message[:300],
+                    )
                 item.future.set_exception(err)
             except Exception as exc:
+                if self.auto_poll:
+                    self.request_stop()
                 msg = f"{type(exc).__name__}: {exc}"
                 err_code: Literal["CONSISTENCY_ERROR", "MODEL_ERROR"] = (
                     "CONSISTENCY_ERROR" if isinstance(exc, sqlite3.DatabaseError) else "MODEL_ERROR"
                 )
                 wrapped = YawRuntimeError(err_code, msg)
                 self._update_state(
-                    lifecycle="degraded" if err_code == "MODEL_ERROR" else self._status.lifecycle,
+                    lifecycle="ready" if err_code == "MODEL_ERROR" else self._status.lifecycle,
                     provider_ready=err_code != "MODEL_ERROR",
                     sync_state="error" if item.op_name == "sync" else "idle",
                     active_op=None,
                     last_error=msg[:300],
                 )
                 item.future.set_exception(wrapped)
+            except BaseException as exc:
+                self.request_stop()
+                self._update_state(
+                    active_op=None,
+                    sync_state="idle",
+                    last_error=f"{type(exc).__name__}: {exc}"[:300],
+                )
+                item.future.set_exception(exc)
+                raise
             else:
                 if item.progress_callback is not None:
                     item.progress_callback("ready")
@@ -664,63 +831,58 @@ class YawRuntime:
                 )
             self._queue.task_done()
 
-    def _apply_delta(
-        self,
-        delta: SyncDelta,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> None:
-        assert self.engine is not None
-        if not delta.deleted_chunk_ids and not delta.added_chunks:
-            return
-        cb = progress_callback
-        if cb is None:
+    def _execute_sync_worker(self) -> SyncOutcome:
+        if self.engine is None:
+            raise YawRuntimeError("NOT_READY", "Engine or CocoIndex app is not initialized.")
+        if self._coco_app is None:
+            self._build_coco_app()
+        assert self._coco_app is not None
 
-            def _default_sync_progress(msg: str) -> None:
-                self._update_state(active_op=msg, sync_state="syncing")
+        self._update_state(active_op="syncing corpus via CocoIndex", sync_state="syncing")
+        with self.engine._lock:
+            before_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
 
-            cb = _default_sync_progress
-        self.engine.set_meta(_PENDING_DELTA_META_KEY, _serialize_sync_delta(delta))
-        if delta.deleted_chunk_ids:
-            self.engine.delete_chunks(delta.deleted_chunk_ids)
-        if delta.added_chunks:
-            self.engine.index_chunks(delta.added_chunks, progress_callback=cb)
-        self.engine.set_meta(_PENDING_DELTA_META_KEY, None)
+        async def _run_coco_update(app: coco.App[..., Any]) -> coco.UpdateStats | None:
+            handle = app.update()
+            await handle.result()
+            return handle.stats()
 
-    def _execute_sync_worker(self) -> SyncDelta:
-        if self.ingestor is None or self.engine is None:
-            raise YawRuntimeError("NOT_READY", "Engine or ingestor is not initialized.")
+        self._pop_indexing_error()
+        update_stats = asyncio.run(_run_coco_update(self._coco_app))
+        err = self._pop_indexing_error()
+        if err is not None:
+            raise err
 
-        def _sync_progress(msg: str) -> None:
-            self._update_state(active_op=msg, sync_state="syncing")
+        if update_stats is not None and update_stats.total.num_errors > 0:
+            raise YawRuntimeError(
+                "CONSISTENCY_ERROR",
+                f"CocoIndex update failed with {update_stats.total.num_errors} component error(s).",
+            )
 
-        # 1. Replay any uncommitted pending delta before polling CocoIndex
-        raw_pending = self.engine.get_meta(_PENDING_DELTA_META_KEY)
-        if raw_pending:
-            pending_delta = _deserialize_sync_delta(raw_pending)
-            self._apply_delta(pending_delta, progress_callback=_sync_progress)
-        else:
-            pending_delta = None
+        with self.engine._lock:
+            after_cids = {str(r[0]) for r in self.engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
+        self._refresh_published_state()
 
-        # 2. Poll CocoIndex for subsequent corpus changes (compiled inside target sink before LMDB commit)
-        _sync_progress("polling CocoIndex for corpus changes")
-        polled_delta = self.ingestor.poll()
-        if getattr(self.ingestor, "on_delta", getattr(self.ingestor, "_on_delta", None)) is None:
-            self._apply_delta(polled_delta, progress_callback=_sync_progress)
+        added = tuple(sorted(after_cids - before_cids))
+        deleted = tuple(sorted(before_cids - after_cids))
+        return SyncOutcome(added_chunks=added, deleted_chunk_ids=deleted)
+
+    def _refresh_published_state(self) -> None:
+        """Invalidate retrieval state after native graph publication and refresh cached stats."""
+        if self.engine is None:
+            raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+        with self.engine._lock:
+            self.engine._csr_graph = None
+            self.engine._csr_cache_key = None
+            self.engine._query_retrieval_memo.clear()
+            self.engine._last_memo_question = None
+            self.engine._hydrate_indexed_cids_from_db()
 
         new_stats = self.engine.get_stats(self.config.config_fingerprint())
         with self._state_lock:
             self._stats = new_stats
 
-        if polled_delta.added_chunks or polled_delta.deleted_chunk_ids or pending_delta is None:
-            return polled_delta
-        return pending_delta
-
-    def request_sync(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> dict[str, Any]:
+    def request_sync(self) -> dict[str, Any]:
         """Request an asynchronous coalesced CocoIndex sync on the worker thread."""
         with self._state_lock:
             if self._pending_sync_future is not None and not self._pending_sync_future.done():
@@ -731,7 +893,7 @@ class YawRuntime:
             scan_id = f"scan-{uuid.uuid4().hex[:8]}"
             self._pending_scan_id = scan_id
 
-        fut = self.submit("sync", self._execute_sync_worker, progress_callback=progress_callback)
+        fut = self.submit("sync", self._execute_sync_worker)
         with self._state_lock:
             self._pending_sync_future = fut
         return {
@@ -739,12 +901,8 @@ class YawRuntime:
             "status": "accepted",
         }
 
-    def sync_now(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> SyncDelta:
-        """Run or await a CocoIndex incremental sync and return the applied SyncDelta."""
+    def sync_now(self) -> SyncOutcome:
+        """Run or await a CocoIndex incremental sync and return the applied SyncOutcome."""
         with self._state_lock:
             existing_fut = (
                 self._pending_sync_future
@@ -754,7 +912,7 @@ class YawRuntime:
         if existing_fut is not None:
             return existing_fut.result()
 
-        fut = self.submit("sync", self._execute_sync_worker, progress_callback=progress_callback)
+        fut = self.submit("sync", self._execute_sync_worker)
         with self._state_lock:
             self._pending_sync_future = fut
         return fut.result()
@@ -763,8 +921,6 @@ class YawRuntime:
         self,
         query: str,
         top_k: int = 5,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> Future[list[HydratedPassage]]:
         """Validate query and enqueue hybrid PPR + 1-indexed disk line hydration."""
         cleaned = validate_query_input(query)
@@ -782,23 +938,19 @@ class YawRuntime:
                 HydratedPassage(pointer=ptr, text=text, score=score, stale_on_disk=False) for ptr, score, text in hits
             ]
 
-        return self.submit("retrieve", _run_retrieve, progress_callback=progress_callback)
+        return self.submit("retrieve", _run_retrieve)
 
     def retrieve(
         self,
         query: str,
         top_k: int = 5,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> list[HydratedPassage]:
         """Synchronously retrieve top-k hydrated passages via the bounded worker queue."""
-        return self.retrieve_async(query, top_k=top_k, progress_callback=progress_callback).result()
+        return self.retrieve_async(query, top_k=top_k).result()
 
     def rag_qa_async(
         self,
         question: str,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> Future[dict[str, Any]]:
         """Validate question and enqueue multi-hop HippoRAG 2 QA on the worker queue."""
         cleaned = validate_query_input(question)
@@ -842,22 +994,16 @@ class YawRuntime:
                 "last_sync_at": self.status().last_sync_at,
             }
 
-        return self.submit("rag_qa", _run_qa, progress_callback=progress_callback)
+        return self.submit("rag_qa", _run_qa)
 
     def rag_qa(
         self,
         question: str,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Synchronously execute multi-hop HippoRAG 2 QA via the bounded worker queue."""
-        return self.rag_qa_async(question, progress_callback=progress_callback).result()
+        return self.rag_qa_async(question).result()
 
-    def rebuild(
-        self,
-        *,
-        progress_callback: Callable[[str], None] | None = None,
-    ) -> IndexStats:
+    def rebuild(self) -> IndexStats:
         """Wipe yaw.db and CocoIndex state on the worker thread and perform a full re-sync."""
 
         def _run_rebuild() -> IndexStats:
@@ -877,7 +1023,7 @@ class YawRuntime:
             self._execute_sync_worker()
             return self.stats()
 
-        return self.submit("rebuild", _run_rebuild, progress_callback=progress_callback).result()
+        return self.submit("rebuild", _run_rebuild).result()
 
     def optimize(
         self,
@@ -895,7 +1041,7 @@ class YawRuntime:
         max_bootstrapped_demos: int | None = None,
         max_labeled_demos: int | None = None,
         corpus_docs: Sequence[str] | None = None,
-        source_files: Sequence[Path | str] | None = None,
+        dataset_bundles: Sequence[DatasetBundle] | None = None,
         progress_callback: Callable[[str], None] | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> Path:
@@ -908,58 +1054,39 @@ class YawRuntime:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
 
             self.validate_optimization_run(target_path, trainset, valset, corpus_docs, mode, run_options)
+            worker_thread = threading.current_thread()
 
             def _progress(msg: str) -> None:
+                if (
+                    msg.startswith("indexing:")
+                    and self.engine is not None
+                    and threading.current_thread() is worker_thread
+                ):
+                    new_stats = self.engine.get_stats(self.config.config_fingerprint())
+                    with self._state_lock:
+                        self._stats = new_stats
                 self._update_state(active_op=msg)
                 if progress_callback is not None:
                     progress_callback(msg)
 
-            opt_chunks = []
-            if corpus_docs or source_files:
-                _progress(f"indexing: preparing {len(corpus_docs or ())} corpus passages")
-                assert self.config.corpus_root is not None
-                assert self.config.state_dir is not None
-                eff_whitelist = (
-                    BENCHMARK_JSON_WHITELIST
-                    if self.config.json_keys_whitelist == ("*",)
-                    else self.config.json_keys_whitelist
-                )
-                eff_blacklist = (
-                    tuple(dict.fromkeys((*self.config.json_keys_blacklist, *BENCHMARK_JSON_BLACKLIST)))
-                    if self.config.json_keys_whitelist == ("*",)
-                    else self.config.json_keys_blacklist
-                )
-                eff_source_files: Sequence[Path | str] | None = source_files
-                if eff_source_files is None and isinstance(run_options, dict) and run_options.get("dataset"):
-                    eff_source_files = resolve_dataset_source_files(
-                        run_options["dataset"],
-                        workspace_root=self.config.workspace_root,
-                        prefer_corpus=True,
-                    )
-                opt_root = Path(self.config.corpus_root).resolve()
-                if eff_source_files and not all(Path(sf).resolve().is_relative_to(opt_root) for sf in eff_source_files):
-                    try:
-                        opt_root = Path(
-                            os.path.commonpath(
-                                [str(opt_root), *(str(Path(sf).resolve().parent) for sf in eff_source_files)]
-                            )
-                        ).resolve()
-                    except ValueError:
-                        opt_root = Path(
-                            os.path.commonpath([str(Path(sf).resolve().parent) for sf in eff_source_files])
-                        ).resolve()
-                    self.engine.workspace_root = opt_root
-                opt_chunks = sync_source_files_for_docs(
-                    corpus_root=opt_root,
-                    state_dir=Path(self.config.state_dir) / "optimize_coco",
-                    allowed_docs=corpus_docs,
-                    source_files=eff_source_files,
-                    json_keys_whitelist=eff_whitelist,
-                    json_keys_blacklist=eff_blacklist,
-                    chunk_size=self.config.chunk_size,
-                    chunk_overlap=self.config.chunk_overlap,
-                    min_chunk_size=self.config.min_chunk_size,
-                )
+            opt_chunks = None
+            if dataset_bundles:
+                _progress("indexing: loading complete persistent corpus snapshot")
+                assert self.config.db_path is not None
+                roots = {bundle.root.parent for bundle in dataset_bundles}
+                if len(roots) != 1:
+                    raise ValueError("Dataset bundles must share one dataset directory")
+                bundle_root = next(iter(roots))
+                self.engine.workspace_root = bundle_root
+                selected_corpus = set(corpus_docs) if corpus_docs else None
+                matched_files: list[str] = []
+                for bundle in dataset_bundles:
+                    by_id = bundle.corpus_by_id()
+                    for doc in bundle.documents:
+                        if selected_corpus is None or by_id.get(doc.document_id) in selected_corpus:
+                            rel_path = (bundle.root / doc.path).relative_to(bundle_root).as_posix()
+                            matched_files.append(rel_path)
+                self.engine.index_chunks(included_files=tuple(matched_files))
                 new_stats = self.engine.get_stats(self.config.config_fingerprint())
                 with self._state_lock:
                     self._stats = new_stats
@@ -979,26 +1106,29 @@ class YawRuntime:
                     max_tokens=self.config.max_output_tokens,
                 )
 
-            _progress(f"optimizing: starting {mode} (auto={resolved_auto}) evolution")
+            _progress(f"optimizing: preparing {mode} (auto={resolved_auto}); validation indexing precedes trials")
             eff_sleep = (
                 sleep_seconds if sleep_seconds is not None else getattr(self.config, "optimize_sleep_seconds", 0.0)
             )
-            self.engine.evolve_prompts(
-                trainset=trainset,
-                valset=valset,
-                mode=mode,
-                save_path=target_path,
-                reflection_lm=eff_ref_lm,
-                reflection_worker_lm=eff_worker_lm,
-                auto=resolved_auto,
-                num_candidates=num_candidates,
-                num_trials=num_trials,
-                progress_callback=_progress,
-                opt_chunks=opt_chunks,
-                sleep_seconds=eff_sleep,
-                max_bootstrapped_demos=max_bootstrapped_demos,
-                max_labeled_demos=max_labeled_demos,
-            )
+            try:
+                self.engine.evolve_prompts(
+                    trainset=trainset,
+                    valset=valset,
+                    mode=mode,
+                    save_path=target_path,
+                    reflection_lm=eff_ref_lm,
+                    reflection_worker_lm=eff_worker_lm,
+                    auto=resolved_auto,
+                    num_candidates=num_candidates,
+                    num_trials=num_trials,
+                    progress_callback=_progress,
+                    opt_chunks=opt_chunks,
+                    sleep_seconds=eff_sleep,
+                    max_bootstrapped_demos=max_bootstrapped_demos,
+                    max_labeled_demos=max_labeled_demos,
+                )
+            except FatalGraphPublicationError as f_err:
+                raise f_err.original from None
             final_stats = self.engine.get_stats(self.config.config_fingerprint())
             with self._state_lock:
                 self._stats = final_stats
@@ -1034,6 +1164,7 @@ class YawRuntime:
         )
         daemon_dir = Path(__file__).parent
         source_paths = sorted((daemon_dir / "graph").rglob("*.py"))
+        source_paths.append(daemon_dir / "indexing.py")
         source_paths.append(daemon_dir / "ingestion" / "corpus.py")
         identity = {
             "version": 1,
@@ -1076,7 +1207,7 @@ class YawRuntime:
                 raise YawRuntimeError(
                     "INVALID_INPUT",
                     "Cannot resume: optimization data, settings, code, packages or output path "
-                    "changed. Start a fresh run without --resume/--db-path; "
+                    "changed. Start a fresh run with --fresh or --db-path; "
                     "old state is preserved.",
                 )
             metric_upgraded = saved_id.get("metric") != identity["metric"]
@@ -1084,15 +1215,16 @@ class YawRuntime:
             if metric_upgraded:
                 checkpoint = target_path.parent / f"{target_path.stem}_telemetry" / "gepa_state.bin"
                 checkpoint.unlink(missing_ok=True)
-            if metric_upgraded or code_upgraded or run_options is not None:
+            if metric_upgraded or code_upgraded or run_options is not None or not saved.get("started_at"):
                 saved["identity"] = identity
+                saved["started_at"] = saved.get("started_at") or datetime.now(UTC).isoformat()
                 if run_options is not None:
                     saved["cli_options"] = run_options
                 with self.engine.managed_conn.transaction() as tx:
                     if metric_upgraded or code_upgraded:
                         tx.execute("DELETE FROM meta WHERE key LIKE 'simba_worker:%'")
                     if metric_upgraded:
-                        tx.execute("DELETE FROM candidate_stage_cache WHERE stage = 'simba_task_score'")
+                        tx.execute("DELETE FROM meta WHERE key LIKE 'simba_task_score:%'")
                     tx.execute(
                         "UPDATE meta SET value = ? WHERE key = 'optimization_run'",
                         (json.dumps(saved),),
@@ -1114,6 +1246,7 @@ class YawRuntime:
                             "output_path": str(target_path),
                             "identity": identity,
                             "cli_options": run_options or {},
+                            "started_at": datetime.now(UTC).isoformat(),
                         }
                     ),
                 ),
@@ -1121,6 +1254,9 @@ class YawRuntime:
 
     def reload_program(self, program_path: Path | str) -> dict[str, Any]:
         """Hot-reload a compiled DSPy program into the running engine in-memory."""
+        return self._submit_program_reload(program_path).result()
+
+    def _submit_program_reload(self, program_path: Path | str) -> Future[dict[str, Any]]:
         p = Path(program_path).resolve()
         if not p.exists() or not p.is_file():
             raise YawRuntimeError("INVALID_INPUT", f"Compiled program file not found: {p}")
@@ -1128,8 +1264,21 @@ class YawRuntime:
         def _run_reload() -> dict[str, Any]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
+            old_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
             self.engine.program.load(str(p))
             self.engine.refresh_program_bindings()
+            new_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
+            if self._openie_endpoint is not None:
+                self._openie_endpoint.program_identity = new_fps[0]
+            if self._embedding_endpoint is not None:
+                self._embedding_endpoint.adapter = self.engine.embedder
+            if old_fps != new_fps:
+                was_live = self._live_thread is not None and self._live_thread.is_alive()
+                if was_live:
+                    self._stop_live_update()
+                self._build_coco_app()
+                if was_live:
+                    self._start_live_update()
             self._update_state()
             return {
                 "reloaded": True,
@@ -1138,7 +1287,7 @@ class YawRuntime:
                 "timestamp": time.time(),
             }
 
-        return self.submit("reload_program", _run_reload).result()
+        return self.submit("reload_program", _run_reload)
 
     def benchmark(
         self,
@@ -1175,15 +1324,11 @@ class YawRuntime:
             else "eval"
         )
 
-        raw_datasets: list[str] = []
-        if datasets is not None:
-            if isinstance(datasets, str):
-                raw_datasets = [p.strip() for p in datasets.split(",") if p.strip()]
-            else:
-                for item in datasets:
-                    raw_datasets.extend(p.strip() for p in str(item).split(",") if p.strip())
+        raw_datasets = parse_dataset_list(datasets)
         if not raw_datasets:
-            if gate_spec and isinstance(gate_spec.get("datasets"), dict) and gate_spec["datasets"]:
+            if gate_spec and isinstance(gate_spec.get("baselines"), dict) and gate_spec["baselines"]:
+                raw_datasets = list(DEFAULT_PARITY_DATASETS)
+            elif gate_spec and isinstance(gate_spec.get("datasets"), dict) and gate_spec["datasets"]:
                 raw_datasets = list(gate_spec["datasets"].keys())
             else:
                 raw_datasets = list(DEFAULT_PARITY_DATASETS)
@@ -1209,46 +1354,12 @@ class YawRuntime:
 
         dataset_reports: dict[str, dict[str, Any]] = {}
         for ds_arg in raw_datasets:
-            cand_path = Path(ds_arg)
-            if cand_path.exists() and cand_path.is_file():
-                resolved_file = cand_path.resolve()
-                raw_data = json.loads(resolved_file.read_text(encoding="utf-8"))
-                samples = raw_data if isinstance(raw_data, list) else raw_data.get("data", raw_data.get("samples", []))
-                corpus: list[dict[str, Any]] = []
-                stem = resolved_file.stem.lower()
-                canonical_ds = DATASET_ALIASES.get(stem, stem)
-                include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
-                )
-                if include_corpus and canonical_ds in DATASET_REGISTRY:
-                    _, corpus_filename = DATASET_REGISTRY[canonical_ds]
-                    if corpus_filename:
-                        sibling_corpus = resolved_file.parent / corpus_filename
-                        if sibling_corpus.exists() and sibling_corpus.is_file():
-                            raw_corpus = json.loads(sibling_corpus.read_text(encoding="utf-8"))
-                            if isinstance(raw_corpus, list):
-                                corpus = raw_corpus
-            else:
-                canonical_ds = resolve_dataset_name(ds_arg)
-                include_corpus = bool(
-                    full_corpus
-                    or eff_max_q is None
-                    or canonical_ds in ("sample", "narrativeqa", "lveval", "enterprise_rag_bench")
-                )
-                if eff_max_q is not None and eff_idx_q is not None:
-                    total_needed: int | None = max(
-                        eff_max_q,
-                        eff_idx_q * 2 if canonical_ds == "popqa" else eff_idx_q,
-                    ) + max(0, query_offset)
-                else:
-                    total_needed = None
-                samples, corpus = load_dataset_files(
-                    canonical_ds,
-                    max_queries=total_needed,
-                    include_corpus=include_corpus,
-                )
+            bundle = resolve_dataset_bundle(ds_arg, workspace_root=self.config.workspace_root)
+            canonical_ds = bundle.dataset
+            samples, document_rows = bundle.read_inputs()
+            corpus = [
+                dict(row, idx=entry.document_id) for entry, row in zip(bundle.documents, document_rows, strict=True)
+            ]
 
             docs, queries, gold_docs, gold_answers = build_benchmark_slice(
                 canonical_ds,
@@ -1288,76 +1399,19 @@ class YawRuntime:
             if progress_callback is not None:
                 progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
 
-            bench_source_files = resolve_dataset_source_files(
-                [ds_arg],
-                workspace_root=self.config.workspace_root,
-                prefer_corpus=include_corpus,
-            )
-            ws_root = (
-                Path(self.config.workspace_root).resolve()
-                if self.config.workspace_root
-                else Path.cwd().resolve()
-            )
-            if bench_source_files and all(sf.is_relative_to(ws_root) for sf in bench_source_files):
-                effective_corpus_root = ws_root
-            elif bench_source_files:
-                try:
-                    effective_corpus_root = Path(
-                        os.path.commonpath([str(ws_root), *(str(sf.parent) for sf in bench_source_files)])
-                    ).resolve()
-                except ValueError:
-                    effective_corpus_root = Path(
-                        os.path.commonpath([str(sf.parent) for sf in bench_source_files])
-                    ).resolve()
-            else:
-                effective_corpus_root = ws_root
-
-            chunks = sync_source_files_for_docs(
-                effective_corpus_root,
-                bench_cfg.state_dir,
-                allowed_docs=docs,
-                source_files=bench_source_files,
-                json_keys_whitelist=bench_cfg.json_keys_whitelist,
-                json_keys_blacklist=bench_cfg.json_keys_blacklist,
-                chunk_size=bench_cfg.chunk_size,
-                chunk_overlap=bench_cfg.chunk_overlap,
-                min_chunk_size=1,
-            )
-
-            prog = self._custom_program if self._custom_program is not None else HippoRAGProgram.from_config(bench_cfg)
-            comp_p = compiled_program or compiled_program_path or bench_cfg.compiled_program_path
-            if comp_p and Path(comp_p).exists() and hasattr(prog, "load"):
-                prog.load(str(comp_p))
-
-            emb = (
-                self._custom_embedder
-                if self._custom_embedder is not None
-                else DSPyEmbeddingAdapter.from_config(bench_cfg)
-            )
-
-            bench_engine = YawGraphEngine(
-                db_path=bench_cfg.db_path,
+            effective_corpus_root = bundle.root
+            prog, _, bench_engine = self._create_bound_engine(
+                bench_cfg,
                 workspace_root=effective_corpus_root,
-                program=prog,
-                embedder=emb,
-                linking_top_k=bench_cfg.linking_top_k,
-                retrieval_top_k=bench_cfg.retrieval_top_k,
-                damping=bench_cfg.damping,
-                synonymy_threshold=bench_cfg.synonymy_threshold,
-                synonymy_top_k=bench_cfg.synonymy_top_k,
-                embed_batch_size=bench_cfg.embed_batch_size,
-                max_context_chars=bench_cfg.max_context_chars,
-                max_ast_expansion_hops=bench_cfg.max_ast_expansion_hops,
-                ast_context_hops=bench_cfg.ast_context_hops,
+                compiled_program_override=compiled_program or compiled_program_path,
+            )
+            matched_files = (
+                tuple(doc.path for doc in bundle.documents if doc.document_id in docs)
+                if docs
+                else tuple(doc.path for doc in bundle.documents)
             )
             try:
-                existing_cids = {str(r[0]) for r in bench_engine.conn.execute("SELECT chunk_id FROM chunks").fetchall()}
-                unindexed = [(ptr, txt) for ptr, txt in chunks if ptr.chunk_id not in existing_cids]
-                index_batches = (
-                    bench_engine.index_chunks(unindexed)
-                    if unindexed
-                    else int(bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
-                )
+                index_batches = bench_engine.index_chunks(included_files=matched_files)
 
                 if progress_callback is not None:
                     progress_callback(f"benchmarking {canonical_ds}: evaluating {len(queries)} queries")
@@ -1371,7 +1425,6 @@ class YawRuntime:
                 bench_records: list[dict[str, Any]] = []
 
                 for q_idx, q in enumerate(queries):
-                    g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
                     g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
                     ens_pred = bench_engine.ensemble(
                         question=q,
@@ -1391,14 +1444,16 @@ class YawRuntime:
                     ret_texts = [t for _, _, t in hits]
                     dpr_texts = [t for _, _, t in dpr_hits]
 
-                    h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
-                    d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
-                    hippo_r1 += h_rec.get(1, 0.0)
-                    hippo_r2 += h_rec.get(2, 0.0)
-                    hippo_r5 += h_rec.get(5, 0.0)
-                    dpr_r1 += d_rec.get(1, 0.0)
-                    dpr_r2 += d_rec.get(2, 0.0)
-                    dpr_r5 += d_rec.get(5, 0.0)
+                    if gold_docs is not None:
+                        g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
+                        h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
+                        d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
+                        hippo_r1 += h_rec.get(1, 0.0)
+                        hippo_r2 += h_rec.get(2, 0.0)
+                        hippo_r5 += h_rec.get(5, 0.0)
+                        dpr_r1 += d_rec.get(1, 0.0)
+                        dpr_r2 += d_rec.get(2, 0.0)
+                        dpr_r5 += d_rec.get(5, 0.0)
 
                     pred_ans = ""
                     dpr_ans: str | None = None
@@ -1409,7 +1464,7 @@ class YawRuntime:
                         hippo_em += em_val
                         hippo_f1 += f1_val
 
-                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5])
+                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5], include_subgraph=False)
                         dpr_pred = (
                             prog.answer_question(context=dpr_ctx_str, question=q)
                             if hasattr(prog, "answer_question")
@@ -1464,11 +1519,15 @@ class YawRuntime:
                     "integrity": {"passed": len(integrity_errors) == 0, "errors": integrity_errors},
                     "evaluation_metrics": {
                         "hipporag": {
-                            "retrieval": {
-                                "Recall@1": round(hippo_r1 / n_q, 4),
-                                "Recall@2": round(hippo_r2 / n_q, 4),
-                                "Recall@5": round(hippo_r5 / n_q, 4),
-                            },
+                            "retrieval": (
+                                {
+                                    "Recall@1": round(hippo_r1 / n_q, 4),
+                                    "Recall@2": round(hippo_r2 / n_q, 4),
+                                    "Recall@5": round(hippo_r5 / n_q, 4),
+                                }
+                                if gold_docs is not None
+                                else {}
+                            ),
                             "qa": (
                                 {
                                     "ExactMatch": round(hippo_em / n_q, 4),
@@ -1479,11 +1538,15 @@ class YawRuntime:
                             ),
                         },
                         "standard_dpr": {
-                            "retrieval": {
-                                "Recall@1": round(dpr_r1 / n_q, 4),
-                                "Recall@2": round(dpr_r2 / n_q, 4),
-                                "Recall@5": round(dpr_r5 / n_q, 4),
-                            },
+                            "retrieval": (
+                                {
+                                    "Recall@1": round(dpr_r1 / n_q, 4),
+                                    "Recall@2": round(dpr_r2 / n_q, 4),
+                                    "Recall@5": round(dpr_r5 / n_q, 4),
+                                }
+                                if gold_docs is not None
+                                else {}
+                            ),
                             "qa": (
                                 {
                                     "ExactMatch": round(dpr_em / n_q, 4),
@@ -1503,20 +1566,19 @@ class YawRuntime:
             finally:
                 bench_engine.close()
 
-        effective_gate_spec = gate_spec or {
-            "mode": effective_mode,
-            "per_dataset_tolerance": 0.0,
-            "require_mean_recall5_parity": True,
-            "require_mean_f1_parity": effective_mode == "eval",
-            "require_mean_em_parity": effective_mode == "eval",
-            "datasets": {
-                ds_key: {
-                    "monkeypatched_hipporag": MONKEYPATCHED_HIPPORAG_BASELINES.get(ds_key, {}),
-                    "paper_70b": PAPER_BASELINES.get(ds_key, {}),
-                }
-                for ds_key in dataset_reports
-            },
-        }
+        if gate_spec is not None:
+            effective_gate_spec = gate_spec
+        else:
+            default_baselines_path = Path(__file__).resolve().parents[2] / "data" / "benchmarks" / "baselines.json"
+            default_baselines = json.loads(default_baselines_path.read_text(encoding="utf-8")).get("baselines", {})
+            effective_gate_spec = {
+                "mode": effective_mode,
+                "per_dataset_tolerance": 0.0,
+                "require_mean_recall5_parity": True,
+                "require_mean_f1_parity": effective_mode == "eval",
+                "require_mean_em_parity": effective_mode == "eval",
+                "baselines": {ds_key: default_baselines.get(ds_key, {}) for ds_key in dataset_reports},
+            }
         gate_eval = evaluate_benchmark_gate(
             dataset_reports,
             effective_gate_spec,

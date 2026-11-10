@@ -1,6 +1,7 @@
 """CLI status and reload protocols using real locks, SQLite and signal files."""
 
 import json
+import sqlite3
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,8 @@ import psutil
 import pytest
 from filelock import FileLock
 
-from yaw.core import YawConfig, YawRuntimeError, load_config
+from daemon.native_inference import publish_inference
+from yaw.core import OpenIERecord, YawConfig, YawRuntimeError, load_config
 from yaw.daemon.cli import (
     handle_daemon_start,
     handle_daemon_stop,
@@ -19,7 +21,7 @@ from yaw.daemon.cli import (
     inspect_status,
     main,
 )
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.storage import open_yaw_db
 
 
@@ -31,23 +33,19 @@ def configured_workspace(tmp_path) -> YawConfig:
 
 
 def seed_openie(path, count):
-    with closing(open_yaw_db(path)) as conn:
-        conn.executemany(
-            "INSERT INTO openie_chunks(chunk_id,entities_json,triples_json) VALUES (?,'[]','[]')",
-            [(f"source-{i}",) for i in range(count)],
-        )
+    publish_inference(path, [OpenIERecord(chunk_id=f"source-{i}", entities=(), triples=()) for i in range(count)])
 
 
 def test_status_reads_only_held_optimizer_locks_and_merges_durable_progress(tmp_path):
     config = configured_workspace(tmp_path)
     assert config.lock_path is not None and config.status_path is not None
     folder = config.lock_path.parent
-    free = FileLock(str(folder / "yaw_optimize_unused.db.lock"))
+    free = FileLock(str(folder / "optimize_yaw_unused.db.lock"))
     with free:
         pass
     seed_openie(config.db_path, 2)
-    seed_openie(folder / "yaw_optimize_test.db", 3)
-    (folder / "status_optimize_test.json").write_text(
+    seed_openie(folder / "optimize_yaw_test.db", 3)
+    (folder / "optimize_status_test.json").write_text(
         json.dumps(
             {
                 "status": {"active_op": "reflecting"},
@@ -56,7 +54,7 @@ def test_status_reads_only_held_optimizer_locks_and_merges_durable_progress(tmp_
         ),
         encoding="utf-8",
     )
-    with FileLock(str(folder / "yaw_optimize_test.db.lock")):
+    with FileLock(str(folder / "optimize_yaw_test.db.lock")):
         stopped = inspect_status(config)
         assert stopped["status"]["lifecycle"] == "stopped"
         assert stopped["active_optimization"]["datestamp"] == "test"
@@ -94,8 +92,8 @@ def test_status_survives_corrupt_optional_status_and_database_files(tmp_path, co
     assert config.lock_path is not None and config.db_path is not None and config.status_path is not None
     config.db_path.write_bytes(b"not SQLite")
     config.status_path.write_text(content, encoding="utf-8")
-    with FileLock(str(config.lock_path)), FileLock(str(config.lock_path.parent / "yaw_optimize_broken.db.lock")):
-        (config.lock_path.parent / "status_optimize_broken.json").write_text(content, encoding="utf-8")
+    with FileLock(str(config.lock_path)), FileLock(str(config.lock_path.parent / "optimize_yaw_broken.db.lock")):
+        (config.lock_path.parent / "optimize_status_broken.json").write_text(content, encoding="utf-8")
         status = inspect_status(config)
     assert status["status"]["lifecycle"] == "ready"
     assert status["active_optimization"]["active_op"] == "optimizing"
@@ -116,7 +114,7 @@ def test_remote_reload_correlates_actual_signal_acknowledgements(tmp_path, capsy
     config = configured_workspace(tmp_path)
     assert config.compiled_program_path is not None
     source = tmp_path / "candidate.json"
-    HippoRAGProgram(include_demos=False).save(str(source))
+    YawProgram().save(str(source))
     folder = tmp_path / ".yaw"
     signal_file = folder / "reload.signal"
     result_file = folder / "reload.result"
@@ -179,8 +177,8 @@ def test_graph_lint_of_missing_or_uninitialized_database_uses_empty_schema(tmp_p
     assert json.loads(capsys.readouterr().out)["conforms"] is True
     with closing(open_yaw_db(config.db_path)) as conn:
         conn.execute("DROP TABLE entities")
-    assert handle_graph_lint(config, as_turtle=True) == 0
-    assert "@prefix" in capsys.readouterr().out
+    with pytest.raises(sqlite3.OperationalError):
+        handle_graph_lint(config, as_turtle=True)
 
 
 def test_cli_requires_a_complete_subcommand(capsys):
@@ -251,6 +249,35 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
                     process.wait(timeout=5)
             except psutil.NoSuchProcess:
                 continue
+
+
+def test_graph_lint_db_path_and_active_optimization_status_counts(tmp_path, capsys):
+    config = configured_workspace(tmp_path)
+    opt_cfg = config.for_optimization()
+    assert opt_cfg.db_path is not None and opt_cfg.lock_path is not None
+    seed_openie(opt_cfg.db_path, 3)
+    with closing(open_yaw_db(opt_cfg.db_path)) as conn:
+        conn.execute("INSERT INTO entities(entity_id, name, definition) VALUES ('entity-1', 'Alpha', 'First entity')")
+        conn.execute(
+            "INSERT INTO entity_labels(label_norm, entity_id, label_kind, raw_label, chunk_id) "
+            "VALUES ('alpha', 'entity-1', 'skos:prefLabel', 'Alpha', 'c0')"
+        )
+        conn.commit()
+
+    assert handle_graph_lint(config, db_path=opt_cfg.db_path) == 0
+    lint_out = json.loads(capsys.readouterr().out)
+    assert lint_out["conforms"] is True
+    assert lint_out["db_path"] == str(opt_cfg.db_path.resolve())
+    assert lint_out["stats"]["entities"] == 1
+    assert lint_out["stats"]["openie_checkpoints"] == 3
+    assert lint_out["label_counts"] == {"skos:prefLabel": 1}
+
+    with FileLock(str(opt_cfg.lock_path)):
+        status_out = inspect_status(config)
+    assert status_out["active_optimization"]["active"] is True
+    assert status_out["active_optimization"]["datestamp"] == "canonical"
+    assert status_out["active_optimization"]["entities"] == 1
+    assert status_out["active_optimization"]["openie_checkpoints"] == 3
 
 
 def test_cli_canonical_dspy_benchmark_handler_and_config_set_no_abbrev():

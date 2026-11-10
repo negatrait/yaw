@@ -3,10 +3,12 @@
 import contextlib
 import hashlib
 import json
+import math
 import os
 import time
 import tomllib
-from dataclasses import dataclass, field, fields
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -73,26 +75,72 @@ DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
 DEFAULT_EXCLUDED_PATTERNS: tuple[str, ...] = (".*", "*/.*", "__pycache__/*")
 
 
-def write_text_atomic(path: Path | str, content: str, *, retries: int = 6) -> None:
-    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+def write_via_temp_atomic(
+    path: Path | str,
+    write_fn: Callable[[Path], Any],
+    *,
+    retries: int = 6,
+) -> None:
+    """Write via a sibling temporary file and atomically replace target."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.{os.getpid()}_{time.time_ns()}.tmp")
+    suffix = target.suffix or ".tmp"
+    tmp = target.with_name(f".{target.stem}.{os.getpid()}.{time.time_ns()}{suffix}")
     max_attempts = max(1, int(retries))
     try:
-        tmp.write_text(content, encoding="utf-8")
+        write_fn(tmp)
         for attempt in range(max_attempts):
             try:
-                os.replace(tmp, target)
+                tmp.replace(target)
                 return
             except PermissionError:
                 if attempt == max_attempts - 1:
-                    target.write_text(content, encoding="utf-8")
-                    return
+                    raise
                 time.sleep(0.01 * (2**attempt))
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
+
+
+def write_text_atomic(
+    path: Path | str,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    retries: int = 6,
+    newline: str | None = None,
+) -> None:
+    """Atomically write UTF-8 text via a sibling temporary file with Windows PermissionError backoff."""
+    write_via_temp_atomic(
+        path,
+        lambda tmp: tmp.write_text(content, encoding=encoding, newline=newline),
+        retries=retries,
+    )
+
+
+def parse_dataset_list(raw: str | Sequence[str] | None) -> list[str]:
+    """Normalize a string or sequence of comma-separated dataset names."""
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    return [part.strip() for item in items for part in str(item).split(",") if part.strip()]
+
+
+def resolve_coco_state_root(state_dir: Path | str) -> Path:
+    """Return the single persistent CocoIndex LMDB directory (<state_dir>/coco_lmdb).
+
+    Never append transient per-candidate SQLite filenames.
+    """
+    resolved = Path(state_dir).resolve()
+    if resolved.name == "coco_lmdb":
+        return resolved
+    if (
+        resolved.name.startswith("coco_state")
+        or resolved.suffix in {".db", ".sqlite", ".sqlite3"}
+        or resolved.is_file()
+    ):
+        return resolved.parent / "coco_lmdb"
+    return resolved / "coco_lmdb"
 
 
 def scale_context_budget(base_budget: int, context_tokens: int) -> int:
@@ -117,7 +165,7 @@ _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
     "corpus_root": "corpus",
     "db_path": ".yaw/yaw.db",
     "lock_path": ".yaw/yaw.db.lock",
-    "state_dir": ".yaw/coco_state",
+    "state_dir": ".yaw/coco_lmdb",
     "log_path": ".yaw/yaw.log",
     "status_path": ".yaw/status.json",
     "compiled_program_path": ".yaw/compiled_program.json",
@@ -147,7 +195,7 @@ class YawConfig:
     excluded_patterns: tuple[str, ...] = DEFAULT_EXCLUDED_PATTERNS
     json_keys_whitelist: tuple[str, ...] = ("*",)
     json_keys_blacklist: tuple[str, ...] = ()
-    chunk_size: int = 1500
+    chunk_size: int = 1200
     chunk_overlap: int = 120
     min_chunk_size: int = 100
     poll_interval_seconds: float = 10.0
@@ -158,12 +206,12 @@ class YawConfig:
     provider: str = "openai"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
-    extraction_model: str = "Gemma-4-E4B-it-GGUF"
-    qa_model: str = "Gemma-4-E4B-it-GGUF"
+    extraction_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    qa_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     max_output_tokens: int | None = None
-    rlm_max_iters: int = 10
-    rlm_max_llm_calls: int = 20
+    rlm_max_iters: int = 20
+    rlm_max_llm_calls: int = 50
     rlm_max_output_chars: int | None = None
     reflection_input_tokens: int | None = None
     reflection_tokenizer_url: str = ""
@@ -171,15 +219,18 @@ class YawConfig:
     gbnf_max_entities: int | None = None
     gbnf_max_triples: int | None = None
     gbnf_max_facts: int = 4
-    gbnf_max_reasoning_chars: int | None = None
+    gbnf_max_reasoning_chars: int | None = 360
 
     # Graph & PPR settings
     linking_top_k: int = 8
     retrieval_top_k: int = 10
     damping: float = 0.5
 
-    synonymy_threshold: float = 0.8
-    synonymy_top_k: int = 100
+    candidate_dense_threshold: float = 0.8
+    candidate_lexical_threshold: float = 0.625
+    auto_merge_threshold: float = 0.98
+    candidate_volume_ratio: float = 1.0
+    synonym_batch_size: int = 4
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
@@ -200,8 +251,8 @@ class YawConfig:
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
     optimize_sleep_seconds: float = 0.0
-    optimize_max_bootstrapped_demos: int = 0
-    optimize_max_labeled_demos: int = 0
+    optimize_max_bootstrapped_demos: int = 1
+    optimize_max_labeled_demos: int = 1
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -212,6 +263,14 @@ class YawConfig:
                 attr,
                 _resolve_path(ws, getattr(self, attr) or "", default_rel),
             )
+        if not all(
+            math.isfinite(value) for value in (self.candidate_dense_threshold, self.candidate_lexical_threshold)
+        ):
+            raise YawRuntimeError("INVALID_INPUT", "Candidate admission thresholds must be finite")
+        if not 0 < self.auto_merge_threshold <= 1:
+            raise YawRuntimeError("INVALID_INPUT", "auto_merge_threshold must be in (0, 1]")
+        if not 0 < self.candidate_volume_ratio < float("inf"):
+            raise YawRuntimeError("INVALID_INPUT", "candidate_volume_ratio must be finite and positive")
         if self.queue_maxsize < 1:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
@@ -256,12 +315,12 @@ class YawConfig:
         object.__setattr__(
             self,
             "optimize_max_bootstrapped_demos",
-            max(0, int(self.optimize_max_bootstrapped_demos or 0)),
+            max(0, int(1 if self.optimize_max_bootstrapped_demos is None else self.optimize_max_bootstrapped_demos)),
         )
         object.__setattr__(
             self,
             "optimize_max_labeled_demos",
-            max(0, int(self.optimize_max_labeled_demos or 0)),
+            max(0, int(1 if self.optimize_max_labeled_demos is None else self.optimize_max_labeled_demos)),
         )
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):
@@ -291,69 +350,32 @@ class YawConfig:
 
     def for_optimization(
         self,
-        datestamp: str | None = None,
         db_override: Path | str | None = None,
     ) -> YawConfig:
-        """Derive an isolated configuration for prompt optimization using *_optimize_<datestamp>.* paths."""
-        import re
-        from datetime import UTC, datetime
-
+        """Derive an isolated configuration for prompt optimization."""
         base_db = Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")
         base_dir = base_db.parent
 
         if db_override is not None:
             raw_path = str(db_override).strip()
-            if raw_path.lower() == "latest":
-                candidates = sorted(
-                    base_dir.glob("yaw_optimize_*.db"),
-                    # Run creation time is encoded in the name. Writes to an older
-                    # run must not make it newer than a subsequently created run.
-                    key=lambda p: p.name,
-                    reverse=True,
-                )
-                candidates = [
-                    p for p in candidates if p.is_file() and re.fullmatch(r"yaw_optimize_\d{8}_\d{6}\.db", p.name)
-                ]
-                if not candidates:
-                    raise YawRuntimeError("INVALID_INPUT", "No optimization run exists to resume.")
-                opt_db = candidates[0]
-            else:
-                opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
-                if not opt_db.is_file():
-                    raise YawRuntimeError("INVALID_INPUT", f"Optimization database does not exist: {opt_db}")
+            if not raw_path:
+                raise YawRuntimeError("INVALID_INPUT", "Optimization database path cannot be empty.")
+            opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
             base_dir = opt_db.parent
-            ds_match = re.search(r"yaw_optimize_(\d{8}_\d{6})", opt_db.name)
-            ds = ds_match.group(1) if ds_match else opt_db.stem
         else:
-            ds = datestamp or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-            opt_db = base_dir / f"yaw_optimize_{ds}.db"
+            opt_db = base_dir / "optimize_yaw.db"
 
-        opt_lock = Path(str(opt_db) + ".lock")
-        opt_status = base_dir / f"status_optimize_{ds}.json"
-        opt_state = base_dir / f"coco_state_optimize_{ds}"
-        opt_program = base_dir / f"compiled_program_optimize_{ds}.json"
-
-        cfg_dict: dict[str, Any] = {
-            f.name: getattr(self, f.name)
-            for f in fields(self)
-            if f.name
-            not in (
-                "corpus_root",
-                "db_path",
-                "lock_path",
-                "status_path",
-                "state_dir",
-                "compiled_program_path",
-            )
-        }
-        cfg_dict["corpus_root"] = self.workspace_root
-        cfg_dict["db_path"] = opt_db
-        cfg_dict["lock_path"] = opt_lock
-        cfg_dict["status_path"] = opt_status
-        cfg_dict["state_dir"] = opt_state
-        cfg_dict["compiled_program_path"] = opt_program
-        cfg_dict["poll_interval_seconds"] = 0.0
-        return YawConfig(**cfg_dict)
+        suffix = opt_db.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+        return replace(
+            self,
+            corpus_root=self.workspace_root,
+            db_path=opt_db,
+            lock_path=Path(str(opt_db) + ".lock"),
+            status_path=base_dir / (f"optimize_status_{suffix}.json" if suffix else "optimize_status.json"),
+            state_dir=base_dir / "coco_lmdb",
+            compiled_program_path=base_dir / (f"optimize_program_{suffix}.json" if suffix else "optimize_program.json"),
+            poll_interval_seconds=0.0,
+        )
 
     def for_benchmark(
         self,
@@ -377,86 +399,17 @@ class YawConfig:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
         sandbox_dir.mkdir(parents=True, exist_ok=True)
 
-        bench_db = sandbox_dir / "yaw.db"
-        bench_lock = sandbox_dir / "yaw.db.lock"
-        bench_status = sandbox_dir / "status.json"
-        bench_state = sandbox_dir / "coco_state"
-        bench_log = sandbox_dir / "yaw.log"
-
-        cfg_dict: dict[str, Any] = {
-            f.name: getattr(self, f.name)
-            for f in fields(self)
-            if f.name
-            not in (
-                "workspace_root",
-                "corpus_root",
-                "db_path",
-                "lock_path",
-                "status_path",
-                "state_dir",
-                "log_path",
-            )
-        }
-        cfg_dict["workspace_root"] = sandbox_dir
-        cfg_dict["corpus_root"] = sandbox_dir
-        cfg_dict["db_path"] = bench_db
-        cfg_dict["lock_path"] = bench_lock
-        cfg_dict["status_path"] = bench_status
-        cfg_dict["state_dir"] = bench_state
-        cfg_dict["log_path"] = bench_log
-        cfg_dict["poll_interval_seconds"] = 0.0
-        if self.json_keys_whitelist == ("*",):
-            cfg_dict["json_keys_whitelist"] = (
-                "title",
-                "text",
-                "paragraph_text",
-                "contents",
-                "context",
-                "context.*",
-                "contexts",
-                "contexts.*",
-                "paragraphs",
-                "paragraphs.*",
-                "document",
-                "document.title",
-                "document.text",
-                "document.summary",
-                "document.summary.*",
-            )
-            cfg_dict["json_keys_blacklist"] = tuple(
-                dict.fromkeys(
-                    (
-                        *self.json_keys_blacklist,
-                        "question*",
-                        "answer*",
-                        "answers*",
-                        "gold*",
-                        "reference*",
-                        "supporting_facts*",
-                        "is_supporting*",
-                        "evidences*",
-                        "obj*",
-                        "subj*",
-                        "prop*",
-                        "*_id",
-                        "id",
-                        "idx",
-                        "type",
-                        "level",
-                        "all_classes",
-                        "distractor",
-                        "length",
-                        "language",
-                        "dataset",
-                        "possible_answers*",
-                        "s_*",
-                        "o_*",
-                        "question_decomposition*",
-                        "answerable*",
-                    )
-                )
-            )
-        return YawConfig(**cfg_dict)
+        return replace(
+            self,
+            workspace_root=sandbox_dir,
+            corpus_root=sandbox_dir,
+            db_path=sandbox_dir / "yaw.db",
+            lock_path=sandbox_dir / "yaw.db.lock",
+            status_path=sandbox_dir / "status.json",
+            state_dir=sandbox_dir / "coco_state",
+            log_path=sandbox_dir / "yaw.log",
+            poll_interval_seconds=0.0,
+        )
 
     def config_fingerprint(self) -> str:
         """Compute deterministic SHA-256 fingerprint of index-affecting settings."""
@@ -481,7 +434,11 @@ class YawConfig:
             "reflection_input_tokens": self.reflection_input_tokens,
             "reflection_tokenizer_url": self.reflection_tokenizer_url,
             "max_context_chars": self.max_context_chars,
-            "synonymy_threshold": self.synonymy_threshold,
+            "candidate_dense_threshold": self.candidate_dense_threshold,
+            "candidate_lexical_threshold": self.candidate_lexical_threshold,
+            "auto_merge_threshold": self.auto_merge_threshold,
+            "candidate_volume_ratio": self.candidate_volume_ratio,
+            "synonym_batch_size": self.synonym_batch_size,
             "damping": self.damping,
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -539,8 +496,11 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "linking_top_k": "graph",
     "retrieval_top_k": "graph",
     "damping": "graph",
-    "synonymy_threshold": "graph",
-    "synonymy_top_k": "graph",
+    "candidate_dense_threshold": "graph",
+    "candidate_lexical_threshold": "graph",
+    "auto_merge_threshold": "graph",
+    "candidate_volume_ratio": "graph",
+    "synonym_batch_size": "graph",
     "embed_batch_size": "graph",
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",
@@ -622,15 +582,14 @@ def load_config(
         section = data.get(sec_name)
         if isinstance(section, dict):
             for k, v in section.items():
+                if sec_name == "graph" and k in {"synonymy_threshold", "synonymy_top_k"}:
+                    raise YawRuntimeError("INVALID_INPUT", f"Retired candidate setting: graph.{k}")
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":
-                        if isinstance(v, str):
-                            kwargs[mapped_k] = tuple(p.strip() for p in v.split(",") if p.strip())
-                        elif isinstance(v, (list, tuple)):
-                            kwargs[mapped_k] = tuple(str(p).strip() for p in v if str(p).strip())
-                        else:
-                            kwargs[mapped_k] = (str(v),)
+                        kwargs[mapped_k] = tuple(
+                            parse_dataset_list(v if isinstance(v, (str, list, tuple)) else [str(v)])
+                        )
                     else:
                         kwargs[mapped_k] = tuple(v) if isinstance(v, list) else v
 
@@ -767,6 +726,9 @@ __all__ = [
     "YawConfig",
     "get_config_value",
     "load_config",
+    "parse_dataset_list",
+    "resolve_coco_state_root",
     "set_config_value",
     "write_text_atomic",
+    "write_via_temp_atomic",
 ]

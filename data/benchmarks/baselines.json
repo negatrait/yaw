@@ -1,0 +1,408 @@
+{
+  "version": 1,
+  "mode": "eval",
+  "queries_per_dataset": 25,
+  "index_queries": 35,
+  "require_mean_recall5_parity": true,
+  "require_mean_f1_parity": true,
+  "require_mean_em_parity": true,
+  "primary_target": "monkeypatched_hipporag",
+  "pinned_commit": "d5c8329422e0a0b834a15874545cb6a74b4f9b26",
+  "hf_base_url": "https://huggingface.co/datasets/osunlp/HippoRAG_2/resolve/main",
+  "upstream_dataset_base_url": "https://raw.githubusercontent.com/OSU-NLP-Group/HippoRAG/d5c8329422e0a0b834a15874545cb6a74b4f9b26/reproduce/dataset",
+  "datasets": {
+    "sample": {
+      "questions_file": "sample.json",
+      "corpus_file": "sample_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": true,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true
+    },
+    "2wikimultihopqa": {
+      "questions_file": "2wikimultihopqa.json",
+      "corpus_file": "2wikimultihopqa_corpus.json",
+      "source_fields": {
+        "id_key": null,
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 0,
+      "default_parity": true,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true
+    },
+    "hotpotqa": {
+      "questions_file": "hotpotqa.json",
+      "corpus_file": "hotpotqa_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": "",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 0,
+      "default_parity": true,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true
+    },
+    "musique": {
+      "questions_file": "musique.json",
+      "corpus_file": "musique_corpus.json",
+      "source_fields": {
+        "id_key": null,
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 0,
+      "default_parity": true,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true
+    },
+    "nq": {
+      "questions_file": "nq_rear.json",
+      "corpus_file": "nq_rear_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": true,
+      "held_out": true,
+      "allow_upstream_github_fallback": false
+    },
+    "popqa": {
+      "questions_file": "popqa.json",
+      "corpus_file": "popqa_corpus.json",
+      "source_fields": {
+        "id_key": null,
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 2,
+      "default_parity": false,
+      "tier2": true,
+      "held_out": false,
+      "allow_upstream_github_fallback": false
+    },
+    "lveval": {
+      "questions_file": "lveval.json",
+      "corpus_file": "lveval_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": true,
+      "sentence_separator": " ",
+      "full_corpus_slice": true,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": true,
+      "held_out": false,
+      "allow_upstream_github_fallback": false
+    },
+    "narrativeqa": {
+      "questions_file": "narrativeqa_dev_10_doc.json",
+      "corpus_file": "narrativeqa_dev_10_doc_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": true,
+      "sentence_separator": " ",
+      "full_corpus_slice": true,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": true,
+      "held_out": false,
+      "allow_upstream_github_fallback": false
+    },
+    "case_study_university": {
+      "questions_file": "case_study_university.json",
+      "corpus_file": "case_study_university_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": false,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true
+    },
+    "enterprise_rag_bench": {
+      "questions_file": "enterprise_rag_bench_questions.json",
+      "corpus_file": "enterprise_rag_bench_corpus.json",
+      "source_fields": {
+        "id_key": "idx",
+        "title_key": "title",
+        "body_key": "text"
+      },
+      "qa_only": false,
+      "sentence_separator": " ",
+      "full_corpus_slice": true,
+      "min_docs_per_query": 0,
+      "default_parity": false,
+      "tier2": false,
+      "held_out": false,
+      "allow_upstream_github_fallback": true,
+      "category_quotas": {
+        "Basic": [33, 5],
+        "Semantic": [25, 4],
+        "Intra-Document Reasoning": [15, 3],
+        "Project Related": [15, 3],
+        "Constrained": [11, 2],
+        "Conflicting Info": [8, 2],
+        "Completeness": [8, 2],
+        "Miscellaneous": [8, 2],
+        "Info Not Found": [8, 2],
+        "High Level": [4, 2]
+      },
+      "train_partition_size": 135
+    }
+  },
+  "baselines": {
+    "2wikimultihopqa": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.4545,
+        "Recall@2": 0.6591,
+        "Recall@5": 0.9091,
+        "ExactMatch": 0.6364,
+        "F1": 0.7227,
+        "indexing_seconds": 616.76,
+        "evaluation_seconds": 173.44,
+        "elapsed_seconds": 790.73
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "Recall@2": 0.762,
+        "Recall@5": 0.904,
+        "ExactMatch": 0.65,
+        "F1": 0.71
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "Recall@2": 0.671,
+        "Recall@5": 0.765,
+        "ExactMatch": 0.575,
+        "F1": 0.615
+      },
+      "hipporag2_gpt4o_mini_nvembed_v2": {
+        "Recall@2": 0.746,
+        "Recall@5": 0.902,
+        "ExactMatch": 0.605,
+        "F1": 0.697
+      },
+      "contriever_llama3.3_70b": {
+        "Recall@2": 0.466,
+        "Recall@5": 0.575,
+        "ExactMatch": 0.381,
+        "F1": 0.419
+      }
+    },
+    "musique": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.3636,
+        "Recall@2": 0.5682,
+        "Recall@5": 0.6818,
+        "ExactMatch": 0.4091,
+        "F1": 0.5485,
+        "indexing_seconds": 1152.93,
+        "evaluation_seconds": 284.18,
+        "elapsed_seconds": 1437.36
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "Recall@2": 0.561,
+        "Recall@5": 0.747,
+        "ExactMatch": 0.372,
+        "F1": 0.486
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "Recall@2": 0.527,
+        "Recall@5": 0.697,
+        "ExactMatch": 0.347,
+        "F1": 0.457
+      },
+      "hipporag2_gpt4o_mini_nvembed_v2": {
+        "Recall@2": 0.535,
+        "Recall@5": 0.742,
+        "ExactMatch": 0.35,
+        "F1": 0.493
+      },
+      "contriever_llama3.3_70b": {
+        "Recall@2": 0.348,
+        "Recall@5": 0.466,
+        "ExactMatch": 0.24,
+        "F1": 0.313
+      }
+    },
+    "hotpotqa": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.475,
+        "Recall@2": 0.775,
+        "Recall@5": 0.9,
+        "ExactMatch": 0.45,
+        "F1": 0.6426,
+        "indexing_seconds": 599.21,
+        "evaluation_seconds": 135.75,
+        "elapsed_seconds": 736.13
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "Recall@2": 0.835,
+        "Recall@5": 0.963,
+        "ExactMatch": 0.627,
+        "F1": 0.755
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "Recall@2": 0.841,
+        "Recall@5": 0.945,
+        "ExactMatch": 0.628,
+        "F1": 0.753
+      },
+      "hipporag2_gpt4o_mini_nvembed_v2": {
+        "Recall@2": 0.805,
+        "Recall@5": 0.957,
+        "ExactMatch": 0.563,
+        "F1": 0.711
+      },
+      "contriever_llama3.3_70b": {
+        "Recall@2": 0.584,
+        "Recall@5": 0.753,
+        "ExactMatch": 0.513,
+        "F1": 0.623
+      }
+    },
+    "nq": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.5833,
+        "Recall@2": 0.8083,
+        "Recall@5": 0.925,
+        "ExactMatch": 0.45,
+        "F1": 0.6327,
+        "indexing_seconds": 807.52,
+        "evaluation_seconds": 110.22,
+        "elapsed_seconds": 917.85
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "Recall@2": 0.456,
+        "Recall@5": 0.78,
+        "ExactMatch": 0.485,
+        "F1": 0.633
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "Recall@2": 0.453,
+        "Recall@5": 0.754,
+        "F1": 0.619
+      },
+      "hipporag_reproduced": {
+        "Recall@2": 0.213,
+        "Recall@5": 0.444,
+        "F1": 0.553
+      }
+    },
+    "popqa": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.8667,
+        "Recall@2": 0.9467,
+        "Recall@5": 1.0,
+        "ExactMatch": 0.68,
+        "F1": 0.7419,
+        "indexing_seconds": 236.44,
+        "evaluation_seconds": 274.38,
+        "elapsed_seconds": 511.12
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "Recall@2": 0.439,
+        "Recall@5": 0.517,
+        "ExactMatch": 0.49,
+        "F1": 0.562
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "Recall@2": 0.453,
+        "Recall@5": 0.51,
+        "F1": 0.557
+      },
+      "hipporag_reproduced": {
+        "Recall@2": 0.4,
+        "Recall@5": 0.538,
+        "F1": 0.559
+      }
+    },
+    "lveval": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.6,
+        "Recall@2": 0.85,
+        "Recall@5": 0.95,
+        "ExactMatch": 0.5,
+        "F1": 0.575,
+        "indexing_seconds": 182.23,
+        "evaluation_seconds": 87.34,
+        "elapsed_seconds": 269.67
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "ExactMatch": 0.08,
+        "F1": 0.129
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "F1": 0.098
+      },
+      "hipporag_reproduced": {
+        "F1": 0.084
+      }
+    },
+    "narrativeqa": {
+      "monkeypatched_hipporag": {
+        "Recall@1": 0.5,
+        "Recall@2": 0.65,
+        "Recall@5": 0.8,
+        "ExactMatch": 0.1,
+        "F1": 0.4557,
+        "indexing_seconds": 333.89,
+        "evaluation_seconds": 146.52,
+        "elapsed_seconds": 480.52
+      },
+      "hipporag2_llama3.3_70b_nvembed_v2": {
+        "ExactMatch": 0.18,
+        "F1": 0.259
+      },
+      "standard_nvembed_v2_llama3.3_70b": {
+        "F1": 0.257
+      },
+      "hipporag_reproduced": {
+        "F1": 0.163
+      }
+    }
+  }
+}

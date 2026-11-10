@@ -1,6 +1,7 @@
 """Serial development checks with durable, honest reports and incremental tests."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -75,9 +76,12 @@ def run_check(
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                        process.wait()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            process.wait(timeout=5)
                 result["exit_code"] = process.returncode
             finally:
+                if process.stdout is not None:
+                    process.stdout.close()
                 reader.join(timeout=10)
     except OSError as exc:
         result.update(status="error", exit_code=None, error=str(exc))

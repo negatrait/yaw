@@ -6,17 +6,32 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Literal
 
 import dspy
-from dspy.evaluate.metrics import F1, normalize_text
+from dspy.evaluate.metrics import F1
 
-from yaw.core import StructuredTriple, compute_mdhash_id, detect_scalar_literal, text_processing
+from yaw.core import (
+    VALID_SHACL_ACTIONS,
+    VALID_SYNONYM_RELATIONS,
+    VALUE_BEARING_SHACL_ACTIONS,
+    StructuredTriple,
+    clean_schema_definition,
+    compute_mdhash_id,
+    detect_scalar_literal,
+    is_resource_label,
+    is_scalar_label,
+    text_processing,
+)
 
 
 def _nullable_text(value: Any) -> str:
     """Model null is missing text, never an entity or definition named 'None'."""
     return "" if value is None else str(value).strip()
+
+
+_clean_definition = clean_schema_definition
 
 
 def _parse_predicate_slot(raw_pred: Any) -> tuple[str, Literal["entity", "literal"] | None] | None:
@@ -161,32 +176,21 @@ def _coerce_structured_triple_item(
         return None
 
     # Check scalar literal constraints
-    s_is_lit, _ = detect_scalar_literal(subj)
     o_is_lit, o_lit_dt = detect_scalar_literal(obj)
-
-    if s_is_lit:
-        if not o_is_lit and obj_kind != "literal":
-            # Literals cannot be RDF subjects: swap subj and obj
-            subj, obj = obj, subj
-            subj_def, obj_def = obj_def, subj_def
-            s_is_lit, o_is_lit = False, True
-            obj_kind = "literal"
-            o_lit_dt = "rdfs:Literal"
-        else:
-            # Both endpoints are scalar literals: invalid RDF statement
-            return None
 
     if obj_kind == "literal" or (not has_explicit_kind and o_is_lit):
         obj_kind = "literal"
-        if not obj_datatype:
-            obj_datatype = o_lit_dt or "rdfs:Literal"
+        if not obj_datatype or obj_datatype == "rdfs:Literal":
+            obj_datatype = o_lit_dt
 
+    subj_def = _clean_definition(subj_def)
+    obj_def = _clean_definition(obj_def)
     if not spo_def:
         spo_def = f"{subj} {pred} {obj}."
     if not subj_def:
-        subj_def = lookup.get(subj) or lookup.get(str(text_processing(subj))) or ""
+        subj_def = _clean_definition(lookup.get(subj) or lookup.get(str(text_processing(subj))) or "")
     if not obj_def:
-        obj_def = lookup.get(obj) or lookup.get(str(text_processing(obj))) or ""
+        obj_def = _clean_definition(lookup.get(obj) or lookup.get(str(text_processing(obj))) or "")
 
     return StructuredTriple(
         subj=subj,
@@ -199,68 +203,6 @@ def _coerce_structured_triple_item(
         obj_datatype=obj_datatype if obj_kind == "literal" else "",
         obj_lang=obj_lang if obj_kind == "literal" else "",
     )
-
-
-def filter_invalid_triples(triples: Sequence[Any]) -> list[list[str]]:
-    """Filter out invalid and duplicate triples, preserving original order."""
-    unique_triples: set[tuple[str, str, str]] = set()
-    valid_triples: list[list[str]] = []
-
-    for triple in triples:
-        if isinstance(triple, (dict, StructuredTriple)):
-            st = _coerce_structured_triple_item(triple)
-            if st is None:
-                continue
-            valid_triple = [st.subj, st.pred, st.obj]
-        elif isinstance(triple, (list, tuple)) and len(triple) == 3:
-            if any(isinstance(x, (list, tuple, dict)) for x in triple):
-                st = _coerce_structured_triple_item(triple)
-                if st is None:
-                    continue
-                valid_triple = [st.subj, st.pred, st.obj]
-            else:
-                valid_triple = [str(item) for item in triple]
-        else:
-            continue
-        key = (valid_triple[0], valid_triple[1], valid_triple[2])
-        if key not in unique_triples:
-            unique_triples.add(key)
-            valid_triples.append(valid_triple)
-
-    return valid_triples
-
-
-def repair_truncated_json(response: str, *, is_triples: bool = False) -> str:
-    """String-aware bracket depth scanner to repair JSON responses truncated by max tokens."""
-    try:
-        json.loads(response)
-        return response
-    except ValueError, TypeError:
-        pass
-
-    depth, in_str, esc, last_end = 0, False, False, -1
-    for i, ch in enumerate(response):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-                if not is_triples and depth == 2:
-                    last_end = i + 1
-        elif ch == '"':
-            in_str = True
-        elif ch in "{[":
-            depth += 1
-        elif ch in "}]":
-            if depth == 3 and ch in "]}":
-                last_end = i + 1
-            depth -= 1
-
-    if last_end == -1:
-        return '{"triples": []}' if is_triples else '{"named_entities": []}'
-    return response[:last_end] + "]}"
 
 
 def _extract_json_list_field(response: str, field_name: str) -> list[Any]:
@@ -299,12 +241,7 @@ def _parse_bare_json_list(response: str) -> list[Any] | None:
     return payload
 
 
-def extract_entity_definitions(
-    raw_input: Any,
-    *,
-    normalize_keys: bool = False,
-    exclude_scalars: bool = False,
-) -> tuple[tuple[str, str], ...]:
+def extract_entity_definitions(raw_input: Any) -> tuple[tuple[str, str], ...]:
     """Extract and deduplicate (entity_name, contextual_definition) pairs from Stage 1 NER, \
 DefineMissingEntities output, or {name: definition} mappings."""
     raw_list: Sequence[Any]
@@ -316,18 +253,9 @@ DefineMissingEntities output, or {name: definition} mappings."""
                 raw_list = _extract_json_list_field(raw_input, "entity_definitions")
             except ValueError:
                 bare = _parse_bare_json_list(raw_input)
-                if bare is not None:
-                    raw_list = bare
-                else:
-                    repaired = repair_truncated_json(raw_input, is_triples=False)
-                    try:
-                        raw_list = _extract_json_list_field(repaired, "named_entities")
-                    except ValueError:
-                        try:
-                            raw_list = _extract_json_list_field(repaired, "entity_definitions")
-                        except ValueError:
-                            bare_repaired = _parse_bare_json_list(repaired)
-                            raw_list = bare_repaired if bare_repaired is not None else ()
+                if bare is None:
+                    raise
+                raw_list = bare
     elif isinstance(raw_input, Mapping):
         if "named_entities" in raw_input or "entity_definitions" in raw_input:
             if "named_entities" in raw_input and isinstance(raw_input["named_entities"], list):
@@ -355,18 +283,17 @@ DefineMissingEntities output, or {name: definition} mappings."""
         elif isinstance(item, (list, tuple)) and len(item) >= 1:
             name = str(item[0]).strip()
             if len(item) >= 2 and item[1] is not None:
-                defn = str(item[1]).strip()
+                defn = _clean_definition(item[1])
         elif isinstance(item, dict):
-            raw_name = item.get("name", item.get("entity", item.get("label", "")))
+            raw_name = item.get("name") or item.get("entity") or item.get("label") or item.get("pref_label", "")
             raw_def = item.get("definition", item.get("def", item.get("skos:definition", "")))
             name = _nullable_text(raw_name)
-            defn = _nullable_text(raw_def)
-        if not name or (exclude_scalars and detect_scalar_literal(name)[0]):
+            defn = _clean_definition(raw_def)
+        if not name:
             continue
-        key = (str(text_processing(name)) or name.lower()) if normalize_keys else name
-        existing_idxs = indices_by_name.get(key)
+        existing_idxs = indices_by_name.get(name)
         if not existing_idxs:
-            indices_by_name[key] = [len(ordered_pairs)]
+            indices_by_name[name] = [len(ordered_pairs)]
             ordered_pairs.append((name, defn))
         elif not defn:
             continue
@@ -390,29 +317,19 @@ DefineMissingEntities output, or {name: definition} mappings."""
     return tuple(ordered_pairs)
 
 
-def extract_named_entities(response: Any, *, exclude_scalars: bool = False) -> tuple[str, ...]:
-    """Extract and deduplicate unique named entities from LLM response (supporting [name, def] pairs and 1D strings)."""
-    seen: set[str] = set()
-    names: list[str] = []
-    for name, _ in extract_entity_definitions(response, exclude_scalars=exclude_scalars):
-        if name not in seen:
-            seen.add(name)
-            names.append(name)
-    return tuple(names)
-
-
 def extract_structured_triples(
     raw_input: Any,
     *,
     entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
+    known_entities: Sequence[str] | None = None,
+    llm_probabilities: Sequence[float | None] | None = None,
 ) -> tuple[StructuredTriple, ...]:
     """Extract, validate, and deduplicate StructuredTriple records from raw list, dict, or JSON string."""
     def_lookup: dict[str, str] = {}
-    multi_defs: dict[str, list[str]] = {}
     if isinstance(entity_definitions, dict):
         for k, v in entity_definitions.items():
             clean_k = str(k).strip()
-            clean_v = str(v).strip()
+            clean_v = _clean_definition(v)
             if clean_k and clean_v:
                 def_lookup[clean_k] = clean_v
                 def_lookup[str(text_processing(clean_k))] = clean_v
@@ -420,32 +337,22 @@ def extract_structured_triples(
         for pair in entity_definitions:
             if isinstance(pair, (list, tuple)) and len(pair) >= 2:
                 clean_k = str(pair[0]).strip()
-                clean_v = str(pair[1]).strip()
+                clean_v = _clean_definition(pair[1])
                 if clean_k and clean_v:
                     norm_k = str(text_processing(clean_k))
                     def_lookup.setdefault(clean_k, clean_v)
                     if norm_k:
                         def_lookup.setdefault(norm_k, clean_v)
-                    for key_str in (clean_k, norm_k):
-                        if key_str:
-                            lst = multi_defs.setdefault(key_str, [])
-                            if all(d.lower() != clean_v.lower() for d in lst):
-                                lst.append(clean_v)
 
     raw_list: Sequence[Any]
     if isinstance(raw_input, str):
         try:
             raw_list = _extract_json_list_field(raw_input, "triples")
         except ValueError:
-            repaired = repair_truncated_json(raw_input, is_triples=True)
-            try:
-                raw_list = _extract_json_list_field(repaired, "triples")
-            except ValueError:
-                try:
-                    loaded = json.loads(raw_input)
-                    raw_list = loaded if isinstance(loaded, list) else []
-                except Exception:
-                    raw_list = []
+            loaded = json.loads(raw_input)
+            if not isinstance(loaded, list):
+                raise
+            raw_list = loaded
     elif isinstance(raw_input, dict) and "triples" in raw_input and isinstance(raw_input["triples"], list):
         raw_list = raw_input["triples"]
     elif isinstance(raw_input, Sequence):
@@ -453,39 +360,56 @@ def extract_structured_triples(
     else:
         raw_list = []
 
-    seen: set[tuple[str, str, str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     results: list[StructuredTriple] = []
-    for item in raw_list:
+    resources = set(known_entities) if known_entities is not None else None
+    catalog: dict[str, set[str]] = {}
+    definition_pairs = list(entity_definitions.items()) if isinstance(entity_definitions, dict) else entity_definitions
+    for name, definition in extract_entity_definitions(definition_pairs):
+        catalog.setdefault(name, set()).add(_clean_definition(definition))
+
+    def resolve_definition(name: str, supplied: str) -> str:
+        choices = catalog.get(name, set())
+        if supplied in choices:
+            return supplied
+        if len(choices) > 1:
+            raise ValueError("Ambiguous NER label requires an existing NER definition")
+        return def_lookup.get(name, "")
+
+    if llm_probabilities is not None and len(llm_probabilities) != len(raw_list):
+        raise ValueError("Triple probabilities do not cover the source records")
+    for index, item in enumerate(raw_list):
         st = _coerce_structured_triple_item(item, def_lookup=def_lookup)
         if st is None:
+            if resources is not None:
+                raise ValueError("Triple extraction returned a malformed statement")
             continue
-        s_norm = str(text_processing(st.subj))
-        o_norm = str(text_processing(st.obj))
-        if (
-            st.obj_kind == "entity"
-            and s_norm
-            and s_norm == o_norm
-            and st.subj_def
-            and st.obj_def
-            and st.subj_def.lower() == st.obj_def.lower()
-        ):
-            senses = multi_defs.get(s_norm) or multi_defs.get(st.subj) or []
-            if len(senses) >= 2:
-                alt_sense = next(
-                    (d for d in senses if d.lower() != st.subj_def.lower()),
-                    st.obj_def,
-                )
-                st = StructuredTriple(
-                    subj=st.subj,
-                    subj_def=st.subj_def,
-                    pred=st.pred,
-                    obj=st.obj,
-                    obj_def=alt_sense,
-                    spo_def=st.spo_def,
-                    obj_kind=st.obj_kind,
-                    obj_datatype=st.obj_datatype,
-                    obj_lang=st.obj_lang,
-                )
+        if resources is not None:
+            if st.subj not in resources or (st.obj_kind == "entity" and st.obj not in resources):
+                raise ValueError("Triple extraction introduced a resource absent from NER")
+            if isinstance(item, dict):
+                raw_subj = item.get("sub", item.get("subj", item.get("subject")))
+                raw_obj = item.get("obj", item.get("object"))
+                for endpoint in (raw_subj, raw_obj) if st.obj_kind == "entity" else (raw_subj,):
+                    if not isinstance(endpoint, str) and (
+                        not isinstance(endpoint, (list, tuple))
+                        or len(endpoint) != 2
+                        or endpoint[1] not in catalog.get(endpoint[0], set())
+                    ):
+                        raise ValueError("Triple resource endpoints must identify existing NER resources")
+                parsed_pred = _parse_predicate_slot(item.get("pred", item.get("predicate")))
+                if parsed_pred is not None and parsed_pred[1] is not None and parsed_pred[1] != st.obj_kind:
+                    raise ValueError("Predicate property type conflicts with literal/resource object")
+            st = replace(
+                st,
+                subj_def=resolve_definition(st.subj, st.subj_def),
+                obj_def=resolve_definition(st.obj, st.obj_def) if st.obj_kind == "entity" else "",
+            )
+            if st.obj_kind == "entity" and (text_processing(st.subj), st.subj_def.strip().casefold()) == (
+                text_processing(st.obj),
+                st.obj_def.strip().casefold(),
+            ):
+                raise ValueError("Statement relates a resource sense to itself")
         key = (
             st.subj,
             st.subj_def.strip().lower(),
@@ -493,26 +417,15 @@ def extract_structured_triples(
             st.obj,
             st.obj_def.strip().lower(),
             st.obj_kind,
+            st.obj_datatype,
+            st.obj_lang,
         )
         if key not in seen:
             seen.add(key)
+            if llm_probabilities is not None:
+                st = replace(st, llm_prob=llm_probabilities[index])
             results.append(st)
     return tuple(results)
-
-
-def extract_triples(response: str) -> tuple[tuple[str, str, str], ...]:
-    """Extract, validate, and deduplicate relation triples from LLM response."""
-    try:
-        raw_list = _extract_json_list_field(response, "triples")
-    except ValueError:
-        repaired = repair_truncated_json(response, is_triples=True)
-        try:
-            raw_list = _extract_json_list_field(repaired, "triples")
-        except ValueError:
-            return ()
-
-    filtered = filter_invalid_triples(raw_list)
-    return tuple((t[0], t[1], t[2]) for t in filtered)
 
 
 def match_facts_to_candidate_indices(
@@ -543,7 +456,7 @@ def match_facts_to_candidate_indices(
 
 
 def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
-    """Extract 3-element string lists from a FactList, dict, JSON string, or list."""
+    """Extract 3-element string lists from a prediction, dict, JSON string, or list."""
     candidates: Any = None
     if hasattr(raw_output, "fact"):
         candidates = raw_output.fact
@@ -576,11 +489,6 @@ def coerce_generated_facts(raw_output: Any) -> list[list[str]]:
             if isinstance(item, (list, tuple)) and len(item) == 3:
                 valid.append([str(x) for x in item])
     return valid
-
-
-def normalize_answer(answer: str) -> str:
-    """Normalize a given string for exact match and F1 comparison."""
-    return str(normalize_text(str(answer)))
 
 
 def compute_qa_em_f1(pred_str: str, gold_answers: Sequence[str]) -> tuple[float, float]:
@@ -707,107 +615,173 @@ def compute_answer_passage_match(
     return bool(dspy.evaluate.answer_passage_match(ex_apm, pred_apm))
 
 
-_SYNONYM_RELATION_ALIASES: dict[str, str] = {
-    "skos:altLabel": "skos:altLabel",
-    "altLabel": "skos:altLabel",
-    "exact_match": "skos:altLabel",
-    "skos:hiddenLabel": "skos:hiddenLabel",
-    "hiddenLabel": "skos:hiddenLabel",
-    "skos:related": "skos:related",
-    "related": "skos:related",
-    "skos:broader": "skos:broader",
-    "broader": "skos:broader",
-    "skos:narrower": "skos:narrower",
-    "narrower": "skos:narrower",
-    "owl:differentFrom": "owl:differentFrom",
-    "differentFrom": "owl:differentFrom",
-}
-VALID_SYNONYM_RELATIONS: frozenset[str] = frozenset(
-    {
-        "skos:altLabel",
-        "skos:hiddenLabel",
-        "skos:related",
-        "skos:broader",
-        "owl:differentFrom",
-    }
-)
-VALID_SHACL_ACTIONS: frozenset[str] = frozenset(
-    {
-        "set_definition",
-        "rewrite_definition",
-        "set_pref_label",
-        "demote_to_alt_label",
-        "merge_altLabel",
-        "merge_hiddenLabel",
-        "add_different_from",
-        "assert_differentFrom",
-        "assert_related",
-        "assert_broader",
-        "invert_broader",
-        "demote_sibling_to_related",
-        "remove_hierarchy_cycle",
-        "remove_conflicting_related",
-        "delete_dangling",
-        "delete_invalid_fact",
-    }
-)
-VALUE_BEARING_SHACL_ACTIONS: frozenset[str] = frozenset(
-    {
-        "set_definition",
-        "rewrite_definition",
-        "set_pref_label",
-    }
-)
-
-
-def parse_synonym_decisions(
-    raw_output: Any,
-    num_pairs: int | None = None,
-) -> list[dict[str, str]]:
-    """Parse and validate SKOS/OWL disambiguation decisions from JudgeSynonyms or OrchestrateSynonymJudgment."""
-    items: Sequence[Any] = ()
+def _extract_decision_items(raw_output: Any) -> Sequence[Any]:
     if hasattr(raw_output, "decisions"):
         items = raw_output.decisions
-    elif isinstance(raw_output, dict) and "decisions" in raw_output:
+    elif isinstance(raw_output, Mapping) and "decisions" in raw_output:
         items = raw_output["decisions"]
     elif isinstance(raw_output, str):
         try:
             items = _extract_json_list_field(raw_output, "decisions")
         except ValueError:
-            try:
-                loaded = json.loads(raw_output)
-                items = loaded if isinstance(loaded, list) else ()
-            except Exception:
-                items = ()
+            loaded = json.loads(raw_output)
+            if isinstance(loaded, list):
+                items = loaded
+            elif isinstance(loaded, Mapping) and "decisions" in loaded and isinstance(loaded["decisions"], list):
+                items = loaded["decisions"]
+            else:
+                raise
     elif isinstance(raw_output, Sequence):
         items = raw_output
+    else:
+        items = ()
+    return items if isinstance(items, Sequence) else ()
 
-    decisions: list[dict[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict):
+
+def _extract_pair_id_and_reasoning(item: Mapping[str, Any]) -> tuple[str, str] | None:
+    pair_id = str(item.get("pair_id", "") or "").strip()
+    reasoning = str(item.get("reasoning", "") or "").strip()
+    if not pair_id or "|" not in pair_id or not reasoning:
+        return None
+    ids = pair_id.split("|")
+    if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
+        return None
+    return pair_id, reasoning
+
+
+def _parse_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "t")
+    return bool(val)
+
+
+def parse_label_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 1 concept equivalence and lexical identity decisions from JudgeLabels."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
             continue
-        pair_id = str(item.get("pair_id", "")).strip()
-        raw_relation = str(item.get("relation", "")).strip()
-        relation = _SYNONYM_RELATION_ALIASES.get(raw_relation, "")
-        canonical = str(item.get("canonical", "")).strip()
-        if relation == "skos:narrower":
-            relation = "skos:broader"
-            canonical = "B" if canonical in ("", "A") else "A"
-        if not pair_id or relation not in VALID_SYNONYM_RELATIONS:
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
             continue
-        decisions.append(
-            {
-                "pair_id": pair_id,
-                "relation": relation,
-                "canonical": canonical if relation == "skos:broader" else (canonical or "A"),
-            }
-        )
-        if num_pairs is not None and num_pairs > 0 and len(decisions) >= num_pairs:
-            break
+        pair_id, reasoning = validated
+        equivalent = _parse_bool(item.get("equivalent"))
+        raw_def = item.get("definition")
+        definition = str(raw_def).strip() if isinstance(raw_def, str) else ""
+        if equivalent and not definition:
+            continue
+        hidden_label = _parse_bool(item.get("hidden_label")) if equivalent else False
+        alt_label = (not hidden_label) if equivalent else False
+        if equivalent and hidden_label:
+            relation: str | None = "skos:hiddenLabel"
+        elif equivalent:
+            relation = "skos:altLabel"
+        else:
+            relation = None
+        dec_entry: dict[str, Any] = {
+            "pair_id": pair_id,
+            "reasoning": reasoning,
+            "equivalent": equivalent,
+            "alt_label": alt_label,
+            "hidden_label": hidden_label,
+            "relation": relation,
+        }
+        if definition:
+            dec_entry["definition"] = definition
+        if "canonical" in item and item["canonical"]:
+            dec_entry["canonical"] = str(item["canonical"])
+        if "source_id" in item and item["source_id"]:
+            dec_entry["source_id"] = str(item["source_id"])
+        if "target_id" in item and item["target_id"]:
+            dec_entry["target_id"] = str(item["target_id"])
+        decisions.append(dec_entry)
     return decisions
 
 
-def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
+def parse_hierarchy_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 2 taxonomic hierarchy decisions from JudgeHierarchy."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
+            continue
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
+            continue
+        pair_id, reasoning = validated
+        broader = _parse_bool(item.get("broader"))
+        narrower = _parse_bool(item.get("narrower"))
+        source_direction: str | None = None
+        if broader and not narrower:
+            relation: str | None = "skos:broader"
+            source_direction = "a_to_b"
+        elif not broader and narrower:
+            relation = "skos:broader"
+            source_direction = "b_to_a"
+        elif broader and narrower:
+            relation = "skos:related"
+            source_direction = None
+        else:
+            relation = None
+            source_direction = None
+        decisions.append(
+            {
+                "pair_id": pair_id,
+                "reasoning": reasoning,
+                "broader": broader,
+                "narrower": narrower,
+                "relation": relation,
+                "source_direction": source_direction,
+            }
+        )
+    return decisions
+
+
+def parse_related_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Parse and validate Stage 3 associative relation decisions from JudgeRelated."""
+    decisions: list[dict[str, Any]] = []
+    for item in _extract_decision_items(raw_output):
+        if not isinstance(item, Mapping):
+            continue
+        validated = _extract_pair_id_and_reasoning(item)
+        if validated is None:
+            continue
+        pair_id, reasoning = validated
+        related = _parse_bool(item.get("related"))
+        relation = "skos:related" if related else "owl:differentFrom"
+        decisions.append(
+            {
+                "pair_id": pair_id,
+                "reasoning": reasoning,
+                "related": related,
+                "relation": relation,
+            }
+        )
+    return decisions
+
+
+def shacl_repair_actions(violations: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
+    """Definition defects permit description repair, never removal of their evidence."""
+    actions: dict[str, set[str]] = {}
+    for violation in violations:
+        shape = violation.get("source_shape", violation.get("shape"))
+        permitted = (
+            {"set_definition"}
+            if violation.get("result_path") == "skos:definition"
+            else {"set_pref_label"}
+            if shape in ("ConceptShape/noScalarLiterals", "ConceptShape/resourceLabel")
+            else VALID_SHACL_ACTIONS
+        )
+        actions.setdefault(str(violation["focus_node"]), set()).update(permitted)
+    return actions
+
+
+def parse_shacl_repairs(
+    raw_output: Any, *, allowed_actions: Mapping[str, set[str]] | None = None
+) -> list[dict[str, str]]:
     """Parse and validate closed-world SHACL repair actions from ProposeSHACLRepairs or HealSHACLViolations."""
     items: Sequence[Any] = ()
     if hasattr(raw_output, "repairs"):
@@ -818,23 +792,28 @@ def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
         try:
             items = _extract_json_list_field(raw_output, "repairs")
         except ValueError:
-            try:
-                loaded = json.loads(raw_output)
-                items = loaded if isinstance(loaded, list) else ()
-            except Exception:
-                items = ()
+            loaded = json.loads(raw_output)
+            if not isinstance(loaded, list):
+                raise
+            items = loaded
     elif isinstance(raw_output, Sequence):
         items = raw_output
 
     repairs: list[dict[str, str]] = []
     for item in items:
         if not isinstance(item, dict):
-            continue
+            raise ValueError(f"Invalid SHACL repair: {item!r}")
         focus_node = str(item.get("focus_node", "")).strip()
         action = str(item.get("action", "")).strip()
         value = str(item.get("value", item.get("target_node", item.get("target", ""))) or "").strip()
         if not focus_node or action not in VALID_SHACL_ACTIONS:
-            continue
+            raise ValueError(f"Invalid SHACL repair: focus={focus_node!r}, action={action!r}")
+        if action in VALUE_BEARING_SHACL_ACTIONS and not value:
+            raise ValueError(f"SHACL repair {action!r} for {focus_node!r} requires a non-empty value")
+        if action == "set_pref_label" and (not is_resource_label(value) or is_scalar_label(value)):
+            raise ValueError(f"SHACL set_pref_label {value!r} for {focus_node!r} is not a lexical resource label")
+        if allowed_actions is not None and action not in allowed_actions.get(focus_node, ()):
+            raise ValueError(f"SHACL repair {action!r} is not permitted for {focus_node!r}")
         repairs.append(
             {
                 "focus_node": focus_node,
@@ -842,6 +821,10 @@ def parse_shacl_repairs(raw_output: Any) -> list[dict[str, str]]:
                 "value": value,
             }
         )
+    if repairs and allowed_actions is not None:
+        missing = set(allowed_actions) - {repair["focus_node"] for repair in repairs}
+        if missing:
+            raise ValueError(f"Incomplete SHACL repairs: missing {sorted(missing)}")
     return repairs
 
 
@@ -876,35 +859,11 @@ def evaluate_benchmark_gate(
     mode: Literal["eval", "retrieval"] = "eval",
     target: str | None = None,
 ) -> dict[str, Any]:
-    """Evaluate per-dataset benchmark reports against a benchmark_gate.json specification."""
-    aliases: dict[str, str] = {
-        "nq_rear": "nq",
-        "naturalquestions": "nq",
-        "2wiki": "2wikimultihopqa",
-        "hotpot": "hotpotqa",
-        "narrative": "narrativeqa",
-        "narrativeqa_dev_10_doc": "narrativeqa",
-        "enterprise": "enterprise_rag_bench",
-        "popqa": "popqa",
-        "lveval": "lveval",
-        "narrativeqa": "narrativeqa",
-        "2wikimultihopqa": "2wikimultihopqa",
-        "hotpotqa": "hotpotqa",
-        "nq": "nq",
-        "musique": "musique",
-        "sample": "sample",
-        "case_study_university": "case_study_university",
-        "enterprise_rag_bench": "enterprise_rag_bench",
-    }
-    raw_aliases = gate_spec.get("aliases")
-    if isinstance(raw_aliases, Mapping):
-        for ak, av in raw_aliases.items():
-            aliases[str(ak).strip().lower()] = str(av).strip()
-
+    """Evaluate per-dataset benchmark reports against a baselines.json specification."""
     effective_mode = str(mode or gate_spec.get("mode", "eval")).strip().lower()
     tolerance = float(gate_spec.get("per_dataset_tolerance", gate_spec.get("tolerance", 0.0)))
     primary_target = str(target or gate_spec.get("primary_target", "monkeypatched_hipporag"))
-    spec_datasets = gate_spec.get("datasets", {})
+    spec_datasets = gate_spec.get("baselines", gate_spec.get("datasets", {}))
     if not isinstance(spec_datasets, Mapping):
         spec_datasets = {}
     targets_map = gate_spec.get("targets", {})
@@ -929,9 +888,7 @@ def evaluate_benchmark_gate(
             continue
         raw_stripped = str(raw_name).strip()
         cleaned = raw_stripped.lower()
-        if cleaned in aliases:
-            canonical = aliases[cleaned]
-        elif cleaned in spec_datasets or cleaned in target_datasets or raw_stripped == cleaned:
+        if cleaned in spec_datasets or cleaned in target_datasets or raw_stripped == cleaned:
             canonical = cleaned
         else:
             canonical = raw_stripped
@@ -969,10 +926,25 @@ def evaluate_benchmark_gate(
         yaw_f1_explicit_none = isinstance(qa_block, Mapping) and "F1" in qa_block and yaw_f1_raw is None
         yaw_em_opt = round(float(yaw_em_raw), 4) if yaw_em_raw is not None else None
         yaw_f1_opt = round(float(yaw_f1_raw), 4) if yaw_f1_raw is not None else None
-        yaw_metrics = {
-            "Recall@1": round(float(ret_block.get("Recall@1", 0.0) or 0.0), 4),
-            "Recall@2": round(float(ret_block.get("Recall@2", 0.0) or 0.0), 4),
-            "Recall@5": round(float(ret_block.get("Recall@5", 0.0) or 0.0), 4),
+        yaw_r1 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@1")) is not None
+            else None
+        )
+        yaw_r2 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@2")) is not None
+            else None
+        )
+        yaw_r5 = (
+            round(float(rv), 4)
+            if isinstance(ret_block, Mapping) and (rv := ret_block.get("Recall@5")) is not None
+            else None
+        )
+        yaw_metrics: dict[str, float | None] = {
+            "Recall@1": yaw_r1,
+            "Recall@2": yaw_r2,
+            "Recall@5": yaw_r5,
             "ExactMatch": yaw_em_opt if yaw_em_opt is not None else 0.0,
             "F1": yaw_f1_opt if yaw_f1_opt is not None else 0.0,
         }
@@ -988,7 +960,6 @@ def evaluate_benchmark_gate(
             or spec_datasets.get(raw_stripped)
             or spec_datasets_lower.get(canonical.lower())
             or spec_datasets_lower.get(cleaned)
-            or (spec_datasets.get("nq_rear") if canonical == "nq" else None)
             or target_datasets.get(canonical)
             or target_datasets.get(cleaned)
             or target_datasets.get(raw_stripped)
@@ -1002,7 +973,7 @@ def evaluate_benchmark_gate(
         base_block = ds_spec.get(primary_target, ds_spec.get("monkeypatched_hipporag", ds_spec))
         if not isinstance(base_block, Mapping):
             base_block = {}
-        paper_block = ds_spec.get("paper_70b", {})
+        paper_block = ds_spec.get("hipporag2_llama3.3_70b_nvembed_v2", ds_spec.get("paper_70b", {}))
         if not isinstance(paper_block, Mapping):
             paper_block = {}
         elif isinstance(paper_block.get("hipporag2_llama3.3_70b_nvembed_v2"), Mapping):
@@ -1024,16 +995,20 @@ def evaluate_benchmark_gate(
             for k in ("Recall@2", "Recall@5", "ExactMatch", "F1")
         }
 
-        delta_vs_hippo = {
-            k: round(yaw_metrics[k] - hippo_metrics[k], 4)
+        delta_vs_hippo: dict[str, float | None] = {
+            k: (round(yv - hippo_metrics[k], 4) if (yv := yaw_metrics[k]) is not None else None)
             for k in ("Recall@1", "Recall@2", "Recall@5", "ExactMatch", "F1")
         }
         delta_vs_paper = {
             "Recall@2": (
-                round(yaw_metrics["Recall@2"] - pv, 4) if (pv := paper_metrics["Recall@2"]) is not None else None
+                round(yv - pv, 4)
+                if (yv := yaw_metrics["Recall@2"]) is not None and (pv := paper_metrics["Recall@2"]) is not None
+                else None
             ),
             "Recall@5": (
-                round(yaw_metrics["Recall@5"] - pv, 4) if (pv := paper_metrics["Recall@5"]) is not None else None
+                round(yv - pv, 4)
+                if (yv := yaw_metrics["Recall@5"]) is not None and (pv := paper_metrics["Recall@5"]) is not None
+                else None
             ),
             "ExactMatch": (
                 round(yaw_em_opt - pv, 4)
@@ -1046,7 +1021,10 @@ def evaluate_benchmark_gate(
                 else None
             ),
         }
-        delta_vs_dpr = {k: round(yaw_metrics[k] - dpr_metrics[k], 4) for k in ("Recall@1", "Recall@2", "Recall@5")}
+        delta_vs_dpr = {
+            k: (round(yv - dpr_metrics[k], 4) if (yv := yaw_metrics[k]) is not None else None)
+            for k in ("Recall@1", "Recall@2", "Recall@5")
+        }
 
         eval_em_enforced = base_em_opt is not None and not yaw_em_explicit_none
         eval_f1_enforced = base_f1_opt is not None and not yaw_f1_explicit_none
@@ -1065,17 +1043,13 @@ def evaluate_benchmark_gate(
             int_errors = integrity.get("errors", [])
             failures.append(f"Integrity gate failed: {int_errors}")
 
-        if delta_vs_hippo["Recall@5"] < tolerance - 1e-9:
-            failures.append(
-                f"Recall@5 delta vs historical HippoRAG ({delta_vs_hippo['Recall@5']:+.4f}) < {tolerance:+.2f}"
-            )
+        if (d_r5 := delta_vs_hippo["Recall@5"]) is not None and d_r5 < tolerance - 1e-9:
+            failures.append(f"Recall@5 delta vs historical HippoRAG ({d_r5:+.4f}) < {tolerance:+.2f}")
         if effective_mode == "eval":
-            if eval_f1_enforced and delta_vs_hippo["F1"] < tolerance - 1e-9:
-                failures.append(f"QA F1 delta vs historical HippoRAG ({delta_vs_hippo['F1']:+.4f}) < {tolerance:+.2f}")
-            if eval_em_enforced and delta_vs_hippo["ExactMatch"] < tolerance - 1e-9:
-                failures.append(
-                    f"ExactMatch delta vs historical HippoRAG ({delta_vs_hippo['ExactMatch']:+.4f}) < {tolerance:+.2f}"
-                )
+            if eval_f1_enforced and (d_f1 := delta_vs_hippo["F1"]) is not None and d_f1 < tolerance - 1e-9:
+                failures.append(f"QA F1 delta vs historical HippoRAG ({d_f1:+.4f}) < {tolerance:+.2f}")
+            if eval_em_enforced and (d_em := delta_vs_hippo["ExactMatch"]) is not None and d_em < tolerance - 1e-9:
+                failures.append(f"ExactMatch delta vs historical HippoRAG ({d_em:+.4f}) < {tolerance:+.2f}")
 
         raw_q = rep.get("num_queries") or rep.get("queries_count")
         if raw_q is None:
@@ -1104,7 +1078,7 @@ def evaluate_benchmark_gate(
         )
 
         ds_confidence = {
-            k: _compute_metric_confidence(yaw_metrics[k], hippo_metrics[k], n_queries)
+            k: _compute_metric_confidence(float(yaw_metrics[k] or 0.0), hippo_metrics[k], n_queries)
             for k in ("Recall@5", "ExactMatch", "F1")
         }
 
@@ -1263,7 +1237,9 @@ def compute_task_quality_score(
     shacl_violations: int | None = None,
     shacl_violations_initial: int = 0,
     shacl_violations_remaining: int = 0,
-    synonym_judge_tokens: int = 0,
+    label_judge_tokens: int = 0,
+    hierarchy_judge_tokens: int = 0,
+    related_judge_tokens: int = 0,
     shacl_healer_tokens: int = 0,
     missing_entity_defs_count: int = 0,
     missing_entity_defs_tokens: int = 0,
@@ -1304,8 +1280,9 @@ def compute_task_quality_score(
 
     missed_str = f" Missed gold items: {list(missed_items)}." if missed_items else ""
     missing_defs_str = (
-        f" [entity_definer] repaired {eff_missing_defs} missing Stage-2 entity definition(s) "
-        f"({eff_missing_def_tokens} aux tokens); emit inline [name, def] pairs in Stage 2 or extract in Stage 1."
+        f" [entity_definer] repaired {eff_missing_defs} missing NER resource definition(s) "
+        f"({eff_missing_def_tokens} aux tokens); extract complete resource definitions in Stage 1. "
+        "Stage 2 must only select supplied resources or extract literal objects."
         if eff_missing_defs > 0
         else ""
     )
@@ -1330,7 +1307,9 @@ def compute_task_quality_score(
         em=obj_scores.get("em"),
         f1=obj_scores.get("f1"),
         tokens=safe_tokens,
-        synonym_judge_tokens=max(0, int(synonym_judge_tokens)),
+        label_judge_tokens=max(0, int(label_judge_tokens)),
+        hierarchy_judge_tokens=max(0, int(hierarchy_judge_tokens)),
+        related_judge_tokens=max(0, int(related_judge_tokens)),
         shacl_healer_tokens=max(0, int(shacl_healer_tokens)),
         shacl_violations_initial=eff_v_init,
         shacl_violations_remaining=eff_v_rem,
@@ -1389,14 +1368,11 @@ __all__ = [
     "doc_matches_gold",
     "evaluate_benchmark_gate",
     "extract_entity_definitions",
-    "extract_named_entities",
     "extract_structured_triples",
-    "extract_triples",
-    "filter_invalid_triples",
     "match_facts_to_candidate_indices",
-    "normalize_answer",
+    "parse_hierarchy_decisions",
+    "parse_label_decisions",
+    "parse_related_decisions",
     "parse_shacl_repairs",
-    "parse_synonym_decisions",
-    "repair_truncated_json",
     "text_processing",
 ]

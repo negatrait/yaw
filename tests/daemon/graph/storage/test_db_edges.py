@@ -6,20 +6,17 @@ from contextlib import closing
 
 import numpy as np
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     deserialize_f32_vector,
-    find_entity_disambiguation_candidates,
-    get_entities_by_label_norm,
+    find_entity_candidates,
     get_entity_metadata_batch,
-    get_facts_with_meta_by_ids,
     initialize_schema,
     open_readonly_yaw_db,
     open_yaw_db,
-    resolve_entity_labels,
     search_chunks_fts,
-    search_entity_vectors_knn,
     search_facts_fts,
     set_meta,
     upsert_entities,
@@ -29,55 +26,32 @@ from yaw.daemon.graph.storage import (
 )
 
 
-def test_legacy_schema_migrates_rows_labels_edges_and_fact_search_without_loss(tmp_path):
-    path = tmp_path / "legacy.db"
-    with closing(sqlite3.connect(path)) as legacy:
-        legacy.executescript("""
-            CREATE TABLE chunks(chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL,
-                start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, title TEXT NOT NULL, content_hash TEXT);
-            INSERT INTO chunks VALUES ('chunk','source.md',1,2,'Source','legacy-hash');
-            CREATE TABLE openie_chunks(chunk_id TEXT PRIMARY KEY, entities_json TEXT NOT NULL,
-                triples_json TEXT NOT NULL);
-            INSERT INTO openie_chunks VALUES ('chunk','["Ada"]','[]');
-            CREATE TABLE entities(entity_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-            INSERT INTO entities VALUES ('ada','Ada');
-            CREATE TABLE facts(fact_id TEXT PRIMARY KEY,subj_id TEXT NOT NULL,pred TEXT NOT NULL,
-                obj_id TEXT NOT NULL,raw_triple_json TEXT NOT NULL);
-            INSERT INTO facts VALUES ('fact','ada','wrote','notes','["Ada","wrote","Notes"]');
-            INSERT INTO facts VALUES ('broken','ada','legacyPredicate','notes','not json');
-            CREATE TABLE edges(src_id TEXT NOT NULL,dst_id TEXT NOT NULL,kind TEXT NOT NULL,
-                weight REAL NOT NULL,PRIMARY KEY(src_id,dst_id,kind));
-            INSERT INTO edges VALUES ('ada','notes','synonymy',0.8);
-            INSERT INTO edges VALUES ('ada','orphan','retired-kind',0.2);
-        """)
+def test_initialize_schema_creates_fresh_tables_without_legacy_migrations_or_backfills(tmp_path):
+    path = tmp_path / "fresh.db"
     with closing(open_yaw_db(path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
         assert "content_hash" not in columns
         assert {"ast_island_start", "ast_island_end"} <= columns
-        assert tuple(conn.execute("SELECT chunk_id,ast_island_start,ast_island_end FROM chunks").fetchone()) == (
-            "chunk",
-            0,
-            0,
-        )
-        assert conn.execute("SELECT structured_triples_json FROM openie_chunks").fetchone()[0] == "[]"
-        assert tuple(conn.execute("SELECT entity_id,name,definition FROM entities").fetchone()) == ("ada", "Ada", "")
-        assert tuple(conn.execute("SELECT label_norm,label_kind,raw_label,chunk_id FROM entity_labels").fetchone()) == (
-            "ada",
-            "skos:prefLabel",
-            "Ada",
-            "__legacy__",
-        )
-        assert [tuple(row) for row in conn.execute("SELECT src_id,dst_id,kind,weight FROM edges")] == [
-            ("ada", "notes", "skos:related", 0.8),
-        ]
-        assert search_facts_fts(conn, "Ada")[0][0] == "fact"
-        assert search_facts_fts(conn, "legacyPredicate")[0][0] == "broken"
-        # The old UNIQUE(name) constraint must be removed for distinct senses.
-        upsert_entities(conn, [("ada-sense-two", "Ada", "Different entity")])
+
+        # Distinct senses with identical names are supported natively without UNIQUE(name)
+        upsert_entities(conn, [("ada-1", "Ada", "Mathematician"), ("ada-2", "Ada", "Programming language")])
         assert conn.execute("SELECT count(*) FROM entities WHERE name='Ada'").fetchone()[0] == 2
-        before = conn.execute("SELECT count(*) FROM fact_fts").fetchone()[0]
+
+        # Direct table inserts without labels, fact_sources, or fact_fts are not backfilled by initialize_schema
+        conn.execute("INSERT INTO entities (entity_id, name, definition) VALUES ('unlabeled', 'Unlabeled', '')")
+        conn.execute(
+            "INSERT INTO facts (fact_id, subj_id, pred, obj_kind, obj_id, raw_triple_json, definition) "
+            "VALUES ('f-raw', 'ada-1', 'inspired', 'entity', 'ada-2', '[\"Ada\",\"inspired\",\"Ada\"]', '')"
+        )
+        conn.execute(
+            "INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id) VALUES ('ada-1', 'ada-2', 'fact', 'c-1')"
+        )
+        conn.commit()
+
         initialize_schema(conn)
-        assert conn.execute("SELECT count(*) FROM fact_fts").fetchone()[0] == before
+        assert conn.execute("SELECT count(*) FROM entity_labels WHERE entity_id = 'unlabeled'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM fact_sources WHERE fact_id = 'f-raw'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM fact_fts WHERE fact_id = 'f-raw'").fetchone()[0] == 0
 
 
 def test_failed_owned_transaction_rolls_back_partial_writes_and_outer_owner_retains_control(tmp_path):
@@ -94,26 +68,6 @@ def test_failed_owned_transaction_rolls_back_partial_writes_and_outer_owner_reta
         assert conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 1
         conn.rollback()
         assert conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 0
-
-
-def test_fact_metadata_preserves_original_triples_and_optional_entity_definitions(tmp_path):
-    with closing(open_yaw_db(tmp_path / "meta.db")) as conn:
-        upsert_entities(conn, [("ada", "Ada", "Mathematician"), ("notes", "Notes", "Publication")])
-        upsert_facts(conn, [("fact", "ada", "wrote", "notes", '["Ada","wrote","Notes"]', "Ada wrote Notes.")])
-        assert get_facts_with_meta_by_ids(conn, []) == {}
-        assert get_facts_with_meta_by_ids(conn, ["missing"]) == {}
-        assert get_facts_with_meta_by_ids(conn, ["fact", "missing"])["fact"] == {
-            "fact_id": "fact",
-            "subj_id": "ada",
-            "pred": "wrote",
-            "obj_id": "notes",
-            "triple": ("Ada", "wrote", "Notes"),
-            "definition": "Ada wrote Notes.",
-            "subj_def": "Mathematician",
-            "obj_def": "Publication",
-        }
-        conn.execute("DELETE FROM entities WHERE entity_id='notes'")
-        assert get_facts_with_meta_by_ids(conn, ["fact"])["fact"]["obj_def"] == ""
 
 
 @pytest.mark.parametrize("blob", [b"", b"x", b"12345"])
@@ -168,44 +122,24 @@ def test_label_priority_is_global_across_sources_even_before_entity_hydration(tm
         with pytest.raises(ValueError, match="Invalid SKOS label_kind"):
             upsert_entity_labels(conn, [("invalid", "pending", "invalid", "Invalid", "a")])
         assert conn.execute("SELECT count(*) FROM entity_labels").fetchone()[0] == before
-        assert get_entities_by_label_norm(conn, []) == {}
-        assert get_entities_by_label_norm(conn, [" "]) == {}
-
-
-def test_label_resolution_uses_available_vectors_and_deterministic_missing_vector_ties(tmp_path):
-    with closing(open_yaw_db(tmp_path / "sense.db")) as conn:
-        upsert_entities(conn, [("a", "Mercury", "Planet"), ("b", "Mercury", "Metal"), ("c", "Unique", "Unique")])
-        upsert_entity_labels(
-            conn,
-            [
-                ("mercury", "a", "skos:prefLabel", "Mercury", "one"),
-                ("mercury", "b", "skos:prefLabel", "Mercury", "two"),
-                ("unique", "c", "skos:prefLabel", "Unique", "three"),
-            ],
-        )
-        assert resolve_entity_labels(conn, []) == {}
-        assert resolve_entity_labels(conn, ["unique"], [1.0, 0.0]) == {"unique": ["c"]}
-        assert resolve_entity_labels(conn, ["mercury"], [0.0, 0.0]) == {"mercury": ["a", "b"]}
-        assert resolve_entity_labels(conn, ["mercury", "unique"], [1.0, 0.0]) == {"mercury": ["a"], "unique": ["c"]}
-        upsert_entity_vectors(conn, [("a", [0.0, 0.0]), ("b", [1.0, 0.0])])
-        assert resolve_entity_labels(conn, ["mercury"], [1.0, 0.0]) == {"mercury": ["b"]}
 
 
 @pytest.mark.parametrize(
     ("name_a", "name_b", "threshold", "lexical"),
     [
         ("", "Beta", 0.8, 0.0),
-        ("WHO", "World Health Organization", 0.8, 0.85),
-        ("United States of America", "USA", 0.8, 0.85),
-        ("alpha beta", "alphabeta", 0.8, 18 / 19),
-        ("alpha beta", "alphabeta", 0.98, 1.0),
+        ("WHO", "World Health Organization", 0.8, 1 / 16),
+        ("United States of America", "USA", 0.8, 4 / 31),
+        ("alpha beta", "alphabeta", 0.8, 18 / 23),
+        ("alpha beta", "alphabeta", 0.98, 18 / 23),
     ],
 )
 def test_disambiguation_keeps_dense_and_lexical_channels_independent(tmp_path, name_a, name_b, threshold, lexical):
     with closing(open_yaw_db(tmp_path / "candidate.db")) as conn:
         upsert_entities(conn, [("a", name_a), ("b", name_b)])
         upsert_entity_vectors(conn, [("a", np.array([1.0, 0.0])), ("b", np.array([1.0, 0.0]))])
-        pairs = find_entity_disambiguation_candidates(conn, lexical_threshold=threshold)
+        seed_candidate_vectors(conn)
+        pairs = find_entity_candidates(conn, lexical_threshold=threshold)
         assert len(pairs) == 1
         assert pairs[0][:2] == ("a", "b")
         assert pairs[0][2] == pytest.approx(1.0)
@@ -221,8 +155,6 @@ def test_open_readonly_yaw_db_enforces_ro_uri_and_busy_timeout(tmp_path):
         assert ro_conn.row_factory is sqlite3.Row
         assert ro_conn.execute("PRAGMA busy_timeout").fetchone()[0] == 2500
         assert ro_conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()["value"] == "1"
-        knn_hits = search_entity_vectors_knn(ro_conn, [1.0, 0.0], top_k=1)
-        assert knn_hits == [("entity-1", pytest.approx(1.0))]
         with pytest.raises(sqlite3.OperationalError):
             ro_conn.execute("INSERT INTO meta (key, value) VALUES ('x', 'y')")
 
@@ -240,7 +172,7 @@ def test_get_entity_metadata_batch_handles_empty_and_multi_batch_queries(tmp_pat
         assert "entity-missing" not in fetched
 
 
-def test_apply_shacl_repairs_executes_closed_world_actions_and_custom_merge_callback(tmp_path):
+def test_shacl_repairs_executes_closed_world_actions_and_custom_merge_callback(tmp_path):
     with closing(open_yaw_db(tmp_path / "repairs.db")) as conn:
         assert apply_shacl_repairs(conn, []) == 0
         upsert_entities(
@@ -280,10 +212,10 @@ def test_apply_shacl_repairs_executes_closed_world_actions_and_custom_merge_call
             [
                 {"focus_node": "", "action": "set_definition", "value": "ignored"},
                 {"focus_node": "entity-1", "action": "set_definition", "value": "Alpha definition"},
-                {"focus_node": "fact-1", "action": "rewrite_definition", "value": "Fact definition"},
+                {"focus_node": "fact-1", "action": "set_definition", "value": "Fact definition"},
                 {"focus_node": "entity-1", "action": "set_pref_label", "value": "Alpha Canonical"},
                 {"focus_node": "entity-2|entity-1", "action": "merge_altLabel", "target_node": "entity-1"},
-                {"focus_node": "entity-1|entity-3", "action": "assert_differentFrom"},
+                {"focus_node": "entity-1|entity-3", "action": "add_different_from"},
                 {"focus_node": "entity-orphan", "action": "delete_orphan"},
             ],
             merge_entities_fn=custom_merge,

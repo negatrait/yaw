@@ -16,7 +16,6 @@ from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
     ServingTokenCounter,
-    deterministic_evidence,
     reflection_digest,
     reflection_examples,
     resolve_evidence,
@@ -35,7 +34,7 @@ def simba_state():
         "version": 2,
         "steps": 0,
         "examples": [{"component_name": "ner", "current_instruction": "Extract", "examples_with_feedback": []}],
-        "predictors": {"qwen_proposer": predictor, "qwen_compressor": copy.deepcopy(predictor)},
+        "predictors": {"llm_proposer": predictor, "llm_compressor": copy.deepcopy(predictor)},
     }
 
 
@@ -47,11 +46,11 @@ def test_simba_checkpoint_rejects_malformed_nested_contracts(defect):
     elif defect == "example-input":
         state["examples"][0]["component_name"] = None
     elif defect == "signature":
-        state["predictors"]["qwen_proposer"]["signature"]["instructions"] = None
+        state["predictors"]["llm_proposer"]["signature"]["instructions"] = None
     elif defect == "field":
-        state["predictors"]["qwen_proposer"]["signature"]["fields"][0]["description"] = 2
+        state["predictors"]["llm_proposer"]["signature"]["fields"][0]["description"] = 2
     else:
-        state["predictors"]["qwen_proposer"]["demos"] = ["not-object"]
+        state["predictors"]["llm_proposer"]["demos"] = ["not-object"]
     with pytest.raises(ValueError, match="Malformed"):
         validate_simba_state(state)
 
@@ -69,23 +68,6 @@ def test_checkpoint_writer_identity_and_active_request_are_validated():
         validate_active_checkpoint(active, "different-run")
     with pytest.raises(ValueError, match="request identity"):
         validate_active_checkpoint({**active, "request": "missing"}, "context")
-
-
-def test_deterministic_selector_handles_nested_malformed_and_nonfinite_scores():
-    examples = reflection_examples(
-        [
-            {"Feedback": {"score": 1.0}},
-            {"Score": "invalid"},
-            {"Score": "nan"},
-            {"Score": {}},
-            {"Feedback": "score=0.8"},
-        ]
-    )
-    selection = deterministic_evidence(examples)
-    resolved = resolve_evidence(examples, selection)
-    assert len(resolved) == 5
-    assert resolved[-2]["evidence"]["Feedback"]["score"] == 1.0
-    assert resolved[-1]["evidence"]["Feedback"] == "score=0.8"
 
 
 def test_reflection_examples_serialize_native_schema_values_and_keep_stable_ids():

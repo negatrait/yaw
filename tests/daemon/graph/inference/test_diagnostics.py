@@ -5,7 +5,7 @@ import copy
 import dspy
 import pytest
 
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.inference.diagnostics import (
     DiagnosticHistory,
     diagnostic_boundary,
@@ -14,7 +14,7 @@ from yaw.daemon.graph.inference.diagnostics import (
 
 
 def test_candidate_copy_keeps_predictors_but_drops_diagnostic_payloads() -> None:
-    program = HippoRAGProgram()
+    program = YawProgram()
     predictor = program.qa.predict
     predictor.signature = predictor.signature.with_instructions("Keep this candidate instruction.")
     predictor.demos = [dspy.Example(context="source", question="q", answer="a", reasoning="r")]

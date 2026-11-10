@@ -1,0 +1,185 @@
+"""Tests for pure-JSON GBNF grammars of the 3-stage W3C semantic cascade."""
+
+import pytest
+
+from yaw.daemon.graph.inference.grammars import (
+    DSPY_NER_GBNF_GRAMMAR,
+    DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
+    DSPY_TRIPLES_GBNF_GRAMMAR,
+    build_dspy_hierarchy_judge_grammar,
+    build_dspy_label_judge_grammar,
+    build_dspy_related_judge_grammar,
+    build_dspy_shacl_repair_grammar,
+    build_dspy_triples_grammar,
+)
+
+
+def test_label_judge_grammar_structure() -> None:
+    grammar = build_dspy_label_judge_grammar()
+    assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
+    assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
+    assert ', \\"equivalent\\": " equiv-branch' in grammar
+    assert (
+        'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"'
+        in grammar
+    )
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert 'boolean ::= "true" | "false"' in grammar
+
+
+def test_label_judge_grammar_bounded_decisions() -> None:
+    grammar = build_dspy_label_judge_grammar(max_decisions=2)
+    assert 'decision (", " decision)?' in grammar
+
+
+def test_label_judge_grammar_pair_ids() -> None:
+    pairs = ["apple|fruit", "tree|plant"]
+    grammar = build_dspy_label_judge_grammar(pair_ids=pairs)
+    assert 'decision-0 ::= "{\\"pair_id\\": \\"apple|fruit\\", \\"reasoning\\": "' in grammar
+    assert 'decision-1 ::= "{\\"pair_id\\": \\"tree|plant\\", \\"reasoning\\": "' in grammar
+    assert 'root ::= "{\\"decisions\\": [" decision-0 ", " decision-1 "]}"' in grammar
+
+
+def test_label_judge_grammar_invalid_pair_ids() -> None:
+    with pytest.raises(ValueError, match="nonempty, unique"):
+        build_dspy_label_judge_grammar(pair_ids=[])
+
+    with pytest.raises(ValueError, match="nonempty, unique"):
+        build_dspy_label_judge_grammar(pair_ids=["a|b", "a|b"])
+
+    with pytest.raises(ValueError, match="Invalid synonym pair ID"):
+        build_dspy_label_judge_grammar(pair_ids=["invalid"])
+
+    with pytest.raises(ValueError, match="Invalid synonym pair ID"):
+        build_dspy_label_judge_grammar(pair_ids=["same|same"])
+
+
+def test_hierarchy_judge_grammar_structure() -> None:
+    grammar = build_dspy_hierarchy_judge_grammar()
+    assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
+    assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
+    assert ', \\"broader\\": " boolean' in grammar
+    assert ', \\"narrower\\": " boolean' in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert 'boolean ::= "true" | "false"' in grammar
+
+
+def test_hierarchy_judge_grammar_pair_ids() -> None:
+    pairs = ["car|vehicle"]
+    grammar = build_dspy_hierarchy_judge_grammar(pair_ids=pairs)
+    assert 'decision-0 ::= "{\\"pair_id\\": \\"car|vehicle\\", \\"reasoning\\": "' in grammar
+    assert ', \\"broader\\": " boolean' in grammar
+    assert ', \\"narrower\\": " boolean' in grammar
+
+
+def test_hierarchy_judge_grammar_invalid_pair_ids() -> None:
+    with pytest.raises(ValueError, match="nonempty, unique"):
+        build_dspy_hierarchy_judge_grammar(pair_ids=[])
+
+    with pytest.raises(ValueError, match="Invalid synonym pair ID"):
+        build_dspy_hierarchy_judge_grammar(pair_ids=["single"])
+
+
+def test_related_judge_grammar_structure() -> None:
+    grammar = build_dspy_related_judge_grammar()
+    assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
+    assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
+    assert ', \\"related\\": " boolean' in grammar
+    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert 'boolean ::= "true" | "false"' in grammar
+
+
+def test_related_judge_grammar_pair_ids() -> None:
+    pairs = ["doctor|hospital"]
+    grammar = build_dspy_related_judge_grammar(pair_ids=pairs)
+    assert 'decision-0 ::= "{\\"pair_id\\": \\"doctor|hospital\\", \\"reasoning\\": "' in grammar
+    assert ', \\"related\\": " boolean' in grammar
+
+
+def test_custom_reasoning_chars() -> None:
+    g100 = build_dspy_label_judge_grammar(max_reasoning_chars=100)
+    assert 'reasoning-str ::= "\\"" char{1,100} "\\""' in g100
+
+    gunlimited = build_dspy_label_judge_grammar(max_reasoning_chars=None)
+    assert 'reasoning-str ::= "\\"" char+ "\\""' in gunlimited
+
+
+def test_adapter_resolves_3_stage_grammars() -> None:
+    from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
+    from yaw.daemon.graph.inference.prompts import (
+        CompressInstructionSignature,
+        JudgeHierarchy,
+        JudgeLabels,
+        JudgeRelated,
+        ProposeInstructionSignature,
+    )
+
+    adapter = YawGBNFAdapter(enable_gbnf=True)
+    g_label = adapter.resolve_grammar(JudgeLabels)
+    assert g_label is not None
+    assert "hidden_label" in g_label
+
+    g_hier = adapter.resolve_grammar(JudgeHierarchy)
+    assert g_hier is not None
+    assert "broader" in g_hier
+
+    g_rel = adapter.resolve_grammar(JudgeRelated)
+    assert g_rel is not None
+    assert "related" in g_rel
+
+    g_prop = adapter.resolve_grammar(ProposeInstructionSignature)
+    assert g_prop is not None
+    assert "new_instruction" in g_prop
+
+    g_comp = adapter.resolve_grammar(CompressInstructionSignature)
+    assert g_comp is not None
+    assert "shortened_instruction" in g_comp
+    assert "new_instruction" not in g_comp
+
+
+def _parse_gbnf_rules(grammar: str) -> dict[str, str]:
+    rules: dict[str, str] = {}
+    for line in grammar.splitlines():
+        name, body = line.split(" ::= ", 1)
+        rules[name] = body
+    return rules
+
+
+def test_shacl_repair_grammar_lexical_label_branch_and_abstention() -> None:
+    base_rules = _parse_gbnf_rules(DSPY_SHACL_REPAIR_GBNF_GRAMMAR)
+    assert base_rules["label"] == '"\\"" non-letter* letter char* "\\""'
+    assert base_rules["letter"] == "[a-zA-Z\\x80-\\U0010FFFF]"
+    assert base_rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"
+
+    grammar = build_dspy_shacl_repair_grammar(
+        allowed_actions={"entity-1": {"set_pref_label"}, "fact-1": {"set_definition"}}
+    )
+    rules = _parse_gbnf_rules(grammar)
+    assert rules["repair-list"] == '"[]" | "[" repair-0 (", " repair-0)* ", " repair-1 (", " repair-1)* "]"'
+    assert rules["repair-0"] == (
+        '"{\\"focus_node\\": " "\\"entity-1\\"" ", \\"action\\": " ("\\"set_pref_label\\"") ", \\"value\\": " label "}"'
+    )
+    assert rules["repair-1"] == (
+        '"{\\"focus_node\\": " "\\"fact-1\\"" ", \\"action\\": " ("\\"set_definition\\"") ", \\"value\\": " string "}"'
+    )
+    assert rules["label"] == '"\\"" non-letter* letter char* "\\""'
+    assert rules["letter"] == "[a-zA-Z\\x80-\\U0010FFFF]"
+    assert rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"
+
+
+def test_ner_and_triples_grammars_bound_repetition_and_string_length() -> None:
+    ner_rules = _parse_gbnf_rules(DSPY_NER_GBNF_GRAMMAR)
+    assert ner_rules["entity-list"] == '"[]" | "[" entity-pair (", " entity-pair){0,39} "]"'
+    assert ner_rules["string"] == '"\\"" char{1,512} "\\""'
+    assert ner_rules["label"] == '"\\"" non-letter* letter char* "\\""'
+
+    open_triples = _parse_gbnf_rules(DSPY_TRIPLES_GBNF_GRAMMAR)
+    assert open_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert open_triples["triple"] == '"{\\"sub\\": " resource-slot ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"'
+    assert open_triples["pred-obj"] == 'resource-pred ", \\"obj\\": " resource-slot | literal-statement'
+    assert open_triples["resource-slot"] == 'string | "[" string ", " string "]"'
+    assert open_triples["string"] == '"\\"" char{1,512} "\\""'
+
+    pinned_triples = _parse_gbnf_rules(build_dspy_triples_grammar(None, [["HubSpot", "CRM platform."]]))
+    assert pinned_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert pinned_triples["string"] == '"\\"" char{1,512} "\\""'

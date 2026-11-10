@@ -12,11 +12,9 @@ from yaw.daemon.graph.inference.parsers import (
     compute_qa_em_f1,
     extract_entity_definitions,
     extract_structured_triples,
-    extract_triples,
-    filter_invalid_triples,
     match_facts_to_candidate_indices,
+    parse_label_decisions,
     parse_shacl_repairs,
-    parse_synonym_decisions,
     text_processing,
 )
 
@@ -108,10 +106,11 @@ def test_same_label_different_senses_do_not_collapse_into_one_concept():
     definitions = json.loads(
         '[["Mercury", "A planet"], ["mercury", "An element"], ["Mercury", "A PLANET"], ["", ""], ["short"]]'
     )
-    result = extract_structured_triples([("Mercury", "differs from", "Mercury")], entity_definitions=definitions)
+    extracted = extract_entity_definitions(definitions)
+    assert extracted == (("Mercury", "A planet"), ("mercury", "An element"), ("short", ""))
+    result = extract_structured_triples([("Mercury", "orbits", "Sun")], entity_definitions=definitions)
     assert len(result) == 1
     assert result[0].subj_def == "A planet"
-    assert result[0].obj_def == "An element"
 
 
 @pytest.mark.parametrize(
@@ -120,16 +119,16 @@ def test_same_label_different_senses_do_not_collapse_into_one_concept():
         ('noise {bad} {"other": []} {"entity_definitions": [["Ada", "Mathematician"]]}', (("Ada", "Mathematician"),)),
         ('```json\n[["Ada", "Mathematician"]]\n```', (("Ada", "Mathematician"),)),
         ('```\n["Ada"]\n```', (("Ada", ""),)),
-        ('{"entity_definitions": [["Ada", "Mathematician"], ["unfinished', (("Ada", "Mathematician"),)),
         ({"entity_definitions": [["Ada", "Mathematician"]]}, (("Ada", "Mathematician"),)),
         ({"named_entities": "wrong type"}, ()),
-        ("[42]", ()),
-        ("not JSON", ()),
         (None, ()),
     ],
 )
 def test_entity_response_envelopes_and_truncation(payload, expected):
     assert extract_entity_definitions(payload) == expected
+    for bad in ('{"entity_definitions": [["Ada", "Mathematician"], ["unfinished', "[42]", "not JSON"):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_entity_definitions(bad)
 
 
 def test_entity_definitions_fill_missing_data_and_preserve_homographs():
@@ -151,9 +150,12 @@ def test_entity_definitions_fill_missing_data_and_preserve_homographs():
     )
 
 
-@pytest.mark.parametrize("payload", ["", "not JSON", '{"triples": "wrong type"}', 42, None])
+@pytest.mark.parametrize("payload", [42, None])
 def test_broken_structured_response_envelopes_produce_no_triples(payload):
     assert extract_structured_triples(payload) == ()
+    for bad in ("", "not JSON", '{"triples": "wrong type"}'):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_structured_triples(bad)
 
 
 @pytest.mark.parametrize(
@@ -166,7 +168,8 @@ def test_bare_and_wrapped_structured_triples_are_equivalent(payload):
 
 @pytest.mark.parametrize("payload", ["not JSON", '{"triples": "wrong type"}'])
 def test_plain_triple_parser_rejects_invalid_response_shapes(payload):
-    assert extract_triples(payload) == ()
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_structured_triples(payload)
 
 
 @pytest.mark.parametrize(
@@ -199,14 +202,13 @@ def test_fact_envelopes_preserve_actual_candidates(envelope):
     assert coerce_generated_facts({"fact": "wrong type"}) == []
 
 
-def test_entity_definitions_mapping_and_normalize_keys():
+def test_entity_definitions_mapping_and_deduplication():
     assert extract_entity_definitions({"Ada Lovelace": "English mathematician", "Engine": None}) == (
         ("Ada Lovelace", "English mathematician"),
         ("Engine", ""),
     )
     assert extract_entity_definitions(
-        [("Ada Lovelace", ""), ("ada lovelace", "English mathematician")],
-        normalize_keys=True,
+        [("Ada Lovelace", ""), ("Ada Lovelace", "English mathematician")],
     ) == (("Ada Lovelace", "English mathematician"),)
 
 
@@ -222,37 +224,53 @@ def test_empty_answer_metrics_and_triple_filtering():
     assert compute_qa_em_f1("A", []) == (0.0, 0.0)
     assert compute_qa_em_f1("A B", ["B C"]) == (0.0, pytest.approx(2 / 3))
     assert text_processing(json.loads("12")) == "12"
-    assert filter_invalid_triples([{}, ["short"], StructuredTriple("A", pred="p", obj="B")]) == [["A", "p", "B"]]
+    assert [
+        list(t.as_tuple())
+        for t in extract_structured_triples([{}, ["short"], StructuredTriple("A", pred="p", obj="B")])
+    ] == [["A", "p", "B"]]
 
 
 @pytest.mark.parametrize("name", ['A"B', "A\\B"])
 def test_truncation_repair_preserves_escaped_characters_in_completed_names(name):
     truncated = json.dumps({"named_entities": [name]})[:-2] + ', "unfinished'
-    assert extract_entity_definitions(truncated) == ((name, ""),)
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_entity_definitions(truncated)
 
 
 def test_wrong_nested_response_envelopes_and_missing_filter_output_are_not_facts():
-    assert extract_structured_triples('{"other":[["A"]], "unfinished') == ()
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        extract_structured_triples('{"other":[["A"]], "unfinished')
     assert extract_structured_triples({"triples": [["A", "p", "B"]]})[0].as_tuple() == ("A", "p", "B")
     assert match_facts_to_candidate_indices([("A", "p", "B")], coerce_generated_facts("No structured response")) == []
 
 
-def test_invalid_synonym_items_cannot_displace_a_later_valid_decision():
+def test_invalid_label_items_cannot_displace_a_later_valid_decision():
     raw = [
         None,
-        {"pair_id": "", "relation": "related"},
-        {"pair_id": "0", "relation": "unknown"},
-        {"pair_id": "1", "relation": "related"},
+        {"pair_id": "", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "0", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "a|b", "reasoning": "", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
     ]
-    assert parse_synonym_decisions(raw) == [{"pair_id": "1", "relation": "skos:related", "canonical": "A"}]
+    assert parse_label_decisions(raw) == [
+        {
+            "pair_id": "a|b",
+            "reasoning": "valid",
+            "equivalent": True,
+            "alt_label": True,
+            "hidden_label": False,
+            "relation": "skos:altLabel",
+            "definition": "Valid def",
+        }
+    ]
 
 
 @pytest.mark.parametrize("envelope", ["prediction", "dictionary", "json", "bare-json", "list"])
 def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
     decisions = [
-        {"pair_id": "0", "relation": "related"},
-        {"pair_id": "1", "relation": "differentFrom"},
-        {"pair_id": "2", "relation": "unknown"},
+        {"pair_id": "a|b", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": False},
+        {"pair_id": "c|d", "reasoning": "valid", "equivalent": True, "definition": "Valid def", "hidden_label": True},
+        {"pair_id": "e", "reasoning": "invalid pair_id"},
         "invalid",
     ]
     repairs = [
@@ -270,11 +288,32 @@ def test_synonym_and_shacl_decisions_reject_unknown_actions(envelope):
             "list": value,
         }[envelope]
 
-    assert parse_synonym_decisions(wrap("decisions", decisions), num_pairs=1) == [
-        {"pair_id": "0", "relation": "skos:related", "canonical": "A"},
+    assert parse_label_decisions(wrap("decisions", decisions)) == [
+        {
+            "pair_id": "a|b",
+            "reasoning": "valid",
+            "equivalent": True,
+            "alt_label": True,
+            "hidden_label": False,
+            "relation": "skos:altLabel",
+            "definition": "Valid def",
+        },
+        {
+            "pair_id": "c|d",
+            "reasoning": "valid",
+            "equivalent": True,
+            "alt_label": False,
+            "hidden_label": True,
+            "relation": "skos:hiddenLabel",
+            "definition": "Valid def",
+        },
     ]
-    assert parse_shacl_repairs(wrap("repairs", repairs)) == [
+    with pytest.raises(ValueError, match="Invalid SHACL repair"):
+        parse_shacl_repairs(wrap("repairs", repairs))
+    assert parse_shacl_repairs(wrap("repairs", repairs[:1])) == [
         {"focus_node": "A", "action": "set_definition", "value": "A concept"},
     ]
-    assert parse_synonym_decisions("not JSON") == []
-    assert parse_shacl_repairs("not JSON") == []
+    with pytest.raises(json.JSONDecodeError):
+        parse_label_decisions("not JSON")
+    with pytest.raises(json.JSONDecodeError):
+        parse_shacl_repairs("not JSON")

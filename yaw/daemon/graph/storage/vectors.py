@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from .db import YawConnection, batched, write_tx
+from .db import batched, ensure_vec0_table, write_tx
 
 _MAX_FTS_TERMS = 24
 FTS_STOPWORDS = frozenset(
@@ -84,26 +84,33 @@ def deserialize_f32_vector(blob: bytes) -> np.ndarray:
     """Deserialize float32 bytes back into a 1D numpy array."""
     if len(blob) % 4 != 0 or len(blob) == 0:
         raise ValueError(f"Invalid float32 byte buffer length: {len(blob)}")
-    return np.frombuffer(blob, dtype=np.float32).copy()
+    return np.frombuffer(blob, dtype=np.float32)
 
 
 def _upsert_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     if not vectors:
         return
     table, id_col = _VEC_TABLES[kind]
+    deduped = {str(item_id): serialize_f32_vector(vec) for item_id, vec in vectors}
+    dim = len(next(iter(deduped.values()))) // 4
     with write_tx(conn):
+        ensure_vec0_table(conn, table, id_col, dim)
         conn.executemany(
-            f"INSERT OR REPLACE INTO {table} ({id_col}, embedding) VALUES (?, ?)",
-            ((item_id, serialize_f32_vector(vec)) for item_id, vec in vectors),
+            f'DELETE FROM "{table}" WHERE "{id_col}" = ?',
+            ((item_id,) for item_id in deduped),
+        )
+        conn.executemany(
+            f'INSERT INTO "{table}" ("{id_col}", "embedding") VALUES (?, ?)',
+            deduped.items(),
         )
 
 
 def _search_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     query_vec: np.ndarray | Sequence[float],
     top_k: int,
@@ -112,23 +119,28 @@ def _search_knn(
         return []
     table, id_col = _VEC_TABLES[kind]
     blob = serialize_f32_vector(query_vec)
+    if conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None:
+        return []
+    k = min(int(top_k), 4096)
     cursor = conn.execute(
         f"""
-        SELECT {id_col}, (1.0 - dist) AS similarity
-        FROM (
-            SELECT {id_col}, vec_distance_cosine(embedding, ?) AS dist
+        WITH knn AS MATERIALIZED (
+            SELECT {id_col}, distance
             FROM {table}
-            ORDER BY dist ASC
-            LIMIT ?
+            WHERE embedding MATCH ? AND k = ?
+            ORDER BY distance
         )
+        SELECT {id_col}, (1.0 - distance) AS similarity
+        FROM knn
+        ORDER BY distance ASC, {id_col} ASC
         """,
-        (blob, top_k),
+        (blob, k),
     )
     return [(str(row[0]), float(row[1])) for row in cursor]
 
 
 def upsert_chunk_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert chunk embedding vectors into chunk_vec."""
@@ -136,7 +148,7 @@ def upsert_chunk_vectors(
 
 
 def upsert_entity_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert entity embedding vectors into entity_vec."""
@@ -144,7 +156,7 @@ def upsert_entity_vectors(
 
 
 def upsert_fact_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     vectors: Sequence[tuple[str, np.ndarray | Sequence[float]]],
 ) -> None:
     """Upsert fact embedding vectors into fact_vec."""
@@ -152,7 +164,7 @@ def upsert_fact_vectors(
 
 
 def search_chunk_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],
     top_k: int = 10,
 ) -> list[tuple[str, float]]:
@@ -160,17 +172,8 @@ def search_chunk_vectors_knn(
     return _search_knn(conn, "chunk", query_vec, top_k)
 
 
-def search_entity_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
-    query_vec: np.ndarray | Sequence[float],
-    top_k: int = 10,
-) -> list[tuple[str, float]]:
-    """Bounded SQL KNN top-k cosine search over entity_vec."""
-    return _search_knn(conn, "entity", query_vec, top_k)
-
-
 def search_fact_vectors_knn(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],
     top_k: int = 10,
 ) -> list[tuple[str, float]]:
@@ -179,7 +182,7 @@ def search_fact_vectors_knn(
 
 
 def get_entity_vectors(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     entity_ids: Sequence[str],
 ) -> dict[str, np.ndarray]:
     """Load entity embedding vectors by entity_id in bounded SQL batches."""
@@ -210,7 +213,7 @@ def _extract_fts_terms(query: str) -> list[str]:
 
 
 def _search_fts_bm25(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     kind: str,
     query: str,
     top_k: int,
@@ -242,7 +245,7 @@ def _search_fts_bm25(
 
 
 def search_chunks_fts(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query: str,
     top_k: int = 20,
 ) -> list[tuple[str, float]]:
@@ -251,7 +254,7 @@ def search_chunks_fts(
 
 
 def search_facts_fts(
-    conn: sqlite3.Connection | YawConnection,
+    conn: sqlite3.Connection,
     query: str,
     top_k: int = 50,
 ) -> list[tuple[str, float]]:

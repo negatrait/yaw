@@ -1,24 +1,31 @@
 """Executable specifications for HippoRAG benchmark slicing, evaluation, and integrity gates."""
 
-import importlib.util
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from benchmark import (
-    ALIASES,
+    BASELINES,
     DATASET_REGISTRY,
     DATASETS,
-    MONKEYPATCHED_HIPPORAG_BASELINES,
-    PAPER_BASELINES,
-    TEXT_STOPWORDS,
     build_benchmark_slice,
     check_benchmark_integrity,
     get_gold_answers,
     get_gold_docs,
     load_dataset_files,
 )
+from yaw.daemon.graph.inference import YawProgram
+from yaw.daemon.indexing import bind_native_indexing
+from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name
+from yaw.daemon.ingestion.bundles import document_identity
+from yaw.daemon.ingestion.corpus import chunk_source_text
+
+
+def selected_texts(ids, corpus):
+    by_id = {document_identity(row): f"{row['title']}\n{row['text']}" for row in corpus}
+    return [by_id[document_id] for document_id in ids]
 
 
 class DatasetSliceTests(unittest.TestCase):
@@ -116,6 +123,7 @@ class DatasetSliceTests(unittest.TestCase):
                 max_queries=max_q,
                 full_corpus=False,
             )
+            docs = selected_texts(docs, self.musique_corpus)
             self.assertEqual(len(queries), max_q)
             self.assertEqual(len(gold_docs), max_q)
             self.assertEqual(len(gold_answers), max_q)
@@ -128,6 +136,7 @@ class DatasetSliceTests(unittest.TestCase):
         docs, queries, _, _ = build_benchmark_slice(
             "musique", self.musique_samples, self.musique_corpus, max_queries=1, full_corpus=True
         )
+        docs = selected_texts(docs, self.musique_corpus)
         self.assertEqual(len(queries), 1)
         self.assertEqual(len(docs), 6)
         self.assertIn("Extra Corpus Doc\nOnly in full corpus.", docs)
@@ -147,6 +156,7 @@ class DatasetSliceTests(unittest.TestCase):
             tmp_path = Path(tmp)
             (tmp_path / "sample.json").write_text(json.dumps(self.musique_samples), encoding="utf-8")
             (tmp_path / "sample_corpus.json").write_text(json.dumps(self.musique_corpus[:3]), encoding="utf-8")
+            prepare_dataset_bundle("sample", tmp_path / "sample_corpus.json", tmp_path / "sample.json", tmp_path)
             samples, corpus = load_dataset_files("sample", dataset_dir=tmp_path)
             self.assertEqual(len(samples), 2)
             self.assertEqual(len(corpus), 3)
@@ -165,16 +175,17 @@ class DatasetSliceTests(unittest.TestCase):
                 load_dataset_files("sample", dataset_dir=tmp_path, max_queries=0, include_corpus=False)
 
     def test_dataset_aliasing_and_registry_resolution(self):
-        expected_aliases = {
-            "2wiki": "2wikimultihopqa",
-            "hotpot": "hotpotqa",
-            "naturalquestions": "nq",
-            "nq_rear": "nq",
-            "narrative": "narrativeqa",
-            "enterprise": "enterprise_rag_bench",
-        }
-        for alias, canonical in expected_aliases.items():
-            self.assertEqual(ALIASES.get(alias), canonical)
+        rejected_aliases = (
+            "2wiki",
+            "hotpot",
+            "naturalquestions",
+            "nq_rear",
+            "narrative",
+            "enterprise",
+        )
+        for alias in rejected_aliases:
+            with self.assertRaises(ValueError):
+                resolve_dataset_name(alias)
 
         expected_registry = {
             "sample": ("sample.json", "sample_corpus.json"),
@@ -195,12 +206,13 @@ class DatasetSliceTests(unittest.TestCase):
             ),
         }
         for name, files in expected_registry.items():
+            self.assertEqual(resolve_dataset_name(name), name)
             self.assertEqual(DATASET_REGISTRY.get(name), files)
 
         for ds in DATASETS:
             self.assertIn(ds, DATASET_REGISTRY)
 
-        # Verify load_dataset_files with aliases resolves files correctly
+        # Verify load_dataset_files accepts canonical names and rejects aliases
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "nq_rear.json").write_text(
@@ -208,15 +220,17 @@ class DatasetSliceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tmp_path / "nq_rear_corpus.json").write_text(json.dumps([]), encoding="utf-8")
-            samples, _ = load_dataset_files("naturalquestions", dataset_dir=tmp_path)
+            prepare_dataset_bundle("nq", tmp_path / "nq_rear_corpus.json", tmp_path / "nq_rear.json", tmp_path)
+            samples, _ = load_dataset_files("nq", dataset_dir=tmp_path)
             self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0]["question"], "Q1")
 
-            samples_nq, _ = load_dataset_files("nq_rear", dataset_dir=tmp_path)
-            self.assertEqual(len(samples_nq), 1)
+            for alias in ("naturalquestions", "nq_rear"):
+                with self.assertRaises(ValueError):
+                    load_dataset_files(alias, dataset_dir=tmp_path)
 
     def test_distractor_padding_in_benchmark_slice(self):
-        samples = [
+        samples: list[dict[str, Any]] = [
             {
                 "question": f"Question {i}?",
                 "reference": [f"Ans {i}"],
@@ -227,10 +241,12 @@ class DatasetSliceTests(unittest.TestCase):
             }
             for i in range(15)
         ]
+        corpus = [{"title": c["title"], "text": c["text"]} for q in samples for c in q["contexts"]]
         # Explicit index_queries: max_queries=2, index_queries=4 -> pools passages from samples 0..3
         docs, queries, gold_docs, gold_answers = build_benchmark_slice(
-            "nq", samples, corpus=[], max_queries=2, index_queries=4, full_corpus=False
+            "nq", samples, corpus=corpus, max_queries=2, index_queries=4, full_corpus=False
         )
+        docs = selected_texts(docs, corpus)
         self.assertEqual(len(queries), 2)
         self.assertEqual(len(gold_docs), 2)
         self.assertEqual(len(gold_answers), 2)
@@ -244,8 +260,9 @@ class DatasetSliceTests(unittest.TestCase):
 
         # Default index_queries: max_queries=10, index_queries=None -> defaults to int(10 * 1.4) = 14
         docs_def, queries_def, gold_docs_def, _ = build_benchmark_slice(
-            "nq", samples, corpus=[], max_queries=10, index_queries=None, full_corpus=False
+            "nq", samples, corpus=corpus, max_queries=10, index_queries=None, full_corpus=False
         )
+        docs_def = selected_texts(docs_def, corpus)
         self.assertEqual(len(queries_def), 10)
         self.assertEqual(len(gold_docs_def), 10)
         # Sample 13 must be in docs (pooled up to index 14)
@@ -255,7 +272,7 @@ class DatasetSliceTests(unittest.TestCase):
 
         # Negative boundary on index_queries
         with self.assertRaises(ValueError):
-            build_benchmark_slice("nq", samples, corpus=[], max_queries=2, index_queries=0)
+            build_benchmark_slice("nq", samples, corpus=corpus, max_queries=2, index_queries=0)
 
     def test_nq_gold_extraction(self):
         samples = [
@@ -340,35 +357,23 @@ class DatasetSliceTests(unittest.TestCase):
         self.assertEqual(gold_answers, [["Arenas"]])
 
         gold_docs = get_gold_docs(samples, "lveval")
-        self.assertEqual(gold_docs, [["\nArenas de Savoie, duc de Bob was a military commander."]])
+        self.assertIsNone(gold_docs)
 
-        # Test bounded slice generation for lveval
-        slice_docs, queries, s_gold, _ = build_benchmark_slice(
-            "lveval", samples, corpus=[], max_queries=1, index_queries=2, full_corpus=False
-        )
-        self.assertEqual(len(queries), 1)
-        self.assertTrue(set(gold_docs[0]).issubset(set(slice_docs)))
+        import re
 
-        # Test top-2 capping when multiple passages match
-        multi_passage_sample = [
-            {
-                "question": "Who is Duke Bob?",
-                "gold_ans": "Bob",
-                "answers": ["Bob"],
-                "context": (
-                    "### Passage 1\n"
-                    "Bob is a famous duke and military leader.\n"
-                    "### Passage 2\n"
-                    "Bob was born in 1800.\n"
-                    "### Passage 3\n"
-                    "Bob ruled the province peacefully.\n"
-                ),
-            }
+        corpus = [
+            {"title": "", "text": text.strip()}
+            for text in re.split(r"### Passage \d+\n", samples[0]["context"])
+            if text.strip()
         ]
-        top2_gold = get_gold_docs(multi_passage_sample, "lveval")
-        self.assertEqual(len(top2_gold[0]), 2)
-        # Passage 1 has "bob", "duke" (both answer and question match, highest rank)
-        self.assertEqual(top2_gold[0][0], "\nBob is a famous duke and military leader.")
+        # LV-Eval is QA-only and selects the full corpus in build_benchmark_slice
+        slice_docs, queries, s_gold, _ = build_benchmark_slice(
+            "lveval", samples, corpus=corpus, max_queries=1, index_queries=2, full_corpus=False
+        )
+        slice_docs = selected_texts(slice_docs, corpus)
+        self.assertEqual(len(queries), 1)
+        self.assertIsNone(s_gold)
+        self.assertEqual(len(slice_docs), len(corpus))
 
     def test_narrativeqa_gold_extraction(self):
         samples = [
@@ -392,13 +397,8 @@ class DatasetSliceTests(unittest.TestCase):
             gold_answers,
             [["She is a crossword writer for the Sacramento Herald.", "Crossword puzzle writer."]],
         )
-        gold_docs = get_gold_docs(samples, "narrativeqa")
-        self.assertEqual(
-            gold_docs,
-            [["All About Steve\nMary Horowitz, a crossword puzzle writer for the Sacramento Herald."]],
-        )
+        self.assertIsNone(get_gold_docs(samples, "narrativeqa"))
 
-        # Test with corpus matching chunks by doc_id and answer keywords
         corpus = [
             {"idx": "doc123_0", "title": "Script", "text": "Unrelated scene."},
             {
@@ -408,33 +408,16 @@ class DatasetSliceTests(unittest.TestCase):
             },
             {"idx": "other_0", "title": "Other", "text": "Different document."},
         ]
-        corpus_gold = get_gold_docs(samples, "narrativeqa", corpus=corpus)
-        self.assertEqual(corpus_gold, [["Script\nMary works as a crossword writer for the Herald."]])
+        self.assertIsNone(get_gold_docs(samples, "narrativeqa", corpus=corpus))
 
-        # Test bounded slice generation for narrativeqa
+        # NarrativeQA is QA-only and selects the full corpus in build_benchmark_slice
         slice_docs, queries, s_gold, _ = build_benchmark_slice(
             "narrativeqa", samples, corpus, max_queries=1, index_queries=2, full_corpus=False
         )
+        slice_docs = selected_texts(slice_docs, corpus)
         self.assertEqual(len(queries), 1)
-        self.assertTrue(set(corpus_gold[0]).issubset(set(slice_docs)))
-
-        # Test top-2 capping when multiple chunks match
-        multi_chunk_corpus = [
-            {
-                "idx": "doc123_0",
-                "title": "Script",
-                "text": "Mary Horowitz is a crossword writer for the Sacramento Herald.",
-            },
-            {"idx": "doc123_1", "title": "Script", "text": "Crossword puzzle writer in the city."},
-            {"idx": "doc123_2", "title": "Script", "text": "Mary has a job."},
-            {"idx": "doc123_3", "title": "Script", "text": "Unrelated line."},
-        ]
-        multi_gold = get_gold_docs(samples, "narrativeqa", corpus=multi_chunk_corpus)
-        self.assertEqual(len(multi_gold[0]), 2)
-        self.assertEqual(
-            multi_gold[0][0],
-            "Script\nMary Horowitz is a crossword writer for the Sacramento Herald.",
-        )
+        self.assertIsNone(s_gold)
+        self.assertEqual(len(slice_docs), len(corpus))
 
     def test_paper_baselines_contain_all_required_datasets(self):
         for name in (
@@ -446,37 +429,37 @@ class DatasetSliceTests(unittest.TestCase):
             "lveval",
             "narrativeqa",
         ):
-            self.assertIn(name, PAPER_BASELINES)
+            self.assertIn(name, BASELINES)
 
         # NQ
-        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780)
-        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485)
-        self.assertEqual(PAPER_BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.633)
-        self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754)
-        self.assertEqual(PAPER_BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.619)
-        self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["Recall@5"], 0.444)
-        self.assertEqual(PAPER_BASELINES["nq"]["hipporag_reproduced"]["F1"], 0.553)
+        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780)
+        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485)
+        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.633)
+        self.assertEqual(BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754)
+        self.assertEqual(BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.619)
+        self.assertEqual(BASELINES["nq"]["hipporag_reproduced"]["Recall@5"], 0.444)
+        self.assertEqual(BASELINES["nq"]["hipporag_reproduced"]["F1"], 0.553)
 
         # PopQA
-        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517)
-        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490)
-        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.562)
-        self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510)
-        self.assertEqual(PAPER_BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.557)
-        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["Recall@5"], 0.538)
-        self.assertEqual(PAPER_BASELINES["popqa"]["hipporag_reproduced"]["F1"], 0.559)
+        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517)
+        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490)
+        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.562)
+        self.assertEqual(BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510)
+        self.assertEqual(BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.557)
+        self.assertEqual(BASELINES["popqa"]["hipporag_reproduced"]["Recall@5"], 0.538)
+        self.assertEqual(BASELINES["popqa"]["hipporag_reproduced"]["F1"], 0.559)
 
         # LV-Eval
-        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080)
-        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129)
-        self.assertEqual(PAPER_BASELINES["lveval"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.098)
-        self.assertEqual(PAPER_BASELINES["lveval"]["hipporag_reproduced"]["F1"], 0.084)
+        self.assertEqual(BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080)
+        self.assertEqual(BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129)
+        self.assertEqual(BASELINES["lveval"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.098)
+        self.assertEqual(BASELINES["lveval"]["hipporag_reproduced"]["F1"], 0.084)
 
         # NarrativeQA
-        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180)
-        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259)
-        self.assertEqual(PAPER_BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
-        self.assertEqual(PAPER_BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
+        self.assertEqual(BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180)
+        self.assertEqual(BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259)
+        self.assertEqual(BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
+        self.assertEqual(BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
 
     def test_monkeypatched_hipporag_baselines_contain_all_required_datasets(self):
         for name in (
@@ -488,8 +471,8 @@ class DatasetSliceTests(unittest.TestCase):
             "lveval",
             "narrativeqa",
         ):
-            self.assertIn(name, MONKEYPATCHED_HIPPORAG_BASELINES)
-            entry = MONKEYPATCHED_HIPPORAG_BASELINES[name]
+            self.assertIn(name, BASELINES)
+            entry = BASELINES[name]["monkeypatched_hipporag"]
             self.assertIn("Recall@1", entry)
             self.assertIn("Recall@2", entry)
             self.assertIn("Recall@5", entry)
@@ -499,129 +482,57 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertGreater(entry["evaluation_seconds"], 0.0)
             self.assertGreater(entry["elapsed_seconds"], 0.0)
 
+        spec_path = Path(__file__).resolve().parent.parent / "data" / "benchmarks" / "baselines.json"
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(spec["datasets"]), set(DATASETS))
+        self.assertEqual(spec["baselines"], BASELINES)
+
     def test_enterprise_rag_bench_10_category_stratification_and_distractors(self):
-        from collections import Counter
-
         from yaw.daemon.cli import _load_dataset_splits
+        from yaw.daemon.ingestion import ENTERPRISE_CATEGORY_QUOTAS
 
-        spec = importlib.util.spec_from_file_location(
-            "download_datasets",
-            Path(__file__).resolve().parent.parent / "scripts" / "download-datasets.py",
-        )
-        assert spec is not None and spec.loader is not None
-        dl_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(dl_mod)
-
-        quotas = dl_mod.ENTERPRISE_CATEGORY_QUOTAS
-        self.assertEqual(len(quotas), 10)
-        self.assertEqual(sum(tr for tr, _ in quotas.values()), 150)
-        self.assertEqual(sum(va for _, va in quotas.values()), 100)
-
-        synthetic_questions = []
-        synthetic_docs = []
-        tools = ["slack", "github", "google_drive", "confluence", "jira"]
-        q_idx = 0
-        for cat, (n_tr, n_va) in quotas.items():
-            for _i in range(n_tr + n_va + 4):
-                qid = f"q_{q_idx}"
-                tool = tools[q_idx % len(tools)]
-                gold_id = f"gold_{q_idx}"
-                synthetic_docs.append(
+        questions, documents = [], []
+        for category, (nt, nv) in ENTERPRISE_CATEGORY_QUOTAS.items():
+            for i in range(nt + nv + 2):
+                did = f"{category}-{i}"
+                documents.append({"idx": did, "title": did, "text": "Original text"})
+                questions.append(
                     {
-                        "doc_id": gold_id,
-                        "source_type": tool,
-                        "title": f"Gold Doc {q_idx}",
-                        "content": f"Supporting enterprise content for {qid} in {cat}.",
+                        "question_id": did,
+                        "question_type": category,
+                        "question": did,
+                        "gold_answer": "Original answer",
+                        "expected_doc_ids": [did],
                     }
                 )
-                synthetic_questions.append(
-                    {
-                        "question_id": qid,
-                        "question": f"Enterprise question {q_idx} ({cat})?",
-                        "gold_answer": f"Answer {q_idx}",
-                        "answer_facts": [f"Fact {q_idx}"],
-                        "question_type": cat,
-                        "source_types": [tool],
-                        "expected_doc_ids": [] if cat == "Info Not Found" else [gold_id],
-                    }
-                )
-                q_idx += 1
-
-        for d_idx in range(800):
-            tool = tools[d_idx % len(tools)]
-            synthetic_docs.append(
-                {
-                    "doc_id": f"dist_{d_idx}",
-                    "source_type": tool,
-                    "title": f"Distractor {d_idx}",
-                    "content": f"Hard distractor passage {d_idx} for {tool}.",
-                }
+        # Couple 10 question pairs via shared doc IDs so naive shuffling splits pairs across train/val/holdout
+        for k in range(10):
+            shared = [questions[2 * k]["question_id"], questions[2 * k + 1]["question_id"]]
+            questions[2 * k]["expected_doc_ids"] = shared
+            questions[2 * k + 1]["expected_doc_ids"] = shared
+        documents.extend({"idx": f"d-{i}", "title": f"Distractor {i}", "text": "Noise"} for i in range(100))
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            cp, qp = root / "corpus.json", root / "questions.json"
+            cp.write_text(json.dumps(documents), encoding="utf-8")
+            qp.write_text(json.dumps(questions), encoding="utf-8")
+            bundle = prepare_dataset_bundle("enterprise_rag_bench", cp, qp, root / "outputs/datasets")
+            self.assertEqual(len(bundle.documents), len(documents))
+            self.assertEqual(json.loads(bundle.evaluation_path.read_text(encoding="utf-8")), questions)
+            train, val, corpus = _load_dataset_splits(
+                ["enterprise_rag_bench"], workspace_root=root, max_queries=162, train_queries=135
             )
-
-        with tempfile.TemporaryDirectory() as tmp_str:
-            tmp_root = Path(tmp_str)
-            ds_dir = tmp_root / "outputs" / "datasets"
-            q_path, c_path = dl_mod.download_enterprise_rag_bench(
-                ds_dir,
-                distractor_factor=2.0,
-                seed=42,
-                force=True,
-                questions_rows=synthetic_questions,
-                documents_rows=synthetic_docs,
-            )
-            self.assertTrue(q_path.exists())
-            self.assertTrue(c_path.exists())
-
-            queries_data = json.loads(q_path.read_text(encoding="utf-8"))
-            self.assertEqual(len(queries_data), 250)
-            train_slice = queries_data[:150]
-            val_slice = queries_data[150:]
-
-            train_counts = Counter(q["question_type"] for q in train_slice)
-            val_counts = Counter(q["question_type"] for q in val_slice)
-            for cat, (exp_tr, exp_va) in quotas.items():
-                self.assertEqual(train_counts[cat], exp_tr)
-                self.assertEqual(val_counts[cat], exp_va)
-
-            corpus_data = json.loads(c_path.read_text(encoding="utf-8"))
-            corpus_ids = {c["idx"] for c in corpus_data}
-
-            for q in queries_data:
-                self.assertNotIn("paragraphs", q)
-                self.assertIn("expected_doc_ids", q)
-                self.assertIn("answer_facts", q)
-                self.assertIn("question_type", q)
-                expected = q["expected_doc_ids"]
-                if q["question_type"] == "Info Not Found":
-                    self.assertEqual(len(expected), 0)
-                    self.assertIn("Insufficient information", q["answer_aliases"])
-                else:
-                    self.assertEqual(len(expected), 1)
-                    self.assertTrue(set(expected).issubset(corpus_ids))
-
-            trainset, valset, corpus_docs = _load_dataset_splits(
-                ["enterprise"],
-                workspace_root=tmp_root,
-                max_queries=250,
-                train_queries=150,
-                query_offset=0,
-            )
-            self.assertEqual(len(trainset), 150)
-            assert valset is not None
-            self.assertEqual(len(valset), 100)
-            self.assertGreater(len(corpus_docs), 300)
-            self.assertEqual(len(corpus_docs), len(corpus_data))
-            for ex in trainset[:5] + valset[:5]:
-                self.assertTrue(hasattr(ex, "item_docs"))
-                self.assertEqual(len(ex.item_docs), 0)
-                self.assertIn("item_docs", ex.inputs())
-                self.assertTrue(hasattr(ex, "answer_facts"))
-                self.assertTrue(hasattr(ex, "question_type"))
-
-    def test_text_stopwords(self):
-        self.assertGreater(len(TEXT_STOPWORDS), 50)
-        for expected in ("the", "and", "that", "with", "from", "they"):
-            self.assertIn(expected, TEXT_STOPWORDS)
+            assert val is not None
+            self.assertEqual((len(train), len(val), len(corpus)), (135, 27, 162))
+            self.assertTrue(all("Distractor" not in doc for doc in corpus))
+            train_dids = {did for ex in train for did in ex.expected_doc_ids}
+            val_dids = {did for ex in val for did in ex.expected_doc_ids}
+            selected_qids = {ex.question for ex in [*train, *val]}
+            holdout_dids = {
+                did for q in questions if q["question_id"] not in selected_qids for did in q["expected_doc_ids"]
+            }
+            self.assertTrue(train_dids.isdisjoint(val_dids))
+            self.assertTrue((train_dids | val_dids).isdisjoint(holdout_dids))
 
 
 class EvaluationAndIntegrityTests(unittest.TestCase):
@@ -683,7 +594,7 @@ class EvaluationAndIntegrityTests(unittest.TestCase):
 
 class PaperParityGateTests(unittest.TestCase):
     def test_popqa_slice_pads_to_at_least_two_passages_per_index_query(self):
-        samples = [
+        samples: list[dict[str, Any]] = [
             {
                 "question": f"PopQA Q{i}?",
                 "obj": f"Ans{i}",
@@ -693,13 +604,19 @@ class PaperParityGateTests(unittest.TestCase):
             }
             for i in range(10)
         ]
+        corpus = [
+            {"title": p["title"], "text": p.get("text", p.get("paragraph_text"))}
+            for q in samples
+            for p in q["paragraphs"]
+        ]
         docs, queries, gold_docs, _ = build_benchmark_slice(
-            "popqa", samples, corpus=[], max_queries=2, index_queries=4, full_corpus=False
+            "popqa", samples, corpus=corpus, max_queries=2, index_queries=4, full_corpus=False
         )
         self.assertEqual(len(queries), 2)
         self.assertEqual(len(gold_docs), 2)
         # 4 index_queries * 2 = 8 passages padded from subsequent samples
         self.assertEqual(len(docs), 8)
+        docs = selected_texts(docs, corpus)
         for g in gold_docs:
             self.assertTrue(set(g).issubset(set(docs)))
 
@@ -711,11 +628,11 @@ class PaperParityGateTests(unittest.TestCase):
             format_gate_markdown,
         )
 
-        baseline_rep = build_monkeypatched_baseline_report("2wiki", queries_per_dataset=25)
+        baseline_rep = build_monkeypatched_baseline_report("2wikimultihopqa", queries_per_dataset=25)
         self.assertEqual(baseline_rep["engine"], "hipporag")
         self.assertAlmostEqual(
             baseline_rep["evaluation_metrics"]["hipporag"]["retrieval"]["Recall@5"],
-            MONKEYPATCHED_HIPPORAG_BASELINES["2wikimultihopqa"]["Recall@5"],
+            BASELINES["2wikimultihopqa"]["monkeypatched_hipporag"]["Recall@5"],
         )
 
         hippo_rep = {
@@ -772,7 +689,7 @@ class PaperParityGateTests(unittest.TestCase):
         }
 
         comp = compare_engine_reports(
-            "2wiki",
+            "2wikimultihopqa",
             hippo_rep,
             yaw_rep,
             queries_per_dataset=25,
@@ -817,12 +734,11 @@ class PaperParityGateTests(unittest.TestCase):
 
         import numpy as np
 
-        from benchmark import BENCHMARK_JSON_BLACKLIST, BENCHMARK_JSON_WHITELIST
         from scripts.evaluation import RetrievalRecall as ScriptRetrievalRecall
         from yaw.core import OpenIERecord
         from yaw.daemon.graph.engine import YawGraphEngine
         from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
-        from yaw.daemon.ingestion import sync_corpus_once
+        from yaw.daemon.ingestion.source_targets import SourceSettings
 
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp_path = Path(tmp_str)
@@ -870,18 +786,34 @@ class PaperParityGateTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            delta = sync_corpus_once(
-                corpus_dir,
-                state_dir,
-                chunk_size=180,
-                chunk_overlap=20,
-                min_chunk_size=30,
-                json_keys_whitelist=BENCHMARK_JSON_WHITELIST,
-                json_keys_blacklist=BENCHMARK_JSON_BLACKLIST,
+            source_corpus = tmp_path / "documents.json"
+            source_corpus.write_text(
+                json.dumps(
+                    [
+                        {"title": "Montebello", "text": long_body},
+                        {"title": "Albany", "text": distractor_passage.split("\n", 1)[1]},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            bundle = prepare_dataset_bundle(
+                "musique", source_corpus, corpus_dir / "musique.json", tmp_path / "prepared"
+            )
+            corpus_dir = bundle.root.parent
+            added_chunks = tuple(
+                chunk
+                for doc in bundle.documents
+                for chunk in chunk_source_text(
+                    (bundle.root / doc.path).read_text(encoding="utf-8"),
+                    f"{bundle.dataset}/{doc.path}",
+                    chunk_size=180,
+                    chunk_overlap=20,
+                    min_chunk_size=30,
+                )
             )
             # Long passage is split into multiple sub-chunks, plus 1 distractor chunk
-            self.assertGreaterEqual(len(delta.added_chunks), 3)
-            montebello_subchunks = [(ptr, txt) for ptr, txt in delta.added_chunks if ptr.title == "Montebello"]
+            self.assertGreaterEqual(len(added_chunks), 3)
+            montebello_subchunks = [(ptr, txt) for ptr, txt in added_chunks if ptr.title == "Montebello"]
             self.assertGreaterEqual(len(montebello_subchunks), 2)
             # All Montebello sub-chunks share the exact same parent record AST island
             ast_islands = {
@@ -919,9 +851,12 @@ class PaperParityGateTests(unittest.TestCase):
                 def batch_encode(self, texts, *, instruction="", batch_size=64):
                     return self.encode(texts, instruction=instruction)
 
-            class MinimalProgram:
+            class MinimalProgram(YawProgram):
                 context_window_tokens = 32768
                 max_output_tokens = 4096
+
+                def __init__(self):
+                    super().__init__(context_window_tokens=32768, max_output_tokens=4096, enable_gbnf=False)
 
                 def _context_char_limit(self, base_chars: int = 8000) -> int:
                     return base_chars
@@ -929,7 +864,7 @@ class PaperParityGateTests(unittest.TestCase):
                 def set_retrieval_hook(self, hook):
                     self.hook = hook
 
-                def extract_openie(self, chunk_id, text):
+                def extract_openie(self, chunk_id, text, **kwargs):
                     if "montebello" in text.lower():
                         return OpenIERecord(
                             chunk_id=chunk_id,
@@ -938,11 +873,20 @@ class PaperParityGateTests(unittest.TestCase):
                                 ("erik hort", "born in", "montebello"),
                                 ("montebello", "part of", "rockland county"),
                             ),
+                            entity_definitions=(
+                                ("erik hort", "Person born in Montebello."),
+                                ("montebello", "Incorporated village in Rockland County."),
+                                ("rockland county", "County in New York."),
+                            ),
                         )
                     return OpenIERecord(
                         chunk_id=chunk_id,
                         entities=("albany", "new york"),
                         triples=(("albany", "capital of", "new york"),),
+                        entity_definitions=(
+                            ("albany", "Capital city of New York."),
+                            ("new york", "U.S. state."),
+                        ),
                     )
 
                 def extract_query_intent(self, query):
@@ -951,24 +895,30 @@ class PaperParityGateTests(unittest.TestCase):
                 def filter_triples(self, query, candidates):
                     return [0] if candidates else []
 
-                def judge_synonyms(self, candidates):
+                def judge_semantics(self, candidates, *args, **kwargs):
                     return []
+
+                def synonym_batch_fits(self, batch):
+                    return True
 
                 def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
                     return []
 
-            engine = YawGraphEngine(
-                db_path=tmp_path / "yaw.db",
-                workspace_root=corpus_dir,
-                program=MinimalProgram(),
-                embedder=TitleCheckingEmbedder(profile),
-                retrieval_top_k=5,
+            engine = bind_native_indexing(
+                YawGraphEngine(
+                    db_path=tmp_path / "yaw.db",
+                    workspace_root=corpus_dir,
+                    program=MinimalProgram(),
+                    embedder=TitleCheckingEmbedder(profile),
+                    retrieval_top_k=5,
+                ),
+                source_settings=SourceSettings(("**/*",), (), chunk_size=180, chunk_overlap=20, min_chunk_size=30),
             )
             try:
-                engine.index_chunks(delta.added_chunks)
+                engine.index_chunks(added_chunks)
                 # Verify zero titled chunks degraded to 'title: none'
-                self.assertTrue(len(formatted_doc_inputs) >= len(delta.added_chunks))
-                for fmt_str in formatted_doc_inputs[: len(delta.added_chunks)]:
+                self.assertTrue(len(formatted_doc_inputs) >= len(added_chunks))
+                for fmt_str in formatted_doc_inputs[: len(added_chunks)]:
                     self.assertFalse(
                         fmt_str.startswith("title: none"),
                         f"Expected AST title in formatted embedding input, got: {fmt_str!r}",
@@ -994,138 +944,28 @@ class PaperParityGateTests(unittest.TestCase):
             finally:
                 engine.close()
 
-    def test_benchmark_inplace_corpus_resolution_and_sync(self):
-        import inspect
+    def test_benchmark_bundle_snapshot_is_complete_and_source_aligned(self):
+        from yaw.daemon.graph.storage import hydrate_chunk_pointer
 
-        import numpy as np
-
-        import benchmark
-        from yaw.core import OpenIERecord
-        from yaw.daemon.graph.engine import YawGraphEngine
-        from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
-
-        self.assertTrue(hasattr(benchmark, "resolve_dataset_source_files"))
-        run_src = inspect.getsource(benchmark.run_yaw_benchmark)
-        self.assertIn("workspace_root=PROJECT_ROOT", run_src)
-        self.assertIn("prefer_corpus=True", run_src)
-        self.assertIn("corpus_root=PROJECT_ROOT", run_src)
-        self.assertIn("source_files=source_files", run_src)
-
-        main_src = inspect.getsource(benchmark.main)
-        self.assertIn('"enterprise_rag_bench"', main_src)
-
-        ent_source_files = benchmark.resolve_dataset_source_files(
-            ["enterprise_rag_bench"],
-            workspace_root=benchmark.PROJECT_ROOT,
-            prefer_corpus=True,
-        )
-        self.assertEqual(
-            ent_source_files,
-            [(benchmark.PROJECT_ROOT / "outputs" / "datasets" / "enterprise_rag_bench_corpus.json").resolve()],
-        )
-        ent_samples, ent_corpus = benchmark.load_dataset_files(
-            "enterprise_rag_bench",
-            max_queries=5,
-            include_corpus=True,
-        )
-        ent_docs, ent_queries, _, _ = benchmark.build_benchmark_slice(
-            "enterprise_rag_bench",
-            ent_samples,
-            ent_corpus,
-            max_queries=2,
-            full_corpus=False,
-        )
-        self.assertEqual(len(ent_queries), 2)
-        self.assertEqual(len(ent_docs), len(ent_corpus))
-        self.assertGreaterEqual(len(ent_docs), 1300)
-
-        samples, corpus = benchmark.load_dataset_files("sample", include_corpus=True)
-        docs, _, _, _ = benchmark.build_benchmark_slice("sample", samples, corpus, full_corpus=True)
-        source_files = benchmark.resolve_dataset_source_files(
-            ["sample"],
-            workspace_root=benchmark.PROJECT_ROOT,
-            prefer_corpus=True,
-        )
-        self.assertEqual(
-            source_files,
-            [(benchmark.PROJECT_ROOT / "outputs" / "datasets" / "sample_corpus.json").resolve()],
-        )
-
-        profile = resolve_embedding_profile(task_mode="distinct-titled")
-
-        class _DetEmbedder:
-            def __init__(self, prof):
-                self.profile = prof
-                self.dimensions = 4
-
-            def encode(self, texts, *, instruction=""):
-                vecs = [np.array([0.6, 0.4, 0.5, 0.3], dtype=np.float32) for _ in texts]
-                return np.vstack([v / np.linalg.norm(v) for v in vecs])
-
-            def batch_encode(self, texts, *, instruction="", batch_size=64):
-                return self.encode(texts, instruction=instruction)
-
-        class _DetProgram:
-            context_window_tokens = 32768
-            max_output_tokens = 4096
-
-            def _context_char_limit(self, base_chars: int = 8000) -> int:
-                return base_chars
-
-            def set_retrieval_hook(self, hook):
-                self.hook = hook
-
-            def extract_openie(self, chunk_id, text):
-                return OpenIERecord(
-                    chunk_id=chunk_id,
-                    entities=("erik hort", "montebello"),
-                    triples=(("erik hort", "born in", "montebello"),),
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            cp, qp = root / "corpus.json", root / "questions.json"
+            cp.write_text(json.dumps([{"idx": "a", "title": "A", "text": "Grounded text"}]), encoding="utf-8")
+            qp.write_text(json.dumps([{"question": "Evaluation only", "answer": "Secret"}]), encoding="utf-8")
+            bundle = prepare_dataset_bundle("sample", cp, qp, root / "prepared")
+            chunks = tuple(
+                chunk
+                for doc in bundle.documents
+                for chunk in chunk_source_text(
+                    (bundle.root / doc.path).read_text(encoding="utf-8"),
+                    f"{bundle.dataset}/{doc.path}",
+                    min_chunk_size=1,
                 )
-
-            def extract_query_intent(self, query):
-                return query
-
-            def filter_triples(self, query, candidates):
-                return [0] if candidates else []
-
-            def judge_synonyms(self, candidates):
-                return []
-
-            def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
-                return []
-
-        with tempfile.TemporaryDirectory() as tmp_str:
-            index_dir = Path(tmp_str) / "index"
-            chunks_to_index = benchmark.sync_source_files_for_docs(
-                corpus_root=benchmark.PROJECT_ROOT,
-                state_dir=index_dir / "coco_state",
-                source_files=source_files,
-                allowed_docs=docs,
-                json_keys_whitelist=benchmark.BENCHMARK_JSON_WHITELIST,
-                json_keys_blacklist=benchmark.BENCHMARK_JSON_BLACKLIST,
             )
-            self.assertGreater(len(chunks_to_index), 0)
-            for ptr, _ in chunks_to_index:
-                self.assertEqual(ptr.rel_posix_path, "outputs/datasets/sample_corpus.json")
-                self.assertTrue((benchmark.PROJECT_ROOT / ptr.rel_posix_path).exists())
-                self.assertFalse((index_dir / ptr.rel_posix_path).exists())
-
-            engine = YawGraphEngine(
-                db_path=index_dir / "yaw.db",
-                workspace_root=benchmark.PROJECT_ROOT,
-                program=_DetProgram(),
-                embedder=_DetEmbedder(profile),
-                retrieval_top_k=5,
-            )
-            try:
-                engine.index_chunks(chunks_to_index)
-                dpr_hits = engine.retrieve_dpr("Where was Erik Hort born?", top_k=3)
-                self.assertGreater(len(dpr_hits), 0)
-                for ptr, _, text in dpr_hits:
-                    self.assertEqual(ptr.rel_posix_path, "outputs/datasets/sample_corpus.json")
-                    self.assertTrue(len(text.strip()) > 0)
-            finally:
-                engine.close()
+            self.assertEqual(len(chunks), 1)
+            pointer, text = chunks[0]
+            self.assertIn("/documents/", pointer.rel_posix_path)
+            self.assertEqual(hydrate_chunk_pointer(pointer, bundle.root.parent).text, text)
 
 
 if __name__ == "__main__":

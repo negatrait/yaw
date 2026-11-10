@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import inspect
+import json
 import sqlite3
 from contextlib import closing
 
@@ -13,17 +14,17 @@ from daemon.graph.inference.test_reflection import proposer
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram, RLMInstructionProposer
+from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
-from yaw.daemon.graph.storage import CandidatePayloadCodec
+from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
+from yaw.daemon.indexing import bind_native_indexing
 
 
 def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     assert type(program.qa) is dspy.ChainOfThought
     predictor = dict(program.named_predictors())["qa.predict"]
-    assert dict(program.all_stage_predictors())["qa"] is predictor
-    lm = create_dspy_lm("Gemma-4-E4B-it-GGUF", cache=False)
+    lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", cache=False)
     program.qa.set_lm(lm)
     assert predictor.lm is lm
     predictor.signature = predictor.signature.with_instructions("Use source names.")
@@ -33,7 +34,7 @@ def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
     program.qa.set_lm(None)
     saved = tmp_path / "qa.json"
     program.save(str(saved))
-    restored = HippoRAGProgram(enable_gbnf=False)
+    restored = YawProgram(enable_gbnf=False)
     restored.load(str(saved))
     assert type(restored.qa) is dspy.ChainOfThought
     assert restored.qa.predict.signature.instructions == "Use source names."
@@ -50,7 +51,7 @@ def test_native_lm_capability_defaults_and_copy():
     assert bare._yaw_recipe is None
     assert bare._yaw_context_window_tokens is None
     assert bare._yaw_supports_gbnf is False
-    configured = create_dspy_lm("Gemma-4-E4B-it-GGUF", context_window_tokens=65536)
+    configured = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", context_window_tokens=65536)
     cloned = configured.copy(temperature=0.7)
     assert cloned._yaw_recipe == configured._yaw_recipe
     assert cloned._yaw_context_window_tokens == 65536
@@ -67,7 +68,7 @@ def test_rlm_tool_preserves_signature_binding_and_coroutine_identity(asynchronou
         return left + right
 
     function = async_add if asynchronous else add
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     wrapped = program.shacl_healer_rlm._make_interpreter_tool(dspy.Tool(function))
     assert inspect.signature(wrapped) == inspect.signature(function)
     assert inspect.iscoroutinefunction(wrapped) is asynchronous
@@ -78,8 +79,10 @@ def test_rlm_tool_preserves_signature_binding_and_coroutine_identity(asynchronou
 @pytest.mark.parametrize("have_lm", [False, True])
 def test_bad_reflection_setup_preserves_existing_rows_before_indexing(tmp_path, have_lm):
     lm = create_dspy_lm("reflection-model", cache=False) if have_lm else None
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
-    engine = YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, dspy.Embedder(lambda texts: []))
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    engine = bind_native_indexing(
+        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, dspy.Embedder(lambda texts: []))
+    )
     try:
         from yaw.daemon.graph.storage import upsert_chunk_pointers
 
@@ -111,8 +114,8 @@ def test_invalid_second_predictor_does_not_partially_restore_first():
     prop = RLMInstructionProposer()
     before = prop.dump_simba_state()
     broken = copy.deepcopy(before)
-    broken["predictors"]["qwen_proposer"]["signature"]["instructions"] = "A different writer."
-    broken["predictors"]["qwen_compressor"]["signature"]["fields"] = []
+    broken["predictors"]["llm_proposer"]["signature"]["instructions"] = "A different writer."
+    broken["predictors"]["llm_compressor"]["signature"]["fields"] = []
     with pytest.raises(ValueError, match="schema"):
         prop.load_simba_state(broken)
     assert prop.dump_simba_state() == before
@@ -120,12 +123,18 @@ def test_invalid_second_predictor_does_not_partially_restore_first():
 
 def learning(tmp_path, url, *, resume=False):
     prop = proposer(url, enable_simba=False)
-    task = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=prop.worker_lm, rlm_sub_lm=prop.worker_lm)
-    engine = YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, dspy.Embedder(lambda texts: []))
+    task = YawProgram(enable_gbnf=False, orchestrator_lm=prop.worker_lm, rlm_sub_lm=prop.worker_lm)
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, dspy.Embedder(lambda texts: [])))
     train = [dspy.Example(question="Who?", context="Source.").with_inputs("question", "context")]
     try:
-        engine._configure_simba_task_learning(
-            prop, task, train, lambda gold, pred: 0.0, save_path=tmp_path / "compiled.json", resume=resume
+        configure_simba_task_learning(
+            prop,
+            task,
+            train,
+            lambda gold, pred: 0.0,
+            hooks=engine._build_optimization_hooks(),
+            save_path=tmp_path / "compiled.json",
+            resume=resume,
         )
     except ValueError:
         engine.close()
@@ -141,15 +150,16 @@ def test_malformed_active_sqlite_checkpoint_preserves_durable_bytes(tmp_path, pr
         prop.checkpoint_put("request:one", {"phase": "collecting", "state": prop.dump_simba_state()})
         prop.checkpoint_put("request:one", {"phase": "learning", "state": prop.dump_simba_state()})
         key = engine.conn.execute("SELECT key FROM meta WHERE key LIKE '%:active_reflection'").fetchone()[0]
-        codec = CandidatePayloadCodec(lambda: {})
-        active = codec.decode(engine.get_meta(key))
+        raw_meta = engine.get_meta(key)
+        assert raw_meta is not None
+        active = json.loads(raw_meta)
         if corrupt == "phase":
             active["records"]["request:one"]["phase"] = "mystery"
         elif corrupt == "state":
             active["records"]["request:one"]["state"] = "broken"
         else:
             active["request"] = "request:missing"
-        payload = codec.encode(active)
+        payload = json.dumps(active)
         engine.set_meta(key, payload)
     finally:
         engine.close()
@@ -168,7 +178,9 @@ def test_invalid_request_is_rejected_before_any_sqlite_write(tmp_path, provider)
         with pytest.raises(ValueError, match="phase"):
             prop.checkpoint_put("request:invalid", {"phase": "unknown", "state": prop.dump_simba_state()})
         assert engine.conn.total_changes == before
-        assert engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0] == 0
+        assert (
+            engine.conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'reflection_checkpoint:%'").fetchone()[0] == 0
+        )
     finally:
         engine.close()
     assert calls == []
@@ -184,8 +196,9 @@ def test_corrupted_completed_proposals_fail_without_generation_or_writes(tmp_pat
         assert prop(candidate, data, ["qa.predict"])
         generated = len(calls)
         key = engine.conn.execute("SELECT key FROM meta WHERE key LIKE '%:active_reflection'").fetchone()[0]
-        codec = CandidatePayloadCodec(lambda: {})
-        active = codec.decode(engine.get_meta(key))
+        raw_meta = engine.get_meta(key)
+        assert raw_meta is not None
+        active = json.loads(raw_meta)
         record = active["records"][active["request"]]
         if corrupt == "instruction":
             record["proposals"] = {"qa.predict": None}
@@ -193,7 +206,7 @@ def test_corrupted_completed_proposals_fail_without_generation_or_writes(tmp_pat
             record["proposals"] = {"unknown": "Use evidence."}
         else:
             record["proposals"] = {"qa.predict": "x" * 2000}
-        payload = codec.encode(active)
+        payload = json.dumps(active)
         engine.set_meta(key, payload)
     finally:
         engine.close()

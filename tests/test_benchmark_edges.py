@@ -23,6 +23,7 @@ from yaw.daemon.graph.inference.embedding import (
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.inference.models import embedding_evidence, preflight
+from yaw.daemon.ingestion import prepare_dataset_bundle
 
 
 @pytest.fixture(autouse=True)
@@ -93,11 +94,8 @@ def test_integrity_gate_preserves_provider_errors_and_respects_retrieval_only_mo
     [
         ({"gold_docs": ["one", {"title": "Title", "text": "Body"}, "one"]}, ["one", "Title\nBody"]),
         ({"context": [["Title", ["One", "Two"]]]}, ["Title\nOne Two"]),
-        ({"context": "", "answer": "missing"}, []),
-        ({"context": "unrelated passage", "answer": "missing"}, ["\nunrelated passage"]),
-        ({"document": {"summary": "  Summary  "}}, ["Summary"]),
-        ({"document": {"text": "  Full text  "}}, ["Full text"]),
-        ({"document": {}}, []),
+        ({"contexts": [{"title": "Title", "text": "Body", "is_supporting": True}]}, ["Title\nBody"]),
+        ({"paragraphs": [{"title": "Title", "paragraph_text": "Body", "is_supporting": True}]}, ["Title\nBody"]),
     ],
 )
 def test_gold_document_fallbacks_preserve_exact_format_and_empty_inputs(sample, expected):
@@ -110,7 +108,8 @@ def test_narrative_document_without_answer_match_uses_first_matching_corpus_chun
         {"idx": "other_1", "title": "Other", "text": "Not part of this document"},
         {"idx": "doc_1", "title": "First", "text": "Original context"},
     ]
-    assert benchmark.get_gold_docs([sample], "narrativeqa", corpus) == [["First\nOriginal context"]]
+    assert benchmark.get_gold_docs([sample], "lveval") is None
+    assert benchmark.get_gold_docs([sample], "narrativeqa", corpus) is None
 
 
 @pytest.mark.parametrize("dataset", ["custom", "popqa", "lveval", "narrativeqa"])
@@ -134,42 +133,30 @@ def test_benchmark_slice_pads_from_real_corpus_without_dropping_gold(dataset):
         index_queries=2,
     )
     assert queries == ["Who wrote Notes?"] and answers == [["Ada"]]
-    assert set(gold[0]) <= set(docs)
+    selected = {f"{row['title']}\n{row['text']}" for row in [source, *distractors] if row["idx"] in docs}
+    if dataset in ("lveval", "narrativeqa"):
+        assert gold is None
+        assert len(docs) == 6
+    else:
+        assert gold == [["Notes\nAda wrote Notes."]]
+        assert all(reference in selected for reference in gold[0])
+        assert len(docs) == (2 if dataset == "custom" else 4)
     assert len(docs) == len(set(docs))
-    assert len(docs) == (2 if dataset == "custom" else 4)
 
 
-def test_dataset_loading_uses_real_http_fallback_then_local_cache(tmp_path, monkeypatch, download_server):
-    state, url = download_server
-    state["payload"] = json.dumps([{"question": "Who?", "answer": "Ada", "title": "Title", "text": "Body"}]).encode()
-    monkeypatch.setattr(benchmark, "HF_BASE_URL", url + "/primary")
-    monkeypatch.setattr(benchmark, "UPSTREAM_DATASET_BASE_URL", url + "/fallback")
-    samples, corpus = benchmark.load_dataset_files("sample", tmp_path)
-    assert samples == corpus and samples[0]["answer"] == "Ada"
-    assert state["requests"] == [
-        "/primary/sample.json",
-        "/fallback/sample.json",
-        "/primary/sample_corpus.json",
-        "/fallback/sample_corpus.json",
-    ]
-    before = list(state["requests"])
-    assert benchmark.load_dataset_files("sample", tmp_path, max_queries=1, include_corpus=False) == (samples[:1], [])
-    assert state["requests"] == before
-
-
-def test_dataset_loading_failure_does_not_leave_a_false_cache_entry(tmp_path, monkeypatch, download_server):
-    state, url = download_server
-    state["fail_all"] = True
-    monkeypatch.setattr(benchmark, "HF_BASE_URL", url + "/primary")
-    monkeypatch.setattr(benchmark, "UPSTREAM_DATASET_BASE_URL", url + "/fallback")
-    with pytest.raises(RuntimeError, match="Could not download sample.json"):
+def test_dataset_loading_requires_prepared_bundle_and_preserves_source_files(tmp_path):
+    corpus, qa = tmp_path / "corpus.json", tmp_path / "questions.json"
+    corpus.write_text(json.dumps([{"title": "Title", "text": "Body"}]), encoding="utf-8")
+    qa.write_text(json.dumps([{"question": "Who?", "answer": "Ada"}]), encoding="utf-8")
+    original = corpus.read_bytes(), qa.read_bytes()
+    with pytest.raises(FileNotFoundError):
         benchmark.load_dataset_files("sample", tmp_path)
-    assert not (tmp_path / "sample.json").exists()
-    assert len(state["requests"]) == 2
-    for name in ("../outside", "nested/path"):
-        with pytest.raises(ValueError, match="not a path"):
-            benchmark.load_dataset_files(name, tmp_path)
-    with pytest.raises(ValueError, match="positive integer"):
+    prepare_dataset_bundle("sample", corpus, qa, tmp_path)
+    samples, rows = benchmark.load_dataset_files("sample", tmp_path)
+    assert samples == json.loads(qa.read_text(encoding="utf-8"))
+    assert rows[0]["title"] == "Title" and rows[0]["text"] == "Body"
+    assert (corpus.read_bytes(), qa.read_bytes()) == original
+    with pytest.raises(ValueError):
         benchmark.load_dataset_files("sample", tmp_path, max_queries=0)
 
 
@@ -215,12 +202,17 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
     monkeypatch.setattr(benchmark, "BASE_URL", url)
     # Keep any retry lifecycle lookup inside this disposable environment.
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
+    corpus, qa = tmp_path / "corpus.json", tmp_path / "qa.json"
+    corpus.write_text(json.dumps([{"idx": "notes", "title": "Notes", "text": "Ada wrote Notes."}]), encoding="utf-8")
+    qa.write_text("[]", encoding="utf-8")
+    prepare_dataset_bundle("musique", corpus, qa, tmp_path / "outputs/datasets")
     profile = replace(resolve_embedding_profile(task_mode="distinct-titled"), dimensions=8)
 
     def run(report):
         benchmark.run_yaw_benchmark(
             dataset="musique",
-            docs=["Notes\nAda wrote Notes."],
+            document_ids=["notes"],
             queries=["Who wrote Notes?"],
             gold_docs=[["Notes\nAda wrote Notes."]],
             gold_answers=[["Ada"]],
@@ -284,6 +276,8 @@ def test_benchmark_main_persists_success_or_failure_with_disjoint_probe_queries(
         encoding="utf-8",
     )
     (data / "sample_corpus.json").write_text(json.dumps([paragraph]), encoding="utf-8")
+
+    prepare_dataset_bundle("sample", data / "sample_corpus.json", data / "sample.json", data)
 
     def run():
         return benchmark.main(

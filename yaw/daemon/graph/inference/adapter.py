@@ -7,13 +7,15 @@ import dspy
 
 from .grammars import (
     DSPY_RERANK_GBNF_GRAMMAR,
+    build_dspy_hierarchy_judge_grammar,
     build_dspy_instruction_proposal_grammar,
+    build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
     build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
+    build_dspy_related_judge_grammar,
     build_dspy_shacl_repair_grammar,
-    build_dspy_synonym_judge_grammar,
     build_dspy_triples_grammar,
     lm_supports_gbnf,
 )
@@ -46,7 +48,7 @@ class YawGBNFAdapter(dspy.JSONAdapter):
         self.max_instruction_chars = max_instruction_chars
 
     def resolve_grammar(self, signature: Any) -> str | None:
-        """Resolve the pure-JSON GBNF grammar for any of the 10 direct Qwen signatures (or None for RLM signatures)."""
+        """Resolve the pure-JSON GBNF grammar for any of the 10 direct LM signatures (or None for RLM signatures)."""
         sig_name = getattr(signature, "__name__", str(signature))
         if sig_name in ("HealSHACLViolations", "ReflectiveInnerDistillerSignature"):
             return None
@@ -56,8 +58,12 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             return build_dspy_triples_grammar(self.max_triples)
         if sig_name == "DefineMissingEntities":
             return build_dspy_missing_entity_defs_grammar()
-        if sig_name == "JudgeSynonyms":
-            return build_dspy_synonym_judge_grammar(self.max_entities)
+        if sig_name == "JudgeLabels":
+            return build_dspy_label_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
+        if sig_name == "JudgeHierarchy":
+            return build_dspy_hierarchy_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
+        if sig_name == "JudgeRelated":
+            return build_dspy_related_judge_grammar(self.max_entities, max_reasoning_chars=self.max_reasoning_chars)
         if sig_name == "ProposeSHACLRepairs":
             return build_dspy_shacl_repair_grammar(self.max_entities)
         if sig_name == "ExtractQueryIntent":
@@ -66,8 +72,12 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             return DSPY_RERANK_GBNF_GRAMMAR
         if sig_name == "AnswerQuestion":
             return build_dspy_qa_grammar(self.max_reasoning_chars)
-        if sig_name in ("ProposeInstructionSignature", "CompressInstructionSignature"):
+        if sig_name in ("ProposeInstructionSignature", "ProposeInstruction"):
             return build_dspy_instruction_proposal_grammar(self.max_instruction_chars)
+        if sig_name in ("CompressInstructionSignature", "CompressInstruction"):
+            return build_dspy_instruction_proposal_grammar(self.max_instruction_chars).replace(
+                "new_instruction", "shortened_instruction"
+            )
 
         out_fields = getattr(signature, "output_fields", None)
         in_fields = getattr(signature, "input_fields", None)
@@ -81,7 +91,38 @@ class YawGBNFAdapter(dspy.JSONAdapter):
             if out_keys == ("entity_definitions",):
                 return build_dspy_missing_entity_defs_grammar()
             if out_keys == ("decisions",):
-                return build_dspy_synonym_judge_grammar(self.max_entities)
+                dec_field = out_fields["decisions"]
+                ann_str = str(getattr(dec_field, "annotation", ""))
+                if "LabelDecision" in ann_str or "EquivalentLabelDecision" in ann_str:
+                    return build_dspy_label_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "HierarchyDecision" in ann_str:
+                    return build_dspy_hierarchy_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "RelatedDecision" in ann_str:
+                    return build_dspy_related_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                extra = getattr(dec_field, "json_schema_extra", None)
+                extra_desc = extra.get("desc") if isinstance(extra, Mapping) else None
+                dec_desc = str(getattr(dec_field, "description", None) or extra_desc or "")
+                sig_doc = str(getattr(signature, "__doc__", "") or getattr(signature, "instructions", ""))
+                combined = f"{dec_desc} {sig_doc}".lower()
+                if "alt_label" in combined or "hidden_label" in combined or "stage 1" in combined:
+                    return build_dspy_label_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "broader" in combined or "narrower" in combined or "stage 2" in combined:
+                    return build_dspy_hierarchy_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                if "related" in combined or "stage 3" in combined:
+                    return build_dspy_related_judge_grammar(
+                        self.max_entities, max_reasoning_chars=self.max_reasoning_chars
+                    )
+                return None
             if out_keys == ("repairs",) and "focus_context" in in_keys:
                 return build_dspy_shacl_repair_grammar(self.max_entities)
             if out_keys == ("new_instruction",):

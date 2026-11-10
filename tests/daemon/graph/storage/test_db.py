@@ -4,29 +4,29 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
+from daemon.native_inference import publish_inference
 
 from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage import (
-    delete_chunks,
+    apply_shacl_repairs,
     deserialize_f32_vector,
-    find_entity_disambiguation_candidates,
-    find_entity_synonym_candidates,
+    deserialize_openie_record,
+    find_entity_candidates,
     get_chunk_pointer,
     get_chunk_pointers,
     get_entity_vectors,
-    get_openie_checkpoints,
     initialize_schema,
     inspect_focus_node,
     lint_graph_shacl,
+    load_affected_neighborhood,
     load_graph_topology,
     merge_entities,
     open_managed_yaw_db,
+    open_readonly_yaw_db,
     open_yaw_db,
-    resolve_entity_labels,
-    save_openie_checkpoints,
     search_chunk_vectors_knn,
     search_chunks_fts,
-    search_entity_vectors_knn,
     search_fact_vectors_knn,
     search_facts_fts,
     serialize_f32_vector,
@@ -37,10 +37,10 @@ from yaw.daemon.graph.storage import (
     upsert_entities,
     upsert_entity_labels,
     upsert_entity_vectors,
+    upsert_fact_sources,
     upsert_fact_vectors,
     upsert_facts,
     upsert_semantic_edges,
-    upsert_synonymy_edges,
 )
 
 
@@ -63,7 +63,6 @@ def test_open_yaw_db_wal_and_schema_initialization(tmp_path: Path) -> None:
             "meta",
             "chunks",
             "chunk_fts",
-            "openie_chunks",
             "entities",
             "facts",
             "fact_fts",
@@ -74,6 +73,13 @@ def test_open_yaw_db_wal_and_schema_initialization(tmp_path: Path) -> None:
             "fact_vec",
         }
         assert expected_tables.issubset(table_names)
+        for vec_table in ("chunk_vec", "entity_vec", "fact_vec"):
+            ddl_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (vec_table,),
+            ).fetchone()
+            assert ddl_row is not None
+            assert "USING vec0" in str(ddl_row["sql"])
     finally:
         conn.close()
 
@@ -115,10 +121,6 @@ def test_vector_serialization_and_bounded_knn(tmp_path: Path) -> None:
         np.testing.assert_allclose(ent_vecs["e1"], vec1)
 
         # 5. Entity & Fact KNN
-        ent_hits = search_entity_vectors_knn(conn, vec2, top_k=1)
-        assert ent_hits[0][0] == "e2"
-        assert ent_hits[0][1] == pytest.approx(1.0, abs=1e-4)
-
         fact_hits = search_fact_vectors_knn(conn, vec1, top_k=1)
         assert fact_hits[0][0] == "f1"
         assert fact_hits[0][1] == pytest.approx(1.0, abs=1e-4)
@@ -221,9 +223,12 @@ def test_openie_checkpoints_cache(tmp_path: Path) -> None:
             triples=(("Radio City", "located in", "Bangalore"),),
         )
 
-        save_openie_checkpoints(conn, [rec1, rec2])
+        publish_inference(tmp_path / "test_openie.db", [rec1, rec2])
 
-        loaded = get_openie_checkpoints(conn, ["c1", "c2", "missing"])
+        loaded = {
+            cid: deserialize_openie_record(raw)
+            for cid, raw in conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference")
+        }
         assert len(loaded) == 2
         assert loaded["c1"] == rec1
         assert loaded["c2"] == rec2
@@ -231,7 +236,7 @@ def test_openie_checkpoints_cache(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
+def test_graph_upserts_preserve_chunk_vector_and_fact_owners(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_cascade.db")
     try:
         # Setup 2 chunks
@@ -271,43 +276,17 @@ def test_graph_upserts_and_atomic_cascading_deletion(tmp_path: Path) -> None:
 
         # Synonymy edge between e1 and an alias e1_alias
         upsert_entities(conn, [("e1_alias", "A. Turing")])
-        upsert_synonymy_edges(conn, [("e1", "e1_alias", 0.95)])
+        upsert_semantic_edges(conn, [("e1", "e1_alias", "skos:related", 0.95)])
 
         # Assert initial state
         assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM facts;").fetchone()[0] == 2
 
-        # Delete c1
-        delete_chunks(conn, ["c1"])
-
-        # 1. c1 metadata and vectors removed
-        assert get_chunk_pointer(conn, "c1") is None
-        assert get_chunk_pointer(conn, "c2") is not None
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = 'c2';").fetchone()[0] == 1
-
-        # 2. Fact F1 (exclusive to c1) is deleted, F2 (supported by c2) remains
-        remaining_facts = conn.execute("SELECT fact_id FROM facts;").fetchall()
-        assert [r[0] for r in remaining_facts] == ["f2"]
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM fact_vec WHERE fact_id = 'f2';").fetchone()[0] == 1
-
-        # 3. Entity E1 (exclusive to c1) is deleted, E2 and E3 remain
-        remaining_entities = {r[0] for r in conn.execute("SELECT entity_id FROM entities;").fetchall()}
-        assert "e1" not in remaining_entities
-        assert "e2" in remaining_entities
-        assert "e3" in remaining_entities
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e1';").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM entity_vec WHERE entity_id = 'e2';").fetchone()[0] == 1
-
-        # 4. Synonymy edge incident to deleted e1 is pruned
-        syn_edges = conn.execute("SELECT * FROM edges WHERE kind = 'synonymy';").fetchall()
-        assert len(syn_edges) == 0
     finally:
         conn.close()
 
 
-def test_find_entity_synonym_candidates_in_db(tmp_path: Path) -> None:
+def test_find_entity_candidates_in_db(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_synonymy.db")
     try:
         upsert_entities(
@@ -328,19 +307,22 @@ def test_find_entity_synonym_candidates_in_db(tmp_path: Path) -> None:
         )
 
         # Full scan candidate discovery
-        candidates = find_entity_synonym_candidates(conn, threshold=0.8, top_k=5)
+        seed_candidate_vectors(conn)
+        candidates = find_entity_candidates(conn, dense_threshold=0.8)
         assert len(candidates) == 1
-        ent_a, ent_b, sim = candidates[0]
+        ent_a, ent_b, sim, _ = candidates[0]
         assert {ent_a, ent_b} == {"e1", "e2"}
         assert sim == pytest.approx(0.95, abs=1e-3)
 
         # Incremental scan for a single entity
-        inc_candidates = find_entity_synonym_candidates(conn, entity_ids=["e2"], threshold=0.8, top_k=5)
+        seed_candidate_vectors(conn)
+        inc_candidates = find_entity_candidates(conn, entity_ids=["e2"], dense_threshold=0.8)
         assert len(inc_candidates) == 1
         assert {inc_candidates[0][0], inc_candidates[0][1]} == {"e1", "e2"}
 
         # Incremental scan for orthogonal entity returns empty
-        assert find_entity_synonym_candidates(conn, entity_ids=["e3"], threshold=0.8) == []
+        seed_candidate_vectors(conn)
+        assert find_entity_candidates(conn, entity_ids=["e3"], dense_threshold=0.8) == []
     finally:
         conn.close()
 
@@ -410,7 +392,7 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
             OpenIERecord(cid, (f"Entity {i}",), ((f"Entity {i}", "rel", f"Entity {i}"),))
             for i, cid in enumerate(chunk_ids)
         ]
-        save_openie_checkpoints(conn, records)
+        publish_inference(tmp_path / "test_high_load.db", records)
 
         # Batch lookups exceeding 1,000 IDs
         loaded_ptrs = get_chunk_pointers(conn, chunk_ids)
@@ -419,45 +401,21 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         loaded_vecs = get_entity_vectors(conn, entity_ids)
         assert len(loaded_vecs) == n_items
 
-        loaded_ckpts = get_openie_checkpoints(conn, chunk_ids)
+        loaded_ckpts = dict(conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference"))
         assert len(loaded_ckpts) == n_items
 
-        # Shared fact edge supported by chunk-0 and chunk-1199
-        upsert_facts(
-            conn,
-            [
-                (
-                    "f_shared",
-                    "ent-0",
-                    "linked_to",
-                    "ent-1199",
-                    '["Entity 0", "linked_to", "Entity 1199"]',
-                )
-            ],
-        )
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("ent-0", "ent-1199", "fact", 2.0, "chunk-0"),
-                ("ent-0", "ent-1199", "fact", 2.0, "chunk-1199"),
-            ],
-        )
-
-        # Delete first 1,199 chunks in one batch call, keeping only chunk-1199
-        delete_chunks(conn, chunk_ids[:-1])
-
-        assert conn.execute("SELECT COUNT(*) FROM chunks;").fetchone()[0] == 1
-        # Shared fact edge weight must decrement from 2.0 to 1.0
-        edge_row = conn.execute(
-            "SELECT weight FROM edges WHERE src_id = 'ent-0' AND dst_id = 'ent-1199' AND kind = 'fact';"
-        ).fetchone()
-        assert edge_row is not None
-        assert float(edge_row[0]) == pytest.approx(1.0)
     finally:
         conn.close()
 
 
-def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
+def test_fact_fts_indexing_and_lexical_search(tmp_path: Path) -> None:
+    import yaw.daemon.graph.storage as storage_pkg
+    import yaw.daemon.graph.storage.db as db_mod
+
+    for retired_fn in ("migrate_edges_" + "reasoning", "migrate_epistemic_" + "confidence_columns"):
+        assert not hasattr(storage_pkg, retired_fn)
+        assert not hasattr(db_mod, retired_fn)
+
     conn = open_yaw_db(tmp_path / "test_fact_fts.db")
     try:
         # 1. Upsert facts with triples
@@ -509,32 +467,13 @@ def test_fact_fts_indexing_search_and_backfill(tmp_path: Path) -> None:
         # 6. Non-matching query returns empty list
         assert search_facts_fts(conn, "nonexistentquerytoken123", top_k=5) == []
 
-        # 7. Cascade deletion via delete_chunks
-        p1 = ChunkPointer("c1", "p.txt", 1, 1, "T1")
-        p2 = ChunkPointer("c2", "p.txt", 2, 2, "T2")
-        upsert_chunk_pointers(conn, [(p1, "text1"), (p2, "text2")])
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("ent-curie", "ent-radium", "fact", 1.0, "c1"),
-                ("ent-einstein", "ent-relativity", "fact", 1.0, "c2"),
-            ],
-        )
-        delete_chunks(conn, ["c1"])
-        # fact-1 should now be deleted from facts and fact_fts
-        assert conn.execute("SELECT COUNT(*) FROM facts WHERE fact_id = 'fact-1';").fetchone()[0] == 0
-        assert search_facts_fts(conn, "radium", top_k=5) == []
-        # fact-2 should still be intact
-        assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
-
-        # 8. Test backfill: clear fact_fts and re-run initialize_schema
+        # 7. initialize_schema is purely DDL and never backfills deleted fact_fts rows behind the sink
         conn.execute("INSERT INTO fact_fts(fact_fts) VALUES('delete-all');")
         conn.commit()
         assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 0
         initialize_schema(conn)
-        # Should be backfilled with remaining facts (fact-2 and fact-3)
-        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 2
-        assert len(search_facts_fts(conn, "relativity", top_k=5)) == 1
+        assert conn.execute("SELECT COUNT(*) FROM fact_fts;").fetchone()[0] == 0
+        assert search_facts_fts(conn, "relativity", top_k=5) == []
     finally:
         conn.close()
 
@@ -591,24 +530,11 @@ def test_skos_labels_s13_disjointness_and_homograph_resolution(tmp_path: Path) -
             [("ent-apple-inc", v_tech), ("ent-apple-fruit", v_fruit)],
         )
 
-        # Resolve "Apple" with a tech query vector -> selects ent-apple-inc
-        resolved_tech = resolve_entity_labels(
-            conn, ["Apple"], query_vec=np.array([0.95, 0.05, 0.0, 0.0], dtype=np.float32)
-        )
-        assert resolved_tech["apple"] == ["ent-apple-inc"]
-
-        # Resolve "Apple" with a fruit query vector -> selects ent-apple-fruit
-        resolved_fruit = resolve_entity_labels(
-            conn, ["Apple"], query_vec=np.array([0.05, 0.95, 0.0, 0.0], dtype=np.float32)
-        )
-        assert resolved_fruit["apple"] == ["ent-apple-fruit"]
-
         # 2-channel candidate generation finds lexical cousins even when cosine = 0.0
         upsert_entities(conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")])
         upsert_entity_vectors(conn, [("ent-apple-corp", v_fruit)])
-        candidates = find_entity_disambiguation_candidates(
-            conn, ["ent-apple-inc"], dense_threshold=0.95, dense_top_k=5, lexical_threshold=0.6
-        )
+        seed_candidate_vectors(conn)
+        candidates = find_entity_candidates(conn, ["ent-apple-inc"], dense_threshold=0.95, lexical_threshold=0.45)
         pair_ids = {(a, b) for a, b, _, _ in candidates} | {(b, a) for a, b, _, _ in candidates}
         assert ("ent-apple-inc", "ent-apple-corp") in pair_ids
     finally:
@@ -654,43 +580,47 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
             ],
         )
 
-        # Merge src_id='ent-nyc-alias' into dst_id='ent-nyc-canon'
-        merge_entities(conn, "ent-nyc-alias", "ent-nyc-canon")
-
-        # Alias entity row is gone, its prefLabel "NYC" is now a skos:altLabel on ent-nyc-canon
-        assert conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id = 'ent-nyc-alias';").fetchone()[0] == 0
+        upsert_entity_labels(
+            conn,
+            [
+                ("nyc", "ent-nyc-alias", "skos:prefLabel", "NYC", "c1"),
+                ("new york city", "ent-nyc-canon", "skos:prefLabel", "New York City", "c1"),
+            ],
+        )
+        merged = merge_entities(conn, "ent-nyc-alias", "ent-nyc-canon")
+        canonical = merged.canonical_id
+        assert canonical == "ent-nyc-alias"
+        assert conn.execute("SELECT COUNT(*) FROM entities WHERE entity_id=?", (merged.removed_id,)).fetchone()[0] == 0
         alt_rows = conn.execute(
-            "SELECT raw_label FROM entity_labels WHERE entity_id = 'ent-nyc-canon' AND label_kind = 'skos:altLabel';"
+            "SELECT raw_label FROM entity_labels WHERE entity_id=? AND label_kind='skos:altLabel'", (canonical,)
         ).fetchall()
         assert "NYC" in {r["raw_label"] for r in alt_rows}
 
-        # Fact and edges are redirected to ent-nyc-canon
-        fact_row = conn.execute("SELECT subj_id, obj_id FROM facts WHERE fact_id = 'fact-alias-usa';").fetchone()
-        assert fact_row["subj_id"] == "ent-nyc-canon"
+        fact_row = conn.execute("SELECT subj_id,obj_id FROM facts").fetchone()
+        assert fact_row["subj_id"] == canonical
         assert fact_row["obj_id"] == "ent-usa"
 
         # Now test semantic edges and owl:differentFrom dominance
-        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "skos:related", 0.85)])
-        _, entity_ids, topo_edges = load_graph_topology(conn)
-        assert ("ent-nyc-canon" in entity_ids) and ("ent-usa" in entity_ids)
-        assert any(s == "ent-nyc-canon" and d == "ent-usa" for s, d, _ in topo_edges)
+        upsert_semantic_edges(conn, [(canonical, "ent-usa", "skos:related", 0.85)])
+        _, entity_ids, topo_edges, _ = load_graph_topology(conn)
+        assert (canonical in entity_ids) and ("ent-usa" in entity_ids)
+        assert any(s == canonical and d == "ent-usa" for s, d, _, _ in topo_edges)
 
         # Asserting owl:differentFrom dominates and deletes skos:related
-        upsert_semantic_edges(conn, [("ent-nyc-canon", "ent-usa", "owl:differentFrom", 0.90)])
+        upsert_semantic_edges(conn, [(canonical, "ent-usa", "owl:differentFrom", 0.90)])
         edge_kinds = {
             r["kind"]
-            for r in conn.execute(
-                "SELECT kind FROM edges WHERE src_id = 'ent-nyc-canon' AND dst_id = 'ent-usa';"
-            ).fetchall()
+            for r in conn.execute("SELECT kind FROM edges WHERE src_id=? AND dst_id='ent-usa'", (canonical,)).fetchall()
         }
         assert "skos:related" not in edge_kinds
         assert "owl:differentFrom" in edge_kinds
 
         # Verify load_graph_topology excludes owl:differentFrom (if we remove the fact edge, no edge remains)
+        conn.execute("DELETE FROM facts;")
         conn.execute("DELETE FROM edges WHERE kind = 'fact';")
         conn.commit()
-        _, _, topo_edges_after = load_graph_topology(conn)
-        assert not any({s, d} == {"ent-nyc-canon", "ent-usa"} for s, d, _ in topo_edges_after)
+        _, _, topo_edges_after, _ = load_graph_topology(conn)
+        assert not any({s, d} == {canonical, "ent-usa"} for s, d, _, _ in topo_edges_after)
     finally:
         conn.close()
 
@@ -698,6 +628,7 @@ def test_merge_entities_and_semantic_edge_dominance(tmp_path: Path) -> None:
 def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_shacl.db")
     try:
+        upsert_chunk_pointers(conn, [(ChunkPointer("c1", "doc.md", 1, 2, "Doc"), "Entity A relates to Entity B.")])
         # Insert an entity with empty definition, an entity with valid definition, and an asymmetric semantic edge
         conn.execute("INSERT INTO entities(entity_id, name, definition) VALUES ('ent-a', 'Entity A', '');")
         conn.execute(
@@ -707,19 +638,40 @@ def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> 
             "INSERT INTO facts(fact_id, subj_id, pred, obj_id, raw_triple_json, definition) "
             "VALUES ('fact-ab', 'ent-a', 'relates to', 'ent-b', '[\"Entity A\", \"relates to\", \"Entity B\"]', '');"
         )
+        upsert_fact_sources(conn, [("fact-ab", "c1")])
         conn.execute("INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'fact', 1.0);")
         conn.execute("INSERT INTO edges(src_id, dst_id, kind, weight) VALUES ('ent-a', 'ent-b', 'skos:related', 0.9);")
         conn.commit()
 
-        violations_before = lint_graph_shacl(conn, auto_heal=False)
+        violations_before = lint_graph_shacl(conn)
         shapes_before = {v.shape for v in violations_before}
         assert "ConceptShape/prefLabel" in shapes_before
         assert "ConceptShape/definition" in shapes_before
         assert "StatementShape/closedWorld" in shapes_before
         assert "EdgeShape/closedWorld" in shapes_before
 
-        # Auto-heal repairs deterministic violations (prefLabels, empty definitions, asymmetric semantic edge)
-        violations_after = lint_graph_shacl(conn, auto_heal=True)
+        # Apply explicit SHACL repairs
+        apply_shacl_repairs(
+            conn,
+            [
+                {"focus_node": "ent-a", "action": "set_pref_label", "target_node": "", "value": "Entity A"},
+                {"focus_node": "ent-b", "action": "set_pref_label", "target_node": "", "value": "Entity B"},
+                {
+                    "focus_node": "ent-a",
+                    "action": "set_definition",
+                    "target_node": "",
+                    "value": "Entity A participates in relation: Entity A relates to Entity B.",
+                },
+                {
+                    "focus_node": "fact-ab",
+                    "action": "set_definition",
+                    "target_node": "",
+                    "value": "Entity A relates to Entity B.",
+                },
+                {"focus_node": "ent-a->ent-b", "action": "assert_related", "target_node": "", "value": ""},
+            ],
+        )
+        violations_after = lint_graph_shacl(conn)
         assert violations_after == []
 
         # Inspect focus node neighbourhood
@@ -733,68 +685,6 @@ def test_closed_world_shacl_lint_auto_heal_and_turtle_export(tmp_path: Path) -> 
         assert "@prefix sh: <http://www.w3.org/ns/shacl#> ." in ttl
         assert "sh:conforms true" in ttl
         assert 'skos:prefLabel "Entity A"' in ttl
-    finally:
-        conn.close()
-
-
-def test_delete_chunks_homograph_promotion_preserves_owl_different_from(tmp_path: Path) -> None:
-    """Verify Hazard 1: promoting an altLabel to prefLabel during delete_chunks links surviving homographs via \
-owl:differentFrom."""
-    conn = open_yaw_db(tmp_path / "test_hazard1.db")
-    try:
-        upsert_chunk_pointers(
-            conn,
-            [
-                (ChunkPointer("c1", "doc.md", 1, 5, "Doc 1"), "Apple Inc in Cupertino."),
-                (ChunkPointer("c2", "doc.md", 6, 10, "Doc 2"), "Apple designs consumer hardware."),
-                (ChunkPointer("c3", "doc.md", 11, 15, "Doc 3"), "Apple is an orchard fruit."),
-            ],
-        )
-        upsert_entities(
-            conn,
-            [
-                ("ent-tech", "Apple Inc", "Consumer electronics company in Cupertino"),
-                ("ent-fruit", "Apple", "Edible pome fruit grown on orchard trees"),
-            ],
-        )
-        upsert_entity_labels(
-            conn,
-            [
-                ("apple inc", "ent-tech", "skos:prefLabel", "Apple Inc", "c1"),
-                ("apple", "ent-tech", "skos:altLabel", "Apple", "c2"),
-                ("apple", "ent-fruit", "skos:prefLabel", "Apple", "c3"),
-            ],
-        )
-        upsert_edges_with_sources(
-            conn,
-            [
-                ("c1", "ent-tech", "passage", 1.0, "c1"),
-                ("ent-tech", "c1", "passage", 1.0, "c1"),
-                ("c2", "ent-tech", "passage", 1.0, "c2"),
-                ("ent-tech", "c2", "passage", 1.0, "c2"),
-                ("c3", "ent-fruit", "passage", 1.0, "c3"),
-                ("ent-fruit", "c3", "passage", 1.0, "c3"),
-            ],
-        )
-        assert lint_graph_shacl(conn, auto_heal=False) == []
-
-        # Deleting c1 removes "apple inc" prefLabel from ent-tech and promotes "apple" (from c2) to skos:prefLabel.
-        # Step 7 in delete_chunks must link ent-tech and ent-fruit with symmetric owl:differentFrom (weight = 0.0).
-        delete_chunks(conn, ["c1"])
-
-        tech_name = conn.execute("SELECT name FROM entities WHERE entity_id = 'ent-tech'").fetchone()[0]
-        assert tech_name.lower() == "apple"
-
-        diff_rows = conn.execute(
-            """
-            SELECT src_id, dst_id, weight FROM edges
-            WHERE kind = 'owl:differentFrom'
-            ORDER BY src_id, dst_id
-            """
-        ).fetchall()
-        assert len(diff_rows) == 2
-        assert all(float(r[2]) == 0.0 for r in diff_rows)
-        assert lint_graph_shacl(conn, auto_heal=False) == []
     finally:
         conn.close()
 
@@ -846,7 +736,7 @@ def test_multi_chunk_entity_labels_enforces_skos_s13_and_s14_disjointness(tmp_pa
             ).fetchall()
         ]
         assert pref_norms == ["united states"]
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
     finally:
         conn.close()
 
@@ -856,8 +746,6 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
 ) -> None:
     """Verify H2: facts CHECK constraint, fact_sources provenance, orphan pruning, and merge collision dedup."""
     import sqlite3
-
-    from yaw.daemon.graph.storage import get_facts_with_meta_by_ids, upsert_fact_sources
 
     conn = open_yaw_db(tmp_path / "test_step11_h2.db")
     try:
@@ -942,14 +830,8 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
             ],
         )
 
-        meta = get_facts_with_meta_by_ids(conn, ["fact-lit-1"])
-        assert meta["fact-lit-1"]["obj_kind"] == "literal"
-        assert meta["fact-lit-1"]["obj_id"] is None
-        assert meta["fact-lit-1"]["obj_literal_lex"] == "1912-06-23"
-        assert meta["fact-lit-1"]["obj_datatype"] == "xsd:date"
-
         # SHACL closed-world validation conforms for literal-object facts (obj_id IS NULL)
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         ttl = serialize_graph_turtle(conn)
         assert 'rdf:object "1912-06-23"^^xsd:date' in ttl
 
@@ -964,12 +846,6 @@ def test_step11_literal_facts_check_constraints_fact_sources_and_merge_collision
         }
         assert src_chunks == {"c1", "c2"}
 
-        # 4. Deleting c1 keeps the fact alive (still supported by c2); deleting c2 prunes the orphaned literal fact
-        delete_chunks(conn, ["c1"])
-        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
-        delete_chunks(conn, ["c2"])
-        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -1010,28 +886,230 @@ def test_step11_skos_broader_cycle_safe_cte_and_s27_disjointness(tmp_path: Path)
             ("ent-dog", "ent-mammal"),
             ("ent-mammal", "ent-animal"),
         ]
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
 
-        # 2. Inject a transitive S27 conflict (skos:related between dog and animal) and a 3-hop cycle (animal -> dog)
+        # 2. A 2-hop broader chain (dog -> mammal -> animal) with dog <-> animal skos:related is valid;
+        # injecting a direct 1-hop S27 conflict (dog <-> mammal skos:related) and a 3-hop cycle flags both
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-dog', 'ent-animal', 'skos:related', 0.7)"
         )
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:related', 0.7)"
         )
+        assert [v for v in lint_graph_shacl(conn) if v.shape == "ConceptShape/S27-disjointBroaderRelated"] == []
+        conn.execute("DELETE FROM edges WHERE kind = 'skos:related'")
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-dog', 'ent-mammal', 'skos:related', 0.7)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-mammal', 'ent-dog', 'skos:related', 0.7)"
+        )
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-animal', 'ent-dog', 'skos:broader', 0.8)"
         )
         conn.commit()
 
-        violations = lint_graph_shacl(conn, auto_heal=False)
+        violations = lint_graph_shacl(conn)
         shapes = {v.shape for v in violations}
         assert "ConceptShape/broaderCycle" in shapes
         assert "ConceptShape/S27-disjointBroaderRelated" in shapes
 
-        # 3. Auto-heal breaks the hierarchy cycle and removes the conflicting skos:related edges
-        remaining = lint_graph_shacl(conn, auto_heal=True)
+        # 3. Explicit SHACL repairs break the hierarchy cycle and remove the conflicting skos:related edges
+        apply_shacl_repairs(
+            conn,
+            [
+                {
+                    "focus_node": "ent-animal->ent-dog",
+                    "action": "remove_hierarchy_cycle",
+                    "target_node": "",
+                    "value": "",
+                },
+                {
+                    "focus_node": "ent-dog|ent-mammal",
+                    "action": "remove_conflicting_related",
+                    "target_node": "",
+                    "value": "",
+                },
+            ],
+        )
+        remaining = lint_graph_shacl(conn)
         assert remaining == []
         assert conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'skos:related'").fetchone()[0] == 0
     finally:
+        conn.close()
+
+
+def test_connection_pragmas_configured_across_open_modes(tmp_path: Path) -> None:
+    db_file = tmp_path / "pragmas.db"
+
+    conn = open_yaw_db(db_file)
+    try:
+        assert conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+        assert conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+        assert conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+        assert conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+    managed = open_managed_yaw_db(db_file)
+    try:
+        with managed.transaction() as m_conn:
+            assert m_conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+            assert m_conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+            assert m_conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+            assert m_conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        managed.close()
+
+    ro_conn = open_readonly_yaw_db(db_file)
+    try:
+        assert ro_conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
+        assert ro_conn.execute("PRAGMA temp_store;").fetchone()[0] == 2
+        assert ro_conn.execute("PRAGMA cache_size;").fetchone()[0] == -65536
+        assert ro_conn.execute("PRAGMA mmap_size;").fetchone()[0] > 0
+    finally:
+        ro_conn.close()
+
+
+def test_find_entity_candidates_blas_vectorized_without_match_loops(tmp_path: Path) -> None:
+    conn = open_yaw_db(tmp_path / "syn_blas.db")
+    try:
+        upsert_entities(
+            conn,
+            [
+                ("e1", "Entity 1"),
+                ("e2", "Entity 2"),
+                ("e3", "Entity 3"),
+                ("e4", "Entity 4"),
+                ("e5", "Entity 5"),
+                ("e6", "Entity 6"),
+            ],
+        )
+        upsert_entity_vectors(
+            conn,
+            [
+                ("e1", [1.0, 0.0, 0.0]),
+                ("e2", [0.8, 0.6, 0.0]),
+                ("e3", [0.9, 0.43589, 0.0]),
+                ("e4", [0.9, 0.43589, 0.0]),
+                ("e5", [0.0, 1.0, 0.0]),
+                ("e6", [0.85, 0.52678, 0.0]),
+            ],
+        )
+        upsert_semantic_edges(conn, [("e1", "e6", "owl:differentFrom", 1.0)])
+
+        executed_sql: list[str] = []
+        conn.set_trace_callback(executed_sql.append)
+        try:
+            seed_candidate_vectors(conn)
+            inc_e1_k2 = find_entity_candidates(conn, entity_ids=["e1"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            inc_e1_k4 = find_entity_candidates(conn, entity_ids=["e1"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            full_k1 = find_entity_candidates(conn, entity_ids=None, dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            rev_e3 = find_entity_candidates(conn, entity_ids=["e3"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            rev_e2 = find_entity_candidates(conn, entity_ids=["e2"], dense_threshold=0.8, lexical_threshold=2.0)
+        finally:
+            conn.set_trace_callback(None)
+
+        assert not any("MATCH" in sql.upper() for sql in executed_sql)
+        expected = {("e1", "e2"), ("e1", "e3"), ("e1", "e4")}
+        assert {(a, b) for a, b, _, _ in inc_e1_k2} == expected
+        assert inc_e1_k2 == inc_e1_k4
+        assert ("e1", "e3") in {(a, b) for a, b, _, _ in rev_e3}
+        assert ("e1", "e6") not in {(a, b) for a, b, _, _ in full_k1}
+        assert ("e1", "e2") in {(a, b) for a, b, _, _ in rev_e2}
+    finally:
+        conn.close()
+
+
+def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from yaw.daemon.graph.storage.evidence import evidence_schemas
+    from yaw.daemon.graph.storage.managed_sqlite import create_table
+
+    # (a) Zero-copy deserialize_f32_vector
+    blob = serialize_f32_vector([1.0, 2.0, 3.0])
+    arr = deserialize_f32_vector(blob)
+    assert arr.base is blob
+    assert not arr.flags.writeable
+    np.testing.assert_allclose(arr, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+
+    # (b) Upper-bound length pruning & pre-tokenized lexical disambiguation
+    conn = open_yaw_db(tmp_path / "quick_fixes.db")
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        for schema in asyncio.run(evidence_schemas()):
+            create_table(conn, schema)
+            create_table(stage_conn, schema)
+        long_name = "International Federation of Information Processing Societies"
+        upsert_entities(
+            conn,
+            [
+                ("e_short", "Ada"),
+                ("e_long", long_name),
+                ("e_match", "Adax"),
+                ("e_far", "Zeta"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("ada", "e_short", "skos:prefLabel", "Ada", "c1"),
+                (long_name.lower(), "e_long", "skos:prefLabel", long_name, "c1"),
+                ("adax", "e_match", "skos:prefLabel", "Adax", "c1"),
+                ("zeta", "e_far", "skos:prefLabel", "Zeta", "c1"),
+            ],
+        )
+        upsert_entity_vectors(
+            conn,
+            [
+                ("e_short", [1.0, 0.0, 0.0]),
+                ("e_long", [0.0, 1.0, 0.0]),
+                ("e_match", [0.95, 0.31225, 0.0]),
+                ("e_far", [0.0, 0.0, 1.0]),
+            ],
+        )
+
+        seed_candidate_vectors(conn)
+        cands = find_entity_candidates(
+            conn,
+            entity_ids=["e_short"],
+            dense_threshold=0.99,
+            lexical_threshold=0.50,
+        )
+        assert {(a, b) for a, b, _, _ in cands} == {("e_match", "e_short")}
+
+        # (c) Single-pass BLAS KNN seed discovery in load_affected_neighborhood without vec0 MATCH loops
+        ro_sql: list[str] = []
+        conn.set_trace_callback(ro_sql.append)
+        try:
+            affected = load_affected_neighborhood(
+                conn,
+                stage_conn,
+                seed_entity_ids=("e_short",),
+                seed_label_norms=("ada",),
+                delta_entity_names={"e_new": "Ada"},
+                candidate_dense_threshold=0.8,
+                candidate_lexical_threshold=0.55,
+            )
+        finally:
+            conn.set_trace_callback(None)
+
+        assert "e_short" in affected
+        assert "e_match" in affected
+        assert not any("EMBEDDING MATCH" in sql.upper() for sql in ro_sql)
+        entity_vec_selects = [
+            sql.strip() for sql in ro_sql if sql.lstrip().upper().startswith("SELECT") and "ENTITY_VEC" in sql.upper()
+        ]
+        assert entity_vec_selects
+        assert all("WHERE" in sql.upper() for sql in entity_vec_selects)
+    finally:
+        stage_conn.close()
         conn.close()

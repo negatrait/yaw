@@ -9,7 +9,9 @@ import dspy
 import numpy as np
 
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, HippoRAGProgram
+from yaw.daemon.graph.inference import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, YawProgram
+from yaw.daemon.indexing import bind_native_indexing
+from yaw.daemon.ingestion import prepare_dataset_bundle
 
 
 def main() -> None:
@@ -27,7 +29,7 @@ def main() -> None:
         max_tokens=1000,
     )
     dspy.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -38,12 +40,14 @@ def main() -> None:
             program.ner.signature.instructions + " Preserve every named person."
         )
     embedder = DSPyEmbeddingAdapter(base_url=args.url, api_key="test", caching=False)
-    engine = YawGraphEngine(
-        db_path=args.root / "yaw.db",
-        workspace_root=args.root,
-        program=program,
-        embedder=embedder,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=args.root / "yaw.db",
+            workspace_root=args.root / "datasets",
+            program=program,
+            embedder=embedder,
+            candidate_dense_threshold=-1.0,
+        )
     )
     try:
         if args.mutation == "query":
@@ -66,17 +70,24 @@ def main() -> None:
                     instruction=PASSAGE_INSTRUCTION,
                 )[0],
             )
-        # Force materialization from scratch while retaining only the disk stage
-        # cache. A second process cannot benefit from graph rows or Python RAM.
-        engine._reset_sandbox_graph(clear_openie=True)
         doc = "Alan Turing formulated the Turing machine in 1936."
         if args.mutation == "source":
             doc += " This source was edited after the previous run."
-        engine.index([doc])
-        with engine.managed_conn.transaction() as conn:
-            conn.execute("UPDATE entities SET definition = '' WHERE name IN ('alan turing', 'turing machine')")
-        assert not engine.lint_graph()["conforms"]
-        engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."])
+        source, questions = args.root / "source.json", args.root / "questions.json"
+        source.write_text(
+            json.dumps(
+                [
+                    {"idx": "first", "title": "", "text": doc},
+                    {"idx": "second", "title": "", "text": "Alan M. Turing worked on cryptanalysis at Bletchley Park."},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        questions.write_text("[]", encoding="utf-8")
+        bundle = prepare_dataset_bundle("cache_documents", source, questions, args.root / "datasets")
+        engine.workspace_root = bundle.root
+        matched_files = tuple(doc.path for doc in bundle.documents if doc.document_id in ["first", "second"])
+        engine.index_chunks(included_files=matched_files)
         assert engine.lint_graph()["conforms"]
         print(
             json.dumps(
@@ -84,25 +95,16 @@ def main() -> None:
                     "tokens": {
                         key: engine._graph_rlm_stats[key]
                         for key in (
-                            "synonym_judge_tokens",
+                            "label_judge_tokens",
+                            "hierarchy_judge_tokens",
+                            "related_judge_tokens",
                             "shacl_healer_tokens",
                             "missing_entity_defs_tokens",
                         )
                     },
                     "openie_tokens": [stats["openie_tokens"] for _, stats in sorted(engine._chunk_rlm_stats.items())],
-                    "hits": {
-                        cache.stage: cache.hits
-                        for cache in (
-                            engine._text_vec_cache,
-                            engine._openie_fp_cache,
-                            engine._synonym_fp_cache,
-                            engine._shacl_fp_cache,
-                        )
-                    },
-                    "cache_rows": engine.conn.execute("SELECT COUNT(*) FROM candidate_stage_cache").fetchone()[0],
                     "trace_names": sorted({name for name, _, _ in engine._captured_graph_traces}),
-                    "namespace": engine._candidate_cache_namespace(),
-                    "code_fp": engine._candidate_cache_code_fp,
+                    "namespace": engine._embedding_cache_namespace(),
                     "embedding_kwargs": embedder.default_kwargs,
                     "implementation_root": str(Path(inspect.getfile(YawGraphEngine)).parent),
                 }

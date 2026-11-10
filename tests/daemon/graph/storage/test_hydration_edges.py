@@ -23,21 +23,30 @@ from yaw.daemon.graph.storage.hydration import (
     ("raw", "title", "expected"),
     [
         ("   ", "", ""),
-        ('["only"]', "ignored", "only"),
-        ('[1, "two", 3]', "", "1 two 3"),
-        ('["", ["first", null, "second"]]', "", "first second"),
-        ('["Title", ["One.", "Two."]]', "", "Title\nOne.Two."),
-        ('{"name":"Name","other":2,"absent":null}', "", "Name\nname: Name\nother: 2"),
-        ('"key": "value",', "", "key: value"),
-        ('" string "', "", "string"),
-        ("42", "", "42"),
-        ("plain prose", "Title", "Title\nplain prose"),
-        ("Title\nplain prose", "Title", "Title\nplain prose"),
-        ('{"text":"Title"},', "Title", "Title"),
+        ('"key": "value",', "", '{"key": "value"}'),
+        ('" string "', "", " string "),
+        ('{"title":"Title","text":"Body"}', "", "Title\nBody"),
+        ('{"content":"Body"}', "Title", "Title\nBody"),
     ],
 )
 def test_json_passage_variants_preserve_source_content(raw, title, expected):
     assert normalize_json_passage_text(raw, title) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '["Title", ["One.", "Two."]]',
+        "42",
+        "plain prose",
+        "{broken",
+        '"a":1 "b":2',
+        '"a":1,,"b":2',
+    ],
+)
+def test_json_hydration_rejects_unsupported_or_malformed_sources(raw):
+    with pytest.raises(ValueError):
+        normalize_json_passage_text(raw)
 
 
 def test_span_aliases_and_coalescing_preserve_titles_scores_and_hit_identity():
@@ -115,3 +124,12 @@ def test_budgeted_hydration_keeps_missing_and_normalizes_json_hits(tmp_path):
     assert result[0].text == "Source\nContent"
     assert result[1].stale_on_disk
     assert result[1].pointer.chunk_id == "missing"
+
+
+def test_hydration_rejects_invalid_utf8_instead_of_replacing_bytes(tmp_path):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.storage import hydrate_chunk_pointer
+
+    (tmp_path / "invalid.json").write_bytes(b'{"text":"invalid\xff"}')
+    with pytest.raises(UnicodeDecodeError):
+        hydrate_chunk_pointer(ChunkPointer("chunk-invalid", "invalid.json", 1, 1), tmp_path)

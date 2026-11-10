@@ -7,7 +7,7 @@ from typing import Literal
 import numpy as np
 import scipy.sparse as sp
 
-from yaw.core import RelationTraversalPolicy
+from yaw.core import RelationTraversalPolicy, bayesian_noisy_or, pool_confidences
 
 GraphActivation = Literal[
     "linear",
@@ -75,11 +75,12 @@ def min_max_normalize(scores: np.ndarray) -> np.ndarray:
 def build_transition_matrix(
     chunk_ids: Sequence[str],
     entity_ids: Sequence[str],
-    edges: Sequence[tuple[str, str, float] | tuple[str, str, str, float]],
+    edges: Sequence[tuple[str, str, str, float] | tuple[str, str, float]],
     *,
     beta: float = 0.5,
     policy: RelationTraversalPolicy | None = None,
     directed: bool = False,
+    node_priors: Mapping[str, float | None] | None = None,
 ) -> CSRGraph:
     """Construct a CSR transition operator W(beta) = D_in^-beta A D_out^-(1-beta) (arXiv:2609.32929v1)."""
     ordered_chunks = list(dict.fromkeys(chunk_ids))
@@ -113,9 +114,21 @@ def build_transition_matrix(
         )
     )
 
-    row_list: list[int] = []
-    col_list: list[int] = []
-    w_list: list[float] = []
+    pair_weights: dict[tuple[int, int], list[float]] = {}
+
+    def _add_transition(from_idx: int, to_idx: int, to_node_id: str, edge_w: float, multiplier: float) -> None:
+        if multiplier <= 0.0 or edge_w <= 0.0:
+            return
+        prior = node_priors.get(to_node_id) if node_priors is not None else None
+        if prior is not None:
+            pooled = pool_confidences(edge_w, prior)
+            w_eff = float(multiplier) * (float(pooled) if pooled is not None else float(edge_w))
+        else:
+            w_eff = float(multiplier) * float(edge_w)
+        if w_eff > 0.0:
+            # Transition from from_idx (column) to to_idx (row)
+            pair_weights.setdefault((to_idx, from_idx), []).append(w_eff)
+
     for edge in edges:
         src = edge[0]
         dst = edge[1]
@@ -127,101 +140,47 @@ def build_transition_matrix(
         if len(edge) == 4:
             kind = str(edge[2])
             base_w = float(edge[3])
-            if base_w <= 0.0 or kind == "owl:differentFrom":
-                continue
-            if kind == "skos:broader":
-                is_asymmetric = True
-                w_up = base_w * float(pol.skos_broader_up)
-                w_down = base_w * float(pol.skos_broader_down)
-                if w_up > 0.0:
-                    # Transition from child (u) -> parent (v): adj[v, u]
-                    row_list.append(v)
-                    col_list.append(u)
-                    w_list.append(w_up)
-                if w_down > 0.0 and not directed:
-                    # Transition from parent (v) -> child (u): adj[u, v]
-                    row_list.append(u)
-                    col_list.append(v)
-                    w_list.append(w_down)
-            elif kind in ("fact", "datatype_property", "owl:DatatypeProperty"):
-                if kind in ("datatype_property", "owl:DatatypeProperty"):
-                    eff_w = base_w * float(pol.datatype_property)
-                elif abs((base_w % 1.0) - 0.5) < 1e-6:
-                    eff_w = (base_w / 0.5) * float(pol.datatype_property)
-                else:
-                    eff_w = base_w
-                w_fwd = eff_w * float(pol.fact_forward)
-                w_rev = eff_w * float(pol.fact_reverse)
-                if w_fwd > 0.0:
-                    row_list.append(v)
-                    col_list.append(u)
-                    w_list.append(w_fwd)
-                if w_rev > 0.0 and not directed:
-                    row_list.append(u)
-                    col_list.append(v)
-                    w_list.append(w_rev)
-            elif kind == "passage":
-                w_p = base_w * float(pol.passage)
-                if w_p > 0.0:
-                    row_list.append(v)
-                    col_list.append(u)
-                    w_list.append(w_p)
-                    if not directed:
-                        row_list.append(u)
-                        col_list.append(v)
-                        w_list.append(w_p)
-            else:
-                w_rel = base_w * float(pol.skos_related)
-                if w_rel > 0.0:
-                    row_list.append(v)
-                    col_list.append(u)
-                    w_list.append(w_rel)
-                    if not directed:
-                        row_list.append(u)
-                        col_list.append(v)
-                        w_list.append(w_rel)
         else:
-            weight = float(edge[2])
-            if weight <= 0.0:
-                continue
-            row_list.append(v)
-            col_list.append(u)
-            w_list.append(weight)
+            kind = "passage"
+            base_w = float(edge[2])
+
+        if base_w <= 0.0 or kind == "owl:differentFrom":
+            continue
+
+        if kind == "skos:broader":
+            is_asymmetric = True
+            _add_transition(u, v, dst, base_w, pol.skos_broader_up)
             if not directed:
-                row_list.append(u)
-                col_list.append(v)
-                w_list.append(weight)
-
-    if row_list:
-        rows = np.asarray(row_list, dtype=np.int32)
-        cols = np.asarray(col_list, dtype=np.int32)
-        data = np.asarray(w_list, dtype=np.float64)
-
-        agg_mode = pol.parallel_aggregation
-        if agg_mode in ("sum", "capped_sum"):
-            adj = sp.csr_matrix(
-                (data, (rows, cols)),
-                shape=(n_total, n_total),
-                dtype=np.float64,
-            )
-            adj.sum_duplicates()
-            if agg_mode == "capped_sum":
-                np.minimum(adj.data, float(pol.parallel_cap), out=adj.data)
+                _add_transition(v, u, src, base_w, pol.skos_broader_down)
+        elif kind == "fact":
+            _add_transition(u, v, dst, base_w, pol.fact_forward)
+            if not directed:
+                _add_transition(v, u, src, base_w, pol.fact_reverse)
+        elif kind == "passage":
+            _add_transition(u, v, dst, base_w, pol.passage)
+            if not directed:
+                _add_transition(v, u, src, base_w, pol.passage)
         else:
-            # Pack (row, col) into 64-bit integer keys and keep max weight per directed pair
-            keys = (rows.astype(np.int64) << 32) | cols.astype(np.int64)
-            order = np.lexsort((-data, keys))
-            sorted_keys = keys[order]
-            first_mask = np.empty(len(sorted_keys), dtype=bool)
-            first_mask[0] = True
-            first_mask[1:] = sorted_keys[1:] != sorted_keys[:-1]
-            keep = order[first_mask]
+            _add_transition(u, v, dst, base_w, pol.skos_related)
+            if not directed:
+                _add_transition(v, u, src, base_w, pol.skos_related)
 
-            adj = sp.csr_matrix(
-                (data[keep], (rows[keep], cols[keep])),
-                shape=(n_total, n_total),
-                dtype=np.float64,
-            )
+    if pair_weights:
+        rows: list[int] = []
+        cols: list[int] = []
+        data: list[float] = []
+        for (r, c), w_list in pair_weights.items():
+            w_compound = bayesian_noisy_or(w_list) if len(w_list) > 1 else w_list[0]
+            if w_compound is not None and w_compound > 0.0:
+                rows.append(r)
+                cols.append(c)
+                data.append(w_compound)
+
+        adj = sp.csr_matrix(
+            (np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))),
+            shape=(n_total, n_total),
+            dtype=np.float64,
+        )
     else:
         adj = sp.csr_matrix((n_total, n_total), dtype=np.float64)
 

@@ -6,18 +6,26 @@ from typing import Any
 
 import dspy
 import numpy as np
+import pytest
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram, parse_synonym_decisions
+from yaw.daemon.graph.inference import YawProgram, parse_hierarchy_decisions
+from yaw.daemon.graph.inference.embedding import EmbeddingProfile
+from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
-    delete_chunks,
     lint_graph_shacl,
     load_graph_topology,
     merge_entities,
+    open_yaw_db,
+    upsert_entities,
+    upsert_entity_labels,
     upsert_semantic_edges,
 )
+from yaw.daemon.indexing import bind_native_indexing
+from yaw.daemon.ingestion.corpus import chunk_source_text
 
 
 class DeterministicMockLM(dspy.LM):
@@ -34,6 +42,7 @@ class DeterministicMockLM(dspy.LM):
         self._triples_json: str | None = None
         self._synonym_fn = synonym_fn
         self.observed_candidates: list[dict[str, Any]] = []
+        self.records: dict[str, tuple[str, str, str]] = {}
 
     def set_stage_responses(self, ner_json: str, triples_json: str) -> None:
         self._ner_json = ner_json
@@ -54,36 +63,39 @@ class DeterministicMockLM(dspy.LM):
 
     @staticmethod
     def _parse_candidate_pairs_from_text(text: str) -> list[dict[str, Any]]:
-        decoder = json.JSONDecoder()
-        found: list[dict[str, Any]] = []
-        for idx, ch in enumerate(text):
-            if ch != "[":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(text[idx:])
-            except json.JSONDecodeError:
-                continue
-            if (
-                isinstance(parsed, list)
-                and parsed
-                and all(isinstance(item, dict) and "pair_id" in item for item in parsed)
-            ):
-                found = parsed
-        return found
+        return candidate_rows(text)
 
     def __call__(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         full_text = self._extract_prompt_text(prompt, messages)
+        matched = sorted(
+            (
+                (max(full_text.rfind(text), full_text.rfind(json.dumps(text)[1:-1])), ner, triples)
+                for text, ner, triples in self.records.values()
+            ),
+            reverse=True,
+        )
+        ner_json, triples_json = (
+            matched[0][1:] if matched and matched[0][0] >= 0 else (self._ner_json, self._triples_json)
+        )
+        if "repl_history" in full_text and "variables_info" in full_text:
+            return [
+                json.dumps({"reasoning": "No semantic repair proposed by this fixture.", "code": "SUBMIT(repairs=[])"})
+            ]
         if "candidate_pairs" in full_text or '"pair_id"' in full_text:
             cands = self._parse_candidate_pairs_from_text(full_text)
             self.observed_candidates.extend(cands)
-            decisions = self._synonym_fn(cands) if self._synonym_fn is not None else []
+            decisions = complete_decisions(
+                cands,
+                self._synonym_fn(cands) if self._synonym_fn is not None else [],
+                stage_text=full_text,
+            )
             return [json.dumps({"decisions": decisions})]
-        if "triples" in full_text and "named_entities" in full_text and self._triples_json is not None:
-            return [self._triples_json]
-        if "named_entities" in full_text and self._ner_json is not None:
-            return [self._ner_json]
+        if "triples" in full_text and "named_entities" in full_text and triples_json is not None:
+            return [triples_json]
+        if "named_entities" in full_text and ner_json is not None:
+            return [ner_json]
         out = self._responses[self._idx % len(self._responses)]
         self._idx += 1
         return [out]
@@ -92,6 +104,7 @@ class DeterministicMockLM(dspy.LM):
 class DeterministicMockEmbedder:
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
+        self.profile = EmbeddingProfile("deterministic", "fixture-v1", dim, 2048, "mean", "", "")
 
     def encode(self, texts: Any, instruction: str = "", **kwargs: Any) -> np.ndarray:
         raw = np.ones((len(texts), self.dim), dtype=np.float32)
@@ -103,6 +116,7 @@ class DeterministicMockEmbedder:
 
 
 def _make_engine(
+    synonym_token_counter,
     tmp_path: Path,
     db_name: str,
     synonym_callback: Any = None,
@@ -110,13 +124,17 @@ def _make_engine(
     db_path = tmp_path / db_name
     mock_lm = DeterministicMockLM(synonym_fn=synonym_callback)
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm)
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+        )
     )
     return engine, engine.conn
 
@@ -126,7 +144,7 @@ def _index_chunk_with_record(
     chunk: ChunkPointer,
     text: str,
     record: OpenIERecord,
-) -> None:
+) -> ChunkPointer:
     ner_json = json.dumps(
         {
             "named_entities": [
@@ -139,12 +157,16 @@ def _index_chunk_with_record(
         {
             "triples": [
                 {
-                    "sub": [st.subj, st.subj_def],
+                    "sub": st.subj,
                     "pred": [
                         st.pred,
                         "owl:DatatypeProperty" if st.obj_kind == "literal" else "owl:ObjectProperty",
                     ],
-                    "obj": [st.obj, st.obj_def],
+                    "obj": (
+                        {"value": st.obj, "datatype": st.obj_datatype, "lang": st.obj_lang}
+                        if st.obj_kind == "literal"
+                        else st.obj
+                    ),
                     "def": st.spo_def or f"{st.subj} {st.pred} {st.obj}.",
                 }
                 for st in record.structured_triples
@@ -154,39 +176,45 @@ def _index_chunk_with_record(
     mock_lm = engine.program.rlm_sub_lm
     assert isinstance(mock_lm, DeterministicMockLM)
     mock_lm.set_stage_responses(ner_json, triples_json)
-    engine.index_chunks([(chunk, text)])
+    mock_lm.records[chunk.chunk_id] = (text, ner_json, triples_json)
+    rel_path = str(Path(chunk.rel_posix_path).with_suffix(".json"))
+    rows = [{"text": source} for source, _, _ in mock_lm.records.values()]
+    content = json.dumps(rows, indent=2)
+    (engine.workspace_root / rel_path).write_text(content, encoding="utf8")
+    chunks = chunk_source_text(content, rel_path, min_chunk_size=1)
+    engine.index_chunks(chunks)
+    return next(ptr for ptr, source in chunks if source == text)
 
 
 def test_datatype_property_literal_objects_stored_with_weighted_edges_and_excluded_from_skos(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify owl:DatatypeProperty literal objects are materialized in entities with contextual definitions,
-    connected via 0.5-weighted forward fact edges and passage edges, and excluded from SKOS disambiguation."""
-    # First verify HippoRAGProgram.extract_structured_triples preserves obj_def on obj_kind == 'literal'
+    """Literal objects belong to facts and never become entities or SKOS candidates."""
+    # Literal values are discovered by the fact extractor, not defined by NER.
     lm_triple_json = json.dumps(
         {
             "triples": [
                 {
-                    "sub": ["YAW Service", "A high performance knowledge graph daemon"],
+                    "sub": "YAW Service",
                     "pred": ["listens on port", "owl:DatatypeProperty"],
-                    "obj": ["8080", "Default HTTP listen port for YAW Service"],
+                    "obj": {"value": "8080", "datatype": "xsd:integer", "lang": ""},
                     "def": "YAW Service listens on port 8080.",
                 }
             ]
         }
     )
     dspy.settings.configure(lm=DeterministicMockLM([lm_triple_json]))
-    prog = HippoRAGProgram(enable_gbnf=False)
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     extracted_sts = prog.extract_structured_triples(
         "YAW Service listens on port 8080.",
         [
             ("YAW Service", "A high performance knowledge graph daemon"),
-            ("8080", "Default HTTP listen port for YAW Service"),
         ],
     )
     assert len(extracted_sts) == 1
     assert extracted_sts[0].obj_kind == "literal"
-    assert extracted_sts[0].obj_def == "Default HTTP listen port for YAW Service"
+    assert extracted_sts[0].obj_def == ""
 
     called_candidates: list[dict[str, Any]] = []
 
@@ -201,7 +229,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
             for c in candidates
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_lit_edges.db", synonym_callback=_judge)
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_lit_edges.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-1",
@@ -214,8 +242,6 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         chunk_id="chunk-1",
         entities=[
             ("YAW Service", "A high performance knowledge graph daemon"),
-            ("8080", "Default HTTP listen port for YAW Service"),
-            ("$1.2B", "Annual division revenue"),
         ],
         triples=[
             ("YAW Service", "listens on port", "8080"),
@@ -229,7 +255,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A high performance knowledge graph daemon",
-                obj_def="Default HTTP listen port for YAW Service",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="YAW Service",
@@ -238,78 +264,55 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A high performance knowledge graph daemon",
-                obj_def="Annual division revenue",
+                obj_def="",
             ),
         ],
     )
 
-    _index_chunk_with_record(engine, chunk, "YAW Service listens on port 8080 and generated $1.2B.", record)
+    chunk = _index_chunk_with_record(engine, chunk, "YAW Service listens on port 8080 and generated $1.2B.", record)
 
-    # Verify both 8080 and non-scalar $1.2B are stored as literal nodes with no duplicate '1 2b' concept node
+    # Verify scalar and formatted literals NEVER enter entities
     all_entities = {
-        r[1]: (r[0], r[2])
-        for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
+        r[1]: (r[0], r[2]) for r in conn.execute("SELECT entity_id, name, definition FROM entities").fetchall()
     }
-    assert "8080" in all_entities
-    assert "$1.2B" in all_entities
-    assert "1 2b" not in all_entities
-    lit_id = all_entities["8080"][0]
-    rev_id = all_entities["$1.2B"][0]
-    assert "Default HTTP listen port" in all_entities["8080"][1]
-    assert "Annual division revenue" in all_entities["$1.2B"][1]
+    assert "8080" not in all_entities
+    assert "$1.2B" not in all_entities
+    assert "YAW Service" in all_entities
+    subj_id = all_entities["YAW Service"][0]
 
-    # Verify facts table contains both literal facts with obj_id and obj_literal_lex
+    # Verify facts table contains both literal facts with obj_id=None and obj_literal_lex
     facts = conn.execute(
         "SELECT fact_id, subj_id, pred, obj_id, obj_kind, obj_literal_lex, obj_datatype FROM facts ORDER BY pred"
     ).fetchall()
     assert len(facts) == 2
-    subj_id = facts[0][1]
-    assert {f[3] for f in facts} == {lit_id, rev_id}
+    assert all(f[3] is None for f in facts)
     assert all(f[4] == "literal" for f in facts)
+    assert {f[5] for f in facts} == {"8080", "$1.2B"}
 
-    # Verify edges contains directed forward fact edges (subj_id -> lit_id, subj_id -> rev_id) with weight 0.5
-    fact_edges = {
-        (r[0], r[1]): float(r[3])
-        for r in conn.execute("SELECT src_id, dst_id, kind, weight FROM edges WHERE kind = 'fact'").fetchall()
-    }
-    assert fact_edges == {(subj_id, lit_id): 0.5, (subj_id, rev_id): 0.5}
+    # Verify edges contains zero fact edges to literal objects
+    fact_edges = conn.execute("SELECT src_id, dst_id, kind, weight FROM edges WHERE kind = 'fact'").fetchall()
+    assert len(fact_edges) == 0
 
-    # Verify passage edges connect chunk-1 to subj_id, lit_id, and rev_id
-    passage_edges = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'passage'"
-    ).fetchall()
+    # Verify passage edges connect chunk-1 to subj_id only
+    passage_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'passage'").fetchall()
     passage_pairs = {(r[0], r[1]) for r in passage_edges}
-    assert ("chunk-1", subj_id) in passage_pairs
-    assert ("chunk-1", lit_id) in passage_pairs
-    assert ("chunk-1", rev_id) in passage_pairs
+    assert (chunk.chunk_id, subj_id) in passage_pairs
 
-    # Verify pure literals '8080' and '$1.2B' were excluded from SKOS disambiguation and have zero skos:* edges
+    # Verify pure literals '8080' and '$1.2B' were excluded from SKOS candidate discovery
     assert len(called_candidates) == 0
     skos_edges = conn.execute(
         "SELECT src_id, dst_id, kind FROM edges WHERE kind IN ('skos:broader', 'skos:related')"
     ).fetchall()
     assert len(skos_edges) == 0
 
-    # Verify even direct storage calls to upsert_semantic_edges reject pure literal endpoints
-    upsert_semantic_edges(
-        conn,
-        [
-            (subj_id, lit_id, "skos:related", 1.0),
-            (subj_id, rev_id, "skos:broader", 1.0),
-        ],
-    )
-    skos_after = conn.execute(
-        "SELECT src_id, dst_id, kind FROM edges WHERE kind IN ('skos:broader', 'skos:related')"
-    ).fetchall()
-    assert len(skos_after) == 0
 
-
-def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge_and_delete(
+def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify a surface form used first as a literal and later as an ObjectProperty endpoint is promoted
-    to a skos:Concept, and merge_entities/delete_chunks preserve 0.5 weights on pure literal fact edges."""
-    engine, conn = _make_engine(tmp_path, "test_dual_role.db")
+    to a skos:Concept, and merge_entities preserves 0.5 weights on pure literal fact edges."""
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_dual_role.db")
 
     c1 = ChunkPointer("c1", "doc1.md", 1, 5, "Rollout")
     r1 = OpenIERecord(
@@ -317,7 +320,6 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         entities=[
             ("Gateway Alpha", "Primary API gateway"),
             ("Gateway Beta", "Secondary API gateway alias"),
-            ("8080", "Listen port"),
             ("canary", "Rollout mode string"),
         ],
         triples=[
@@ -333,7 +335,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Primary API gateway",
-                obj_def="Listen port",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="Gateway Beta",
@@ -342,7 +344,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Secondary API gateway alias",
-                obj_def="Listen port",
+                obj_def="",
             ),
             StructuredTriple(
                 subj="Gateway Alpha",
@@ -360,7 +362,6 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         chunk_id="c2",
         entities=[
             ("Gateway Alpha", "Primary API gateway"),
-            ("8080", "Listen port"),
         ],
         triples=[("Gateway Alpha", "fallback port", "8080")],
         structured_triples=[
@@ -371,7 +372,7 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="Primary API gateway",
-                obj_def="Listen port",
+                obj_def="",
             )
         ],
     )
@@ -381,32 +382,8 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
     alpha_id = ent_rows["gateway alpha"]
     beta_id = ent_rows["gateway beta"]
-    lit_id = ent_rows["8080"]
-    canary_id = ent_rows["canary"]
-
-    # While 'canary' only participates in obj_kind='literal' facts, it cannot participate in SKOS edges
-    upsert_semantic_edges(conn, [(canary_id, alpha_id, "skos:related", 0.8)])
-    assert (
-        len(
-            conn.execute(
-                "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related' AND src_id = ? AND dst_id = ?",
-                (canary_id, alpha_id),
-            ).fetchall()
-        )
-        == 0
-    )
-
-    # Merge beta into alpha: fact edge (alpha -> 8080) has 2 literal facts across c1 and c2 -> weight = 0.5 * 2 = 1.0
-    # Delete chunk c2: remaining literal fact in c1 between alpha and 8080 must have weight 0.5 (not 1.0!)
-    merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
-    delete_chunks(conn, ["c2"])
-    assert lint_graph_shacl(conn, auto_heal=False) == []
-    w_row = conn.execute(
-        "SELECT weight FROM edges WHERE src_id = ? AND dst_id = ? AND kind = 'fact'",
-        (alpha_id, lit_id),
-    ).fetchone()
-    assert w_row is not None
-    assert abs(float(w_row[0]) - 0.5) < 1e-6
+    assert "8080" not in ent_rows
+    assert "canary" in ent_rows
 
     # Now promote 'canary' to a skos:Concept by referencing it in an ObjectProperty fact
     c3 = ChunkPointer("c3", "doc3.md", 1, 5, "Rollout Controller")
@@ -439,13 +416,25 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
         (canary_concept_id, argo_id),
     ).fetchall()
     assert len(skos_rows) == 1
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
+
+    # Merge beta into alpha: literal facts across c1 and c2 are merged
+    merged = merge_entities(conn, beta_id, alpha_id, label_kind="skos:altLabel")
+    alpha_id = merged.canonical_id
+    assert lint_graph_shacl(conn) == []
+    lit_fact = conn.execute(
+        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
+    ).fetchone()
+    assert lit_fact is not None
+    assert lit_fact[0] == alpha_id
+    assert lit_fact[1] == "uses port"
+    assert lit_fact[3] == "literal"
+    assert lit_fact[4] is None
 
 
-def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
-    """Verify that entity-to-entity facts store ONLY forward (subj -> obj) edges with weight 1.0,
-    and topology + transition matrix distinguish ObjectProperty (1.0) vs DatatypeProperty (0.5)."""
-    engine, conn = _make_engine(tmp_path, "test_directed_edges.db")
+def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
+    """Resource facts retain measured forward weights; literal objects create no graph edge."""
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_directed_edges.db")
 
     chunk = ChunkPointer(
         chunk_id="chunk-2",
@@ -459,7 +448,6 @@ def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
         entities=[
             ("YAW Daemon", "A service daemon"),
             ("SQLite Engine", "A database engine"),
-            ("8080", "Listen port"),
         ],
         triples=[
             ("YAW Daemon", "embeds", "SQLite Engine"),
@@ -481,7 +469,7 @@ def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
                 obj_kind="literal",
                 obj_datatype="rdfs:Literal",
                 subj_def="A service daemon",
-                obj_def="Listen port",
+                obj_def="",
             ),
         ],
     )
@@ -492,95 +480,55 @@ def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
     ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
     s_id = ent_rows["yaw daemon"]
     o_id = ent_rows["sqlite engine"]
-    lit_id = ent_rows["8080"]
+    assert "8080" not in ent_rows
 
     fact_edges = {
         (r[0], r[1]): float(r[2])
         for r in conn.execute("SELECT src_id, dst_id, weight FROM edges WHERE kind = 'fact'").fetchall()
     }
-    # Must contain ONLY forward edges with 1.0 for ObjectProperty and 0.5 for DatatypeProperty
+    expected_weight = conn.execute(
+        "SELECT fs.atomic_confidence FROM fact_sources fs JOIN facts f USING(fact_id) WHERE f.obj_kind='entity'"
+    ).fetchone()[0]
+    assert 0 < expected_weight < 1
+    # One source observation supports only the forward resource edge.
     assert (s_id, o_id) in fact_edges
     assert (o_id, s_id) not in fact_edges
-    assert abs(fact_edges[(s_id, o_id)] - 1.0) < 1e-6
-    assert (s_id, lit_id) in fact_edges
-    assert (lit_id, s_id) not in fact_edges
-    assert abs(fact_edges[(s_id, lit_id)] - 0.5) < 1e-6
+    assert fact_edges[(s_id, o_id)] == pytest.approx(expected_weight)
+    assert len(fact_edges) == 1
 
-    # Verify load_graph_topology and build_transition_matrix preserve 1.0 vs 0.5
-    chunk_ids, entity_ids, topo_edges = load_graph_topology(conn, include_kinds=True)
+    # Verify literal fact exists strictly in facts table
+    lit_fact = conn.execute(
+        "SELECT subj_id, pred, obj_literal_lex, obj_kind, obj_id FROM facts WHERE obj_literal_lex = '8080'"
+    ).fetchone()
+    assert lit_fact is not None
+    assert lit_fact[0] == s_id
+    assert lit_fact[1] == "uses port"
+    assert lit_fact[3] == "literal"
+    assert lit_fact[4] is None
+
+    # Verify load_graph_topology and build_transition_matrix preserve the fact edge
+    chunk_ids, entity_ids, topo_edges, _ = load_graph_topology(conn)
     topo_fact_weights = {(src, dst): float(w) for src, dst, k, w in topo_edges if k == "fact"}
-    assert abs(topo_fact_weights[(s_id, o_id)] - 1.0) < 1e-6
-    assert abs(topo_fact_weights[(s_id, lit_id)] - 0.5) < 1e-6
+    assert topo_fact_weights[(s_id, o_id)] == pytest.approx(expected_weight)
+    assert len(topo_fact_weights) == 1
 
     policy = RelationTraversalPolicy()
     csr = build_transition_matrix(chunk_ids, entity_ids, topo_edges, policy=policy, directed=True)
     raw_s_to_o = float(csr.transition_t[csr.node_to_idx[o_id], csr.node_to_idx[s_id]])
-    raw_s_to_lit = float(csr.transition_t[csr.node_to_idx[lit_id], csr.node_to_idx[s_id]])
-    assert raw_s_to_o > raw_s_to_lit > 0.0
+    assert raw_s_to_o > 0.0
 
 
-def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canonical_demotes(
+def test_skos_broader_rejects_missing_canonical(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify that inverted subsumption assertions are corrected from child to parent,
-    missing canonical on skos:broader is demoted to symmetric skos:related, and direct
-    upsert_semantic_edges calls also enforce lexical subsumption inversion."""
-    # First check parse_synonym_decisions does not default missing canonical to 'A' on skos:broader
-    parsed = parse_synonym_decisions('{"decisions": [{"pair_id": 0, "relation": "skos:broader"}]}')
+    """Verify that parse_hierarchy_decisions extracts skos:broader and direction cleanly."""
+    payload = json.dumps({"decisions": [{"pair_id": "a|b", "reasoning": "valid", "broader": True, "narrower": False}]})
+    parsed = parse_hierarchy_decisions(payload)
     assert len(parsed) == 1
-    assert parsed[0]["canonical"] == ""
+    assert parsed[0]["relation"] == "skos:broader"
+    assert parsed[0]["source_direction"] == "a_to_b"
 
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [
-            {
-                "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "redwood hosted inference",  # Erroneous canonical pointing to compound!
-            }
-            for c in candidates
-        ]
-
-    engine, conn = _make_engine(tmp_path, "test_subsumption.db", synonym_callback=_judge)
-
-    chunk = ChunkPointer(
-        chunk_id="chunk-3",
-        rel_posix_path="doc3.md",
-        start_line=1,
-        end_line=5,
-        title="Inference Systems",
-    )
-    record = OpenIERecord(
-        chunk_id="chunk-3",
-        entities=[
-            ("inference", "Generic model inference process"),
-            ("redwood hosted inference", "A specialized hosted inference cluster"),
-        ],
-        triples=[],
-        structured_triples=[],
-    )
-
-    _index_chunk_with_record(engine, chunk, "Inference and redwood hosted inference systems.", record)
-
-    ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
-    inf_id = ent_rows["inference"]
-    rhi_id = ent_rows["redwood hosted inference"]
-
-    broader_edges = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'"
-    ).fetchall()
-    assert len(broader_edges) == 1
-    assert tuple(broader_edges[0]) == (rhi_id, inf_id)
-
-    # Verify direct upsert_semantic_edges also inverts erroneous (head -> modifier_head) skos:broader
-    conn.execute("DELETE FROM edges WHERE kind = 'skos:broader'")
-    upsert_semantic_edges(conn, [(inf_id, rhi_id, "skos:broader", 0.85)])
-    direct_broader = conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'"
-    ).fetchall()
-    assert len(direct_broader) == 1
-    assert tuple(direct_broader[0]) == (rhi_id, inf_id)
-
-    # Also verify missing canonical on skos:broader demotes to symmetric skos:related
     def _judge_empty_canonical(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
@@ -591,7 +539,9 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
             for c in candidates
         ]
 
-    engine2, conn2 = _make_engine(tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical)
+    engine2, conn2 = _make_engine(
+        synonym_token_counter, tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical
+    )
     record2 = OpenIERecord(
         chunk_id="chunk-3b",
         entities=[
@@ -601,135 +551,118 @@ def test_lexical_subsumption_guard_inverts_erroneous_direction_and_missing_canon
         triples=[],
         structured_triples=[],
     )
-    _index_chunk_with_record(
-        engine2,
-        ChunkPointer("chunk-3b", "doc3b.md", 1, 5, "Subsystems"),
-        "Alpha engine and beta router.",
-        record2,
-    )
-    assert (
-        len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall())
-        == 0
-    )
-    assert (
-        len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall())
-        == 2
-    )
+    with pytest.raises(ValueError, match="invalid canonical"):
+        _index_chunk_with_record(
+            engine2,
+            ChunkPointer("chunk-3b", "doc3b.md", 1, 5, "Subsystems"),
+            "Alpha engine and beta router.",
+            record2,
+        )
+    assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
+    assert len(conn2.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 0
 
 
-def test_version_sibling_guard_demotes_to_related(tmp_path: Path) -> None:
-    """Verify that coordinate version siblings are demoted from skos:broader to skos:related
-    both in JudgeSynonyms and in direct upsert_semantic_edges calls."""
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [
-            {
-                "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "HTTP 3",
-            }
-            for c in candidates
-        ]
-
-    engine, conn = _make_engine(tmp_path, "test_siblings.db", synonym_callback=_judge)
-
-    chunk = ChunkPointer(
-        chunk_id="chunk-4",
-        rel_posix_path="doc4.md",
-        start_line=1,
-        end_line=5,
-        title="Web Protocols",
-    )
-    record = OpenIERecord(
-        chunk_id="chunk-4",
-        entities=[
-            ("HTTP 2", "Hypertext Transfer Protocol version 2"),
-            ("HTTP 3", "Hypertext Transfer Protocol version 3 over QUIC"),
+def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
+    synonym_token_counter,
+    tmp_path: Path,
+) -> None:
+    """Verify apply_synonym_adjudication executes only Gemma 4 decisions without acronym/homograph overrides,
+    and prevents merging fact-linked poles even when entity names differ."""
+    # 1. Verify ("audit trails", "ATS") with Gemma 4 skos:related is NOT overridden into skos:altLabel merge
+    stage_conn = open_yaw_db(":memory:")
+    upsert_entities(
+        stage_conn,
+        [
+            ("ent-ats", "ATS", "Applicant Tracking System"),
+            ("ent-audit", "audit trails", "Immutable security audit logs"),
+            ("ent-sec-a", "Security", "Security team in doc A"),
+            ("ent-sec-b", "Security", "Security role in doc B"),
         ],
-        triples=[],
-        structured_triples=[],
     )
+    candidates = [
+        {"entity_a": "ent-ats", "entity_b": "ent-audit", "similarity": 0.88},
+        {"entity_a": "ent-sec-a", "entity_b": "ent-sec-b", "similarity": 0.92},
+    ]
+    cand_meta = {
+        "ent-ats": ("ATS", "Applicant Tracking System"),
+        "ent-audit": ("audit trails", "Immutable security audit logs"),
+        "ent-sec-a": ("Security", "Security team in doc A"),
+        "ent-sec-b": ("Security", "Security role in doc B"),
+    }
+    decisions = [
+        {"pair_id": "ent-ats|ent-audit", "relation": "skos:related", "canonical": "ent-audit"},
+        {"pair_id": "ent-sec-a|ent-sec-b", "relation": "skos:related", "canonical": "ent-sec-a"},
+    ]
+    rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+    staged_merges, semantic_batch = apply_synonym_adjudication(
+        stage_conn,
+        candidates,
+        cand_meta,
+        decisions,
+        set(),
+        rlm_stats=rlm_stats,
+    )
+    assert staged_merges == []
+    assert rlm_stats["merged_entities"] == 0
+    assert rlm_stats["different_from_edges"] == 0
+    assert rlm_stats["related_edges"] == 2
+    assert [row[:4] for row in semantic_batch] == [
+        ("ent-ats", "ent-audit", "skos:related", 0.88),
+        ("ent-sec-a", "ent-sec-b", "skos:related", 0.92),
+    ]
+    stage_conn.close()
 
-    _index_chunk_with_record(engine, chunk, "Protocols HTTP 2 and HTTP 3.", record)
-
-    # skos:broader must NOT be emitted
-    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(broader_edges) == 0
-
-    # Symmetric skos:related must be emitted instead
-    related_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()
-    assert len(related_edges) == 2
-
-    # Verify direct upsert_semantic_edges call also demotes version siblings from skos:broader to skos:related
-    ent_rows = {r[0].lower(): r[1] for r in conn.execute("SELECT name, entity_id FROM entities").fetchall()}
-    h2_id, h3_id = ent_rows["http 2"], ent_rows["http 3"]
-    conn.execute("DELETE FROM edges WHERE kind IN ('skos:broader', 'skos:related')")
-    upsert_semantic_edges(conn, [(h2_id, h3_id, "skos:broader", 0.9)])
-    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()) == 0
-    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
-
-
-def test_acronym_guard_routes_to_alt_label_merge(tmp_path: Path) -> None:
-    """Verify that acronym pairs are merged as skos:altLabel instead of emitting skos:broader,
-    both in the JudgeSynonyms loop and in the fallback loop."""
-    def _judge(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+    # 2. Verify fact_linked_pairs prevents self-loop merge even when name_src != name_tgt
+    def _judge_alt(cands: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {
                 "pair_id": c["pair_id"],
-                "relation": "skos:broader",
-                "canonical": "service level objectives",
+                "relation": "skos:altLabel",
+                "canonical": "NetSuite",
             }
-            for c in candidates
+            for c in cands
         ]
 
-    engine, conn = _make_engine(tmp_path, "test_acronym.db", synonym_callback=_judge)
-
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_fact_pole.db", synonym_callback=_judge_alt)
     chunk = ChunkPointer(
         chunk_id="chunk-5",
         rel_posix_path="doc5.md",
         start_line=1,
         end_line=5,
-        title="SRE Concepts",
+        title="ERP Sync",
     )
     record = OpenIERecord(
         chunk_id="chunk-5",
         entities=[
-            ("SLOs", "Reliability goals"),
-            ("service level objectives", "Formal reliability commitments"),
+            ("NetSuite", "Enterprise ERP system"),
+            ("NetSuite import", "Nightly financial import pipeline into NetSuite"),
         ],
-        triples=[],
-        structured_triples=[],
+        triples=[("NetSuite import", "loads into", "NetSuite")],
+        structured_triples=[
+            StructuredTriple(
+                subj="NetSuite import",
+                pred="loads into",
+                obj="NetSuite",
+                obj_kind="entity",
+                subj_def="Nightly financial import pipeline into NetSuite",
+                obj_def="Enterprise ERP system",
+                spo_def="NetSuite import loads into NetSuite.",
+            )
+        ],
     )
+    _index_chunk_with_record(engine, chunk, "NetSuite import loads into NetSuite.", record)
 
-    _index_chunk_with_record(engine, chunk, "SRE SLOs and service level objectives.", record)
-
-    # Zero skos:broader edges
-    broader_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader'").fetchall()
-    assert len(broader_edges) == 0
-
-    # The entities must be merged into 1 entity with skos:altLabel
-    entities = conn.execute("SELECT entity_id, name FROM entities").fetchall()
-    assert len(entities) == 1
-    assert entities[0][1].lower() == "service level objectives"
-
-    labels = conn.execute("SELECT label_norm, label_kind FROM entity_labels").fetchall()
-    kinds = {lkind for _, lkind in labels}
-    assert "skos:prefLabel" in kinds
-    assert "skos:altLabel" in kinds
-
-    # Verify fallback loop also merges acronyms when JudgeSynonyms returns empty decisions
-    engine_fb, conn_fb = _make_engine(
-        tmp_path, "test_acronym_fallback.db", synonym_callback=lambda _: []
-    )
-    _index_chunk_with_record(engine_fb, chunk, "SRE SLOs and service level objectives.", record)
-    entities_fb = conn_fb.execute("SELECT entity_id, name FROM entities").fetchall()
-    assert len(entities_fb) == 1
-    assert entities_fb[0][1].lower() == "service level objectives"
+    # Both fact poles must remain distinct entities and the connecting fact must survive
+    entities = {str(r[1]) for r in conn.execute("SELECT entity_id, name FROM entities").fetchall()}
+    assert entities == {"NetSuite", "NetSuite import"}
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
 
-def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> None:
+def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter, tmp_path: Path) -> None:
     """Verify C++, C#, and Python 3.10 remain distinct entities with preserved surface forms in entities.name
     and entity_labels.raw_label, normalized label_norms in entity_labels, and COLLATE NOCASE on entities.name."""
-    engine, conn = _make_engine(tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
+    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
     chunk = ChunkPointer(
         chunk_id="chunk-tech-1",
         rel_posix_path="languages.md",
@@ -770,7 +703,9 @@ def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> No
         ],
     )
 
-    _index_chunk_with_record(engine, chunk, "C++ contrasts with C#. Python 3.10 interoperates with C++.", record)
+    chunk = _index_chunk_with_record(
+        engine, chunk, "C++ contrasts with C#. Python 3.10 interoperates with C++.", record
+    )
 
     rows = conn.execute("SELECT entity_id, name FROM entities ORDER BY name ASC").fetchall()
     names = {str(r[1]): str(r[0]) for r in rows}
@@ -785,22 +720,33 @@ def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> No
     assert str(nocase_row[0]) == "Python 3.10"
 
     label_rows = conn.execute(
-        "SELECT label_norm, raw_label, label_kind FROM entity_labels WHERE chunk_id = 'chunk-tech-1'"
+        "SELECT label_norm, raw_label, label_kind FROM entity_labels WHERE chunk_id = ?", (chunk.chunk_id,)
     ).fetchall()
     labels_by_norm = {str(r[0]): (str(r[1]), str(r[2])) for r in label_rows}
     assert labels_by_norm["c++"] == ("C++", "skos:prefLabel")
     assert labels_by_norm["c#"] == ("C#", "skos:prefLabel")
     assert labels_by_norm["python 3.10"] == ("Python 3.10", "skos:prefLabel")
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
 
 
 def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_false_different_from(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify cased literal objects ('AWS TGW', 'Pricing addendum', 'KMS/region support matrix', 'Diego Morales')
     and consecutive chunks of the same document ('Priya Nair', 'Ethan Cole', 'Diego Morales') never split into
     duplicate entities or produce false owl:differentFrom edges."""
-    engine, conn = _make_engine(tmp_path, "test_no_false_diff.db", synonym_callback=lambda _: [])
+
+    def judge_same_people(candidates):
+        return [
+            {"pair_id": pair["pair_id"], "relation": "skos:exactMatch", "definition": "A participant in the meeting."}
+            for pair in candidates
+            if pair["name_a"].casefold() == pair["name_b"].casefold()
+        ]
+
+    engine, conn = _make_engine(
+        synonym_token_counter, tmp_path, "test_no_false_diff.db", synonym_callback=judge_same_people
+    )
 
     doc_path = tmp_path / "meeting.md"
     doc_path.write_text(
@@ -884,6 +830,7 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
         chunk_id="chunk-meet-2",
         entities=[
             ("Priya Nair", "A participant in the meeting."),
+            ("Pricing addendum", "Contract pricing document under review"),
             ("Ethan Cole", "A participant in the meeting."),
             ("Diego Morales", "A participant in the meeting."),
             ("Meeting", "Architecture and procurement sync meeting"),
@@ -946,16 +893,248 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
         ]
         assert len(eids) == 1, f"Expected 1 entity for {target_label!r}, got {eids}"
 
-    # Verify Priya Nair combined her header role and dialogue role in her definition
-    priya_def = str(
-        conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0]
-    )
-    assert "Helix Procurement" in priya_def
-    assert "participant in the meeting" in priya_def
+    # Verify Priya Nair retained the longer canonical definition after auto-merge
+    priya_def = str(conn.execute("SELECT definition FROM entities WHERE name = 'Priya Nair'").fetchone()[0])
+    assert priya_def == "A participant in the meeting."
 
     # Zero owl:differentFrom edges in the entire graph
     diff_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'owl:differentFrom'").fetchall()
     assert diff_edges == []
-    assert lint_graph_shacl(conn, auto_heal=False) == []
+    assert lint_graph_shacl(conn) == []
 
 
+def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() -> None:
+    """Verify semantic edges buffered before a later merge in the same batch are remapped to surviving entities
+    with zero EdgeShape/closedWorld dangling-endpoint SHACL violations."""
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-a", "NetSuite", "Enterprise ERP platform"),
+                ("ent-b", "NetSuite import", "Nightly ERP import pipeline"),
+                ("ent-c", "NetSuite staging import", "Staging import pipeline into NetSuite"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("netsuite", "ent-a", "skos:prefLabel", "NetSuite", "c1"),
+                ("netsuite import", "ent-b", "skos:prefLabel", "NetSuite import", "c1"),
+                ("netsuite staging import", "ent-c", "skos:prefLabel", "NetSuite staging import", "c2"),
+            ],
+        )
+        candidates = [
+            {"entity_a": "ent-a", "entity_b": "ent-b", "similarity": 0.85},
+            {"entity_a": "ent-b", "entity_b": "ent-c", "similarity": 0.91},
+        ]
+        cand_meta = {
+            "ent-a": ("NetSuite", "Enterprise ERP platform"),
+            "ent-b": ("NetSuite import", "Nightly ERP import pipeline"),
+            "ent-c": ("NetSuite staging import", "Staging import pipeline into NetSuite"),
+        }
+        decisions = [
+            {"pair_id": "ent-a|ent-b", "relation": "skos:related", "canonical": "ent-a"},
+            {"pair_id": "ent-b|ent-c", "relation": "skos:altLabel", "canonical": "ent-c"},
+        ]
+        rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+        staged_merges, resolved_batch = apply_synonym_adjudication(
+            stage_conn,
+            candidates,
+            cand_meta,
+            decisions,
+            set(),
+            rlm_stats=rlm_stats,
+        )
+        assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [("ent-c", "ent-b")]
+        assert [row[:4] for row in resolved_batch] == [("ent-a", "ent-b", "skos:related", 0.85)]
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()
+
+
+def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separated_clusters() -> None:
+    """Accepted semantic separations and fact poles both survive later transitive merge proposals."""
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-a", "Service Alpha", "Primary service mention A"),
+                ("ent-b", "Alpha Service", "Primary service mention B"),
+                ("ent-c", "Alpha", "Primary service mention C"),
+                ("ent-p1", "Billing Service", "Core billing system"),
+                ("ent-alias", "Billing Platform", "Core billing system alias"),
+                ("ent-p2", "invoice_record", "Invoice record emitted by Billing Service"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("service alpha", "ent-a", "skos:prefLabel", "Service Alpha", "c1"),
+                ("alpha service", "ent-b", "skos:prefLabel", "Alpha Service", "c1"),
+                ("alpha", "ent-c", "skos:prefLabel", "Alpha", "c2"),
+                ("billing service", "ent-p1", "skos:prefLabel", "Billing Service", "c3"),
+                ("billing platform", "ent-alias", "skos:prefLabel", "Billing Platform", "c3"),
+                ("invoice_record", "ent-p2", "skos:prefLabel", "invoice_record", "c3"),
+            ],
+        )
+        candidates = [
+            {"entity_a": "ent-a", "entity_b": "ent-c", "similarity": 0.84},
+            {"entity_a": "ent-a", "entity_b": "ent-b", "similarity": 0.89},
+            {"entity_a": "ent-b", "entity_b": "ent-c", "similarity": 0.87},
+            {"entity_a": "ent-p1", "entity_b": "ent-alias", "similarity": 0.93},
+            {"entity_a": "ent-alias", "entity_b": "ent-p2", "similarity": 0.82},
+        ]
+        cand_meta = {
+            "ent-a": ("Service Alpha", "Primary service mention A"),
+            "ent-b": ("Alpha Service", "Primary service mention B"),
+            "ent-c": ("Alpha", "Primary service mention C"),
+            "ent-p1": ("Billing Service", "Core billing system"),
+            "ent-alias": ("Billing Platform", "Core billing system alias"),
+            "ent-p2": ("invoice_record", "Invoice record emitted by Billing Service"),
+        }
+        decisions = [
+            {"pair_id": "ent-a|ent-c", "relation": "skos:related", "canonical": "ent-a"},
+            {"pair_id": "ent-a|ent-b", "relation": "skos:altLabel", "canonical": "ent-a"},
+            {"pair_id": "ent-b|ent-c", "relation": "skos:altLabel", "canonical": "ent-c"},
+            {"pair_id": "ent-p1|ent-alias", "relation": "skos:altLabel", "canonical": "ent-alias"},
+            {"pair_id": "ent-alias|ent-p2", "relation": "skos:altLabel", "canonical": "ent-p2"},
+        ]
+        rlm_stats = {"merged_entities": 0, "related_edges": 0, "different_from_edges": 0, "broader_edges": 0}
+        staged_merges, resolved_batch = apply_synonym_adjudication(
+            stage_conn,
+            candidates,
+            cand_meta,
+            decisions,
+            {("ent-p1", "ent-p2")},
+            rlm_stats=rlm_stats,
+        )
+        assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [
+            ("ent-b", "ent-a"),
+            ("ent-p1", "ent-alias"),
+        ]
+        assert [row[:4] for row in resolved_batch] == [
+            ("ent-a", "ent-c", "skos:related", 0.84),
+            ("ent-alias", "ent-p2", "skos:related", 0.82),
+        ]
+        surviving = {str(r[0]) for r in stage_conn.execute("SELECT entity_id FROM entities").fetchall()}
+        assert surviving == {"ent-a", "ent-c", "ent-alias", "ent-p2"}
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()
+
+
+def test_statement_shape_closed_world_flags_and_repairs_duplicate_endpoint_definitions() -> None:
+    """Verify StatementShape/closedWorld and validate_stage_invariants('triples') flag statement definitions
+    that duplicate an endpoint entity definition verbatim, and apply_shacl_repairs heals them."""
+    from yaw.daemon.graph.inference.invariants import validate_stage_invariants
+    from yaw.daemon.graph.storage import (
+        apply_shacl_repairs,
+        upsert_chunk_pointers,
+        upsert_fact_sources,
+        upsert_facts,
+    )
+
+    inv_score, inv_fb = validate_stage_invariants(
+        "triples",
+        {
+            "passage": "NetSuite exports records to Snowflake.",
+            "named_entities": [
+                ["NetSuite", "Enterprise ERP system"],
+                ["Snowflake", "Cloud data warehouse"],
+            ],
+        },
+        dspy.Prediction(
+            triples=[
+                {
+                    "sub": "NetSuite",
+                    "pred": ["exports to", "owl:ObjectProperty"],
+                    "obj": "Snowflake",
+                    "def": "Enterprise ERP system",
+                }
+            ]
+        ),
+    )
+    assert inv_score < 1.0
+    assert "StatementShape/closedWorld" in inv_fb
+
+    stage_conn = open_yaw_db(":memory:")
+    try:
+        upsert_chunk_pointers(
+            stage_conn,
+            [(ChunkPointer("c1", "doc.md", 1, 5, "Doc"), "NetSuite exports records to Snowflake.")],
+        )
+        upsert_entities(
+            stage_conn,
+            [
+                ("ent-s", "NetSuite", "Enterprise ERP system"),
+                ("ent-o", "Snowflake", "Cloud data warehouse"),
+            ],
+        )
+        upsert_entity_labels(
+            stage_conn,
+            [
+                ("netsuite", "ent-s", "skos:prefLabel", "NetSuite", "c1"),
+                ("snowflake", "ent-o", "skos:prefLabel", "Snowflake", "c1"),
+            ],
+        )
+        upsert_facts(
+            stage_conn,
+            [
+                (
+                    "fact-dup-subj",
+                    "ent-s",
+                    "exports to",
+                    "ent-o",
+                    '["netsuite", "exports to", "snowflake"]',
+                    "Enterprise ERP system",
+                    "entity",
+                    None,
+                    "",
+                    "",
+                ),
+                (
+                    "fact-dup-obj",
+                    "ent-s",
+                    "syncs with",
+                    "ent-o",
+                    '["netsuite", "syncs with", "snowflake"]',
+                    "Cloud data warehouse",
+                    "entity",
+                    None,
+                    "",
+                    "",
+                ),
+            ],
+        )
+        upsert_fact_sources(stage_conn, [("fact-dup-subj", "c1"), ("fact-dup-obj", "c1")])
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('c1', 'ent-s', 'passage', 1.0)")
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('c1', 'ent-o', 'passage', 1.0)")
+        stage_conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-s', 'ent-o', 'fact', 1.0)")
+
+        violations = lint_graph_shacl(stage_conn)
+        dup_violations = [
+            v for v in violations if v.shape == "StatementShape/closedWorld" and v.result_path == "skos:definition"
+        ]
+        assert {v.focus_node for v in dup_violations} == {"fact-dup-subj", "fact-dup-obj"}
+
+        applied = apply_shacl_repairs(
+            stage_conn,
+            [
+                {
+                    "focus_node": "fact-dup-subj",
+                    "action": "set_definition",
+                    "value": "NetSuite exports records to Snowflake.",
+                },
+                {
+                    "focus_node": "fact-dup-obj",
+                    "action": "set_definition",
+                    "value": "NetSuite syncs financial tables with Snowflake.",
+                },
+            ],
+        )
+        assert applied == 2
+        assert lint_graph_shacl(stage_conn) == []
+    finally:
+        stage_conn.close()

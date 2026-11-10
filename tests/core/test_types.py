@@ -4,20 +4,19 @@ import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 from yaw.core.types import (
     ChunkPointer,
     HydratedPassage,
     OpenIERecord,
     RetrievalResult,
-    SyncDelta,
-    check_lexical_subsumption_inversion,
     compute_chunk_id,
     compute_mdhash_id,
+    detect_scalar_literal,
     inclusive_end_line,
     resolve_corpus_path,
     text_processing,
-    to_rel_posix_path,
 )
 
 
@@ -99,25 +98,6 @@ class TypesTests(unittest.TestCase):
             result.answer = "mutated"  # type: ignore
         self.assertFalse(hasattr(result, "__dict__"))
 
-    def test_sync_delta_invariants(self):
-        delta_empty = SyncDelta()
-        self.assertEqual(delta_empty.added_chunks, ())
-        self.assertEqual(delta_empty.deleted_chunk_ids, ())
-
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
-        delta = SyncDelta(
-            added_chunks=((pointer, "Full chunk body text"),),
-            deleted_chunk_ids=("c0",),
-        )
-        self.assertEqual(len(delta.added_chunks), 1)
-        self.assertEqual(delta.added_chunks[0][0], pointer)
-        self.assertEqual(delta.added_chunks[0][1], "Full chunk body text")
-        self.assertEqual(delta.deleted_chunk_ids, ("c0",))
-
-        with self.assertRaises((FrozenInstanceError, AttributeError)):
-            delta.deleted_chunk_ids = ()  # type: ignore
-        self.assertFalse(hasattr(delta, "__dict__"))
-
     def test_compute_mdhash_id_and_chunk_id(self):
         content = "test text"
         raw_hash = compute_mdhash_id(content)
@@ -149,15 +129,9 @@ class TypesTests(unittest.TestCase):
             resolved = resolve_corpus_path(root, "nested/doc.md")
             self.assertEqual(resolved, sub)
 
-            # Valid relative posix path conversion
-            rel = to_rel_posix_path(root, sub)
-            self.assertEqual(rel, "nested/doc.md")
-
             # Traversal attempt rejection
             with self.assertRaises(ValueError):
                 resolve_corpus_path(root, "../outside.txt")
-            with self.assertRaises(ValueError):
-                to_rel_posix_path(root, root.parent / "outside.txt")
 
     def test_text_processing(self):
         self.assertEqual(text_processing("Apple Inc."), "apple inc")
@@ -186,7 +160,30 @@ class TypesTests(unittest.TestCase):
             ["apple inc", "google llc", "c++", "c#"],
         )
 
-    def test_check_lexical_subsumption_inversion_preserves_technical_tokens(self):
-        self.assertFalse(check_lexical_subsumption_inversion("C", "C++"))
-        self.assertFalse(check_lexical_subsumption_inversion("C++", "C#"))
-        self.assertTrue(check_lexical_subsumption_inversion("C++", "C++ Standard Library"))
+    def test_detect_scalar_literal_xsd_datatypes(self):
+        self.assertEqual(detect_scalar_literal("true"), (True, "xsd:boolean"))
+        self.assertEqual(detect_scalar_literal("FALSE"), (True, "xsd:boolean"))
+        self.assertEqual(detect_scalar_literal("8080"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("-42"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("+100"), (True, "xsd:integer"))
+        self.assertEqual(detect_scalar_literal("3.14159"), (True, "xsd:decimal"))
+        self.assertEqual(detect_scalar_literal("-0.5"), (True, "xsd:decimal"))
+        self.assertEqual(detect_scalar_literal("2026-10-25"), (True, "xsd:date"))
+        self.assertEqual(detect_scalar_literal("2026-10-25T12:30:00Z"), (True, "xsd:dateTime"))
+        self.assertEqual(detect_scalar_literal("2026-10-25 12:30:00+02:00"), (True, "xsd:dateTime"))
+        self.assertEqual(detect_scalar_literal("12:30:00"), (True, "xsd:time"))
+        self.assertEqual(detect_scalar_literal("12:30:00Z"), (True, "xsd:time"))
+        self.assertEqual(detect_scalar_literal("12:30:00+02:00"), (True, "xsd:time"))
+        self.assertEqual(detect_scalar_literal("14:30"), (True, "xsd:time"))
+        self.assertEqual(detect_scalar_literal("2:30 pm"), (True, "xsd:time"))
+        self.assertEqual(detect_scalar_literal("15ms"), (True, "xsd:duration"))
+        self.assertEqual(detect_scalar_literal("10s"), (True, "xsd:duration"))
+        self.assertEqual(detect_scalar_literal("2 min"), (True, "xsd:duration"))
+        self.assertEqual(detect_scalar_literal("PT15M"), (True, "xsd:duration"))
+        self.assertEqual(detect_scalar_literal("P1D"), (True, "xsd:duration"))
+        self.assertEqual(detect_scalar_literal("v1.2.3"), (False, "xsd:string"))
+        self.assertEqual(detect_scalar_literal("99.9%"), (True, "xsd:string"))
+        self.assertEqual(detect_scalar_literal("NetSuite"), (False, "xsd:string"))
+        self.assertEqual(detect_scalar_literal(""), (False, "xsd:string"))
+        non_str: Any = None
+        self.assertEqual(detect_scalar_literal(non_str), (False, "xsd:string"))

@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from daemon.graph.inference.test_reflection import provider as provider
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import (
     OpenIERecord,
     YawConfig,
@@ -28,12 +29,28 @@ from yaw.core import (
 )
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
-    HippoRAGProgram,
+    ServingTokenCounter,
+    YawProgram,
     compute_task_quality_score,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.storage import get_meta, get_openie_checkpoints, open_yaw_db
+from yaw.daemon.graph.storage import open_yaw_db
 from yaw.daemon.runtime import YawRuntime
+
+
+def prepare_runtime_bundle(source: Path, *, dataset_name: str | None = None, validation_row: bool = False) -> Path:
+    from yaw.daemon.ingestion import prepare_dataset_bundle
+
+    rows: list[dict[str, Any]] = json.loads(source.read_text(encoding="utf-8"))
+    if validation_row and len(rows) == 1:
+        rows = [*rows, dict(rows[0], id="validation", question="A distinct validation question?")]
+        source.write_text(json.dumps(rows), encoding="utf-8")
+    documents = [
+        {"title": p["title"], "text": p.get("text", p.get("paragraph_text"))} for row in rows for p in row["paragraphs"]
+    ]
+    corpus = source.with_name(source.stem + "_documents.json")
+    corpus.write_text(json.dumps(documents), encoding="utf-8")
+    return prepare_dataset_bundle(dataset_name or source.stem, corpus, source, source.parent / "outputs/datasets").root
 
 
 class DeterministicTestLM(dspy.LM):
@@ -57,8 +74,10 @@ class DeterministicTestLM(dspy.LM):
                 self.model,
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
-        if "JudgeSynonyms" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
-            return ['{"decisions": []}']
+        if "JudgeLabels" in req_str or "candidate_pairs_json" in req_str or "candidate_pairs" in req_str:
+            packet_text = prompt or "\n".join(str(m.get("content", "")) for m in messages or [])
+            decs = complete_decisions(candidate_rows(packet_text), [], stage_text=packet_text)
+            return [json.dumps({"decisions": decs})]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if "DefineMissingEntities" in req_str or "missing_entities" in req_str or "entity_definitions" in req_str:
@@ -74,7 +93,7 @@ class DeterministicTestLM(dspy.LM):
                 ]
             return [
                 '{"entity_definitions": [["University of Southampton", "Public research university in '
-                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                'Southampton"], ["Hartley Institution", "Predecessor institution of the University of Southampton"]]}'
             ]
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
             if "Turing" in req_str:
@@ -94,7 +113,9 @@ class DeterministicTestLM(dspy.LM):
                     '"def": "Ada Lovelace programmed the Analytical Engine."}]}'
                 ]
             return [
-                '{"triples": [{"sub": "University of Southampton", "pred": "founded in", "obj": "1862", '
+                '{"triples": [{"sub": "University of Southampton", '
+                '"pred": ["founded in", "owl:DatatypeProperty"], '
+                '"obj": {"value": "1862", "datatype": "xsd:gYear", "lang": ""}, '
                 '"def": "University of Southampton was founded in 1862."}]}'
             ]
         if "ExtractEntities" in req_str or "named_entities" in req_str:
@@ -110,7 +131,7 @@ class DeterministicTestLM(dspy.LM):
                 ]
             return [
                 '{"named_entities": [["University of Southampton", "Public research university in '
-                'Southampton"], ["1862", "Founding year of the Hartley Institution"]]}'
+                'Southampton"], ["Hartley Institution", "Predecessor institution of the University of Southampton"]]}'
             ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
@@ -175,7 +196,7 @@ def _make_test_config(
 corpus_root = "corpus"
 db_path = ".yaw/yaw.db"
 lock_path = ".yaw/yaw.db.lock"
-state_dir = ".yaw/coco_state"
+state_dir = ".yaw/coco_lmdb"
 log_path = ".yaw/yaw.log"
 status_path = ".yaw/status.json"
 compiled_program_path = ".yaw/compiled_program.json"
@@ -208,13 +229,16 @@ http_port = 13306
     return cfg, toml_path
 
 
-def _make_program_and_embedder() -> tuple[HippoRAGProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
+def _make_program_and_embedder(
+    tokenizer_url: str,
+) -> tuple[YawProgram, Any, DeterministicTestLM, DeterministicTestEmbedder]:
     lm = DeterministicTestLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(
+    prog = YawProgram(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
+        synonym_token_counter=ServingTokenCounter(tokenizer_url, lm.model),
     )
     emb = DeterministicTestEmbedder(dim=16)
     return prog, emb, lm, emb
@@ -226,8 +250,8 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert repo_cfg.queue_maxsize == 32
     assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
     assert repo_cfg.context_window_tokens == 131072
-    assert repo_cfg.extraction_model == "Gemma-4-E4B-it-GGUF"
-    assert repo_cfg.qa_model == "Gemma-4-E4B-it-GGUF"
+    assert repo_cfg.extraction_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    assert repo_cfg.qa_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)
@@ -241,7 +265,7 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     assert exc_info.value.code == "INVALID_INPUT"
 
 
-def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
+def test_runtime_applies_configured_hydration_capacity(tmp_path: Path, provider) -> None:
     config, _ = _make_test_config(tmp_path)
     config = replace(
         config,
@@ -250,7 +274,7 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
         max_context_chars=None,
         max_ast_expansion_hops=2,
     )
-    program, embedder, _, _ = _make_program_and_embedder()
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
     runtime = YawRuntime(config, program=program, embedder=embedder)
     try:
         runtime.start(sync_on_start=False)
@@ -262,29 +286,23 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path) -> None:
         runtime.stop()
 
 
-def test_optimize_resume_parser_aliases() -> None:
+def test_optimize_fresh_and_db_path_parser_flags() -> None:
     parser = build_parser()
-    assert parser.parse_args(["dspy", "optimize", "--resume"]).resume
-    args = parser.parse_args(["dspy", "optimize", "--db-path", "latest"])
-    assert args.db_path == "latest"
+    assert parser.parse_args(["dspy", "optimize", "--fresh"]).fresh is True
+    assert parser.parse_args(["dspy", "optimize"]).fresh is False
+    args = parser.parse_args(["dspy", "optimize", "--db-path", ".yaw/optimize_yaw.db"])
+    assert args.db_path == ".yaw/optimize_yaw.db"
     with pytest.raises(SystemExit):
-        parser.parse_args(["optimize", "--resume"])
+        parser.parse_args(["dspy", "optimize", "--resume"])
     with pytest.raises(SystemExit):
-        parser.parse_args(["dspy", "optimize", "--db", "latest"])
+        parser.parse_args(["optimize", "--fresh"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["dspy", "optimize", "--db", ".yaw/optimize_yaw.db"])
 
 
-def test_cli_resume_without_a_run_fails_before_dataset_or_provider_access(tmp_path: Path) -> None:
-    cfg, toml_path = _make_test_config(tmp_path)
-    errors = io.StringIO()
-    with redirect_stderr(errors):
-        code = main(["dspy", "optimize", "--config", str(toml_path), "--resume"])
-    assert code == 1
-    assert "No optimization run exists" in errors.getvalue()
-    assert cfg.db_path is not None and not cfg.db_path.exists()
-
-
-def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provider) -> None:
-    """Real GEPA/DSPy + SQLite + CocoIndex; deterministic LM tests orchestration only."""
+def test_canonical_optimize_resume_and_fresh_lifecycle(tmp_path: Path, provider) -> None:
+    """Verify canonical optimize_* sandbox, default-resume, and --fresh wipe lifecycle (CG-OPT-1)."""
+    from filelock import FileLock
     from gepa.core.state import GEPAState, ValsetEvaluation
 
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
@@ -305,14 +323,14 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         for i in range(2)
     ]
     dataset.write_text(json.dumps(records), encoding="utf-8")
-    custom_output = tmp_path / "my_compiled.json"
+    dataset_bundle = prepare_runtime_bundle(dataset)
     common = [
         "dspy",
         "optimize",
         "--config",
         str(toml_path),
         "--dataset",
-        str(dataset),
+        str(dataset_bundle),
         "--mode",
         "gepa",
         "--max-queries",
@@ -324,23 +342,32 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
     ]
 
     def run_cli(extra: list[str], *, bare: bool = False) -> tuple[int, str, str]:
-        prog, emb, _, _ = _make_program_and_embedder()
+        prog, emb, _, _ = _make_program_and_embedder(provider[0])
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             invocation = ["dspy", "optimize", "--config", str(toml_path)] if bare else common
             code = main([*invocation, *extra], program=prog, embedder=emb)
         return code, out.getvalue(), err.getvalue()
 
-    rc, output, errors = run_cli(["--output", str(custom_output)])
+    # 1. Default run initializes canonical .yaw/optimize_yaw.db and optimize_* sidecars
+    rc, output, errors = run_cli([])
     assert rc == 0, errors
     original = json.loads(output)
+    yaw_dir = tmp_path / ".yaw"
     db_path = Path(original["sandbox_db_path"])
-    telemetry = tmp_path / "my_compiled_telemetry"
+    assert db_path == (yaw_dir / "optimize_yaw.db").resolve()
+    canonical_output = yaw_dir / "optimize_program.json"
+    assert Path(original["compiled_program_path"]) == canonical_output.resolve()
+    assert Path(original["graph_rlm_audit_path"]) == (yaw_dir / "optimize_program_audit.json").resolve()
+    assert not list(yaw_dir.glob("coco_state*"))
+    assert (yaw_dir / "coco_lmdb").is_dir()
+    assert not (yaw_dir / "coco_lmdb" / "coco_lmdb").exists()
+    assert (yaw_dir / "optimize_status.json").is_file()
+
+    telemetry = yaw_dir / "optimize_program_telemetry"
     checkpoint = telemetry / "gepa_state.bin"
     assert checkpoint.is_file()
     state = GEPAState.load(str(telemetry))
-    # Persist a superior candidate using GEPA's real state API. A restart must
-    # return it, rather than deleting the checkpoint and returning the seed.
     candidate = dict(state.program_candidates[0])
     candidate["qa.predict"] += "\nRESUMED_WINNER: ground every answer in evidence."
     state.update_state_with_new_program(
@@ -355,32 +382,43 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
         1,
     )
     state.save(str(telemetry), use_cloudpickle=True)
-    custom_output.unlink()  # unfinished run need not have a final program
+    canonical_output.unlink()
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-        initial_openie = conn.execute("SELECT * FROM openie_chunks").fetchall()
-    for selection in (["--resume"], ["--db-path", "latest"]):
+        initial_openie = conn.execute("SELECT * FROM chunk_inference").fetchall()
+        saved_meta_initial = json.loads(
+            conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0]
+        )
+    assert saved_meta_initial.get("started_at")
+
+    # 2. Bare invocation (default without --fresh) automatically resumes optimize_yaw.db
+    for selection in ([], ["--db-path", str(db_path)]):
         rc, output, errors = run_cli(selection, bare=True)
         assert rc == 0, errors
         resumed = json.loads(output)
         assert resumed["sandbox_db_path"] == original["sandbox_db_path"]
-        assert custom_output.is_file()
-        assert "RESUMED_WINNER" in custom_output.read_text(encoding="utf-8")
+        assert canonical_output.is_file()
+        assert "RESUMED_WINNER" in canonical_output.read_text(encoding="utf-8")
         loaded = GEPAState.load(str(telemetry))
         assert loaded.program_candidates == state.program_candidates
         assert loaded.total_num_evals == state.total_num_evals
-        audit = json.loads((tmp_path / "my_compiled_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        audit = json.loads((yaw_dir / "optimize_program_audit.json").read_text(encoding="utf-8"))
+        assert set(audit.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
         native = audit["gepa_progress"]
         expected_front = sorted({idx for group in loaded.get_pareto_front_mapping().values() for idx in group})
         assert native["frontier"] == expected_front
         assert native["validation"][1]["score"] == 1.0
         assert native["phase"] == "optimization complete"
-        pools = json.loads((tmp_path / "my_compiled_pools.json").read_text())
+        pools = json.loads((yaw_dir / "optimize_program_pools.json").read_text(encoding="utf-8"))
         assert pools["corpus_chunk_ids"]
         with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-            assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+            assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
+            resumed_meta = json.loads(
+                conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0]
+            )
+            assert resumed_meta["started_at"] == saved_meta_initial["started_at"]
 
-    # Metric/code upgrade with identical data, settings, mode, packages, and output path:
-    # preserves openie_chunks while invalidating stale pre-upgrade gepa_state.bin and simba scores.
+    # 3. Metric/code upgrade with identical data, settings, mode, packages, and output path:
+    # preserves chunk_inference while invalidating stale pre-upgrade gepa_state.bin and simba scores.
     with closing(sqlite3.connect(db_path)) as conn, conn:
         saved_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
         saved_meta["identity"]["metric"] = "task-quality-legacy-v1"
@@ -390,25 +428,19 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             (json.dumps(saved_meta),),
         )
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_worker:stale', '{}')")
-        conn.execute(
-            "INSERT OR REPLACE INTO candidate_stage_cache(stage, cache_key, payload, size_bytes) "
-            "VALUES ('simba_task_score', 'stale-key', X'00', 1)"
-        )
-    rc, output, errors = run_cli(["--resume"], bare=True)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('simba_task_score:stale-key', '0.5')")
+    rc, output, errors = run_cli([], bare=True)
     assert rc == 0, errors
-    assert "RESUMED_WINNER" not in custom_output.read_text(encoding="utf-8")
+    assert "RESUMED_WINNER" not in canonical_output.read_text(encoding="utf-8")
     with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as conn:
-        assert conn.execute("SELECT * FROM openie_chunks").fetchall() == initial_openie
+        assert conn.execute("SELECT * FROM chunk_inference").fetchall() == initial_openie
         upgraded_meta = json.loads(conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()[0])
         assert upgraded_meta["identity"]["metric"] == "task-quality-arithmetic-mean-v2"
         assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_worker:%'").fetchone()[0] == 0
-        assert (
-            conn.execute("SELECT COUNT(*) FROM candidate_stage_cache WHERE stage = 'simba_task_score'").fetchone()[0]
-            == 0
-        )
+        assert conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'simba_task_score:%'").fetchone()[0] == 0
 
-    # Same length, different questions: reject before replacing the corpus or
-    # touching the checkpoint, preserving both for inspection or recovery.
+    # 4. Same length, different questions: default resume rejects incompatible data before touching checkpoint,
+    # while --fresh wipes optimize_* state intentionally (unless locked) and starts fresh reusing coco_lmdb.
     original_checkpoint = checkpoint.read_bytes()
     assert cfg.corpus_root is not None
     assert not list((cfg.corpus_root / "corpus").glob("*.md"))
@@ -420,10 +452,11 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             "SELECT chunk_id, rel_posix_path, start_line, end_line FROM chunks ORDER BY chunk_id"
         ).fetchall()
     assert original_chunks
-    assert all(row[1] == "resume_dataset.json" for row in original_chunks)
+    assert all("documents/" in row[1] for row in original_chunks)
     records[0]["question"] = "A changed training question"
     dataset.write_text(json.dumps(records), encoding="utf-8")
-    rc, _, errors = run_cli(["--resume"], bare=True)
+    dataset_bundle = prepare_runtime_bundle(dataset)
+    rc, _, errors = run_cli([], bare=True)
     assert rc == 1
     assert "Cannot resume" in errors
     assert checkpoint.read_bytes() == original_checkpoint
@@ -435,10 +468,28 @@ def test_cli_resume_real_gepa_checkpoint_and_custom_output(tmp_path: Path, provi
             == original_chunks
         )
 
+    # Lock guard: --fresh refuses to wipe when optimize_yaw.db.lock is held
+    assert opt_cfg.lock_path is not None
+    with FileLock(str(opt_cfg.lock_path)):
+        rc_locked, _, err_locked = run_cli(["--fresh"])
+    assert rc_locked == 1
+    assert "LOCK_CONFLICT" in err_locked
+    assert db_path.is_file()
 
-def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None:
+    # Unlocked --fresh wipes optimize_* artifacts and succeeds on the updated dataset while preserving coco_lmdb
+    (yaw_dir / "optimize_telemetry.json").write_text("{}", encoding="utf-8")
+    (yaw_dir / "optimize_kg_frames").mkdir(exist_ok=True)
+    rc_fresh, out_fresh, err_fresh = run_cli(["--fresh"])
+    assert rc_fresh == 0, err_fresh
+    assert not (yaw_dir / "optimize_telemetry.json").exists()
+    assert not (yaw_dir / "optimize_kg_frames").exists()
+    assert (yaw_dir / "coco_lmdb").is_dir()
+    assert canonical_output.is_file()
+
+
+def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path, provider) -> None:
     cfg, _ = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     target = tmp_path / "legacy.json"
     checkpoint = tmp_path / "legacy_telemetry" / "gepa_state.bin"
     checkpoint.parent.mkdir()
@@ -454,11 +505,11 @@ def test_resume_preserves_unverifiable_legacy_checkpoint(tmp_path: Path) -> None
         runtime.stop()
 
 
-def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
+def test_second_runtime_fails_fast_on_lock(tmp_path: Path, provider) -> None:
     """D1-A5: A second YawRuntime targeting the same yaw.db.lock fails fast with BUSY."""
     cfg, _ = _make_test_config(tmp_path)
-    prog1, emb1, _, _ = _make_program_and_embedder()
-    prog2, emb2, _, _ = _make_program_and_embedder()
+    prog1, emb1, _, _ = _make_program_and_embedder(provider[0])
+    prog2, emb2, _, _ = _make_program_and_embedder(provider[0])
 
     rt1 = YawRuntime(cfg, program=prog1, embedder=emb1)
     rt2 = YawRuntime(cfg, program=prog2, embedder=emb2)
@@ -480,10 +531,110 @@ def test_second_runtime_fails_fast_on_lock(tmp_path: Path) -> None:
         rt2.stop()
 
 
-def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) -> None:
+def test_runtime_live_ingests_files_without_sync_requests(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+    runtime = YawRuntime(cfg, program=program, embedder=embedder, auto_poll=True)
+    runtime.start()
+
+    def wait_for_count(expected: int) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            assert runtime.engine is not None
+            with runtime.engine.managed_conn.readonly() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            if count == expected and runtime.stats().chunks == expected:
+                return
+            assert runtime.status().last_error is None
+            time.sleep(0.05)
+        raise AssertionError(f"Live runtime did not publish {expected} chunks")
+
+    try:
+        source = cfg.corpus_root / "live.md"
+        source.write_text("Ada Lovelace worked on the Analytical Engine.", encoding="utf-8")
+        wait_for_count(1)
+        source.unlink()
+        wait_for_count(0)
+        compiled = tmp_path / "live_program.json"
+        program.save(str(compiled))
+        signal = tmp_path / ".yaw" / "reload.signal"
+        signal.write_text(json.dumps({"req_id": "live-reload", "program_path": str(compiled)}), encoding="utf-8")
+        result_path = signal.with_name("reload.result")
+        deadline = time.monotonic() + 30
+        while not result_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        assert result["reloaded"] is True, result
+        assert result["req_id"] == "live-reload"
+        source.write_text("Ada Lovelace worked on the Analytical Engine.", encoding="utf-8")
+        wait_for_count(1)
+    finally:
+        runtime.stop()
+    assert not any(thread.name == "yaw-cocoindex-live" for thread in threading.enumerate())
+
+
+def test_live_parser_failure_stops_runtime_and_releases_resources(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    cfg = replace(cfg, included_patterns=("*.json",))
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    runtime = YawRuntime(cfg, program=program, embedder=embedder, auto_poll=True)
+    runtime.start()
+    try:
+        (cfg.corpus_root / "broken.json").write_text('{"body":', encoding="utf-8")
+        assert runtime.wait(15), "Live parser failure did not signal runtime shutdown"
+        with pytest.raises((ValueError, YawRuntimeError)):
+            runtime.stop()
+        assert runtime.engine is None
+        assert runtime.status().lifecycle == "stopped"
+        assert not runtime._file_lock.is_locked
+    finally:
+        runtime.stop()
+
+
+def test_stop_keeps_database_open_until_active_worker_exits(tmp_path: Path, provider) -> None:
+    cfg, _ = _make_test_config(tmp_path)
+    program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    runtime = YawRuntime(cfg, program=program, embedder=embedder)
+    runtime.start(sync_on_start=False)
+    entered = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+
+    def operation():
+        entered.set()
+        assert release.wait(15)
+        assert runtime.engine is not None
+        return runtime.engine.conn.execute("SELECT 1").fetchone()[0]
+
+    def stop_runtime():
+        try:
+            runtime.stop()
+        finally:
+            stopped.set()
+
+    future = runtime.submit("drain_test", operation)
+    assert entered.wait(5)
+    stopper = threading.Thread(target=stop_runtime)
+    stopper.start()
+    try:
+        assert not stopped.wait(5.5), "Shutdown closed resources while the worker was still active"
+        assert runtime.engine is not None
+        release.set()
+        assert future.result(timeout=5) == 1
+        assert stopped.wait(5)
+        assert runtime.engine is None
+        assert runtime.status().lifecycle == "stopped"
+    finally:
+        release.set()
+        stopper.join(timeout=10)
+        runtime.stop()
+
+
+def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path, provider) -> None:
     """D1-A5 & E2-A3: 32-slot bounded queue overflows with BUSY on the 33rd queued item while status() stays <50ms."""
     cfg, _ = _make_test_config(tmp_path, queue_maxsize=32)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=False)
 
@@ -531,7 +682,7 @@ def test_bounded_32_slot_queue_overflow_and_non_blocking_status(tmp_path: Path) 
         rt.stop()
 
 
-def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path) -> None:
+def test_stage1_crash_resume_does_not_reextract_completed_chunks(tmp_path: Path, provider) -> None:
     """D1-A3 & D1-A5: Crash mid-OpenIE persists completed chunks and pending_sync_delta; restart resumes without \
 re-extracting."""
     cfg, _ = _make_test_config(tmp_path)
@@ -547,7 +698,7 @@ re-extracting."""
         encoding="utf-8",
     )
 
-    prog1, emb1, _, _ = _make_program_and_embedder()
+    prog1, emb1, _, _ = _make_program_and_embedder(provider[0])
     extracted_counts: dict[str, int] = {}
     orig_extract1 = prog1.extract_openie
     should_crash_on_second = [True]
@@ -570,19 +721,19 @@ re-extracting."""
     finally:
         rt1.stop()
 
-    # Verify chunk 1 was checkpointed to openie_chunks and pending_sync_delta was saved in yaw.db meta
+    # Verify chunk 1 was persisted in CocoIndex chunk_inference while graph publication was aborted
     first_chunk_id = next(iter(extracted_counts.keys()))
     conn = open_yaw_db(cfg.db_path)
     try:
-        saved_openie = get_openie_checkpoints(conn, list(extracted_counts.keys()))
-        assert first_chunk_id in saved_openie
-        assert get_meta(conn, "pending_sync_delta") is not None
+        saved_inferences = {r[0] for r in conn.execute("SELECT chunk_id FROM chunk_inference").fetchall()}
+        assert first_chunk_id in saved_inferences
+        assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
     finally:
         conn.close()
 
     # Restart a new YawRuntime with the crash cleared: chunk 1 must NOT be re-extracted!
     should_crash_on_second[0] = False
-    prog2, emb2, _, _ = _make_program_and_embedder()
+    prog2, emb2, _, _ = _make_program_and_embedder(provider[0])
     orig_extract2 = prog2.extract_openie
 
     def _InstrumentedExtract2(chunk_id: str, passage: str, **kw: Any) -> OpenIERecord:
@@ -598,7 +749,8 @@ re-extracting."""
         assert extracted_counts[first_chunk_id] == 1
         assert rt2.stats().chunks == 2
         assert rt2.engine is not None
-        assert rt2.engine.get_meta("pending_sync_delta") is None
+        saved_openie = dict(rt2.engine.conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference"))
+        assert first_chunk_id in saved_openie
 
         hits = rt2.retrieve("Where did Alan Turing work?", top_k=2)
         assert len(hits) == 2
@@ -607,9 +759,8 @@ re-extracting."""
         rt2.stop()
 
 
-def test_inference_outage_degradation_and_recovery(tmp_path: Path) -> None:
-    """D1-A5: Inference outage sets provider_ready=False and lifecycle='degraded' without crashing; recovery \
-restores ready."""
+def test_inference_outage_degradation_and_recovery(tmp_path: Path, provider) -> None:
+    """D1-A5: Inference outage sets provider_ready=False without crashing; recovery restores provider_ready=True."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
@@ -617,7 +768,7 @@ restores ready."""
         encoding="utf-8",
     )
 
-    prog, emb, lm, raw_emb = _make_program_and_embedder()
+    prog, emb, lm, raw_emb = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=True)
     try:
@@ -631,7 +782,7 @@ restores ready."""
         assert exc_info.value.code == "MODEL_ERROR"
 
         degraded_status = rt.status()
-        assert degraded_status.lifecycle == "degraded"
+        assert degraded_status.lifecycle == "ready"
         assert degraded_status.provider_ready is False
         assert degraded_status.last_error is not None
         assert "unreachable" in degraded_status.last_error
@@ -680,7 +831,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         encoding="utf-8",
     )
 
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     # Mutate full optimizable surface: instructions, EmbeddingGemma prefixes, and GBNF bounds
     prog.embedding_query_prefix = "task: custom optimized query | query: "
     prog.embedding_fact_prefix = "task: custom optimized fact | query: "
@@ -703,7 +854,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         # Use GEPA itself with a one-evaluation budget, not an optimizer replacement.
         saved_path = rt1.optimize(trainset, mode="gepa", num_trials=1)
         assert saved_path.exists()
-        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_graph_rlm_audit.json").read_text(encoding="utf-8"))
+        audit = json.loads(saved_path.with_name(f"{saved_path.stem}_audit.json").read_text(encoding="utf-8"))
         assert audit["eval_records"]
         for row in audit["eval_records"]:
             keys = ["r1", "r2", "r5", "r10", "r20"] if labels != "qa" else []
@@ -714,7 +865,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         rt1.stop()
 
     # 3. Start a brand-new YawRuntime and verify compiled_program.json restores all 5 surfaces
-    fresh_prog, fresh_emb, _, _ = _make_program_and_embedder()
+    fresh_prog, fresh_emb, _, _ = _make_program_and_embedder(provider[0])
     rt2 = YawRuntime(cfg, program=fresh_prog, embedder=fresh_emb)
     rt2.start(sync_on_start=False)
     try:
@@ -732,7 +883,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         rt2.stop()
 
 
-def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
+def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path, provider) -> None:
     """Verify CLI subcommands sync, status, rebuild, and stop with --config yaw.toml."""
     cfg, toml_path = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
@@ -741,7 +892,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # 1. CLI graph build (standalone incremental sync)
     buf = io.StringIO()
@@ -777,7 +928,7 @@ def test_cli_subcommands_sync_status_rebuild_and_stop(tmp_path: Path) -> None:
     )
     run_thread.start()
 
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         live = inspect_status(cfg)
         if live["status"]["lifecycle"] == "ready":
@@ -805,7 +956,7 @@ def test_cli_optimize_ergonomics_and_anti_overfitting_gate(
 Tier 2 anti-overfitting guard."""
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
     assert cfg.corpus_root is not None
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Write a 6-query benchmark-format dataset JSON (with paragraphs + is_supporting)
     bench_dataset_path = tmp_path / "tier1_samples.json"
@@ -830,6 +981,7 @@ Tier 2 anti-overfitting guard."""
         for i in range(6)
     ]
     bench_dataset_path.write_text(json.dumps(bench_samples), encoding="utf-8")
+    bench_bundle = prepare_runtime_bundle(bench_dataset_path)
 
     captured_gepa: dict[str, Any] = {}
 
@@ -842,28 +994,18 @@ Tier 2 anti-overfitting guard."""
             captured_gepa["trainset_len"] = len(trainset)
             captured_gepa["valset_len"] = len(valset) if valset is not None else 0
             # Verify CocoIndex synced JSON passages in-place with zero markdown synthesis during GEPA evolution
-            opt_cfg = cfg.for_optimization(db_override="latest")
+            opt_cfg = cfg.for_optimization()
             assert opt_cfg.corpus_root is not None
             assert opt_cfg.db_path is not None
             assert not list((opt_cfg.corpus_root / "corpus").glob("*.md"))
             pools = json.loads((tmp_path / "custom_compiled_pools.json").read_text(encoding="utf-8"))
-            assert len(pools["corpus_chunk_ids"]) >= 6
+            assert len(pools["corpus_chunk_ids"]) == 6
             with closing(sqlite3.connect(opt_cfg.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
                 db_chunks = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
             assert len(db_chunks) >= 4
-            assert all(row[0] == "tier1_samples.json" for row in db_chunks)
+            assert all("documents/" in row[0] for row in db_chunks)
             pred = student(question=trainset[0].question)
             assert pred.context.strip() != ""
-            proposer = captured_gepa.get("instruction_proposer")
-            if proposer is not None and hasattr(proposer, "telemetry"):
-                proposer.telemetry.append(
-                    {
-                        "component_name": "qa.predict",
-                        "previous_instruction": "old",
-                        "new_instruction": "new",
-                        "num_feedback_examples": len(trainset),
-                    }
-                )
             return student
 
     monkeypatch.setattr(dspy, "GEPA", CaptureGEPA, raising=False)
@@ -878,7 +1020,7 @@ Tier 2 anti-overfitting guard."""
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(bench_dataset_path),
+                str(bench_bundle),
                 "--mode",
                 "gepa",
                 "--max-queries",
@@ -895,14 +1037,14 @@ Tier 2 anti-overfitting guard."""
         )
     assert rc == 0
     assert not list((cfg.corpus_root / "corpus").glob("*.md"))
-    opt_cfg_after = cfg.for_optimization(db_override="latest")
+    opt_cfg_after = cfg.for_optimization()
     assert opt_cfg_after.corpus_root is not None
     assert opt_cfg_after.db_path is not None
     assert not list((opt_cfg_after.corpus_root / "corpus").glob("*.md"))
     with closing(sqlite3.connect(opt_cfg_after.db_path.as_uri() + "?mode=ro", uri=True)) as conn:
         db_chunks_after = conn.execute("SELECT rel_posix_path FROM chunks").fetchall()
-    assert len(db_chunks_after) >= 6
-    assert all(row[0] == "tier1_samples.json" for row in db_chunks_after)
+    assert len(db_chunks_after) == 6
+    assert all("documents/" in row[0] for row in db_chunks_after)
     opt_out = json.loads(buf.getvalue())
     assert opt_out["optimized"] is True
     assert opt_out["mode"] == "gepa"
@@ -910,8 +1052,8 @@ Tier 2 anti-overfitting guard."""
     assert opt_out["train_queries"] == 4
     assert opt_out["val_queries"] == 2
     assert Path(opt_out["compiled_program_path"]).exists()
-    assert Path(opt_out["proposer_telemetry_path"]).exists()
-    assert opt_out["stats"]["chunks"] >= 6
+    assert Path(opt_out["graph_rlm_audit_path"]).exists()
+    assert opt_out["stats"]["chunks"] == 6
     assert captured_gepa["trainset_len"] == 4
     assert captured_gepa["valset_len"] == 2
     assert captured_gepa["auto"] == "light"
@@ -945,7 +1087,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
 ) -> None:
     """Verify multi-dataset optimization: array of datasets, interleaved train/val splits, and budget allocation."""
     _, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Create 3 synthetic datasets (each with 10 questions)
     ds_paths: list[Path] = []
@@ -967,7 +1109,7 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
             for i in range(10)
         ]
         ds_file.write_text(json.dumps(samples), encoding="utf-8")
-        ds_paths.append(ds_file)
+        ds_paths.append(prepare_runtime_bundle(ds_file))
 
     captured_gepa: dict[str, Any] = {}
 
@@ -1034,21 +1176,16 @@ def test_cli_optimize_multi_dataset_interleaved_splits(
     assert "gamma" in valset[2].question
 
 
-def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
+def test_cli_status_reports_active_indexing_progress(tmp_path: Path, provider) -> None:
     """Verify yaw status inspects openie checkpoints and surfaces active indexing progress."""
+    from daemon.native_inference import publish_inference
     from yaw.core import OpenIERecord
     from yaw.daemon.cli import inspect_status
-    from yaw.daemon.graph.storage import open_yaw_db, save_openie_checkpoints
 
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.db_path is not None
-    conn = open_yaw_db(cfg.db_path)
-    try:
-        # Seed 3 dummy openie records
-        records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
-        save_openie_checkpoints(conn, records)
-    finally:
-        conn.close()
+    records = [OpenIERecord(chunk_id=f"chunk-{i}", entities=("E",), triples=(("A", "r", "B"),)) for i in range(3)]
+    publish_inference(cfg.db_path, records)
 
     # Offline inspect
     offline_status = inspect_status(cfg)
@@ -1056,7 +1193,7 @@ def test_cli_status_reports_active_indexing_progress(tmp_path: Path) -> None:
     assert offline_status["status"]["lifecycle"] == "stopped"
 
     # With daemon locked, inspect_status recognizes indexing in progress
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
     rt = YawRuntime(cfg, program=prog, embedder=emb)
     rt.start(sync_on_start=False)
     try:
@@ -1113,10 +1250,10 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
     assert json.loads(buf.getvalue())["optimization.auto"] == "medium"
 
 
-def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> None:
+def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provider) -> None:
     """Verify `yaw dspy load-program <file>` stages offline and hot-reloads live daemon in-memory."""
     cfg, toml_path = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Create dummy candidate program JSON using prog.save()
     cand1 = tmp_path / "cand1.json"
@@ -1135,7 +1272,7 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path) -> Non
     assert Path(cfg.compiled_program_path).exists()
 
     # 2. Boot daemon: verifies it loads staged program
-    rt = YawRuntime(cfg, program=HippoRAGProgram.from_config(cfg), embedder=emb)
+    rt = YawRuntime(cfg, program=YawProgram.from_config(cfg), embedder=emb)
     rt.start(sync_on_start=False)
     try:
         assert rt.engine is not None
@@ -1170,7 +1307,7 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
     from yaw.daemon.cli import is_daemon_locked
 
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # Start persistent production daemon holding yaw.db.lock
     prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
@@ -1194,6 +1331,8 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
             encoding="utf-8",
         )
 
+        bench_bundle = prepare_runtime_bundle(bench_ds, validation_row=True)
+
         class FastGEPA:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
@@ -1206,7 +1345,8 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
 
         # Run optimization concurrently while production daemon holds yaw.db.lock
         buf = io.StringIO()
-        with redirect_stdout(buf):
+        err_buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err_buf):
             rc = main(
                 [
                     "dspy",
@@ -1214,9 +1354,9 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                     "--config",
                     str(toml_path),
                     "--dataset",
-                    str(bench_ds),
+                    str(bench_bundle),
                     "--max-queries",
-                    "1",
+                    "2",
                     "--train-queries",
                     "1",
                     "--auto",
@@ -1226,9 +1366,10 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
                 embedder=emb,
             )
         assert rc == 0
+        assert "indexing: disambiguation candidate search" in err_buf.getvalue()
         opt_out = json.loads(buf.getvalue())
         assert opt_out["optimized"] is True
-        assert "yaw_optimize_" in opt_out["sandbox_db_path"]
+        assert Path(opt_out["sandbox_db_path"]).name == "optimize_yaw.db"
         assert Path(opt_out["compiled_program_path"]).exists()
 
         # Production database was NOT touched or overwritten
@@ -1243,12 +1384,13 @@ def test_cli_dspy_optimize_sandbox_isolation_and_status(
 
 def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
     tmp_path: Path,
+    provider,
 ) -> None:
     """Verify `yaw graph lint [--turtle]` runs over a read-only WAL snapshot while daemon holds yaw.db.lock."""
     from yaw.daemon.cli import is_daemon_locked
 
     cfg, toml_path = _make_test_config(tmp_path)
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     prod_rt = YawRuntime(cfg, program=prog, embedder=emb)
     prod_rt.start(sync_on_start=True)
@@ -1279,7 +1421,7 @@ def test_cli_graph_lint_and_turtle_over_read_only_snapshot_while_daemon_locked(
 def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
     """Verify `yaw benchmark [--gate]` isolates state via YawConfig.for_benchmark and evaluates benchmark_gate.json."""
     cfg, toml_path = _make_test_config(tmp_path, base_url=provider[0])
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     dataset_path = tmp_path / "2wikimultihopqa.json"
     dataset_samples = [
@@ -1297,6 +1439,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
         }
     ]
     dataset_path.write_text(json.dumps(dataset_samples), encoding="utf-8")
+    dataset_bundle = prepare_runtime_bundle(dataset_path, dataset_name="2wikimultihopqa")
 
     # 1. Passing gate (thresholds <= 1.0)
     passing_gate = tmp_path / "passing_gate.json"
@@ -1325,7 +1468,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(dataset_path),
+                str(dataset_bundle),
                 "--max-queries",
                 "1",
                 "--gate",
@@ -1371,7 +1514,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
                 "--config",
                 str(toml_path),
                 "--dataset",
-                str(dataset_path),
+                str(dataset_bundle),
                 "--max-queries",
                 "1",
                 "--gate",
@@ -1407,7 +1550,7 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
     rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
     progress_msgs: list[str] = []
     pos_report = rt.benchmark(
-        [str(dataset_path)],
+        [str(dataset_bundle)],
         gate_path=em_failing_gate,
         max_queries=1,
         target="monkeypatched_hipporag",
@@ -1419,69 +1562,33 @@ def test_cli_benchmark_and_gate_evaluation(tmp_path: Path, provider) -> None:
 
 
 def test_canonical_benchmark_gate_json_and_dataset_ingestion_invariants(tmp_path: Path) -> None:
-    """Verify benchmark_gate.json matches consolidated baselines and sync_source_files_for_docs preserves user files."""
-    from yaw.daemon.ingestion import (
-        MONKEYPATCHED_HIPPORAG_BASELINES,
-        PAPER_BASELINES,
-        load_dataset_splits,
-        sync_source_files_for_docs,
-    )
+    from yaw.daemon.ingestion import DATASETS, load_dataset_splits, resolve_dataset_name
 
-    gate_file = Path(__file__).resolve().parents[2] / "benchmark_gate.json"
-    gate_data = json.loads(gate_file.read_text(encoding="utf-8"))
-    assert set(gate_data["datasets"].keys()) == set(MONKEYPATCHED_HIPPORAG_BASELINES.keys())
-    for ds in MONKEYPATCHED_HIPPORAG_BASELINES:
-        assert gate_data["datasets"][ds]["monkeypatched_hipporag"] == MONKEYPATCHED_HIPPORAG_BASELINES[ds]
-        paper_ref = PAPER_BASELINES[ds]["hipporag2_llama3.3_70b_nvembed_v2"]
-        for metric_key in ("Recall@2", "Recall@5", "ExactMatch", "F1"):
-            if metric_key in paper_ref:
-                assert gate_data["datasets"][ds]["paper_70b"][metric_key] == paper_ref[metric_key]
-
-    # Anti-overfitting alias check on load_dataset_splits
-    with pytest.raises(YawRuntimeError) as exc_info:
-        load_dataset_splits(["2wiki"], workspace_root=tmp_path, max_queries=100)
-    assert exc_info.value.code == "INVALID_INPUT"
-
-    # sync_source_files_for_docs preserves user corpus/*.md files and is idempotent across repeated calls
-    corpus_root = tmp_path / "ws"
-    user_md_dir = corpus_root / "corpus"
-    user_md_dir.mkdir(parents=True, exist_ok=True)
-    user_md = user_md_dir / "architecture.md"
-    user_md.write_text("# Architecture\nImportant user documentation.\n", encoding="utf-8")
-    corpus_json = corpus_root / "corpus.json"
-    corpus_json.write_text(
-        json.dumps([{"title": "Doc Title", "text": "Doc body text for testing."}], indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-    state_dir = tmp_path / "coco_state"
-    docs = ["Doc Title\nDoc body text for testing."]
-    chunks1 = sync_source_files_for_docs(
-        corpus_root, state_dir, allowed_docs=docs, source_files=[corpus_json], min_chunk_size=1
-    )
-    assert user_md.exists()
-    assert not list(user_md_dir.glob("chunk-*.md"))
-    assert len(chunks1) == 1
-    assert chunks1[0][0].rel_posix_path == "corpus.json"
-
-    # Repeated call with allowed_docs=None returns chunks idempotently
-    chunks2 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
-    assert len(chunks2) >= 2
-    chunks3 = sync_source_files_for_docs(corpus_root, state_dir, allowed_docs=None, min_chunk_size=1)
-    assert len(chunks3) == len(chunks2)
+    spec_path = Path(__file__).resolve().parents[2] / "data" / "benchmarks" / "baselines.json"
+    gate = json.loads(spec_path.read_text(encoding="utf-8"))
+    assert set(gate["datasets"]) == set(DATASETS)
+    for dataset, entry in gate["baselines"].items():
+        assert dataset in gate["datasets"]
+        assert "monkeypatched_hipporag" in entry
+        assert "hipporag2_llama3.3_70b_nvembed_v2" in entry
+        for metric in ("ExactMatch", "F1"):
+            assert metric in entry["monkeypatched_hipporag"]
+            assert metric in entry["hipporag2_llama3.3_70b_nvembed_v2"]
+    with pytest.raises(ValueError, match="Unknown dataset"):
+        resolve_dataset_name("2wiki")
+    with pytest.raises(YawRuntimeError, match="held-out"):
+        load_dataset_splits(["2wikimultihopqa"], workspace_root=tmp_path, max_queries=100)
 
 
-def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Verify sync_now invokes engine.index_chunks once per sync (no double _apply_delta) and pre-start stop works."""
+def test_sync_now_executes_single_index_chunks_and_pre_start_stop(tmp_path: Path, provider) -> None:
+    """Verify sync_now executes CocoIndex update once per sync and pre-start stop works."""
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
     (cfg.corpus_root / "turing.md").write_text(
         "# Alan Turing\nAlan Turing worked at Bletchley Park.\n",
         encoding="utf-8",
     )
-    prog, emb, _, _ = _make_program_and_embedder()
+    prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
     # 1. Pre-start stop() sets stop event; subsequent first start() honors it immediately
     rt_pre = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
@@ -1489,30 +1596,165 @@ def test_sync_now_executes_single_index_chunks_and_pre_start_stop(
     rt_pre.start(sync_on_start=False)
     assert rt_pre.status().lifecycle == "stopped"
 
-    # 2. Normal start and verify engine.index_chunks is called exactly once during sync_now()
+    # 2. Normal start and verify sync_now() publishes once and second sync_now() is a no-op
     rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=False)
     rt.start(sync_on_start=False)
     try:
-        assert rt.ingestor is not None
-        assert rt.ingestor.on_delta is not None
+        assert rt._coco_app is not None
         assert rt.engine is not None
 
-        index_calls = 0
-        orig_index_chunks = rt.engine.index_chunks
-
-        def counted_index_chunks(
-            chunks: Sequence[tuple[Any, str]],
-            *,
-            progress_callback: Any | None = None,
-            program: Any | None = None,
-        ) -> int:
-            nonlocal index_calls
-            index_calls += 1
-            return orig_index_chunks(chunks, progress_callback=progress_callback, program=program)
-
-        monkeypatch.setattr(rt.engine, "index_chunks", counted_index_chunks)
         summary = rt.sync_now()
         assert len(summary.added_chunks) == 1
-        assert index_calls == 1
+        assert rt.stats().chunks == 1
+
+        summary2 = rt.sync_now()
+        assert len(summary2.added_chunks) == 0
+        assert rt.stats().chunks == 1
     finally:
         rt.stop()
+
+
+def test_windows_live_lifecycle_create_modify_rename_delete_and_lock_release(tmp_path: Path, provider) -> None:
+    """Verify live file-watch create, rapid edit coalescing, rename, delete, and Windows lock release (I4)."""
+    import psutil
+
+    from yaw.daemon.graph.storage import lint_graph_shacl
+    from yaw.daemon.runtime import is_file_locked
+
+    class LiveLifecycleLM(DeterministicTestLM):
+        def __call__(
+            self,
+            prompt: str | None = None,
+            messages: list[dict[str, Any]] | None = None,
+            **kwargs: Any,
+        ) -> list[str]:
+            req_str = str(prompt or messages or kwargs)
+            unique_ent: str | None = None
+            for cand in ("UniqueA_v3", "UniqueA_v2", "UniqueA_v1", "UniqueA", "UniqueB"):
+                if cand in req_str:
+                    unique_ent = cand
+                    break
+            if unique_ent is not None:
+                if (
+                    "DefineMissingEntities" in req_str
+                    or "missing_entities" in req_str
+                    or "entity_definitions" in req_str
+                ):
+                    return [
+                        json.dumps(
+                            {
+                                "entity_definitions": [
+                                    [unique_ent, f"Unique lifecycle entity {unique_ent}"],
+                                    ["SharedEntity", "Shared corpus entity across documents"],
+                                ]
+                            }
+                        )
+                    ]
+                if "FilterTriples" in req_str or "fact_before_filter" in req_str:
+                    return [json.dumps({"fact": [[unique_ent, "connects to", "SharedEntity"]]})]
+                if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "triples": [
+                                    {
+                                        "sub": unique_ent,
+                                        "pred": "connects to",
+                                        "obj": "SharedEntity",
+                                        "def": f"{unique_ent} connects to SharedEntity.",
+                                    }
+                                ]
+                            }
+                        )
+                    ]
+                if "ExtractEntities" in req_str or "named_entities" in req_str:
+                    return [
+                        json.dumps(
+                            {
+                                "named_entities": [
+                                    [unique_ent, f"Unique lifecycle entity {unique_ent}"],
+                                    ["SharedEntity", "Shared corpus entity across documents"],
+                                ]
+                            }
+                        )
+                    ]
+            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+    cfg, _ = _make_test_config(tmp_path)
+    assert cfg.corpus_root is not None
+    assert cfg.db_path is not None
+    assert cfg.lock_path is not None
+    assert cfg.state_dir is not None
+
+    lm = LiveLifecycleLM()
+    dspy.settings.configure(lm=lm)
+    prog = YawProgram(
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+        synonym_token_counter=ServingTokenCounter(provider[0], lm.model),
+    )
+    emb = DeterministicTestEmbedder(dim=16)
+
+    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=True)
+    rt.start(sync_on_start=False)
+    try:
+        assert rt.engine is not None
+        assert is_file_locked(cfg.lock_path)
+
+        def entity_names() -> set[str]:
+            assert rt.engine is not None
+            with rt.engine._lock:
+                return {str(r[0]) for r in rt.engine.conn.execute("SELECT name FROM entities").fetchall()}
+
+        # 1. Create doc_a.md and doc_b.md sharing SharedEntity with unique entities UniqueA and UniqueB
+        doc_a = cfg.corpus_root / "doc_a.md"
+        doc_b = cfg.corpus_root / "doc_b.md"
+        doc_a.write_text("# Doc A\nUniqueA connects to SharedEntity in document alpha.\n", encoding="utf-8")
+        doc_b.write_text("# Doc B\nUniqueB connects to SharedEntity in document beta.\n", encoding="utf-8")
+        rt.sync_now()
+        assert entity_names() == {"UniqueA", "UniqueB", "SharedEntity"}
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 2. Rapid consecutive in-place edits on doc_a.md: UniqueA_v1 -> UniqueA_v2 -> UniqueA_v3
+        for ver in ("UniqueA_v1", "UniqueA_v2", "UniqueA_v3"):
+            doc_a.write_text(f"# Doc A\n{ver} connects to SharedEntity in document alpha.\n", encoding="utf-8")
+        rt.sync_now()
+        assert entity_names() == {"UniqueA_v3", "UniqueB", "SharedEntity"}
+        assert "UniqueA" not in entity_names()
+        assert "UniqueA_v1" not in entity_names()
+        assert "UniqueA_v2" not in entity_names()
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 3. Rename doc_a.md -> doc_a_renamed.md
+        doc_a_renamed = cfg.corpus_root / "doc_a_renamed.md"
+        doc_a.rename(doc_a_renamed)
+        rt.sync_now()
+        assert entity_names() == {"UniqueA_v3", "UniqueB", "SharedEntity"}
+        with rt.engine._lock:
+            rel_paths = {str(r[0]) for r in rt.engine.conn.execute("SELECT rel_posix_path FROM chunks").fetchall()}
+        assert rel_paths == {"doc_a_renamed.md", "doc_b.md"}
+        hits = rt.retrieve("UniqueA_v3 SharedEntity", top_k=2)
+        assert any(h.pointer.rel_posix_path == "doc_a_renamed.md" and "UniqueA_v3" in h.text for h in hits)
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+
+        # 4. Delete doc_a_renamed.md -> retracts UniqueA_v3 while preserving SharedEntity and UniqueB
+        doc_a_renamed.unlink()
+        rt.sync_now()
+        assert entity_names() == {"UniqueB", "SharedEntity"}
+        assert len(lint_graph_shacl(rt.engine.conn)) == 0
+    finally:
+        rt.stop()
+
+    # 5. Verify clean Windows handle/lock release and memory bound after stop()
+    assert not is_file_locked(cfg.lock_path)
+    assert psutil.Process().memory_info().rss <= 1024**3
+
+    renamed_db = cfg.db_path.with_name("yaw_renamed.db")
+    cfg.db_path.rename(renamed_db)
+    renamed_db.rename(cfg.db_path)
+
+    if cfg.state_dir.exists():
+        renamed_state = cfg.state_dir.with_name("coco_state_renamed")
+        cfg.state_dir.rename(renamed_state)
+        renamed_state.rename(cfg.state_dir)

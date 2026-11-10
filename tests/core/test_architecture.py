@@ -1,12 +1,86 @@
 """AST-enforced architecture containment and zero-cross-domain import boundary tests."""
 
 import ast
+import re
 import sys
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 YAW_DIR = PROJECT_ROOT / "yaw"
+DOCS_DIR = PROJECT_ROOT / "docs"
+RULES_DIR = PROJECT_ROOT / ".agents" / "rules"
+AGENTS_DIR = PROJECT_ROOT / ".agents" / "agents"
+
+_VALID_SUBAGENT_TOOLS = frozenset(
+    {
+        "send_message",
+        "read_file",
+        "search_web",
+        "schedule",
+        "run_command",
+        "manage_task",
+        "write_file",
+        "edit_file",
+    }
+)
+_CANONICAL_DOCS_INVENTORY = frozenset(
+    {
+        "arxiv-2405.14831v3-hipporag.md",
+        "arxiv-2502.14802v1-hipporag2.md",
+        "coverage-plan.md",
+        "dspy-improvements.md",
+        "enterprise-rag-bench-training-plan.md",
+        "epic-1-hipporag-daemon.md",
+        "epic-2-fastmcp-http.md",
+        "epic-3-performance.md",
+        "epistemic-confidence-spec.md",
+        "evaluation-graph-storage.md",
+        "evaluation-inference.md",
+        "evaluation-ingestion.md",
+        "evaluation-testing.md",
+        "evaluation.md",
+        "model-evaluation.md",
+        "native-cocoindex-indexing.md",
+        "native-cocoindex-graph.md",
+        "pre-epic2-memo.md",
+        "w3c-improvements.md",
+    }
+)
+_MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+_WIKI_LINK_RE = re.compile(r"\[\[[^\]]+\]\]")
+
+
+def _parse_yaml_frontmatter(md_path: Path) -> tuple[dict[str, object], str]:
+    """Parse YAML frontmatter delimited by --- at the top of a Markdown file."""
+    text = md_path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} is missing opening YAML frontmatter '---'")
+    end_idx = text.find("\n---\n", 4)
+    if end_idx == -1:
+        raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} is missing closing YAML frontmatter '---'")
+    raw_yaml = text[4:end_idx]
+    body = text[end_idx + 5 :]
+    loaded = yaml.safe_load(raw_yaml)
+    if not isinstance(loaded, dict):
+        raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} frontmatter did not parse to a mapping")
+    return loaded, body
+
+
+def _strip_fenced_code_blocks(markdown_text: str) -> str:
+    """Remove fenced code blocks and inline code spans before scanning prose links."""
+    lines: list[str] = []
+    in_fence = False
+    for line in markdown_text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            lines.append(re.sub(r"`[^`]*`", "", line))
+    return "\n".join(lines)
 
 
 def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
@@ -213,7 +287,7 @@ class ArchitectureTests(unittest.TestCase):
         import yaw.daemon.graph.inference as inference
 
         self.assertTrue(hasattr(inference, "create_dspy_lm"))
-        self.assertTrue(hasattr(inference, "HippoRAGProgram"))
+        self.assertTrue(hasattr(inference, "YawProgram"))
         self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
         self.assertTrue(hasattr(inference, "compute_task_quality_score"))
         self.assertTrue(hasattr(inference, "check_benchmark_integrity"))
@@ -228,9 +302,9 @@ class ArchitectureTests(unittest.TestCase):
         self.assertFalse(hasattr(inference, "CacheOpenAI"))
         self.assertFalse(hasattr(inference, "chat_identity"))
 
-        # Verify yaw/daemon/graph top-level files are strictly __init__.py, engine.py, and ppr.py
+        # Graph orchestration and deterministic transforms remain in their owning domain.
         graph_files = {f.name for f in (YAW_DIR / "daemon" / "graph").glob("*.py")}
-        self.assertEqual(graph_files, {"__init__.py", "engine.py", "ppr.py"})
+        self.assertEqual(graph_files, {"__init__.py", "engine.py", "ppr.py", "normalization.py", "planner.py"})
 
         # Verify storage public facade
         import yaw.daemon.graph.storage as storage
@@ -250,10 +324,14 @@ class ArchitectureTests(unittest.TestCase):
         # Verify ingestion public facade
         import yaw.daemon.ingestion as ingestion
 
-        self.assertTrue(hasattr(ingestion, "CorpusIngestor"))
-        self.assertTrue(hasattr(ingestion, "chunk_markdown_text"))
-        self.assertTrue(hasattr(ingestion, "sync_corpus_once"))
-        self.assertTrue(hasattr(ingestion, "extract_chunk_title"))
+        self.assertTrue(hasattr(ingestion, "declare_source_file"))
+        self.assertTrue(hasattr(ingestion, "chunk_source_text"))
+        self.assertTrue(hasattr(ingestion, "SourceMetadata"))
+        self.assertTrue(hasattr(ingestion, "chunk_source_text"))
+        self.assertFalse(hasattr(ingestion, "chunk_markdown_text"))
+        self.assertFalse(hasattr(ingestion, "chunk_json_text"))
+        self.assertFalse(hasattr(ingestion, "CorpusIngestor"))
+        self.assertFalse(hasattr(ingestion, "sync_corpus_once"))
 
         with self.assertRaises(AttributeError):
             _ = ingestion._CHUNK_HANDLER
@@ -302,7 +380,7 @@ class ArchitectureTests(unittest.TestCase):
         core_files = list((YAW_DIR / "core").glob("*.py"))
         self.assertEqual(
             {f.name for f in core_files},
-            {"__init__.py", "config.py", "logger.py", "types.py"},
+            {"__init__.py", "config.py", "constants.py", "logger.py", "types.py"},
         )
 
         # Python supplies the authoritative set, including platform-specific modules.
@@ -419,6 +497,78 @@ class ArchitectureTests(unittest.TestCase):
             "Protected/private cross-module imports detected:\n" + "\n".join(violations),
         )
 
+    def test_zero_cross_module_private_attributes(self):
+        """Rule 5b: Zero cross-object private/protected attribute access across storage, ingestion, and graph.
+
+        Forbids accessing _-prefixed attributes on objects other than self, cls, or super(),
+        with the sole documented exemption of managed._conn in db.py for low-level PRAGMA configuration.
+        Also forbids any access to ._provider across all of yaw/ outside managed_sqlite.py.
+        """
+
+        def is_self_cls_super(val_node: ast.AST) -> bool:
+            if isinstance(val_node, ast.Name) and val_node.id in {"self", "cls"}:
+                return True
+            return bool(
+                isinstance(val_node, ast.Call) and isinstance(val_node.func, ast.Name) and val_node.func.id == "super"
+            )
+
+        target_files = (
+            sorted((YAW_DIR / "daemon" / "graph" / "storage").glob("*.py"))
+            + [YAW_DIR / "daemon" / "indexing.py"]
+            + sorted((YAW_DIR / "daemon" / "ingestion").glob("*.py"))
+            + [
+                YAW_DIR / "daemon" / "graph" / "planner.py",
+                YAW_DIR / "daemon" / "graph" / "normalization.py",
+                YAW_DIR / "daemon" / "graph" / "ppr.py",
+            ]
+        )
+        self.assertGreater(len(target_files), 0, "No target files found for private attribute scan")
+
+        violations: list[str] = []
+        for py_file in target_files:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr.startswith("_")
+                    and not node.attr.startswith("__")
+                    and not is_self_cls_super(node.value)
+                ):
+                    if py_file.name == "db.py" and node.attr == "_conn":
+                        continue
+                    violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                        f"cross-object access of private attribute '{node.attr}'"
+                    )
+
+        self.assertEqual(
+            violations,
+            [],
+            "Cross-object private attribute accesses detected:\n" + "\n".join(violations),
+        )
+
+        all_yaw_files = sorted(YAW_DIR.rglob("*.py"))
+        provider_violations: list[str] = []
+        for py_file in all_yaw_files:
+            if py_file.name == "managed_sqlite.py":
+                continue
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == "_provider":
+                    provider_violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                        f"cross-module access of TableTarget._provider is forbidden"
+                    )
+
+        self.assertEqual(
+            provider_violations,
+            [],
+            "Forbidden ._provider attribute accesses detected outside managed_sqlite.py:\n"
+            + "\n".join(provider_violations),
+        )
+
     def test_zero_circular_dependencies_across_all_yaw_modules(self):
         """Rule 6: The global module import graph must form a strict DAG with zero circular dependencies."""
         graph = build_internal_import_graph()
@@ -449,3 +599,297 @@ class ArchitectureTests(unittest.TestCase):
         cycles = find_import_cycles(synthetic_cyclic)
         self.assertEqual(len(cycles), 1)
         self.assertEqual(cycles[0], ["a", "b", "c", "a"])
+
+    def test_agent_rules_yaml_frontmatter_and_size_caps(self):
+        """Rule 7: All .agents/rules/*.md files have valid YAML frontmatter, <4 KB size, and zero @[] includes."""
+        rule_files = sorted(RULES_DIR.glob("*.md"))
+        self.assertEqual(
+            {f.name for f in rule_files},
+            {
+                "yaw.md",
+                "daemon.md",
+                "graph-storage.md",
+                "inference.md",
+                "tests.md",
+                "canonical-files.md",
+                "docs.md",
+                "agent-rules.md",
+            },
+        )
+
+        for rule_file in rule_files:
+            rel = rule_file.relative_to(PROJECT_ROOT)
+            size_bytes = len(rule_file.read_bytes())
+            self.assertLess(size_bytes, 4096, f"Rule {rel} exceeds 4 KB cap ({size_bytes} bytes)")
+
+            meta, body = _parse_yaml_frontmatter(rule_file)
+            self.assertEqual(meta.get("trigger"), "glob", f"Rule {rel} must set trigger: glob")
+            globs_val = meta.get("globs")
+            self.assertIsInstance(globs_val, str, f"Rule {rel} globs must be a YAML string")
+            assert isinstance(globs_val, str)
+            patterns = [p.strip() for p in globs_val.split(",") if p.strip()]
+            self.assertGreater(len(patterns), 0, f"Rule {rel} must declare at least one glob pattern")
+
+            desc = meta.get("description")
+            self.assertIsInstance(desc, str, f"Rule {rel} must declare a description string")
+            assert isinstance(desc, str)
+            word_count = len(desc.split())
+            self.assertTrue(1 <= word_count <= 60, f"Rule {rel} description must be 1..60 words (got {word_count})")
+            self.assertNotIn("@[", body, f"Rule {rel} must use pointer links [label](path), never @[label](path)")
+
+    def test_custom_subagents_yaml_frontmatter_and_tool_validity(self):
+        """Rule 8: Custom subagents in .agents/agents/*/agent.md mount visibly with valid tools and current stack."""
+        expected_agents = {"critic", "simplifier", "ontologist"}
+        agent_files = {p.parent.name: p for p in AGENTS_DIR.glob("*/agent.md")}
+        self.assertEqual(set(agent_files.keys()), expected_agents)
+
+        retired_markers = ("sample-llm-wiki", "pyshacl.validate", "lean-ctx", "audit_report.md")
+        for agent_name, agent_path in sorted(agent_files.items()):
+            rel = agent_path.relative_to(PROJECT_ROOT)
+            meta, body = _parse_yaml_frontmatter(agent_path)
+            self.assertEqual(meta.get("name"), agent_name, f"Subagent {rel} name mismatch")
+            self.assertIs(meta.get("hidden"), False, f"Subagent {rel} must set hidden: false to mount in <subagents>")
+            self.assertIs(
+                meta.get("inheritCustomizations"),
+                True,
+                f"Subagent {rel} must set inheritCustomizations: true",
+            )
+
+            desc = meta.get("description")
+            self.assertIsInstance(desc, str, f"Subagent {rel} must declare a description string")
+            assert isinstance(desc, str)
+            word_count = len(desc.split())
+            self.assertTrue(1 <= word_count <= 60, f"Subagent {rel} description must be 1..60 words (got {word_count})")
+
+            tools = meta.get("tools")
+            self.assertIsInstance(tools, list, f"Subagent {rel} tools must be a YAML list")
+            assert isinstance(tools, list)
+            unknown_tools = set(tools) - _VALID_SUBAGENT_TOOLS
+            self.assertEqual(unknown_tools, set(), f"Subagent {rel} declares invalid tools: {sorted(unknown_tools)}")
+            if agent_name == "critic":
+                self.assertTrue(
+                    {"write_file", "edit_file"}.isdisjoint(tools),
+                    "Critic subagent must remain read-only (no write_file or edit_file)",
+                )
+
+            for marker in retired_markers:
+                self.assertNotIn(marker, body, f"Subagent {rel} contains retired reference '{marker}'")
+
+    def test_every_repo_target_file_matches_at_least_one_rule_glob(self):
+        """Rule 9: Every repo target file matches its owning .agents/rules glob without unintended overlap."""
+        rule_globs_by_name: dict[str, list[str]] = {}
+        for rule_file in sorted(RULES_DIR.glob("*.md")):
+            meta, _ = _parse_yaml_frontmatter(rule_file)
+            globs_val = meta.get("globs")
+            assert isinstance(globs_val, str)
+            rule_globs_by_name[rule_file.name] = [p.strip() for p in globs_val.split(",") if p.strip()]
+
+        target_files = (
+            list(YAW_DIR.rglob("*.py"))
+            + list((PROJECT_ROOT / "tests").rglob("*.py"))
+            + [PROJECT_ROOT / "benchmark.py"]
+            + list((PROJECT_ROOT / "scripts").rglob("*.py"))
+            + list(DOCS_DIR.rglob("*.md"))
+            + list(RULES_DIR.glob("*.md"))
+            + list(AGENTS_DIR.rglob("*.md"))
+            + [PROJECT_ROOT / "AGENTS.md", PROJECT_ROOT / "FOUNDATIONAL.md", PROJECT_ROOT / "README.md"]
+        )
+        self.assertGreater(len(target_files), 0)
+
+        unmatched: list[str] = []
+        overlapping: list[str] = []
+        for file_path in target_files:
+            rel_posix = PurePosixPath(file_path.relative_to(PROJECT_ROOT).as_posix())
+            matched_rules = [
+                rule_name
+                for rule_name, patterns in rule_globs_by_name.items()
+                if any(rel_posix.full_match(pattern) for pattern in patterns)
+            ]
+            if not matched_rules:
+                unmatched.append(str(rel_posix))
+            elif len(matched_rules) > 1 and str(rel_posix) != "tests/core/test_architecture.py":
+                overlapping.append(f"{rel_posix}: matched multiple rules {matched_rules}")
+
+        self.assertEqual(
+            unmatched,
+            [],
+            "Repository files not covered by any .agents/rules/*.md glob:\n" + "\n".join(unmatched),
+        )
+        self.assertEqual(
+            overlapping,
+            [],
+            "Repository files matched overlapping .agents/rules/*.md globs:\n" + "\n".join(overlapping),
+        )
+
+    def test_zero_broken_markdown_links_and_zero_wiki_links(self):
+        """Rule 10: Zero [[wiki-links]] and zero broken relative Markdown links across rules, agents, and docs."""
+        non_arxiv_docs = [p for p in sorted(DOCS_DIR.glob("*.md")) if not p.name.startswith("arxiv-")]
+        checked_files = (
+            [PROJECT_ROOT / "AGENTS.md", PROJECT_ROOT / "FOUNDATIONAL.md", PROJECT_ROOT / "README.md"]
+            + sorted(RULES_DIR.glob("*.md"))
+            + sorted(AGENTS_DIR.glob("*/agent.md"))
+            + non_arxiv_docs
+        )
+
+        wiki_violations: list[str] = []
+        broken_links: list[str] = []
+        for md_file in checked_files:
+            rel_source = md_file.relative_to(PROJECT_ROOT)
+            prose = _strip_fenced_code_blocks(md_file.read_text(encoding="utf-8"))
+            for match in _WIKI_LINK_RE.finditer(prose):
+                wiki_violations.append(f"{rel_source}: forbidden wiki-link {match.group(0)}")
+
+            for match in _MD_LINK_RE.finditer(prose):
+                raw_target = match.group(1).strip()
+                if not raw_target or raw_target.startswith(
+                    ("http://", "https://", "mailto:", "file://", "conversation://", "#")
+                ):
+                    continue
+                path_part = raw_target.split("#", 1)[0].strip()
+                if not path_part:
+                    continue
+                resolved = (md_file.parent / path_part).resolve()
+                if not resolved.exists():
+                    broken_links.append(f"{rel_source}: broken relative link '{raw_target}' -> {resolved}")
+
+        self.assertEqual(wiki_violations, [], "Forbidden [[wiki-links]] found:\n" + "\n".join(wiki_violations))
+        self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
+
+    def test_every_doc_is_reachable_from_rules_and_canonical_inventory(self):
+        """Rule 11: docs/ matches the canonical 19-file inventory and every doc is reachable from .agents/rules/*.md."""
+        actual_docs = {p.name for p in DOCS_DIR.glob("*.md")}
+        self.assertEqual(
+            actual_docs,
+            _CANONICAL_DOCS_INVENTORY,
+            f"docs/ inventory drift. Extra: {sorted(actual_docs - _CANONICAL_DOCS_INVENTORY)}, "
+            f"Missing: {sorted(_CANONICAL_DOCS_INVENTORY - actual_docs)}",
+        )
+
+        domain_rules = ("daemon.md", "graph-storage.md", "inference.md", "tests.md")
+        linked_docs: set[str] = set()
+        for rule_name in domain_rules:
+            rule_file = RULES_DIR / rule_name
+            _, body = _parse_yaml_frontmatter(rule_file)
+            for match in _MD_LINK_RE.finditer(body):
+                raw_target = match.group(1).split("#", 1)[0].strip()
+                if not raw_target or raw_target.startswith(("http://", "https://", "file://", "conversation://")):
+                    continue
+                resolved = (rule_file.parent / raw_target).resolve()
+                if resolved.parent == DOCS_DIR.resolve() and resolved.suffix == ".md":
+                    linked_docs.add(resolved.name)
+
+        unreachable = sorted(_CANONICAL_DOCS_INVENTORY - linked_docs)
+        self.assertEqual(
+            unreachable,
+            [],
+            f"docs/*.md files not reachable from domain rules {domain_rules}: {unreachable}",
+        )
+
+    def test_canonical_module_purity_and_behavioral_contracts(self):
+        """Rule 12: Canonical Category A modules preserve strict AST import purity and behavioral boundaries."""
+        stdlib = sys.stdlib_module_names
+
+        # 1. ppr.py: pure numpy/scipy/yaw.core sparse math operator (zero sqlite3, dspy, cocoindex, or daemon imports)
+        ppr_path = YAW_DIR / "daemon" / "graph" / "ppr.py"
+        for lineno, mod in parse_module_imports(ppr_path):
+            top = mod.split(".")[0]
+            self.assertIn(
+                top,
+                stdlib | {"numpy", "scipy", "yaw"},
+                f"ppr.py:{lineno} imports forbidden package '{mod}'",
+            )
+            self.assertNotEqual(top, "sqlite3", f"ppr.py:{lineno} must not import sqlite3")
+            if top == "yaw":
+                self.assertTrue(
+                    mod == "yaw.core" or mod.startswith("yaw.core."),
+                    f"ppr.py:{lineno} must only import yaw.core, got '{mod}'",
+                )
+
+        # 2. normalization.py: stateless OpenIE normalization (zero sqlite3, dspy, cocoindex, network, or storage)
+        norm_path = YAW_DIR / "daemon" / "graph" / "normalization.py"
+        forbidden_norm = {"sqlite3", "dspy", "cocoindex", "httpx", "openai", "urllib", "http", "socket"}
+        for lineno, mod in parse_module_imports(norm_path):
+            top = mod.split(".")[0]
+            self.assertNotIn(top, forbidden_norm, f"normalization.py:{lineno} imports forbidden module '{mod}'")
+            self.assertFalse(
+                mod.startswith("yaw.daemon.graph.storage"),
+                f"normalization.py:{lineno} must not import storage '{mod}'",
+            )
+
+        # 3. Storage leaf modules: zero network/HTTP imports anywhere in storage/*.py,
+        #    and zero dspy imports in canonical graph storage modules
+        storage_dir = YAW_DIR / "daemon" / "graph" / "storage"
+        forbidden_storage_net = {"openai", "httpx", "urllib", "http", "socket"}
+        for storage_file in sorted(storage_dir.glob("*.py")):
+            rel = storage_file.relative_to(PROJECT_ROOT)
+            for lineno, mod in parse_module_imports(storage_file):
+                top = mod.split(".")[0]
+                self.assertNotIn(top, forbidden_storage_net, f"{rel}:{lineno} imports forbidden module '{mod}'")
+
+        canonical_storage_files = (
+            "db.py",
+            "vectors.py",
+            "graph_ops.py",
+            "managed_sqlite.py",
+            "rows.py",
+            "evidence.py",
+            "hydration.py",
+            "shacl.py",
+        )
+        for storage_name in canonical_storage_files:
+            storage_file = storage_dir / storage_name
+            for lineno, mod in parse_module_imports(storage_file):
+                top = mod.split(".")[0]
+                self.assertNotEqual(top, "dspy", f"{storage_name}:{lineno} must not import dspy ('{mod}')")
+
+        # 3b. vectors.py: pure sqlite3 + numpy + .db vector/FTS primitives
+        vectors_path = storage_dir / "vectors.py"
+        for lineno, mod in parse_module_imports(vectors_path):
+            top = mod.split(".")[0]
+            self.assertIn(
+                top,
+                stdlib | {"numpy", "yaw"},
+                f"vectors.py:{lineno} imports unexpected package '{mod}'",
+            )
+            if top == "yaw":
+                self.assertEqual(mod, "yaw.daemon.graph.storage.db", f"vectors.py:{lineno} unexpected import '{mod}'")
+
+        # 3c. shacl.py: pure in-process SQLite SHACL & Turtle serializer (stdlib + yaw.core + storage siblings only)
+        shacl_path = storage_dir / "shacl.py"
+        for lineno, mod in parse_module_imports(shacl_path):
+            top = mod.split(".")[0]
+            self.assertIn(top, stdlib | {"yaw"}, f"shacl.py:{lineno} imports unexpected package '{mod}'")
+
+        # 3d. The target sink must use the managed transaction, never commit independently.
+        pub_path = storage_dir / "managed_sqlite.py"
+        pub_tree = ast.parse(pub_path.read_text(encoding="utf-8"), filename=str(pub_path))
+        for node in ast.walk(pub_tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotEqual(
+                    node.func.attr,
+                    "commit",
+                    f"managed_sqlite.py:{node.lineno} must not call .commit() directly",
+                )
+
+        # 4. adapter.py & retriever.py: thin DSPy bridges (zero sqlite3, cocoindex, or raw HTTP imports;
+        #    YawGBNFAdapter never overrides JSONAdapter.parse or JSONAdapter.format)
+        inference_dir = YAW_DIR / "daemon" / "graph" / "inference"
+        forbidden_bridge = {"sqlite3", "cocoindex", "httpx", "openai", "urllib", "http", "socket"}
+        for bridge_name in ("adapter.py", "retriever.py"):
+            bridge_path = inference_dir / bridge_name
+            for lineno, mod in parse_module_imports(bridge_path):
+                top = mod.split(".")[0]
+                self.assertNotIn(top, forbidden_bridge, f"{bridge_name}:{lineno} imports forbidden module '{mod}'")
+
+        adapter_path = inference_dir / "adapter.py"
+        adapter_tree = ast.parse(adapter_path.read_text(encoding="utf-8"), filename=str(adapter_path))
+        adapter_classes = [n for n in adapter_tree.body if isinstance(n, ast.ClassDef) and n.name == "YawGBNFAdapter"]
+        self.assertEqual(len(adapter_classes), 1, "YawGBNFAdapter class not found in adapter.py")
+        adapter_methods = {
+            n.name for n in adapter_classes[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertEqual(
+            adapter_methods,
+            {"__init__", "resolve_grammar", "_prepare_gbnf_kwargs", "__call__", "acall"},
+            f"YawGBNFAdapter must not override parse/format or add recovery methods: {sorted(adapter_methods)}",
+        )

@@ -42,7 +42,7 @@ class EmbeddingTests(unittest.TestCase):
                     distinct_titled_profile.index_identity,
                 }
             ),
-            3,
+            2,
         )
 
         # Explicit Title: or Markdown #..###### heading on line 1 -> title: {heading} | text: {body}
@@ -163,8 +163,6 @@ class EmbeddingTests(unittest.TestCase):
         )
         self.assertEqual(adapter.telemetry[0]["predictor"], "embedder")
         self.assertEqual(adapter.telemetry[0]["num_inputs"], 2)
-        adapter.reset_telemetry()
-        self.assertEqual(adapter.telemetry, [])
 
     def test_legacy_embedding_shim_is_retired(self):
         """Verify RetrievalEmbedding is completely removed from embedding and inference facade."""

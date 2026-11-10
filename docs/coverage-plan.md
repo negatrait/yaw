@@ -49,7 +49,7 @@ scripts-coverage.json are retained as scope-specific historical measurements.
 Next packet: remaining engine indexing normalization, optimizer/program state,
 remaining SQLite integrity repairs, and runtime/CLI.
 Dashboard and parity report rendering now have real SVG/audit tests; subprocess
-downloader tests verify cached operation without external network. See evaluation
+downloader tests verify cached operation without external network. See [evaluation-testing.md](evaluation-testing.md)
 section 41 for the completed 60-case regression packet and actual reporting fixes.
 Section 42 records native HTTP/SQLite checkpoint replay after stage-cache
 eviction and complete reflection-module line coverage in development data.

@@ -1,7 +1,7 @@
-"""Native DSPy HippoRAGProgram orchestrator."""
+"""Native DSPy YawProgram orchestrator."""
 
 import json
-import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -9,37 +9,39 @@ from typing import Any, Literal
 import dspy
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
-from yaw.core.types import OpenIERecord, StructuredTriple
+from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch, is_resource_label, pool_confidences
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .chat import create_dspy_lm
+from .confidence import extraction_logprob_votes, judge_logprob_votes
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
+    build_dspy_hierarchy_judge_grammar,
+    build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
     build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
+    build_dspy_related_judge_grammar,
     build_dspy_rerank_grammar,
     build_dspy_shacl_repair_grammar,
-    build_dspy_synonym_judge_grammar,
     build_dspy_triples_grammar,
     lm_supports_gbnf,
 )
-from .invariants import is_abstaining_answer, should_retry_stage_invariants, validate_stage_invariants
+from .invariants import validate_stage_invariants
 from .parsers import (
     coerce_generated_facts,
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
+    parse_hierarchy_decisions,
+    parse_label_decisions,
+    parse_related_decisions,
     parse_shacl_repairs,
-    parse_synonym_decisions,
+    shacl_repair_actions,
     text_processing,
 )
 from .prompts import (
-    NER_DEMOS,
-    QA_DEMOS,
-    TRIPLE_DEMOS,
-    TRIPLE_FILTER_DEMOS,
     AnswerQuestion,
     DefineMissingEntities,
     ExtractEntities,
@@ -47,62 +49,29 @@ from .prompts import (
     ExtractTriples,
     FilterTriples,
     HealSHACLViolations,
-    JudgeSynonyms,
+    JudgeHierarchy,
+    JudgeLabels,
+    JudgeRelated,
     ProposeSHACLRepairs,
 )
+from .reflection import ServingTokenCounter
 from .retriever import YawRetriever, YawRM
-from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM, build_rlm_action_demos
+from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM
+from .synonyms import SynonymRequestBudget
 
 
-def _bounded_prompt_json(items: Sequence[Any], max_items: int, max_chars: int) -> str:
-    """Fit whole structured input items; never split a JSON item to fit a prompt."""
-    selected = list(items[:max_items])
-    while selected:
-        rendered = json.dumps(selected, ensure_ascii=False)
-        if len(rendered) <= max_chars:
-            return rendered
-        selected.pop()
-    return "[]"
-
-
-def _merge_openie_definitions(
-    entities: Sequence[str],
-    entity_definitions: Sequence[tuple[str, str]],
-    structured_triples: Sequence[StructuredTriple],
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """Merge NER entities, NER definitions, and structured-triple inline definitions without duplicates."""
-    merged_entities: list[str] = list(entities)
-    seen_entity_names: set[str] = set(merged_entities)
-    seen_entity_norms: set[str] = {str(text_processing(name)) for name in merged_entities if str(text_processing(name))}
-    raw_pairs: list[tuple[str, str]] = list(entity_definitions)
-    for st in structured_triples:
-        mention_pairs = (
-            ((st.subj, st.subj_def),) if st.obj_kind == "literal" else ((st.subj, st.subj_def), (st.obj, st.obj_def))
-        )
-        for ent_name, ent_def in mention_pairs:
-            if not ent_name:
-                continue
-            ent_norm = str(text_processing(ent_name))
-            if ent_name not in seen_entity_names and (not ent_norm or ent_norm not in seen_entity_norms):
-                merged_entities.append(ent_name)
-                seen_entity_names.add(ent_name)
-                if ent_norm:
-                    seen_entity_norms.add(ent_norm)
-            raw_pairs.append((ent_name, ent_def))
-
-    return tuple(merged_entities), extract_entity_definitions(raw_pairs, normalize_keys=True)
-
-
-class HippoRAGProgram(dspy.Module):
+class YawProgram(dspy.Module):
     """Unified DSPy Module for HippoRAG 2 OpenIE, EDC/SKOS Schema Canon, SHACL Repair, Recognition Memory, and \
 Multi-Hop QA.
 
-    Exposes the 9 canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
-    1. **8 Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
+    Exposes the canonical runtime stage predictors (out of the 12 total DSPy signatures in YAW):
+    1. **Direct GBNF Predictors (configured chat model on `llama.cpp` GPU):**
        - `ner` (`ExtractEntities`)
        - `triples` (`ExtractTriples`)
        - `entity_definer` (`DefineMissingEntities`)
-       - `synonym_judge` (`JudgeSynonyms`)
+       - `label_judge` (`JudgeLabels`)
+       - `hierarchy_judge` (`JudgeHierarchy`)
+       - `related_judge` (`JudgeRelated`)
        - `shacl_repair` (`ProposeSHACLRepairs`)
        - `triple_filter` (`FilterTriples`)
        - `query_intent` (`ExtractQueryIntent`)
@@ -111,7 +80,7 @@ Multi-Hop QA.
        - `shacl_healer_rlm` (`HealSHACLViolations`) running inside `dspy.PythonInterpreter` (managed \
 Deno/Pyodide WASM) with
          bound graph inspection, hydration, repair, and SQL SHACL linting tools (`inspect_focus_node`,
-         `hydrate_chunk`, `qwen_propose_shacl_repairs`, `apply_shacl_repairs`, `lint_shacl`).
+         `hydrate_chunk`, `propose_repairs`, `lint_shacl`). Repairs are returned as proposals.
     3. **First-Class Embedding Trail (`record_embedding_telemetry` / `embedding_audit_trail`):**
        - Tracks every `DSPyEmbeddingAdapter` (`dspy.Embedder`) invocation and the 3 optimizable
          task prefixes (`embedding_query_prefix`, `embedding_fact_prefix`, `embedding_document_prefix`)
@@ -121,27 +90,26 @@ Deno/Pyodide WASM) with
     def __init__(
         self,
         *,
-        include_demos: bool = False,
         enable_gbnf: bool = False,
         gbnf_max_entities: int | None = None,
         gbnf_max_triples: int | None = None,
         gbnf_max_facts: int = 4,
-        gbnf_max_reasoning_chars: int | None = None,
+        gbnf_max_reasoning_chars: int | None = 360,
         embedding_query_prefix: str | None = None,
         embedding_fact_prefix: str | None = None,
         embedding_document_prefix: str | None = None,
         adapter: dspy.Adapter | None = None,
         orchestrator_lm: Any = None,
-        rlm_max_iters: int = 10,
-        rlm_max_llm_calls: int = 20,
+        rlm_max_iters: int = 20,
+        rlm_max_llm_calls: int = 50,
         rlm_max_output_chars: int | None = None,
         rlm_sub_lm: Any = None,
         rlm_tools: list[Callable[..., Any]] | None = None,
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         compiled_path: str | Path | None = None,
-        enable_react_fallback: bool = False,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        synonym_token_counter: Any = None,
     ) -> None:
         super().__init__()
         if context_window_tokens is None:
@@ -159,6 +127,9 @@ Deno/Pyodide WASM) with
         context_char_limit(1, context_window_tokens, max_output_tokens)
         self.context_window_tokens = context_window_tokens
         self.max_output_tokens = max_output_tokens
+        self.synonym_token_counter = synonym_token_counter
+        self._synonym_tokenizer_settings: tuple[str, str] | None = None
+        self._synonym_budget: SynonymRequestBudget | None = None
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
@@ -190,24 +161,25 @@ Deno/Pyodide WASM) with
         self._pair_inspector: Callable[[str, str], str] | None = None
         self._chunk_hydrator: Callable[[str], str] | None = None
         self._ast_island_hydrator: Callable[[str], str] | None = None
-        self._shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None
         self._shacl_linter: Callable[[], list[dict[str, str]]] | None = None
+        self._focus_context: str = ""
         self._graph_search_tool: Callable[[str], str] | None = None
-        self._last_ner_definitions: dict[str, str] = {}
-        self.max_invariant_retries: int = 1
-        self.enable_react_fallback: bool = bool(enable_react_fallback)
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self.history = DiagnosticHistory()
         self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.entity_def_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
-        self.synonym_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.label_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.hierarchy_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.related_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.shacl_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
 
-        # 8 Direct GBNF Predictors with distinct Signatures
+        # 10 Direct GBNF Predictors with distinct Signatures
         self.ner = dspy.Predict(ExtractEntities)
         self.triples = dspy.Predict(ExtractTriples)
         self.entity_definer = dspy.Predict(DefineMissingEntities)
-        self.synonym_judge = dspy.Predict(JudgeSynonyms)
+        self.label_judge = dspy.Predict(JudgeLabels)
+        self.hierarchy_judge = dspy.Predict(JudgeHierarchy)
+        self.related_judge = dspy.Predict(JudgeRelated)
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
         self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
@@ -236,14 +208,6 @@ Deno/Pyodide WASM) with
 
         self._bind_predictor_lms()
 
-        if include_demos:
-            self.ner.demos = list(NER_DEMOS)
-            self.triples.demos = list(TRIPLE_DEMOS)
-            self.triple_filter.demos = list(TRIPLE_FILTER_DEMOS)
-            self.qa.predict.demos = list(QA_DEMOS)
-            rlm_demos = build_rlm_action_demos()
-            self.shacl_healer_rlm.generate_action.demos = list(rlm_demos["shacl_repair"])
-
         self.loaded_from_path: Path | None = None
         if compiled_path is not None:
             path = Path(compiled_path)
@@ -262,12 +226,14 @@ Deno/Pyodide WASM) with
         bounded: bool = True,
         telemetry_key: str = "telemetry",
     ) -> dict[str, list[dict[str, Any]]]:
-        """Return serialized copies of all 5 program telemetry and audit trails."""
+        """Return serialized copies of all program telemetry and audit trails."""
         limits = {
             "telemetry": 250,
             "embedding_audit_trail": 250,
             "entity_def_audit_trail": 250,
-            "synonym_audit_trail": 100,
+            "label_judge_audit_trail": 100,
+            "hierarchy_judge_audit_trail": 100,
+            "related_judge_audit_trail": 100,
             "shacl_audit_trail": 100,
         }
         out: dict[str, list[dict[str, Any]]] = {}
@@ -287,7 +253,9 @@ Deno/Pyodide WASM) with
                 self.ner,
                 self.triples,
                 self.entity_definer,
-                self.synonym_judge,
+                self.label_judge,
+                self.hierarchy_judge,
+                self.related_judge,
                 self.shacl_repair,
                 self.triple_filter,
                 self.query_intent,
@@ -297,20 +265,6 @@ Deno/Pyodide WASM) with
             self.qa.set_lm(orchestrator)
             self.shacl_healer_rlm.set_lm(orchestrator)
 
-    def all_stage_predictors(self) -> list[tuple[str, Any]]:
-        """Return all 9 canonical stage predictors (8 direct GBNF + 1 SHACL RLM healer)."""
-        return [
-            ("ner", self.ner),
-            ("triples", self.triples),
-            ("entity_definer", self.entity_definer),
-            ("synonym_judge", self.synonym_judge),
-            ("shacl_repair", self.shacl_repair),
-            ("shacl_healer_rlm", self.shacl_healer_rlm),
-            ("triple_filter", self.triple_filter),
-            ("query_intent", self.query_intent),
-            ("qa", self.qa.predict),
-        ]
-
     def set_graph_tools(
         self,
         *,
@@ -318,16 +272,14 @@ Deno/Pyodide WASM) with
         pair_inspector: Callable[[str, str], str] | None = None,
         chunk_hydrator: Callable[[str], str] | None = None,
         ast_island_hydrator: Callable[[str], str] | None = None,
-        shacl_repair_applier: Callable[[Sequence[Mapping[str, Any]]], int] | None = None,
         shacl_linter: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
         """Bind storage tools (`inspect_focus_node`, `inspect_pair`, `hydrate_chunk`, `hydrate_ast_island`, \
-`apply_shacl_repairs`, `lint_shacl`) for the SHACL RLM sandbox."""
+`lint_shacl`) for the read-only SHACL RLM sandbox."""
         self._node_inspector = node_inspector
         self._pair_inspector = pair_inspector
         self._chunk_hydrator = chunk_hydrator
         self._ast_island_hydrator = ast_island_hydrator
-        self._shacl_repair_applier = shacl_repair_applier
         self._shacl_linter = shacl_linter
 
     def set_graph_search_tool(
@@ -337,15 +289,14 @@ Deno/Pyodide WASM) with
         """Bind a graph fact search callback for multi-hop `dspy.ReActV2` fallback exploration."""
         self._graph_search_tool = search_fn
 
-    def copy_runtime_hooks_to(self, target: HippoRAGProgram) -> None:
-        """Copy runtime retrieval and graph tool hooks onto a sibling `HippoRAGProgram`."""
+    def copy_runtime_hooks_to(self, target: YawProgram) -> None:
+        """Copy runtime retrieval and graph tool hooks onto a sibling `YawProgram`."""
         target.set_retrieval_hook(self._retrieval_hook)
         target.set_graph_tools(
             node_inspector=self._node_inspector,
             pair_inspector=self._pair_inspector,
             chunk_hydrator=self._chunk_hydrator,
             ast_island_hydrator=self._ast_island_hydrator,
-            shacl_repair_applier=self._shacl_repair_applier,
             shacl_linter=self._shacl_linter,
         )
         target.set_graph_search_tool(self._graph_search_tool)
@@ -355,8 +306,8 @@ Deno/Pyodide WASM) with
             target.rm.default_k = self.rm.default_k
 
     @classmethod
-    def from_config(cls, config: YawConfig) -> HippoRAGProgram:
-        """Construct a HippoRAGProgram from a YawConfig."""
+    def from_config(cls, config: YawConfig) -> YawProgram:
+        """Construct a YawProgram from a YawConfig."""
         assert config.max_output_tokens is not None and config.rlm_max_output_chars is not None
         orch_lm = create_dspy_lm(
             config.qa_model,
@@ -397,6 +348,7 @@ Deno/Pyodide WASM) with
         program.shacl_healer_rlm.max_iters = config.rlm_max_iters
         program.shacl_healer_rlm.max_llm_calls = config.rlm_max_llm_calls
         program.shacl_healer_rlm.max_output_chars = config.rlm_max_output_chars
+        program._synonym_tokenizer_settings = (config.base_url, config.reflection_tokenizer_url)
         return program
 
     def _context_char_limit(self, base_chars: int) -> int:
@@ -406,6 +358,8 @@ Deno/Pyodide WASM) with
         """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes and GBNF structural bounds."""
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
         yaw_surface: dict[str, Any] = {
+            "graph_schema": "scheme-free-v1",
+            "shacl_tools": "canonical-report-v1",
             "gbnf_max_entities": self.gbnf_max_entities,
             "gbnf_max_triples": self.gbnf_max_triples,
             "gbnf_max_facts": self.gbnf_max_facts,
@@ -424,6 +378,10 @@ Deno/Pyodide WASM) with
         state_copy = dict(state)
         state_copy.setdefault("retriever", {"k": getattr(self.retriever, "k", 10)})
         yaw_surface = state_copy.pop("yaw_surface", None)
+        if not isinstance(yaw_surface, dict) or yaw_surface.get("graph_schema") != "scheme-free-v1":
+            raise ValueError("Incompatible program graph schema; recompile against the scheme-free graph")
+        if yaw_surface.get("shacl_tools") != "canonical-report-v1":
+            raise ValueError("Incompatible SHACL tool contract; start a fresh optimization")
         deployment_lms = {name: predictor.lm for name, predictor in self.named_predictors() if predictor.lm is not None}
         # Missing legacy predictors retain constructor defaults. Explicitly
         # saved empty demo lists must survive loading without reseeding.
@@ -468,7 +426,7 @@ Deno/Pyodide WASM) with
         self.loaded_from_path = Path(path).resolve()
         return super().load(str(path), *args, **kwargs)
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> HippoRAGProgram:
+    def __deepcopy__(self, memo: dict[int, Any]) -> YawProgram:
         """Clone all DSPy predictors while preserving live LM clients and the engine retrieval hook."""
         import copy
 
@@ -482,8 +440,8 @@ Deno/Pyodide WASM) with
                 "_pair_inspector",
                 "_chunk_hydrator",
                 "_ast_island_hydrator",
-                "_shacl_repair_applier",
                 "_shacl_linter",
+                "_focus_context",
                 "_graph_search_tool",
                 "orchestrator_lm",
                 "rlm_sub_lm",
@@ -503,6 +461,9 @@ Deno/Pyodide WASM) with
             k=getattr(self.retriever, "k", 10),
             rm=new_prog.rm,
         )
+        new_prog.shacl_healer_rlm._user_tools = new_prog.shacl_healer_rlm._normalize_tools(
+            new_prog._build_shacl_repl_tools()
+        )
         return new_prog
 
     def _resolve_worker_lm(self, fallback_lm: dspy.LM | None = None) -> dspy.LM | None:
@@ -514,38 +475,18 @@ Deno/Pyodide WASM) with
     def _build_shacl_repl_tools(self) -> list[Callable[..., Any]]:
         """Build the closed-world SHACL healing tools exposed inside `shacl_healer_rlm`."""
 
-        def qwen_propose_shacl_repairs(
-            violations: Any = None,
-            focus_context: str = "",
-            violations_json: Any = None,
-        ) -> list[dict[str, str]]:
-            """Propose bounded closed-world SHACL repairs using Qwen GPU GBNF."""
+        def propose_repairs() -> list[dict[str, str]]:
+            """Propose repairs for the actual batch report with complete structured focus context."""
+            if self._shacl_linter is None or (not self._focus_context.strip() and self._node_inspector is None):
+                raise ValueError("SHACL repair requires a bound report and node inspector")
             worker_lm = self._resolve_worker_lm()
-            raw = violations if violations is not None else violations_json
-            resolved_context = str(focus_context or "")
-            if not resolved_context.strip() and self._node_inspector is not None and raw:
-                try:
-                    parsed_items = json.loads(raw) if isinstance(raw, str) else list(raw)
-                except json.JSONDecodeError, TypeError:
-                    parsed_items = []
-                seen_fns: list[str] = []
-                for item in parsed_items:
-                    fn = (
-                        str(item.get("focus_node", "")).strip()
-                        if isinstance(item, Mapping)
-                        else str(getattr(item, "focus_node", "")).strip()
-                    )
-                    if fn and fn not in seen_fns:
-                        seen_fns.append(fn)
-                dossiers: list[str] = []
-                for fn in seen_fns[:8]:
-                    info = self._node_inspector(fn)
-                    if isinstance(info, Mapping):
-                        md = str(info.get("markdown_dossier", "")).strip()
-                        if md:
-                            dossiers.append(md)
-                if dossiers:
-                    resolved_context = "\n\n---\n\n".join(dossiers)
+            raw = self._shacl_linter()
+            if self._focus_context.strip():
+                resolved_context = self._focus_context
+            else:
+                assert self._node_inspector is not None
+                foci = dict.fromkeys(str(item["focus_node"]) for item in raw)
+                resolved_context = json.dumps([self._node_inspector(fn) for fn in foci], ensure_ascii=False)
             return self.propose_shacl_repairs(
                 raw,
                 focus_context=resolved_context,
@@ -593,37 +534,29 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 return ""
             return str(self._graph_search_tool(str(query)))
 
-        def apply_shacl_repairs(repairs: Any) -> int:
-            """Apply bounded SHACL repair actions to the active in-transaction database connection."""
-            if self._shacl_repair_applier is None:
-                return 0
-            parsed = parse_shacl_repairs(repairs)
-            return int(self._shacl_repair_applier(parsed))
-
         def lint_shacl() -> list[dict[str, str]]:
-            """Re-run closed-world SQL SHACL validation on the active in-transaction database connection."""
+            """Read the proposal's violations; repair proposals are applied only after SUBMIT."""
             if self._shacl_linter is None:
                 return []
             return list(self._shacl_linter())
 
         return [
-            qwen_propose_shacl_repairs,
+            propose_repairs,
             inspect_focus_node,
             inspect_pair,
             hydrate_chunk,
             hydrate_ast_island,
             read_source_chunk,
             search_graph,
-            apply_shacl_repairs,
             lint_shacl,
         ]
 
-    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True):
-        ctx_kwargs: dict[str, Any] = {}
+    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True, adapter: dspy.Adapter | None = None):
+        ctx_kwargs: dict[str, Any] = {"warn_on_type_mismatch": False, "disable_history": True, "max_history_size": 0}
         if lm is not None:
             ctx_kwargs["lm"] = lm
         if use_json_adapter:
-            ctx_kwargs["adapter"] = self.json_adapter
+            ctx_kwargs["adapter"] = adapter or self.json_adapter
         return dspy.context(**ctx_kwargs)
 
     def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.BaseLM | None) -> bool:
@@ -672,11 +605,12 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any,
         use_gbnf: bool | None,
         grammar_fn: Callable[[], str],
+        request_adapter: dspy.Adapter | None = None,
+        collect_logprobs: bool = False,
         **inputs: Any,
     ) -> Any:
         from dspy.utils.usage_tracker import track_usage
 
-        retry_count = 0
         inv_score = 1.0
         inv_feedback = ""
         with track_usage() as usage_tracker:
@@ -693,11 +627,11 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                     stage_name or active_name,
                     inputs,
                     pred,
-                    shacl_linter=self._shacl_linter,
+                    shacl_linter=None,
                 )
             else:
                 predictor = direct_mod.predict if isinstance(direct_mod, dspy.ChainOfThought) else direct_mod
-                effective_lm = lm or predictor.lm or dspy.settings.lm
+                effective_lm = lm or getattr(predictor, "lm", None) or dspy.settings.lm
                 direct_inputs = dict(inputs)
                 if isinstance(direct_inputs.get("passage"), str) and len(
                     direct_inputs["passage"]
@@ -712,9 +646,12 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 call_kwargs: dict[str, Any] = {}
                 if lm is not None:
                     call_kwargs["lm"] = lm
+                config: dict[str, Any] = {"logprobs": True} if collect_logprobs else {}
                 if self._should_use_gbnf(use_gbnf, effective_lm):
-                    call_kwargs["config"] = {"extra_body": {"grammar": grammar_fn()}}
-                with self._dspy_ctx(effective_lm, use_json_adapter=True):
+                    config["extra_body"] = {"grammar": grammar_fn()}
+                if config:
+                    call_kwargs["config"] = config
+                with self._dspy_ctx(effective_lm, use_json_adapter=True, adapter=request_adapter):
                     pred = direct_mod(**direct_inputs, **call_kwargs)
                     inv_score, inv_feedback = validate_stage_invariants(
                         stage_name,
@@ -722,30 +659,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                         pred,
                         shacl_linter=None,
                     )
-                    max_retries = self.max_invariant_retries
-                    while (
-                        inv_score < 1.0
-                        and retry_count < max_retries
-                        and should_retry_stage_invariants(stage_name, pred, effective_lm)
-                    ):
-                        retry_count += 1
-                        retry_cfg = dict(call_kwargs.get("config") or {})
-                        retry_cfg["rollout_id"] = retry_count
-                        retry_kwargs = {**call_kwargs, "config": retry_cfg}
-                        try:
-                            cand_pred = direct_mod(**direct_inputs, **retry_kwargs)
-                        except Exception:
-                            break
-                        cand_score, cand_fb = validate_stage_invariants(
-                            stage_name,
-                            direct_inputs,
-                            cand_pred,
-                            shacl_linter=None,
-                        )
-                        if cand_score >= inv_score:
-                            pred = cand_pred
-                            inv_score = cand_score
-                            inv_feedback = cand_fb
                 active_mod = direct_mod
                 active_name = "qa" if stage_name == "qa" else (stage_name or "direct")
         tokens = usage_tracker.get_total_tokens()
@@ -761,10 +674,9 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 is_rlm=bool(is_rlm and rlm_mod is not None),
                 usage=tokens,
                 inputs_summary=str(list(inputs.keys())),
-                outputs_summary=str(pred)[:240],
+                outputs_summary=str({key: value for key, value in pred.items() if key != "logprobs"})[:240],
                 invariant_score=inv_score,
                 invariant_feedback=inv_feedback,
-                invariant_retries=retry_count,
             )
         return pred
 
@@ -774,10 +686,11 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], tuple[tuple[str, str, float | None], ...]]:
         pred = self._invoke_stage(
             self.ner,
             stage_name="ner",
+            collect_logprobs=True,
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
@@ -786,11 +699,22 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_entities = getattr(pred, "named_entities", [])
         parsed_defs = extract_entity_definitions(raw_entities)
-        enriched_defs: list[tuple[str, str]] = [
-            (ename, edef or self._last_ner_definitions.get(ename, "")) for ename, edef in parsed_defs
-        ]
-        entities = tuple(ename for ename, _ in enriched_defs)
-        return entities, tuple(enriched_defs)
+        measurements = extraction_logprob_votes(pred.get("logprobs"), "named_entities", raw_entities)
+        if "logprobs" in pred:
+            del pred["logprobs"]
+        votes: dict[tuple[str, str], list[float | None]] = {}
+        for item, probability in zip(raw_entities, measurements, strict=True):
+            for name, definition in extract_entity_definitions([item]):
+                votes.setdefault((name, definition.casefold()), []).append(probability)
+        probabilities = tuple(
+            (name, definition, pool_confidences(*votes[(name, definition.casefold())]))
+            for name, definition in parsed_defs
+        )
+        literals = [name for name, _ in parsed_defs if not is_resource_label(name)]
+        if literals:
+            raise ValueError(f"NER resource label lacks lexical content (literals are not resources): {literals!r}")
+        entities = tuple(ename for ename, _ in parsed_defs)
+        return entities, tuple(parsed_defs), probabilities
 
     def extract_entity_definitions(
         self,
@@ -800,19 +724,8 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         use_gbnf: bool | None = None,
     ) -> tuple[tuple[str, str], ...]:
         """Run DSPy NER extraction and return deduplicated (entity_name, contextual_definition) pairs."""
-        _, entity_defs = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
+        _, entity_defs, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         return entity_defs
-
-    def extract_entities(
-        self,
-        passage: str,
-        *,
-        lm: Any = None,
-        use_gbnf: bool | None = None,
-    ) -> tuple[str, ...]:
-        """Run DSPy NER extraction on Qwen w/ GBNF."""
-        entities, _ = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
-        return entities
 
     def define_missing_entities(
         self,
@@ -824,7 +737,7 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         use_gbnf: bool | None = None,
         _record_audit: bool = True,
     ) -> tuple[tuple[str, str], ...]:
-        """Synthesize contextual definitions via DefineMissingEntities for triple entities lacking definitions."""
+        """Repair definitions of requested NER resources without discovering new resources."""
         deduped: list[str] = []
         for item in missing_entities:
             name = str(item).strip()
@@ -836,7 +749,9 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         triples_payload: list[Any] = []
         for t in triples:
             if isinstance(t, StructuredTriple):
-                triples_payload.append(list(t.as_tuple()))
+                triples_payload.append(t.as_tuple())
+            elif isinstance(t, (list, tuple)) and len(t) == 3:
+                triples_payload.append((str(t[0]), str(t[1]), str(t[2])))
             elif isinstance(t, (list, tuple, dict)):
                 triples_payload.append(t)
 
@@ -854,30 +769,21 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         )
         raw_defs = getattr(pred, "entity_definitions", getattr(pred, "named_entities", []))
         parsed = extract_entity_definitions(raw_defs)
+        requested_norms = {str(text_processing(name)) for name in deduped}
         exact_map: dict[str, str] = {}
         norm_map: dict[str, str] = {}
         for ename, edef in parsed:
+            if str(text_processing(ename)) not in requested_norms:
+                raise ValueError("Definition repair introduced an unrequested resource")
             if ename and edef:
                 exact_map[ename] = edef
                 norm_map[str(text_processing(ename))] = edef
 
         resolved: list[tuple[str, str]] = []
-        seen_names: set[str] = set()
-        for idx, m_name in enumerate(deduped):
+        for m_name in deduped:
             defn = exact_map.get(m_name) or norm_map.get(str(text_processing(m_name))) or ""
-            if not defn and len(parsed) == len(deduped):
-                defn = parsed[idx][1]
             if defn:
                 resolved.append((m_name, defn))
-                seen_names.add(m_name)
-                if not _record_audit:
-                    self._last_ner_definitions[m_name] = defn
-        for ename, edef in parsed:
-            if ename and edef and ename not in seen_names:
-                resolved.append((ename, edef))
-                seen_names.add(ename)
-                if not _record_audit:
-                    self._last_ner_definitions[ename] = edef
 
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         if _record_audit:
@@ -904,150 +810,46 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         entity_definitions: Sequence[tuple[str, str]] | dict[str, str] | None = None,
         lm: Any = None,
         use_gbnf: bool | None = None,
-        _repair_missing_defs: bool = True,
     ) -> tuple[StructuredTriple, ...]:
-        """Run DSPy triple extraction and return structured triples with contextual definitions."""
-        merged_defs: dict[str, str] = {}
-        all_def_pairs: list[tuple[str, str]] = []
-        defined_entity_names: list[str] = []
-        for k, v in self._last_ner_definitions.items():
-            if k and v:
-                merged_defs[k] = v
-                merged_defs[str(text_processing(k))] = v
-                all_def_pairs.append((k, v))
-        if isinstance(entity_definitions, Mapping):
-            for k, v in entity_definitions.items():
-                ck = str(k).strip()
-                cv = str(v).strip()
-                if ck and cv:
-                    merged_defs[ck] = cv
-                    merged_defs[str(text_processing(ck))] = cv
-                    all_def_pairs.append((ck, cv))
-                    if ck not in defined_entity_names:
-                        defined_entity_names.append(ck)
-        elif isinstance(entity_definitions, Sequence):
-            for pair in entity_definitions:
-                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                    ck = str(pair[0]).strip()
-                    cv = str(pair[1]).strip() if pair[1] is not None else ""
-                    if ck and cv:
-                        merged_defs[ck] = cv
-                        merged_defs[str(text_processing(ck))] = cv
-                        all_def_pairs.append((ck, cv))
-                        if ck not in defined_entity_names:
-                            defined_entity_names.append(ck)
-        for item in named_entities:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                k = str(item[0]).strip()
-                v = str(item[1]).strip() if item[1] is not None else ""
-                if k and v:
-                    merged_defs[k] = v
-                    merged_defs[str(text_processing(k))] = v
-                    all_def_pairs.append((k, v))
-                    if k not in defined_entity_names:
-                        defined_entity_names.append(k)
-
-        known_entities_for_grammar: list[str] = defined_entity_names or [
-            (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
-            for x in named_entities
-            if (str(x[0]).strip() if isinstance(x, (list, tuple)) and len(x) >= 1 else str(x).strip())
+        """Link the NER catalog; only literal objects may introduce new values."""
+        names = [
+            str(item[0]).strip() if isinstance(item, (list, tuple)) else str(item).strip() for item in named_entities
         ]
-
+        if not names:
+            return ()
+        definitions = list(
+            entity_definitions.items() if isinstance(entity_definitions, dict) else entity_definitions or ()
+        )
+        definitions.extend(
+            (name, definition) for name, definition in extract_entity_definitions(named_entities) if definition
+        )
+        normalized_entities: list[Any] = [
+            (str(item[0]), str(item[1]))
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+            else str(item[0] if isinstance(item, (list, tuple)) and item else item)
+            for item in named_entities
+        ]
         pred = self._invoke_stage(
             self.triples,
             stage_name="triples",
+            collect_logprobs=True,
             is_rlm=False,
             lm=lm,
             use_gbnf=use_gbnf,
-            grammar_fn=lambda: build_dspy_triples_grammar(
-                self.gbnf_max_triples,
-                known_entities=known_entities_for_grammar,
-            ),
+            grammar_fn=lambda: build_dspy_triples_grammar(self.gbnf_max_triples, known_entities=named_entities),
             passage=passage,
-            named_entities=list(named_entities),
+            named_entities=normalized_entities,
         )
-
         raw_triples = getattr(pred, "triples", [])
-        structured = list(extract_structured_triples(raw_triples, entity_definitions=all_def_pairs or merged_defs))
-
-        # Propagate any inline [name, def] pairs across all triples in the same chunk first
-        for st in structured:
-            if st.subj and st.subj_def:
-                merged_defs[st.subj] = st.subj_def
-                merged_defs[str(text_processing(st.subj))] = st.subj_def
-            if st.obj and st.obj_def:
-                merged_defs[st.obj] = st.obj_def
-                merged_defs[str(text_processing(st.obj))] = st.obj_def
-
-        missing_names: list[str] = []
-        for idx, st in enumerate(structured):
-            s_def = st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-            o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
-            if s_def != st.subj_def or o_def != st.obj_def:
-                structured[idx] = StructuredTriple(
-                    subj=st.subj,
-                    subj_def=s_def,
-                    pred=st.pred,
-                    obj=st.obj,
-                    obj_def=o_def,
-                    spo_def=st.spo_def,
-                    obj_kind=st.obj_kind,
-                    obj_datatype=st.obj_datatype,
-                    obj_lang=st.obj_lang,
-                )
-            if st.subj and not s_def and st.subj not in missing_names:
-                missing_names.append(st.subj)
-            if st.obj_kind != "literal" and st.obj and not o_def and st.obj not in missing_names:
-                missing_names.append(st.obj)
-
-        if _repair_missing_defs and missing_names:
-            repaired_defs = self.define_missing_entities(
-                passage,
-                missing_names,
-                triples=structured,
-                lm=lm,
-                use_gbnf=use_gbnf,
-            )
-            for ename, edef in repaired_defs:
-                if ename and edef:
-                    merged_defs[ename] = edef
-                    merged_defs[str(text_processing(ename))] = edef
-            for idx, st in enumerate(structured):
-                s_def = (
-                    st.subj_def or merged_defs.get(st.subj, "") or merged_defs.get(str(text_processing(st.subj)), "")
-                )
-                o_def = st.obj_def or merged_defs.get(st.obj, "") or merged_defs.get(str(text_processing(st.obj)), "")
-                if s_def != st.subj_def or o_def != st.obj_def:
-                    structured[idx] = StructuredTriple(
-                        subj=st.subj,
-                        subj_def=s_def,
-                        pred=st.pred,
-                        obj=st.obj,
-                        obj_def=o_def,
-                        spo_def=st.spo_def,
-                        obj_kind=st.obj_kind,
-                        obj_datatype=st.obj_datatype,
-                        obj_lang=st.obj_lang,
-                    )
-
-        return tuple(structured)
-
-    def extract_triples(
-        self,
-        passage: str,
-        named_entities: Sequence[Any],
-        *,
-        lm: Any = None,
-        use_gbnf: bool | None = None,
-    ) -> tuple[tuple[str, str, str], ...]:
-        """Run DSPy triple extraction on Qwen w/ GBNF."""
-        structured = self.extract_structured_triples(
-            passage,
-            named_entities,
-            lm=lm,
-            use_gbnf=use_gbnf,
+        probabilities = extraction_logprob_votes(pred.get("logprobs"), "triples", raw_triples)
+        if "logprobs" in pred:
+            del pred["logprobs"]
+        return extract_structured_triples(
+            raw_triples,
+            entity_definitions=definitions,
+            known_entities=names,
+            llm_probabilities=probabilities,
         )
-        return tuple(st.as_tuple() for st in structured)
 
     def extract_openie(
         self,
@@ -1057,13 +859,11 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> OpenIERecord:
-        """Execute OpenIE (NER w/ definitions -> Structured Triples -> Missing Entity Definitions) for a passage \
+        """Execute OpenIE (NER-owned resources/definitions -> resource-closed statements) for a passage \
 chunk."""
-        entities, entity_definitions = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
+        entities, entity_definitions, entity_probabilities = self._run_ner_stage(passage, lm=lm, use_gbnf=use_gbnf)
         has_nonempty_defs = any(defn for _, defn in entity_definitions)
-        stage2_entities_input: list[Any] = (
-            [[name, defn] for name, defn in entity_definitions] if has_nonempty_defs else list(entities)
-        )
+        stage2_entities_input: list[Any] = list(entity_definitions) if has_nonempty_defs else list(entities)
         structured_triples = self.extract_structured_triples(
             passage,
             stage2_entities_input,
@@ -1071,76 +871,294 @@ chunk."""
             lm=lm,
             use_gbnf=use_gbnf,
         )
-        merged_entities, merged_defs = _merge_openie_definitions(entities, entity_definitions, structured_triples)
         triples = tuple(st.as_tuple() for st in structured_triples)
         return OpenIERecord(
             chunk_id=chunk_id,
-            entities=merged_entities,
+            entities=entities,
             triples=triples,
             structured_triples=structured_triples,
-            entity_definitions=merged_defs,
+            entity_definitions=entity_definitions,
+            entity_probabilities=entity_probabilities,
         )
 
-    def judge_synonyms(
+    def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:
+        """Resolve a verified tokenizer for the active synonym LM, retaining one budget object."""
+        effective = lm or self.label_judge.lm or dspy.settings.lm
+        if effective is None:
+            raise ValueError("Synonym judgment requires an LM")
+        counter = self.synonym_token_counter
+        if counter is None:
+            settings = self._synonym_tokenizer_settings
+            base_url = settings[0] if settings else effective.kwargs.get("api_base")
+            if not base_url:
+                raise ValueError("Synonym judgment requires an explicit serving token counter")
+            counter = ServingTokenCounter(base_url, effective.model, settings[1] if settings else "")
+            self.synonym_token_counter = counter
+        if isinstance(counter, ServingTokenCounter):
+            counter = counter.for_model(effective.model)
+            self.synonym_token_counter = counter
+        if (
+            self._synonym_budget is None
+            or self._synonym_budget.counter is not counter
+            or self._synonym_budget.adapter is not self.json_adapter
+            or self._synonym_budget.output_tokens != self.max_output_tokens
+            or self._synonym_budget.context_tokens
+            != min(self.context_window_tokens, getattr(counter, "context_tokens", self.context_window_tokens))
+        ):
+            self._synonym_budget = SynonymRequestBudget(
+                self.json_adapter,
+                counter,
+                self.context_window_tokens,
+                self.max_output_tokens,
+            )
+        return self._synonym_budget
+
+    def synonym_batch_fits(self, batch: SynonymEvidenceBatch) -> bool:
+        """Check a whole pair packet including signature, demos, output budget and chat template."""
+        lm = self.label_judge.lm or dspy.settings.lm
+        return self.synonym_request_budget(lm).fits(batch, self.label_judge, lm)
+
+    def _run_judge_stage(
         self,
-        candidate_pairs: Sequence[Mapping[str, Any]] | str,
+        stage_name: Literal["label_judge", "hierarchy_judge", "related_judge"],
+        batch: SynonymEvidenceBatch,
         *,
         lm: Any = None,
         use_gbnf: bool | None = None,
-    ) -> list[dict[str, str]]:
-        """Classify candidate entity pairs into SKOS/OWL relations (`skos:altLabel`, `skos:hiddenLabel`, \
-`skos:related`, `owl:differentFrom`)."""
-        if not candidate_pairs:
-            return []
-        if isinstance(candidate_pairs, str):
-            pairs_json = candidate_pairs.strip()
-            if not pairs_json or pairs_json == "[]":
-                return []
-            if len(pairs_json) > self._context_char_limit(12000):
-                try:
-                    parsed_pairs = json.loads(pairs_json)
-                    if isinstance(parsed_pairs, list):
-                        pairs_json = _bounded_prompt_json(
-                            parsed_pairs,
-                            scale_context_budget(16, self.context_window_tokens),
-                            self._context_char_limit(12000),
-                        )
-                except json.JSONDecodeError, TypeError:
-                    pairs_json = pairs_json[: self._context_char_limit(12000)]
-        else:
-            pairs_list = [dict(p) for p in candidate_pairs if isinstance(p, Mapping)]
-            if not pairs_list:
-                return []
-            pairs_json = _bounded_prompt_json(
-                pairs_list, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
-            )
-        if pairs_json == "[]":
+        captured_traces: list[Any] | None = None,
+        rlm_stats: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute a single synonym judgment stage."""
+        from .diagnostics import extract_named_trace_entries
+
+        if not batch.candidates:
             return []
 
+        predictor_map = {
+            "label_judge": (
+                self.label_judge,
+                build_dspy_label_judge_grammar,
+                parse_label_decisions,
+                self.label_judge_audit_trail,
+            ),
+            "hierarchy_judge": (
+                self.hierarchy_judge,
+                build_dspy_hierarchy_judge_grammar,
+                parse_hierarchy_decisions,
+                self.hierarchy_judge_audit_trail,
+            ),
+            "related_judge": (
+                self.related_judge,
+                build_dspy_related_judge_grammar,
+                parse_related_decisions,
+                self.related_judge_audit_trail,
+            ),
+        }
+        predictor, grammar_fn, parser_fn, audit_trail = predictor_map[stage_name]
+        budget = self.synonym_request_budget(lm)
+
         prev_telem_len = len(self.telemetry)
-        pred = self._invoke_stage(
-            self.synonym_judge,
-            stage_name="synonym_judge",
-            is_rlm=False,
-            lm=lm,
-            use_gbnf=use_gbnf,
-            grammar_fn=build_dspy_synonym_judge_grammar,
-            candidate_pairs=pairs_json,
+        local_stage_trace: list[Any] = []
+        with dspy.context(trace=local_stage_trace, usage_tracker=None):
+            started = time.perf_counter()
+            pred = self._invoke_stage(
+                predictor,
+                stage_name=stage_name,
+                is_rlm=False,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                grammar_fn=lambda: grammar_fn(
+                    pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
+                    max_reasoning_chars=self.gbnf_max_reasoning_chars,
+                ),
+                request_adapter=budget,
+                collect_logprobs=True,
+                candidate_pairs=batch.payload,
+            )
+            elapsed = time.perf_counter() - started
+
+        score, feedback = validate_stage_invariants(
+            stage_name,
+            {"candidate_pairs": batch.payload},
+            pred,
         )
-        raw_decisions = getattr(pred, "decisions", [])
-        decisions = parse_synonym_decisions(raw_decisions)
+        if score < 1.0:
+            raise ValueError(feedback)
+
+        parsed_decs = parser_fn(pred.decisions)
+        judge_logprob_votes(pred.get("logprobs"), parsed_decs)
+        if "logprobs" in pred:
+            del pred["logprobs"]
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
-        self.synonym_audit_trail.append(
+        summary = {
+            "packet_id": batch.cache_identity,
+            "pair_count": len(batch.candidates),
+            "packet_chars": len(batch.payload),
+            "input_tokens": budget.last_count,
+            "construction_seconds": batch.construction_seconds,
+            "inference_seconds": elapsed,
+            "cache_hit": False,
+        }
+        if len(self.telemetry) > prev_telem_len:
+            self.telemetry[-1].update(summary)
+
+        stage_traces = extract_named_trace_entries(
+            self,
+            local_stage_trace,
+            allowed_names={stage_name},
+        )
+        if captured_traces is not None:
+            captured_traces.extend(stage_traces)
+        if rlm_stats is not None:
+            tok_key = f"{stage_name}_tokens"
+            rlm_stats[tok_key] = int(rlm_stats.get(tok_key, 0)) + stage_tokens
+
+        audit_trail.append(
             {
                 "mode": "direct",
-                "predictor": "synonym_judge",
-                "signature": JudgeSynonyms.__name__,
+                "predictor": stage_name,
+                "signature": getattr(predictor.signature, "__name__", str(predictor.signature)),
                 "tokens_used": stage_tokens,
-                "candidate_pairs": pairs_json,
-                "decisions": decisions,
+                **summary,
+                "decisions": parsed_decs,
             }
         )
-        return decisions
+
+        return parsed_decs
+
+    def judge_semantics(
+        self,
+        batch: SynonymEvidenceBatch,
+        *,
+        lm: Any = None,
+        use_gbnf: bool | None = None,
+        captured_traces: list[Any] | None = None,
+        rlm_stats: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Judge candidate pairs via short-circuiting 3-stage W3C semantic cascade."""
+        if not batch.candidates:
+            return []
+
+        payload_obj = json.loads(batch.payload)
+        pairs_list = payload_obj.get("pairs", [])
+        if not pairs_list:
+            return []
+
+        pairs_by_id = {p["pair_id"]: p for p in pairs_list}
+        resolved_decisions: list[dict[str, Any]] = []
+        votes: dict[str, list[float | None]] = {pid: [] for pid in pairs_by_id}
+
+        # 1. Rule W1: Direct facts skip Stage 1 directly to Stage 2
+        stage1_pids: list[str] = []
+        stage2_pids: list[str] = []
+        for p in pairs_list:
+            pid = p["pair_id"]
+            if p.get("direct_facts") or p.get("merge_forbidden"):
+                stage2_pids.append(pid)
+            else:
+                stage1_pids.append(pid)
+
+        # 2. Stage 1: JudgeLabels (skos:altLabel / skos:hiddenLabel)
+        if stage1_pids:
+            stage1_batch = batch.subset(stage1_pids)
+            s1_decs = self._run_judge_stage(
+                "label_judge",
+                stage1_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s1_decs:
+                pid = dec["pair_id"]
+                votes[pid].append(dec["llm_prob"])
+                equiv = bool(dec.get("equivalent"))
+                hidden = bool(dec.get("hidden_label"))
+                if equiv and hidden:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:hiddenLabel"
+                    resolved_decisions.append(dec_copy)
+                elif equiv:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:altLabel"
+                    resolved_decisions.append(dec_copy)
+                else:
+                    stage2_pids.append(pid)
+
+        # 4. Stage 2: JudgeHierarchy (skos:broader / skos:narrower)
+        stage2_residuals: list[str] = []
+        if stage2_pids:
+            stage2_batch = batch.subset(stage2_pids)
+            s2_decs = self._run_judge_stage(
+                "hierarchy_judge",
+                stage2_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s2_decs:
+                pid = dec["pair_id"]
+                votes[pid].append(dec["llm_prob"])
+                ea, eb = pid.split("|", 1)
+                broader = bool(dec.get("broader"))
+                narrower = bool(dec.get("narrower"))
+                if broader and not narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:broader"
+                    dec_copy["source_id"] = ea
+                    dec_copy["target_id"] = eb
+                    resolved_decisions.append(dec_copy)
+                elif not broader and narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:broader"
+                    dec_copy["source_id"] = eb
+                    dec_copy["target_id"] = ea
+                    resolved_decisions.append(dec_copy)
+                elif broader and narrower:
+                    dec_copy = dict(dec)
+                    dec_copy["relation"] = "skos:related"
+                    resolved_decisions.append(dec_copy)
+                else:
+                    stage2_residuals.append(pid)
+
+        # 5. Rule W1 / W2 on Stage 2 (False, False) pairs: direct facts or shared roles -> skos:related
+        stage3_pids: list[str] = []
+        for pid in stage2_residuals:
+            p = pairs_by_id[pid]
+            if p.get("direct_facts") or p.get("shared_role_facts"):
+                resolved_decisions.append(
+                    {
+                        "pair_id": pid,
+                        "reasoning": "Deterministic skos:related via Rule W1/W2 statement role / direct fact",
+                        "relation": "skos:related",
+                    }
+                )
+            else:
+                stage3_pids.append(pid)
+
+        # 6. Stage 3: JudgeRelated (skos:related vs owl:differentFrom)
+        if stage3_pids:
+            stage3_batch = batch.subset(stage3_pids)
+            s3_decs = self._run_judge_stage(
+                "related_judge",
+                stage3_batch,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                captured_traces=captured_traces,
+                rlm_stats=rlm_stats,
+            )
+            for dec in s3_decs:
+                votes[dec["pair_id"]].append(dec["llm_prob"])
+                dec_copy = dict(dec)
+                related = bool(dec.get("related"))
+                dec_copy["relation"] = "skos:related" if related else "owl:differentFrom"
+                resolved_decisions.append(dec_copy)
+
+        # 7. Aggregate all resolved decisions and return
+        for decision in resolved_decisions:
+            decision["llm_prob"] = pool_confidences(*votes[decision["pair_id"]])
+        return batch.resolve_decisions(resolved_decisions)
 
     def propose_shacl_repairs(
         self,
@@ -1153,30 +1171,17 @@ chunk."""
     ) -> list[dict[str, str]]:
         """Propose bounded closed-world SHACL repair actions for the given violations.
 
-        By default (`mode=None`), executes the single-level RLM Python REPL healer
-        (`shacl_healer_rlm` / `HealSHACLViolations`), which inspects focus nodes,
-        hydrates source chunks, and delegates structured repair synthesis to its
-        inner `qwen_propose_shacl_repairs` tool (`mode="direct"` -> `shacl_repair` /
-        `ProposeSHACLRepairs` with pure-JSON GBNF).
+        By default (`mode=None`), dispatches directly to `shacl_repair` (`ProposeSHACLRepairs`
+        with pure-JSON GBNF) when `focus_context` is pre-hydrated, and otherwise executes the
+        single-level RLM Python REPL healer (`shacl_healer_rlm` / `HealSHACLViolations`).
         """
         if not violations:
             return []
-        is_rlm = True if mode is None else (mode == "rlm")
+        is_rlm = (not bool(focus_context.strip())) if mode is None else (mode == "rlm")
         if isinstance(violations, str):
             violations_json = violations.strip()
             if not violations_json or violations_json == "[]":
                 return []
-            if not is_rlm and len(violations_json) > self._context_char_limit(12000):
-                try:
-                    parsed_v = json.loads(violations_json)
-                    if isinstance(parsed_v, list):
-                        violations_json = _bounded_prompt_json(
-                            parsed_v,
-                            scale_context_budget(16, self.context_window_tokens),
-                            self._context_char_limit(12000),
-                        )
-                except json.JSONDecodeError, TypeError:
-                    violations_json = violations_json[: self._context_char_limit(12000)]
         else:
             serialized: list[dict[str, str]] = []
             for v in violations:
@@ -1202,32 +1207,34 @@ chunk."""
                     )
             if not serialized:
                 return []
-            violations_json = (
-                json.dumps(serialized, ensure_ascii=False)
-                if is_rlm
-                else _bounded_prompt_json(
-                    serialized, scale_context_budget(16, self.context_window_tokens), self._context_char_limit(12000)
-                )
-            )
+            violations_json = json.dumps(serialized, ensure_ascii=False)
         if violations_json == "[]":
             return []
 
         stage_inputs: dict[str, Any] = {"violations": violations_json}
+        allowed_actions = shacl_repair_actions(json.loads(violations_json))
         if not is_rlm:
-            stage_inputs["focus_context"] = focus_context[: self._context_char_limit(12000)]
+            stage_inputs["focus_context"] = focus_context
         prev_telem_len = len(self.telemetry)
-        pred = self._invoke_stage(
-            self.shacl_repair,
-            self.shacl_healer_rlm,
-            stage_name="shacl_repair",
-            is_rlm=is_rlm,
-            lm=lm,
-            use_gbnf=use_gbnf,
-            grammar_fn=build_dspy_shacl_repair_grammar,
-            **stage_inputs,
-        )
+        prev_focus_context = self._focus_context
+        if is_rlm:
+            self._focus_context = focus_context
+        try:
+            pred = self._invoke_stage(
+                self.shacl_repair,
+                self.shacl_healer_rlm,
+                stage_name="shacl_repair",
+                is_rlm=is_rlm,
+                lm=lm,
+                use_gbnf=use_gbnf,
+                grammar_fn=lambda: build_dspy_shacl_repair_grammar(allowed_actions=allowed_actions),
+                **stage_inputs,
+            )
+        finally:
+            if is_rlm:
+                self._focus_context = prev_focus_context
         raw_repairs = getattr(pred, "repairs", [])
-        repairs = parse_shacl_repairs(raw_repairs)
+        repairs = parse_shacl_repairs(raw_repairs, allowed_actions=allowed_actions)
         stage_tokens = int(self.telemetry[-1].get("tokens_used", 0)) if len(self.telemetry) > prev_telem_len else 0
         self.shacl_audit_trail.append(
             {
@@ -1253,7 +1260,7 @@ chunk."""
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> list[int]:
-        """Filter candidate triples on Qwen w/ dynamic candidate-literal GBNF."""
+        """Filter candidate triples on llama w/ dynamic candidate-literal GBNF."""
         if not candidate_facts:
             return []
         effective_max_facts = self.gbnf_max_facts if max_facts is None else max_facts
@@ -1279,13 +1286,12 @@ chunk."""
         lm: Any = None,
         use_gbnf: bool | None = None,
     ) -> str:
-        """Rewrite question into a declarative query_intent string (GBNF on Qwen GPU, temp=0.4, freq_penalty=0.2)."""
+        """Rewrite question into a declarative query_intent string (GBNF on llama, GPU, temp=1.0)."""
         from dspy.utils.usage_tracker import track_usage
 
         effective_lm = lm or self.query_intent.lm or dspy.settings.lm
         call_cfg: dict[str, Any] = {
-            "temperature": 0.4,
-            "frequency_penalty": 0.2,
+            "temperature": 1.0,
         }
         if self._should_use_gbnf(use_gbnf, effective_lm):
             call_cfg["extra_body"] = {"grammar": build_dspy_query_intent_grammar()}
@@ -1339,56 +1345,6 @@ chunk."""
         self.rm.hook = hook
         self.retriever.hook = hook
 
-    def _run_react_qa_fallback(
-        self,
-        question: str,
-        initial_context: str,
-    ) -> dspy.Prediction | None:
-        """Run bounded `dspy.ReActV2` multi-hop graph exploration when single-shot PPR/QA abstains or retrieval \
-confidence < 0.15."""
-        react_cls = getattr(dspy, "ReActV2", None)
-        if react_cls is None:
-            return None
-
-        def search_graph_facts(query: str) -> str:
-            """Search the knowledge graph or retrieval engine for facts matching query."""
-            if self._graph_search_tool is not None:
-                return str(self._graph_search_tool(str(query)))
-            if self._retrieval_hook is not None:
-                ctx, _, _ = self.rm._invoke_hook(str(query))
-                return str(ctx)
-            return ""
-
-        def inspect_entity_neighborhood(entity_id: str) -> str:
-            """Inspect the 1-hop entity neighborhood and definitions for entity_id."""
-            if self._node_inspector is not None:
-                return json.dumps(self._node_inspector(str(entity_id)), ensure_ascii=False)
-            return "{}"
-
-        def read_passage_chunk(chunk_id: str) -> str:
-            """Hydrate the original passage chunk text for chunk_id."""
-            if self._chunk_hydrator is not None:
-                return str(self._chunk_hydrator(str(chunk_id)))
-            return ""
-
-        sig = self.qa.predict.signature
-        eff_lm = self.orchestrator_lm or self.rlm_sub_lm
-        try:
-            agent = react_cls(
-                sig,
-                tools=[
-                    search_graph_facts,
-                    inspect_entity_neighborhood,
-                    read_passage_chunk,
-                ],
-                max_iters=10,
-            )
-            with self._dspy_ctx(eff_lm, use_json_adapter=True):
-                return agent(context=initial_context, question=question)
-        except Exception as exc:
-            logging.getLogger(__name__).debug("ReActV2 fallback skipped (%s: %s)", type(exc).__name__, exc)
-            return None
-
     @diagnostic_boundary
     def forward(
         self,
@@ -1430,15 +1386,6 @@ confidence < 0.15."""
                         reas_str = ""
                     else:
                         pred = self.answer_question(context=hydrated_ctx, question=question, use_gbnf=use_gbnf)
-                        top_score = max(scores) if len(scores) > 0 else 1.0
-                        if self.enable_react_fallback and (
-                            is_abstaining_answer(str(getattr(pred, "answer", "") or "")) or top_score < 0.15
-                        ):
-                            react_pred = self._run_react_qa_fallback(question, hydrated_ctx)
-                            if react_pred is not None and not is_abstaining_answer(
-                                str(getattr(react_pred, "answer", "") or "")
-                            ):
-                                pred = react_pred
                         ans_str = str(getattr(pred, "answer", "") or "")
                         reas_str = str(getattr(pred, "reasoning", "") or "")
                 tokens = usage_tracker.get_total_tokens()
@@ -1453,14 +1400,14 @@ confidence < 0.15."""
                 if tokens and hasattr(res, "set_lm_usage"):
                     res.set_lm_usage(tokens)
                 return res
-            raise ValueError("context must be provided when no retrieval_hook is registered on HippoRAGProgram.")
-        raise ValueError("Either (context, question) or question must be provided to HippoRAGProgram.")
+            raise ValueError("context must be provided when no retrieval_hook is registered on YawProgram.")
+        raise ValueError("Either (context, question) or question must be provided to YawProgram.")
 
     def as_async(self) -> Any:
-        """Return a `dspy.asyncify`-wrapped async callable for this `HippoRAGProgram`."""
+        """Return a `dspy.asyncify`-wrapped async callable for this `YawProgram`."""
         return dspy.asyncify(self)
 
 
 __all__ = [
-    "HippoRAGProgram",
+    "YawProgram",
 ]

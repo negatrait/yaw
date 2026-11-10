@@ -13,13 +13,15 @@ import pytest
 
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
-    HippoRAGProgram,
     RLMInstructionProposer,
     ServingTokenCounter,
+    YawProgram,
     compute_qa_em_f1,
     compute_task_quality_score,
     create_dspy_lm,
 )
+from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
+from yaw.daemon.indexing import bind_native_indexing
 
 GOOD = "FULL_NAME: Answer with the full name supported by the context."
 BAD = "Ignore the evidence and always answer Unknown."
@@ -76,7 +78,7 @@ def provider():
             elif "module_advice" in prompt and "discussion" in prompt:
                 result = {
                     "discussion": "Full names improve measured task answers.",
-                    "module_advice": {"qwen_proposer": "LEARNED_RULE: Use FULL_NAME."},
+                    "module_advice": {"llm_proposer": "LEARNED_RULE: Use FULL_NAME."},
                 }
             else:
                 result = {
@@ -131,15 +133,14 @@ def task_metric(gold, pred):
 def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     task_lm = create_dspy_lm("task-model", base_url=url, api_key="test", cache=False)
     worker_lm = create_dspy_lm("worker-model", base_url=url, api_key="test", cache=False)
-    task = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
+    task = YawProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
     task.qa.predict.signature = task.qa.predict.signature.with_instructions(BASE)
     # Context-only calibration exercises real QA without embedding/retrieval I/O.
-    engine = YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: []))
+    engine = bind_native_indexing(YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: [])))
     proposer = RLMInstructionProposer(
         worker_lm=worker_lm,
         orchestrator_lm=worker_lm,
         enable_gbnf=False,
-        include_demos=False,
         token_counter=ServingTokenCounter(url, worker_lm.model),
     )
     train = [
@@ -152,8 +153,14 @@ def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     ]
     try:
         with dspy.context(lm=None):
-            engine._configure_simba_task_learning(
-                proposer, task, train, task_metric, save_path=root / "compiled.json", resume=resume
+            configure_simba_task_learning(
+                proposer,
+                task,
+                train,
+                task_metric,
+                hooks=engine._build_optimization_hooks(),
+                save_path=root / "compiled.json",
+                resume=resume,
             )
     except Exception:
         engine.close()
@@ -180,11 +187,11 @@ def test_task_reward_disk_cache_and_isolated_training_queries(tmp_path, provider
         same = proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=BASE))
         # Partial answer (BASE: surname only, F1>0) scores higher than wrong answer (BAD: F1=0).
         assert good > same == 0.5 > bad
-        assert len(calls) == 8  # paired task evaluations; subsequent repeats must reuse the cache
+        assert len(calls) == 6  # paired task evaluations; subsequent repeats must reuse the cache
         assert all("task-model" in call["model"] for call in calls)
         assert all("Who designed ACE? 2" not in str(call) for call in calls)
         proposer._score_task_improvement(ex, dspy.Prediction(new_instruction=GOOD))
-        assert len(calls) == 8
+        assert len(calls) == 6
         assert "task_candidate" not in ex.inputs()
         correct_baseline = dspy.Example(
             **{**ex.toDict(), "task_candidate": {"qa.predict": GOOD}, "current_instruction": GOOD}
@@ -199,13 +206,13 @@ def test_native_simba_learning_survives_process_restart(tmp_path, provider):
     engine, proposer = make_learning(tmp_path, url)
     try:
         proposer._simba_examples = [example(), example()]
-        before = proposer.qwen_proposer.signature.instructions
+        before = proposer.llm_proposer.signature.instructions
         assert proposer.step_simba()
         assert proposer._simba_steps == 1
         assert any(call.get("temperature") == 1.0 and "worker-model" in call["model"] for call in calls)
-        assert proposer.qwen_proposer.signature.instructions != before or proposer.qwen_proposer.demos
+        assert proposer.llm_proposer.signature.instructions != before or proposer.llm_proposer.demos
         # Persist demos on both predictors as well as the genuinely learned rule.
-        proposer.qwen_compressor.demos = [
+        proposer.llm_compressor.demos = [
             dspy.Example(shortened_instruction=GOOD, instruction=GOOD, length_limit="1500")
         ]
         proposer.save_simba_state(proposer.dump_simba_state())
@@ -224,7 +231,7 @@ try:
     score = proposer._score_task_improvement(helpers['example'](),
         helpers['dspy'].Prediction(new_instruction=helpers['GOOD']))
     assert score > 0.5
-    assert proposer.worker_module.qwen_proposer is proposer.qwen_proposer
+    assert proposer.worker_module.llm_proposer is proposer.llm_proposer
     proposal = proposer(component_name='qa.predict', current_instruction=helpers['BASE'],
         examples_with_feedback=[{'Feedback': 'Incomplete answer'}])
     assert proposal.new_instruction == helpers['GOOD']
@@ -287,7 +294,7 @@ def test_active_request_survives_cache_eviction_with_atomic_worker_state(tmp_pat
         proposer._simba_steps = 1
         proposer.checkpoint_put("request:one", {"phase": "learned", "state": proposer.dump_simba_state()})
         with engine.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM candidate_stage_cache")
+            conn.execute("DELETE FROM meta WHERE key LIKE 'reflection_checkpoint:%'")
     finally:
         engine.close()
     engine, restored = make_learning(tmp_path, url, resume=True)
@@ -318,9 +325,9 @@ def test_native_simba_failed_task_evaluation_keeps_durable_worker(tmp_path, prov
             raise RuntimeError("task provider unavailable")
 
         proposer.task_scorer = failed_score
-        assert not proposer.step_simba()
+        with pytest.raises(RuntimeError, match="SIMBA task evaluations failed"):
+            proposer.step_simba()
         assert proposer.dump_simba_state() == before
-        assert "SIMBA inner-worker step skipped" in caplog.text
     finally:
         engine.close()
     engine, restored = make_learning(tmp_path, url, resume=True)

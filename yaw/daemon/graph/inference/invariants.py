@@ -1,21 +1,21 @@
 """Closed-world SHACL/SKOS stage invariant validation."""
 
-import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from yaw.core.types import StructuredTriple
+from yaw.core import (
+    VALID_SHACL_ACTIONS,
+    VALUE_BEARING_SHACL_ACTIONS,
+    is_irreflexive_statement,
+    text_processing,
+)
 
 from .parsers import (
-    VALID_SHACL_ACTIONS,
-    VALID_SYNONYM_RELATIONS,
-    VALUE_BEARING_SHACL_ACTIONS,
     coerce_generated_facts,
     extract_entity_definitions,
     extract_structured_triples,
     parse_shacl_repairs,
-    text_processing,
 )
 
 _ABSTAIN_PATTERNS: tuple[str, ...] = (
@@ -44,69 +44,63 @@ def is_abstaining_answer(answer: str) -> bool:
 STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
     "ner": (
         "named_entities",
-        ("named_entities", "named entities"),
-        'Respond with JSON: {"named_entities": [["entity", "concise contextual definition"], ...]}.',
+        ("named_entities", "named entities", "entities"),
+        "Populate `named_entities` with deduplicated resource label and contextual definition pairs.",
     ),
     "triples": (
         "triples",
-        ("triples",),
-        'Respond with JSON: {"triples": [{"sub": "...", "pred": "...", "obj": "...", "def": "..."}, ...]}.',
+        ("triples", "statements"),
+        "Populate `triples` with passage-supported reified `rdf:Statement` facts.",
     ),
     "entity_definer": (
         "entity_definitions",
         ("entity_definitions", "entity definitions"),
-        'Respond with JSON: {"entity_definitions": [["entity_name", "concise contextual definition"], ...]}.',
+        "Populate `entity_definitions` with contextual definitions paired with each requested entity name.",
     ),
-    "synonym_judge": (
+    "label_judge": (
         "decisions",
         ("decisions",),
-        'Respond with JSON: {"decisions": [{"pair_id": "id_a|id_b", "relation": '
-        '"skos:altLabel|skos:hiddenLabel|skos:related|skos:broader|owl:differentFrom", "canonical": '
-        '"id_a_or_id_b"}, ...]}.',
+        (
+            "Populate `decisions` with identity equivalence decisions, supplying a unified definition "
+            "and `hidden_label` flag only when equivalent."
+        ),
+    ),
+    "hierarchy_judge": (
+        "decisions",
+        ("decisions",),
+        "Populate `decisions` with hierarchical subsumption decisions (`broader` and `narrower`).",
+    ),
+    "related_judge": (
+        "decisions",
+        ("decisions",),
+        "Populate `decisions` with associative relation decisions (`related`).",
     ),
     "shacl_repair": (
         "repairs",
         ("repairs",),
-        'Respond with JSON: {"repairs": [{"focus_node": "...", "action": "...", "value": "..."}, ...]}.',
+        "Populate `repairs` with closed-world SHACL repair actions for the reported focus nodes.",
+    ),
+    "shacl_healer_rlm": (
+        "repairs",
+        ("repairs",),
+        "Populate `repairs` with closed-world SHACL repair actions for the reported focus nodes.",
     ),
     "triple_filter": (
-        '"fact"',
-        ('"fact"', "'fact'"),
-        'Output in JSON: {"fact": [["s1", "p1", "o1"], ...]}.',
+        "fact",
+        ("fact", "facts"),
+        "Populate `fact` with up to 4 verbatim subject-predicate-object triples from `fact_before_filter`.",
     ),
-    "fact_filter": (
-        '"fact"',
-        ('"fact"', "'fact'"),
-        'Output in JSON: {"fact": [["s1", "p1", "o1"], ...]}.',
+    "query_intent": (
+        "query_intent",
+        ("query_intent", "query intent"),
+        "Populate `query_intent` with a concise declarative statement of the sought fact.",
+    ),
+    "qa": (
+        "answer",
+        ("answer",),
+        "Populate `answer` with a definitive closed-world answer grounded in `context`.",
     ),
 }
-
-
-def _count_connected_components(triples: Sequence[StructuredTriple]) -> int:
-    adj: dict[str, set[str]] = {}
-    for st in triples:
-        u = str(text_processing(st.subj)) or st.subj.strip().lower()
-        v = str(text_processing(st.obj)) or st.obj.strip().lower()
-        if not u or not v:
-            continue
-        adj.setdefault(u, set()).add(v)
-        adj.setdefault(v, set()).add(u)
-    if not adj:
-        return 0
-    visited: set[str] = set()
-    components = 0
-    for node in adj:
-        if node in visited:
-            continue
-        components += 1
-        stack = [node]
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            stack.extend(adj.get(cur, set()) - visited)
-    return components
 
 
 def validate_stage_invariants(
@@ -116,7 +110,7 @@ def validate_stage_invariants(
     *,
     shacl_linter: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[float, str]:
-    """Validate all 9 stage contracts and 6 closed-world SHACL/SKOS/connected-node invariants.
+    """Validate stage contracts and closed-world SHACL/SKOS invariants.
 
     Returns `(score, feedback)` where `score` is in `[0.0, 1.0]` (`1.0` = full pass).
     """
@@ -185,23 +179,18 @@ def validate_stage_invariants(
 
         stage1_raw = inputs.get("named_entities") or ()
         stage1_norms: set[str] = set()
+        stage1_defs: dict[str, str] = {}
         if isinstance(stage1_raw, Sequence) and not isinstance(stage1_raw, str):
             for ent in stage1_raw:
                 ename = str(ent[0]).strip() if isinstance(ent, (list, tuple)) and len(ent) >= 1 else str(ent).strip()
+                edef = str(ent[1]).strip() if isinstance(ent, (list, tuple)) and len(ent) >= 2 else ""
                 if ename:
-                    stage1_norms.add(str(text_processing(ename)) or ename.lower())
+                    norm_e = str(text_processing(ename)) or ename.lower()
+                    stage1_norms.add(norm_e)
+                    if edef:
+                        stage1_defs[norm_e] = edef.lower()
 
         closed_world_norms = set(stage1_norms)
-        for st in structured:
-            if st.subj and st.subj_def and st.subj_def.strip().lower() != st.subj.strip().lower():
-                closed_world_norms.add(str(text_processing(st.subj)) or st.subj.lower())
-            if (
-                st.obj_kind != "literal"
-                and st.obj
-                and st.obj_def
-                and st.obj_def.strip().lower() != st.obj.strip().lower()
-            ):
-                closed_world_norms.add(str(text_processing(st.obj)) or st.obj.lower())
 
         unregistered: list[str] = []
         self_loops: list[str] = []
@@ -212,16 +201,20 @@ def validate_stage_invariants(
                 continue
             s_norm = str(text_processing(st.subj)) or st.subj.lower()
             o_norm = str(text_processing(st.obj)) or st.obj.lower()
-            if st.obj_kind != "literal" and s_norm == o_norm:
-                s_def_clean = st.subj_def.strip().lower()
-                o_def_clean = st.obj_def.strip().lower()
-                if not s_def_clean or not o_def_clean or s_def_clean == o_def_clean:
-                    self_loops.append(st.subj)
-            if stage1_norms:
-                if s_norm not in closed_world_norms:
-                    unregistered.append(st.subj)
-                if st.obj_kind != "literal" and o_norm not in closed_world_norms:
-                    unregistered.append(st.obj)
+            spo_clean = st.spo_def.strip().lower()
+            s_def_clean = st.subj_def.strip().lower() or stage1_defs.get(s_norm, "")
+            o_def_clean = st.obj_def.strip().lower() or stage1_defs.get(o_norm, "")
+            if (s_def_clean and spo_clean == s_def_clean) or (
+                st.obj_kind != "literal" and o_def_clean and spo_clean == o_def_clean
+            ):
+                incomplete += 1
+                continue
+            if not is_irreflexive_statement(st.subj, st.pred, st.obj, s_def_clean, o_def_clean, st.obj_kind):
+                self_loops.append(st.subj)
+            if s_norm not in closed_world_norms:
+                unregistered.append(st.subj)
+            if st.obj_kind != "literal" and o_norm not in closed_world_norms:
+                unregistered.append(st.obj)
 
         issues = []
         if incomplete:
@@ -229,16 +222,7 @@ def validate_stage_invariants(
         if self_loops:
             issues.append(f"Self-loop triple(s) on {self_loops}")
         if unregistered:
-            issues.append(
-                f"StatementShape/closedWorld unregistered novel entities without inline [name, def]: {unregistered}"
-            )
-
-        components = _count_connected_components(structured)
-        if len(structured) >= 2 and len(stage1_norms) >= 2 and components > 1:
-            issues.append(
-                f"Disconnected subgraph ({components} components across "
-                f"{len(structured)} triples; missing bridge predicates)"
-            )
+            issues.append(f"StatementShape/closedWorld resources absent from NER: {unregistered}")
 
         if not issues:
             return 1.0, "PASS [triples]"
@@ -272,36 +256,84 @@ def validate_stage_invariants(
             f"[entity_definer] ConceptShape/definition missing or tautological for: {unrepaired}",
         )
 
-    if stage == "synonym_judge":
+    if stage in ("label_judge", "hierarchy_judge", "related_judge"):
         raw_decisions = getattr(prediction, "decisions", None)
         items = list(raw_decisions) if isinstance(raw_decisions, (list, tuple)) else []
         if not items:
-            return 0.0, "[synonym_judge] Empty decisions (EdgeShape/closedWorld)."
-        seen_pairs: dict[str, tuple[str, str]] = {}
+            return 0.0, f"[{stage}] Empty decisions (EdgeShape/closedWorld)."
+        seen_pairs: set[str] = set()
         issues = []
+        packet = inputs.get("candidate_pairs", "")
+        try:
+            packet = json.loads(packet) if isinstance(packet, str) else packet
+        except json.JSONDecodeError:
+            packet = None
+        expected = (
+            {pair["pair_id"] for pair in packet["pairs"]}
+            if isinstance(packet, dict)
+            and packet.get("format") == "synonym-evidence-v2"
+            and isinstance(packet.get("pairs"), list)
+            else None
+        )
+        bool_keys = {
+            "label_judge": (),
+            "hierarchy_judge": ("broader", "narrower"),
+            "related_judge": ("related",),
+        }[stage]
+
         for d in items:
             if not isinstance(d, Mapping):
                 issues.append("EdgeShape/closedWorld non-dict decision")
                 continue
             pair_id = str(d.get("pair_id", "") or "").strip()
-            rel = str(d.get("relation", "") or "").strip()
-            canon = str(d.get("canonical", "") or "").strip()
+            reasoning = str(d.get("reasoning", "") or "").strip()
+            if not reasoning:
+                issues.append(f"Empty reasoning string for {pair_id!r}")
+            if expected is not None and (pair_id not in expected or pair_id in seen_pairs):
+                issues.append(f"Unknown or duplicate pair {pair_id!r}")
             if "|" not in pair_id:
                 issues.append(f"EdgeShape/closedWorld invalid pair_id={pair_id!r}")
                 continue
             id_a, id_b = [p.strip() for p in pair_id.split("|", 1)]
             if not id_a or not id_b or id_a == id_b:
                 issues.append(f"EdgeShape/closedWorld self-loop or empty pair_id={pair_id!r}")
-            if rel not in VALID_SYNONYM_RELATIONS:
-                issues.append(f"ConceptShape/S13-disjointLabels invalid relation={rel!r}")
-            if canon not in ("A", "B", id_a, id_b):
-                issues.append(f"EdgeShape/closedWorld invalid canonical={canon!r} for {pair_id!r}")
-            if pair_id in seen_pairs and seen_pairs[pair_id] != (rel, canon):
-                issues.append(f"ConceptShape/homographDifferentFrom conflicting decisions for {pair_id!r}")
-            seen_pairs[pair_id] = (rel, canon)
+            if stage == "label_judge":
+                if "equivalent" not in d:
+                    issues.append(f"Missing boolean field 'equivalent' for {pair_id!r}")
+                elif not isinstance(d["equivalent"], bool):
+                    issues.append(f"Non-boolean value {d['equivalent']!r} for 'equivalent' in {pair_id!r}")
+                elif d["equivalent"] is True:
+                    raw_def = d.get("definition")
+                    if not isinstance(raw_def, str) or not raw_def.strip():
+                        issues.append(f"Missing or empty 'definition' for equivalent=True in {pair_id!r}")
+                    if "hidden_label" in d and not isinstance(d["hidden_label"], bool):
+                        issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                    if "alt_label" in d and not isinstance(d["alt_label"], bool):
+                        issues.append(f"Non-boolean value {d['alt_label']!r} for 'alt_label' in {pair_id!r}")
+                    if d.get("alt_label") is True and d.get("hidden_label") is True:
+                        issues.append(f"Conflicting alt_label=True and hidden_label=True in {pair_id!r}")
+                else:
+                    if "alt_label" in d and not isinstance(d["alt_label"], bool):
+                        issues.append(f"Non-boolean value {d['alt_label']!r} for 'alt_label' in {pair_id!r}")
+                    elif "hidden_label" in d and not isinstance(d["hidden_label"], bool):
+                        issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
+                    elif d.get("alt_label") is True or d.get("hidden_label") is True:
+                        issues.append(f"Conflicting alt_label/hidden_label with equivalent=False in {pair_id!r}")
+            else:
+                for bk in bool_keys:
+                    if bk not in d:
+                        issues.append(f"Missing boolean field {bk!r} for {pair_id!r}")
+                    elif not isinstance(d[bk], bool):
+                        issues.append(f"Non-boolean value {d[bk]!r} for {bk!r} in {pair_id!r}")
+            if pair_id in seen_pairs:
+                issues.append(f"Duplicate pair_id={pair_id!r}")
+            seen_pairs.add(pair_id)
+
+        if expected is not None and seen_pairs != expected:
+            issues.append(f"Missing pairs: {sorted(expected - seen_pairs)}")
         if not issues:
-            return 1.0, "PASS [synonym_judge]"
-        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[synonym_judge] {'; '.join(issues)}"
+            return 1.0, f"PASS [{stage}]"
+        return max(0.0, round(1.0 - 0.35 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
 
     if stage in ("shacl_repair", "shacl_healer_rlm"):
         raw_repairs = getattr(prediction, "repairs", None)
@@ -409,21 +441,23 @@ def validate_stage_invariants(
             return 1.0, "PASS [qa]"
         return max(0.2, round(1.0 - 0.45 * len(issues), 4)), f"[qa] {'; '.join(issues)}"
 
-    if stage in ("qwen_proposer", "qwen_compressor"):
-        new_inst = str(getattr(prediction, "new_instruction", "") or "").strip()
+    if stage in ("llm_proposer", "llm_compressor"):
+        inst_field = "shortened_instruction" if stage == "llm_compressor" else "new_instruction"
+        new_inst = str(getattr(prediction, inst_field, "") or "").strip()
         max_chars = int(inputs.get("max_instruction_chars", 1500) or 1500)
         comp_name = str(inputs.get("component_name", "") or "").strip()
+        comp_stage = comp_name.removesuffix(".predict")
         cur_inst = str(inputs.get("current_instruction", "") or "").strip()
         if not new_inst:
-            return 0.0, f"[{stage}] Empty new_instruction."
+            return 0.0, f"[{stage}] Empty {inst_field}."
         issues = []
         if len(new_inst) > max_chars:
             issues.append(f"Instruction length {len(new_inst)} > {max_chars}")
         for marker in ("<TargetAnswer>", "<TargetPassage>", "<TargetEntity>"):
             if marker in new_inst:
                 issues.append(f"Leaked placeholder marker {marker}")
-        if comp_name in STAGE_SCHEMA_CONTRACTS:
-            strict_key, alt_markers, _ = STAGE_SCHEMA_CONTRACTS[comp_name]
+        if comp_stage in STAGE_SCHEMA_CONTRACTS:
+            strict_key, alt_markers, _ = STAGE_SCHEMA_CONTRACTS[comp_stage]
             had_strict = strict_key in cur_inst if cur_inst else True
             has_strict = strict_key in new_inst
             has_any = any(m.lower() in new_inst.lower() for m in alt_markers)
@@ -433,57 +467,11 @@ def validate_stage_invariants(
             return 1.0, f"PASS [{stage}]"
         return max(0.0, round(1.0 - 0.4 * len(issues), 4)), f"[{stage}] {'; '.join(issues)}"
 
-    return 1.0, f"PASS [{stage}]"
-
-
-def should_retry_stage_invariants(
-    stage_name: str,
-    pred: Any,
-    effective_lm: Any,
-) -> bool:
-    """Determine if `_invoke_stage` can perform a self-correction retry without exhausting scripted `DummyLM` queues."""
-    if stage_name == "triples":
-        # Stage 2 missing definitions are repaired by Stage 3 (DefineMissingEntities)
-        return False
-    if stage_name == "ner":
-        raw_entities = getattr(pred, "named_entities", None)
-        if (
-            isinstance(raw_entities, (list, tuple))
-            and raw_entities
-            and not any(isinstance(x, (list, tuple, Mapping)) for x in raw_entities)
-        ):
-            return False
-
-    target_lm = effective_lm
-    if target_lm is None:
-        return False
-    answers_it = getattr(target_lm, "answers", None)
-    if answers_it is not None and not isinstance(answers_it, Mapping):
-        try:
-            peek_it = copy.copy(answers_it)
-            next_ans = next(peek_it, None)
-        except TypeError:
-            return False
-        if not isinstance(next_ans, Mapping):
-            return False
-        expected_key_map = {
-            "ner": "named_entities",
-            "entity_definer": "entity_definitions",
-            "synonym_judge": "decisions",
-            "shacl_repair": "repairs",
-            "triple_filter": "fact",
-            "query_intent": "query_intent",
-            "qa": "answer",
-        }
-        exp_key = expected_key_map.get(stage_name)
-        if exp_key and exp_key not in next_ans:
-            return False
-    return True
+    raise ValueError(f"Unknown stage contract for invariant validation: {stage!r}")
 
 
 __all__ = [
     "STAGE_SCHEMA_CONTRACTS",
     "is_abstaining_answer",
-    "should_retry_stage_invariants",
     "validate_stage_invariants",
 ]

@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yaw"
 version = "0.1.0"
-description = "HippoRAG 2 evaluation workspace"
+description = "HippoRAG 2 -style GraphRAG on a local LLM"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "cocoindex>=1.0.26",
+    "cocoindex>=1.1.0",
     "dspy[deno]>=3.4.1",
     "filelock>=3.32.7",
     "matplotlib>=3.11.2",
@@ -53,6 +53,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 addopts = ["--testmon"]
+faulthandler_timeout = 120
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = ["live: explicitly enabled tests against a resident inference service"]

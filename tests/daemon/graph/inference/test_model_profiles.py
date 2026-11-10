@@ -119,17 +119,18 @@ class ProfileTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         bad_adapter.batch_encode(["wrong dimensions"])
 
-    def test_identity_changes_for_quant_prompt_pooling_dimensions_and_task_modes(self):
+    def test_index_identity_changes_only_for_vector_producing_settings(self):
         self.assertEqual(len({p.index_identity for p in PROFILES.values()}), 3)
         profile = next(iter(PROFILES.values()))
         for changed in (
-            replace(profile, query_prefix="new query: "),
+            replace(profile, document_prefix="new document: "),
             replace(profile, dimensions=256),
             replace(profile, pooling="last"),
         ):
             self.assertNotEqual(profile.index_identity, changed.index_identity)
+        self.assertEqual(profile.index_identity, replace(profile, query_prefix="new query: ").index_identity)
         mode_identities = {resolve_embedding_profile(MODEL, mode).index_identity for mode in GEMMA_TASK_MODES}
-        self.assertEqual(len(mode_identities), len(GEMMA_TASK_MODES))
+        self.assertEqual(len(mode_identities), 2)
         with self.assertRaises(ValueError):
             resolve_embedding_profile("Qwen3-Embedding-0.6B-GGUF", "qa")
 

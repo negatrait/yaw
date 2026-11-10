@@ -1,7 +1,10 @@
 """Frozen, zero-dependency data contracts and pure coordinate/ID helpers for YAW."""
 
 import hashlib
+import json
+import math
 import re
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, overload
@@ -24,6 +27,39 @@ class YawRuntimeError(RuntimeError):
         super().__init__(f"[{code}] {message}")
         self.code: ErrorCode = code
         self.message: str = message
+
+
+class FatalGraphPublicationError(BaseException):
+    """Fatal graph publication failure that aborts optimizer execution without being swallowed."""
+
+    def __init__(self, original: BaseException) -> None:
+        self.original = original
+        super().__init__(str(original))
+
+
+def json_document_fields(data: object, default_title: str = "") -> tuple[str, str]:
+    """One rendering contract for decoded document objects and projected values."""
+    if isinstance(data, str):
+        return default_title, data
+    if not isinstance(data, dict):
+        raise ValueError("JSON document must be an object or string")
+    title = data.get("title", default_title)
+    if "text" in data:
+        body = data["text"]
+    elif "content" in data:
+        body = data["content"]
+    else:
+        body = json.dumps(data, ensure_ascii=False)
+    if not isinstance(title, str) or not isinstance(body, str):
+        raise ValueError("JSON document title/body must be strings")
+    return title, body
+
+
+def render_document_text(title: str, body: str) -> str:
+    """Render source fields once, preserving an already present title line."""
+    if title and body != title and not body.startswith((title + "\n", title + "\r\n")):
+        return f"{title}\n{body}"
+    return body
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,6 +86,116 @@ class HydratedPassage:
 
 
 @dataclass(slots=True, frozen=True)
+class SynonymEvidenceBatch:
+    """A bounded model request with reversible IDs and content-addressed evidence."""
+
+    candidates: tuple[dict[str, Any], ...]
+    payload: str
+    identifiers: dict[str, str]
+    construction_seconds: float = 0.0
+
+    @property
+    def cache_identity(self) -> str:
+        value = ["synonym-evidence-v2", self.payload, self.identifiers, self.candidates]
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def resolve_decisions(self, decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Validate exact pair coverage and resolve request-local IDs before graph writes."""
+        pairs = {p["pair_id"] for p in json.loads(self.payload)["pairs"]}
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for decision in decisions:
+            pair = str(decision.get("pair_id", "") or "").strip()
+            if not pair or pair not in pairs or pair in seen:
+                raise ValueError(f"Unknown or duplicate synonym pair {pair!r}")
+            if "|" not in pair:
+                raise ValueError(f"Invalid synonym pair ID {pair!r}")
+            a, b = pair.split("|", 1)
+            real_a = self.identifiers.get(a, a)
+            real_b = self.identifiers.get(b, b)
+            resolved_entry: dict[str, Any] = {
+                **decision,
+                "pair_id": f"{real_a}|{real_b}",
+            }
+            if "source_id" in decision and decision["source_id"]:
+                src = str(decision["source_id"])
+                if src not in (a, b):
+                    raise ValueError(f"Invalid source_id {src!r} for synonym pair {pair!r}")
+                resolved_entry["source_id"] = self.identifiers.get(src, src)
+            if "target_id" in decision and decision["target_id"]:
+                tgt = str(decision["target_id"])
+                if tgt not in (a, b):
+                    raise ValueError(f"Invalid target_id {tgt!r} for synonym pair {pair!r}")
+                resolved_entry["target_id"] = self.identifiers.get(tgt, tgt)
+            if "canonical" in decision and decision["canonical"]:
+                canonical = str(decision["canonical"])
+                if canonical not in (a, b):
+                    raise ValueError(f"Invalid canonical ID {canonical!r} for synonym pair {pair!r}")
+                resolved_entry["canonical"] = self.identifiers.get(canonical, canonical)
+            result.append(resolved_entry)
+            seen.add(pair)
+        if seen != pairs:
+            raise ValueError(f"Missing synonym decisions for {sorted(pairs - seen)}")
+        return result
+
+    def subset(self, pair_ids: Collection[str]) -> SynonymEvidenceBatch:
+        """Return a new SynonymEvidenceBatch containing only the requested pair IDs."""
+        target_ids = set(pair_ids)
+        parsed = json.loads(self.payload)
+        all_pairs = parsed.get("pairs", [])
+        filtered_pairs = []
+        for p in all_pairs:
+            alias_pair = p.get("pair_id", "")
+            if "|" in alias_pair:
+                a, b = alias_pair.split("|", 1)
+                real_pair = f"{self.identifiers.get(a, a)}|{self.identifiers.get(b, b)}"
+            else:
+                real_pair = alias_pair
+            if alias_pair in target_ids or real_pair in target_ids:
+                filtered_pairs.append(p)
+
+        filtered_pair_aliases = {p["pair_id"] for p in filtered_pairs}
+        filtered_pair_reals = {
+            f"{self.identifiers.get(p['pair_id'].split('|', 1)[0], p['pair_id'].split('|', 1)[0])}|"
+            f"{self.identifiers.get(p['pair_id'].split('|', 1)[1], p['pair_id'].split('|', 1)[1])}"
+            for p in filtered_pairs
+            if "|" in p.get("pair_id", "")
+        }
+
+        filtered_candidates = [
+            c
+            for c in self.candidates
+            if c.get("pair_id") in filtered_pair_aliases
+            or c.get("pair_id") in filtered_pair_reals
+            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_reals
+            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_aliases
+        ]
+
+        needed_aliases = {
+            part for p in filtered_pairs if "|" in p.get("pair_id", "") for part in p["pair_id"].split("|", 1)
+        }
+        filtered_identifiers = {k: v for k, v in self.identifiers.items() if k in needed_aliases}
+
+        ratio = (len(filtered_pairs) / len(all_pairs)) if all_pairs else 1.0
+        new_construction_seconds = self.construction_seconds * ratio
+
+        new_payload = json.dumps(
+            {
+                "format": "synonym-evidence-v2",
+                "pairs": filtered_pairs,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return SynonymEvidenceBatch(
+            candidates=tuple(filtered_candidates),
+            payload=new_payload,
+            identifiers=filtered_identifiers,
+            construction_seconds=new_construction_seconds,
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class StructuredTriple:
     """An OpenIE relation triple enriched with inline subject, object, and statement definitions."""
 
@@ -62,6 +208,11 @@ class StructuredTriple:
     obj_kind: Literal["entity", "literal"] = "entity"
     obj_datatype: str = ""
     obj_lang: str = ""
+    llm_prob: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.llm_prob is not None and (not math.isfinite(self.llm_prob) or not 0 <= self.llm_prob <= 1):
+            raise ValueError("Invalid triple model probability")
 
     @property
     def subject(self) -> str:
@@ -91,39 +242,22 @@ class StructuredTriple:
             d["obj_kind"] = self.obj_kind
             d["obj_datatype"] = self.obj_datatype
             d["obj_lang"] = self.obj_lang
+        if self.llm_prob is not None:
+            d["llm_prob"] = self.llm_prob
         return d
 
 
 @dataclass(slots=True, frozen=True)
 class RelationTraversalPolicy:
-    """Versioned relation-aware directed traversal policy for Personalized PageRank."""
+    """Relation-aware directed Markov transition multipliers for Personalized PageRank."""
 
     passage: float = 1.0
     fact_forward: float = 1.0
     fact_reverse: float = 1.0
-    datatype_property: float = 0.5
     skos_related: float = 1.0
     skos_broader_up: float = 1.0
     skos_broader_down: float = 0.5
     owl_different_from: float = 0.0
-    parallel_aggregation: Literal["max", "sum", "capped_sum"] = "max"
-    parallel_cap: float = 2.0
-
-    @property
-    def fact_fwd(self) -> float:
-        return self.fact_forward
-
-    @property
-    def fact_rev(self) -> float:
-        return self.fact_reverse
-
-    @property
-    def skos_broader(self) -> float:
-        return self.skos_broader_up
-
-    @property
-    def skos_narrower(self) -> float:
-        return self.skos_broader_down
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -138,6 +272,11 @@ class OpenIERecord:
     triples: tuple[tuple[str, str, str], ...]
     structured_triples: tuple[StructuredTriple, ...] = ()
     entity_definitions: tuple[tuple[str, str], ...] = ()
+    entity_probabilities: tuple[tuple[str, str, float | None], ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(p is not None and (not math.isfinite(p) or not 0 <= p <= 1) for _, _, p in self.entity_probabilities):
+            raise ValueError("Invalid NER model probability")
 
 
 @dataclass(slots=True, frozen=True)
@@ -160,14 +299,6 @@ class RetrievalResult:
     question: str
     passages: tuple[HydratedPassage, ...]
     answer: str | None = None
-
-
-@dataclass(slots=True, frozen=True)
-class SyncDelta:
-    """Coalesced file additions and deletions emitted by the ingestion pipeline."""
-
-    added_chunks: tuple[tuple[ChunkPointer, str], ...] = ()
-    deleted_chunk_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -246,6 +377,54 @@ def text_processing(text: Any) -> str | list[Any]:
     return " ".join("".join(out).split())
 
 
+def is_resource_label(label: str) -> bool:
+    """A NER resource label has lexical content: an ASCII letter or any non-ASCII character.
+
+    Mirrors the GBNF NER `label` rule (GBNF has no Unicode categories, so every non-ASCII
+    character counts). Punctuation, numbers, dates and other data values are literals.
+    """
+    return any(ch.isalpha() or not ch.isascii() for ch in label)
+
+
+def is_scalar_label(label: str) -> bool:
+    """Whether a label's normalized form is an XSD scalar literal.
+
+    The single downstream classification of NER labels: normalization, materialization and
+    evidence binding must agree on which labels bind as resources (native graph spec §5.3).
+    """
+    return detect_scalar_literal(text_processing(label))[0]
+
+
+def clean_surface_label(raw: str) -> str:
+    """Strip whitespace and stray leading/trailing clause delimiters (:;,)."""
+    return raw.strip().strip(":;,").strip()
+
+
+def is_irreflexive_statement(
+    subj: str,
+    pred: str,
+    obj: str,
+    subj_def: str = "",
+    obj_def: str = "",
+    obj_kind: str = "entity",
+) -> bool:
+    """Return True iff the statement does not relate a resource sense to itself or repeat subj as a literal."""
+    s_norm = str(text_processing(subj))
+    o_norm = str(text_processing(obj))
+    if not s_norm or not o_norm:
+        return False
+    if obj_kind == "literal":
+        if s_norm == o_norm:
+            return False
+        p_norm = str(text_processing(pred))
+        sd_norm = str(text_processing(subj_def))
+        return not (p_norm and sd_norm and p_norm == sd_norm)
+    return not (
+        s_norm == o_norm
+        and (not subj_def.strip() or not obj_def.strip() or subj_def.strip().casefold() == obj_def.strip().casefold())
+    )
+
+
 def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:
     """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
     payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"
@@ -268,145 +447,92 @@ def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
     return target_path
 
 
-def to_rel_posix_path(corpus_root: Path, file_path: Path | str) -> str:
-    """Convert an absolute or relative file path to a relative POSIX path under corpus_root."""
-    root_resolved = corpus_root.resolve()
-    target_path = Path(file_path).resolve()
-    if not target_path.is_relative_to(root_resolved):
-        raise ValueError(f"File path {file_path!r} resolves outside corpus root {corpus_root}")
-    return target_path.relative_to(root_resolved).as_posix()
-
-
-_SCALAR_FALLBACK_RE = re.compile(
-    r"^(?:"
-    r"\d{4}[-/\s](?:0?[1-9]|1[0-2])[-/\s](?:0?[1-9]|[12]\d|3[01])"
-    r"(?:[T\s]\d{2}[:\s]\d{2}(?:[:\s]\d{2}(?:[.\s]\d+)?)?\s*(?:Z|UTC|GMT|[+-]?\s*\d{2}[:\s]?\d{2})?)?"
-    r"|(?:true|false)"
-    r"|[+-]?\d+(?:[.,]\d+)*(?:\s*%)?"
-    r"|v(?:ersion)?\s*\d+(?:[.\s]\d+)+(?:[-_][a-zA-Z0-9]+)?"
-    r"|\d+(?:\.\d+){2,}(?:[-_][a-zA-Z0-9]+)?"
-    r")$",
+_XSD_BOOLEAN_RE = re.compile(r"^(?:true|false)$", re.IGNORECASE)
+_XSD_INTEGER_RE = re.compile(r"^[+-]?\d+$")
+_XSD_DECIMAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
+_XSD_DATETIME_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$",
     re.IGNORECASE,
 )
-_ORDINAL_SUFFIX_RE = re.compile(
-    r"^(.*?[a-z])[-\s_.]*?(?:[-\s_.]+v(?:ersion)?[-\s_.]*)?(\d+(?:[-\s_.]+\d+)*(?:[-_.]?[a-z])?)$",
+_XSD_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
+_XSD_TIME_RE = re.compile(
+    r"^(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?|(?:1[0-2]|0?[1-9]):[0-5]\d(?::[0-5]\d)?\s*(?:am|pm))$",
     re.IGNORECASE,
 )
-_ACRONYM_STOPWORDS = frozenset({"of", "the", "and", "in", "on", "for", "to", "a", "an", "by", "with"})
+_XSD_DURATION_RE = re.compile(
+    r"^-?P(?=\d|T\d)(?:(?:\d+Y)?(?:\d+M)?(?:\d+D)?)(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$",
+    re.IGNORECASE,
+)
+_CURRENCY_PREFIX_RE = re.compile(
+    r"^[\$€£¥]\s*\d+(?:\.\d+)?(?:\s*[kKmMbBtT]|(?:\s*(?:thousand|million|billion|trillion)))?$",
+    re.IGNORECASE,
+)
+_CURRENCY_SUFFIX_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|cents?|dollars?)$", re.IGNORECASE)
+_DURATION_LATENCY_RE = re.compile(
+    r"^(?:p\d+\s+)?\d+(?:\.\d+)?\s*(?:ns|µs|us|ms|s|sec|seconds?|min|minutes?|h|hours?|days?)$",
+    re.IGNORECASE,
+)
+_PERCENT_STORAGE_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:%|MB|GB|KB|TB|PB|bytes?)$", re.IGNORECASE)
+_QUANTIFIED_COUNT_RE = re.compile(r"^\d+\s+(?:events?|requests?|tokens?|queries|pods?|nodes?)$", re.IGNORECASE)
 
 
 def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
-    """Minimal fallback helper for bare ISO dates, numbers/percentages, booleans, and version strings."""
+    """Classify clear-cut scalar literals into W3C XSD datatypes; default rdfs:Literal fallback is xsd:string."""
     _ = definition
     if not isinstance(text, str):
-        return (False, "")
+        return (False, "xsd:string")
     val = text.strip()
-    if val and _SCALAR_FALLBACK_RE.match(val):
-        return (True, "rdfs:Literal")
-    return (False, "")
-
-
-def _split_version_or_ordinal(name: str) -> tuple[str, str] | None:
-    """Split a concept name into normalized (base_concept, version_or_ordinal_suffix)."""
-    m = _ORDINAL_SUFFIX_RE.match(name)
-    if m is None:
-        return None
-    base = re.sub(r"[-\s_.]+", " ", m.group(1)).strip()
-    if base == "version":
-        base = "v"
-    suff = re.sub(r"[-\s_.]+", ".", m.group(2)).strip()
-    while re.match(r"^\d+(?:\.\d+)*\.0$", suff):
-        suff = suff[:-2]
-    if not base or not suff:
-        return None
-    return (base, suff)
-
-
-def is_version_or_ordinal_sibling(name_a: str, name_b: str) -> bool:
-    """Return True if two concept names differ only by trailing version, ordinal, tier, or severity."""
-    if not isinstance(name_a, str) or not isinstance(name_b, str):
-        return False
-    na = name_a.strip().lower()
-    nb = name_b.strip().lower()
-    if not na or not nb or na == nb:
-        return False
-    sa = _split_version_or_ordinal(na)
-    sb = _split_version_or_ordinal(nb)
-    if sa is None or sb is None:
-        return False
-    return sa[0] == sb[0] and sa[1] != sb[1]
-
-
-def _matches_initialism(short_clean: str, words: list[str]) -> bool:
-    """Check whether short_clean matches the initialism of words (or its plural)."""
-    if len(words) < 2 or not any(len(w) >= 2 for w in words):
-        return False
-    acr = "".join(w[0].lower() for w in words)
-    if short_clean == acr:
-        return True
-    if short_clean.endswith("s") and len(short_clean) > 2 and short_clean[:-1] == acr:
-        return True
-    content_words = [w for w in words if w.lower() not in _ACRONYM_STOPWORDS]
-    if len(content_words) >= 2 and len(content_words) != len(words):
-        acr_content = "".join(w[0].lower() for w in content_words)
-        if short_clean == acr_content or (
-            short_clean.endswith("s") and len(short_clean) > 2 and short_clean[:-1] == acr_content
-        ):
-            return True
-    return False
-
-
-def is_acronym_pair(name_a: str, name_b: str) -> bool:
-    """Return True if one entity name is an acronym or initialism of the other."""
-    if not isinstance(name_a, str) or not isinstance(name_b, str):
-        return False
-    na = name_a.strip()
-    nb = name_b.strip()
-    if not na or not nb or na.lower() == nb.lower():
-        return False
-    if is_version_or_ordinal_sibling(na, nb):
-        return False
-    short_cand, long_cand = (na, nb) if len(na) < len(nb) else (nb, na)
-    if any(ch.isspace() for ch in short_cand):
-        return False
-    short_clean = re.sub(r"[^a-zA-Z0-9]", "", short_cand).lower()
-    long_clean = re.sub(r"[^a-zA-Z0-9]", "", long_cand).lower()
-    if not (2 <= len(short_clean) <= 8) or short_clean == long_clean:
-        return False
-    if short_clean in _ACRONYM_STOPWORDS:
-        return False
-    if sum(ch.isalpha() for ch in short_clean) < 2:
-        return False
-    words = [w for w in re.findall(r"[a-zA-Z0-9]+", long_cand) if w]
-    if _matches_initialism(short_clean, words):
-        return True
-    short_base = short_clean[:-1] if short_clean.endswith("s") and len(short_clean) > 2 else short_clean
-    self_tokens = {short_clean, short_base, short_base + "s"}
-    trimmed_words = list(words)
-    if trimmed_words and trimmed_words[-1].lower() in self_tokens:
-        trimmed_words = trimmed_words[:-1]
-    elif trimmed_words and trimmed_words[0].lower() in self_tokens:
-        trimmed_words = trimmed_words[1:]
-    if len(trimmed_words) != len(words):
-        return _matches_initialism(short_clean, trimmed_words)
-    return False
-
-
-def check_lexical_subsumption_inversion(name_narrower: str, name_broader: str) -> bool:
-    """Return True if an asserted (narrower -> broader) hierarchy edge violates lexical subsumption.
-
-    In SKOS, an edge (narrower, broader, 'skos:broader') asserts narrower is a child of broader.
-    If the child's token set T(narrower) is a strict subset of the parent's token set T(broader),
-    the hierarchy is inverted (the parent is actually the specialized compound concept).
-    """
-    if not isinstance(name_narrower, str) or not isinstance(name_broader, str):
-        return False
-    if is_version_or_ordinal_sibling(name_narrower, name_broader) or is_acronym_pair(
-        name_narrower, name_broader
+    if not val:
+        return (False, "xsd:string")
+    if _XSD_BOOLEAN_RE.match(val):
+        return (True, "xsd:boolean")
+    if _XSD_INTEGER_RE.match(val):
+        return (True, "xsd:integer")
+    if _XSD_DECIMAL_RE.match(val):
+        return (True, "xsd:decimal")
+    if _XSD_DATETIME_RE.match(val):
+        return (True, "xsd:dateTime")
+    if _XSD_DATE_RE.match(val):
+        return (True, "xsd:date")
+    if _XSD_TIME_RE.match(val):
+        return (True, "xsd:time")
+    if _XSD_DURATION_RE.match(val) or _DURATION_LATENCY_RE.match(val):
+        return (True, "xsd:duration")
+    if (
+        _CURRENCY_PREFIX_RE.match(val)
+        or _CURRENCY_SUFFIX_RE.match(val)
+        or _PERCENT_STORAGE_RE.match(val)
+        or _QUANTIFIED_COUNT_RE.match(val)
     ):
-        return False
-    toks_n = {tok for tok in str(text_processing(name_narrower)).split() if tok}
-    toks_b = {tok for tok in str(text_processing(name_broader)).split() if tok}
-    if not toks_n or not toks_b:
-        return False
-    return toks_n < toks_b
+        return (True, "xsd:string")
+    return (False, "xsd:string")
+
+
+def pool_confidences(*signals: float | None, eps: float = 1e-6) -> float | None:
+    """Logarithmic Opinion Pool (Geometric Mean) over non-None signals in [eps, 1 - eps], or None if all None.
+
+    Invariant: pool_confidences(p, p) == p, pool_confidences(p, None) == p,
+    pool_confidences(None, None) is None.
+    """
+    valid = [float(s) for s in signals if s is not None]
+    if not valid:
+        return None
+    clamped = [min(1.0 - eps, max(eps, s)) for s in valid]
+    log_sum = sum(math.log(s) for s in clamped)
+    return float(math.exp(log_sum / len(clamped)))
+
+
+def bayesian_noisy_or(confidences: Sequence[float | None], *, eps: float = 1e-6) -> float | None:
+    """Compute 1 - prod(1 - c_i) over non-None observations in [eps, 1 - eps], or None if all None.
+
+    Each observation contributes additive Shannon evidence: -log(1 - c_i).
+    """
+    valid = [float(c) for c in confidences if c is not None]
+    if not valid:
+        return None
+    clamped = [min(1.0 - eps, max(eps, c)) for c in valid]
+    prod_complement = 1.0
+    for c in clamped:
+        prod_complement *= 1.0 - c
+    res = 1.0 - prod_complement
+    return float(min(1.0 - eps, max(eps, res)))

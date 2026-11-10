@@ -2,79 +2,36 @@
 
 import functools
 import inspect
-import json
 from collections.abc import Callable
 from typing import Any
 
 import dspy
 
-from .parsers import (
-    coerce_generated_facts,
-    extract_entity_definitions,
-    extract_named_entities,
-    extract_triples,
-    parse_shacl_repairs,
-    parse_synonym_decisions,
-)
+from .parsers import parse_shacl_repairs
 
 STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
-        "RLM SHACL HEALING WORKFLOW:\n"
-        "1. Parse `violations` (`import json; items = json.loads(violations)`) and inspect each unique "
-        "`focus_node` using `inspect_focus_node(focus_node)` (which handles `'entity-a|entity-b'`, "
-        "`'entity-a->entity-b'`, `'fact-...'`, and `'entity-...'` and returns `'markdown_dossier'` with "
-        "SKOS/RDF/OWL profiles, reified facts, and hydrated source chunks). Use `inspect_pair(a, b)`, "
-        "`hydrate_ast_island(chunk_id)`, `hydrate_chunk(chunk_id)`, or `search_graph(query)` if additional "
-        "document or neighborhood context is needed.\n"
-        "2. Delegate structured repair synthesis with the gathered dossier context:\n"
+        "RLM SHACL HEALING WORKFLOW (SINGLE-STEP DELEGATION):\n"
+        "`propose_repairs()` takes zero arguments and automatically supplies the complete structured "
+        "`inspect_focus_node` dossiers, W3C SKOS/RDF/OWL profiles, endpoint entities, and hydrated "
+        "`source_passages` for every reported violation in `violations`. Do NOT spend an iteration "
+        "printing `violations` or calling `inspect_focus_node` before `propose_repairs()`. In Iteration 1, "
+        "delegate once and submit immediately:\n"
         "```python\n"
-        "import json\n"
-        "items = json.loads(violations)\n"
-        "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
-        "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
-        "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-        "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
+        "repairs = propose_repairs()\n"
         "SUBMIT(repairs=repairs)\n"
         "```"
     ),
     "instruction_proposer_inner": (
-        "Inspect examples_with_feedback in Python. Select evidence by evidence_id and field path; "
-        "use start/end character offsets for string excerpts. Include failures and successes. "
+        "Inspect examples_with_feedback directly in Python without calling llm_query or llm_query_batched, and "
+        "call SUBMIT immediately once evidence is selected. Select evidence by evidence_id and field path inside "
+        "that example dict (use `[]` for the full example or `['Feedback']`, never an example list index like `[0]`); "
+        "use start/end character offsets only when `path` resolves to a string. Include failures and successful "
         "contrasts. Never write instructions or reconstruct facts. "
         "SUBMIT(selection={'diagnosis': 'brief generalizable diagnosis', "
         "'references': [{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})"
     ),
 }
-
-
-def build_rlm_action_demos() -> dict[str, list[dspy.Example]]:
-    """Build few-shot action demonstrations for single-level RLM sandboxes."""
-    from dspy.primitives.repl_types import REPLHistory
-
-    empty_history = REPLHistory()
-    return {
-        "shacl_repair": [
-            dspy.Example(
-                variables_info="Variable: `violations` (type: str): JSON list of SHACLViolation report items",
-                repl_history=empty_history,
-                iteration="1/10",
-                reasoning=(
-                    "Inspect the violating focus nodes to gather their SKOS/RDF/OWL profiles, reified facts, "
-                    "and source chunk dossiers, then delegate to Qwen worker with focus_context and submit."
-                ),
-                code="```python\n"
-                "import json\n"
-                "items = json.loads(violations)\n"
-                "seen = list(dict.fromkeys(v['focus_node'] for v in items if v.get('focus_node')))\n"
-                "dossiers = [inspect_focus_node(fn).get('markdown_dossier', '') for fn in seen[:8]]\n"
-                "focus_context = '\\n\\n---\\n\\n'.join(d for d in dossiers if d)\n"
-                "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=focus_context)\n"
-                "SUBMIT(repairs=repairs)\n"
-                "```",
-            ).with_inputs("variables_info", "repl_history", "iteration")
-        ],
-        "instruction_proposer_inner": [],
-    }
 
 
 def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
@@ -83,48 +40,22 @@ def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
             val = val[name]
         elif len(val) == 1:
             val = next(iter(val.values()))
-    if name == "named_entities" and isinstance(val, str):
-        defs = extract_entity_definitions(val)
-        if defs:
-            return [[k, v] if v else k for k, v in defs]
-        return list(extract_named_entities(val))
-    if name == "entity_definitions":
-        if isinstance(val, (str, dict, list, tuple)):
-            defs = extract_entity_definitions(val)
-            return [[k, v] for k, v in defs if k]
-        return val
-    if name == "triples":
-        if isinstance(val, str):
-            try:
-                loaded = json.loads(val)
-            except json.JSONDecodeError, TypeError, ValueError:
-                loaded = None
-            if isinstance(loaded, list):
-                return loaded
-            return [list(t) for t in extract_triples(val)]
-        if isinstance(val, (list, tuple)):
-            return list(val)
-        return val
-    if name == "decisions":
-        return parse_synonym_decisions(val)
     if name == "repairs":
         return parse_shacl_repairs(val)
-    if name == "fact":
-        return coerce_generated_facts(val)
     if annotation is str and isinstance(val, str):
         return val.strip()
     return val
 
 
 def sanitize_repl_code(code: str) -> str:
-    """Strip hallucinated imports of pre-bound sandbox tools (`qwen_*`, `inspect_focus_node`, `inspect_pair`, \
+    """Strip hallucinated imports of pre-bound sandbox tools (`llm_*`, `inspect_focus_node`, `inspect_pair`, \
 `hydrate_chunk`, `hydrate_ast_island`, `search_graph`, `apply_shacl_repairs`, `lint_shacl`, `synthesize_instruction`, \
 `SUBMIT`, `llm_query`)."""
     cleaned_lines: list[str] = []
     for line in code.splitlines():
         stripped = line.strip()
         if (stripped.startswith("from ") or stripped.startswith("import ")) and (
-            "qwen_" in stripped
+            "llm_" in stripped
             or "inspect_node" in stripped
             or "inspect_focus_node" in stripped
             or "inspect_pair" in stripped
@@ -147,7 +78,7 @@ _RLM_Base: Any = getattr(dspy, "RLM", dspy.Module)
 
 
 class PositionalSafeRLM(_RLM_Base):
-    """RLM subclass that binds positional tool arguments, enforces 1-step Qwen delegation, and normalizes SUBMIT \
+    """RLM subclass that binds positional tool arguments, enforces 1-step LM delegation, and normalizes SUBMIT \
 payloads."""
 
     def __init__(self, *args: Any, stage_rule: str = "", **kwargs: Any) -> None:
@@ -232,56 +163,9 @@ payloads."""
                     raw_output[name] = _normalize_rlm_field(name, raw_output[name], annotation)
         return super()._process_final_output(result, output_field_names)
 
-    def _extract_fallback(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-    ) -> dspy.Prediction:
-        try:
-            pred = super()._extract_fallback(variables, history, output_field_names)
-        except Exception:
-            payload: dict[str, Any] = {}
-            for name in output_field_names:
-                for var in variables if isinstance(variables, list) else []:
-                    if hasattr(var, "name") and var.name == name:
-                        payload[name] = var.value
-                        break
-                    elif isinstance(var, dict) and name in var:
-                        payload[name] = var[name]
-                        break
-                if name not in payload:
-                    field = self.signature.output_fields.get(name)
-                    annotation = getattr(field, "annotation", None)
-                    if annotation is list or getattr(annotation, "__origin__", None) is list:
-                        payload[name] = []
-                    elif annotation is dict or getattr(annotation, "__origin__", None) is dict:
-                        payload[name] = {}
-                    elif annotation in (int, float):
-                        payload[name] = 0
-                    else:
-                        payload[name] = ""
-            traj: list[Any] = []
-            for item in history or []:
-                dump_fn = getattr(item, "model_dump", None)
-                traj.append(dump_fn() if callable(dump_fn) else str(item))
-            pred = dspy.Prediction(
-                trajectory=traj,
-                final_reasoning="Extract fallback recovered from REPL state",
-                **payload,
-            )
-        for name in output_field_names:
-            field = self.signature.output_fields[name]
-            annotation = getattr(field, "annotation", str)
-            val = getattr(pred, name, None)
-            if annotation is str and isinstance(val, str):
-                setattr(pred, name, val.strip())
-        return pred
-
 
 __all__ = [
     "PositionalSafeRLM",
     "STAGE_RLM_DELEGATION_RULES",
-    "build_rlm_action_demos",
     "sanitize_repl_code",
 ]

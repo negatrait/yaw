@@ -5,7 +5,6 @@ from pathlib import Path
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
-    get_facts_with_meta_by_ids,
     inspect_focus_node,
     lint_graph_shacl,
     open_yaw_db,
@@ -27,8 +26,6 @@ ALL_11_SHACL_SHAPES = {
     "ConceptShape/broaderCycle",
     "ConceptShape/S27-disjointBroaderRelated",
     "ConceptShape/noScalarLiterals",
-    "ConceptShape/lexicalSubsumption",
-    "ConceptShape/siblingNotBroader",
     "ProvenanceShape/factSources",
 }
 
@@ -132,9 +129,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         # - dangling endpoint (ent-sys -> ent-dangling)
         # - skos:related + owl:differentFrom collision on non-homographs (ent-sys | ent-s13)
         # - asymmetric skos:related (ent-sys -> ent-eng without reverse)
-        conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-dangling', 'fact', 1.0)"
-        )
+        conn.execute("INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-dangling', 'fact', 1.0)")
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-s13', 'ent-sys', 'skos:related', 0.6)"
         )
@@ -151,7 +146,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-eng', 'skos:related', 0.7)"
         )
 
-        # 7. ConceptShape/broaderCycle (2-cycle and 3-cycle) & ConceptShape/S27-disjointBroaderRelated:
+        # 7. ConceptShape/broaderCycle (2-cycle and 3-cycle) & 1-hop ConceptShape/S27-disjointBroaderRelated:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-2cyc-a', 'ent-2cyc-b', 'skos:broader', 0.8)"
         )
@@ -167,6 +162,8 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:broader', 0.8)"
         )
+        # 2-hop broader chain (leaf -> mid -> root) with leaf <-> root skos:related is valid under non-transitive
+        # skos:broader; direct 1-hop leaf -> mid with leaf <-> mid skos:related violates S27:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) "
             "VALUES ('ent-s27-leaf', 'ent-s27-mid', 'skos:broader', 0.8)"
@@ -182,6 +179,14 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) "
             "VALUES ('ent-s27-root', 'ent-s27-leaf', 'skos:related', 0.5)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) "
+            "VALUES ('ent-s27-leaf', 'ent-s27-mid', 'skos:related', 0.5)"
+        )
+        conn.execute(
+            "INSERT INTO edges (src_id, dst_id, kind, weight) "
+            "VALUES ('ent-s27-mid', 'ent-s27-leaf', 'skos:related', 0.5)"
         )
 
         # 8. ConceptShape/noScalarLiterals:
@@ -273,7 +278,7 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
         upsert_fact_sources(conn, [("fact-dangling", "c1"), ("fact-empty-def", "c1")])
         # Note: we deliberately DO NOT call upsert_fact_sources for fact-orphan-1
 
-        violations = lint_graph_shacl(conn, auto_heal=False)
+        violations = lint_graph_shacl(conn)
         shapes = {v.shape for v in violations}
         assert ALL_11_SHACL_SHAPES.issubset(shapes), f"Missing shapes: {ALL_11_SHACL_SHAPES - shapes}"
 
@@ -298,10 +303,9 @@ def test_shacl_new_shapes_detection(tmp_path: Path) -> None:
             "ent-cyc-b",
             "ent-cyc-c",
         }.issubset(focus_by_shape["ConceptShape/broaderCycle"])
-        assert "ent-s27-leaf|ent-s27-root" in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
+        assert "ent-s27-leaf|ent-s27-mid" in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
+        assert "ent-s27-leaf|ent-s27-root" not in focus_by_shape["ConceptShape/S27-disjointBroaderRelated"]
         assert {"ent-date", "ent-lit-port"}.issubset(focus_by_shape["ConceptShape/noScalarLiterals"])
-        assert "ent-eng->ent-sec-eng" in focus_by_shape["ConceptShape/lexicalSubsumption"]
-        assert "ent-v1->ent-v2" in focus_by_shape["ConceptShape/siblingNotBroader"]
         assert "fact-orphan-1" in focus_by_shape["ProvenanceShape/factSources"]
 
     finally:
@@ -411,7 +415,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-multi-pref', 'skos:related', 0.7)"
         )
 
-        # Seed Shape 7 (broaderCycle 2-cycle & 3-cycle + S27 transitive broader/related conflict)
+        # Seed Shape 7 (broaderCycle 2-cycle & 3-cycle + 1-hop S27 broader/related conflict)
         conn.execute(
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-2cyc-a', 'ent-2cyc-b', 'skos:broader', 0.8)"
         )
@@ -428,10 +432,10 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:broader', 0.8)"
         )
         conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-a', 'ent-cyc-c', 'skos:related', 0.5)"
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-a', 'ent-cyc-b', 'skos:related', 0.5)"
         )
         conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-c', 'ent-cyc-a', 'skos:related', 0.5)"
+            "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-cyc-b', 'ent-cyc-a', 'skos:related', 0.5)"
         )
 
         # Seed Shape 9 (lexicalSubsumption) & Shape 10 (siblingNotBroader) via raw SQL
@@ -566,21 +570,63 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
             "INSERT INTO edges (src_id, dst_id, kind, weight) VALUES ('ent-sys', 'ent-lit-port', 'skos:related', 0.6)"
         )
 
-        # Before auto-heal, all 11 SHACL shapes flag violations
-        pre_violations = lint_graph_shacl(conn, auto_heal=False)
+        # Before repair, all 11 SHACL shapes flag violations
+        pre_violations = lint_graph_shacl(conn)
         pre_shapes = {v.shape for v in pre_violations}
         assert ALL_11_SHACL_SHAPES.issubset(pre_shapes), f"Missing pre-heal shapes: {ALL_11_SHACL_SHAPES - pre_shapes}"
 
-        # Run deterministic auto-heal
-        remaining = lint_graph_shacl(conn, auto_heal=True)
+        # Apply explicit SHACL repairs across all 11 shapes
+        repairs = [
+            {"focus_node": "ent-no-pref", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {"focus_node": "ent-multi-pref", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-empty-def",
+                "action": "set_definition",
+                "target_node": "",
+                "value": "Undocumented service component.",
+            },
+            {"focus_node": "ent-s13", "action": "demote_to_alt_label", "target_node": "", "value": ""},
+            {"focus_node": "ent-hom-a|ent-hom-b", "action": "add_different_from", "target_node": "", "value": ""},
+            {"focus_node": "fact-dangling-1", "action": "delete_dangling", "target_node": "", "value": ""},
+            {
+                "focus_node": "fact-empty-def-1",
+                "action": "set_definition",
+                "target_node": "",
+                "value": "system caches in caching layer.",
+            },
+            {"focus_node": "ent-sys->ent-missing", "action": "delete_dangling", "target_node": "", "value": ""},
+            {"focus_node": "ent-s13|ent-sys", "action": "remove_conflicting_related", "target_node": "", "value": ""},
+            {"focus_node": "ent-sys->ent-multi-pref", "action": "assert_related", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-2cyc-b->ent-2cyc-a",
+                "action": "remove_hierarchy_cycle",
+                "target_node": "",
+                "value": "",
+            },
+            {"focus_node": "ent-cyc-c->ent-cyc-a", "action": "remove_hierarchy_cycle", "target_node": "", "value": ""},
+            {
+                "focus_node": "ent-cyc-a|ent-cyc-b",
+                "action": "remove_conflicting_related",
+                "target_node": "",
+                "value": "",
+            },
+            {"focus_node": "ent-lit-port", "action": "remove_scalar_entity", "target_node": "", "value": ""},
+            {"focus_node": "ent-date", "action": "remove_scalar_entity", "target_node": "", "value": ""},
+            {"focus_node": "ent-eng->ent-sec-eng", "action": "invert_broader", "target_node": "", "value": ""},
+            {"focus_node": "ent-v1->ent-v2", "action": "demote_sibling_to_related", "target_node": "", "value": ""},
+            {"focus_node": "fact-no-src", "action": "ground_fact_source", "target_node": "", "value": "c1"},
+            {"focus_node": "fact-no-src-es", "action": "ground_fact_source", "target_node": "", "value": "c2"},
+            {"focus_node": "fact-truly-orphan", "action": "delete_orphan", "target_node": "", "value": ""},
+        ]
+        applied = apply_shacl_repairs(conn, repairs)
+        assert applied == len(repairs)
+        remaining = lint_graph_shacl(conn)
         assert remaining == [], f"Unexpected remaining violations: {remaining}"
 
         # 1. ConceptShape/prefLabel healed: ent-no-pref promoted, ent-multi-pref demoted extra prefLabel
         no_pref_kinds = [
             str(r[0])
-            for r in conn.execute(
-                "SELECT label_kind FROM entity_labels WHERE entity_id = 'ent-no-pref'"
-            ).fetchall()
+            for r in conn.execute("SELECT label_kind FROM entity_labels WHERE entity_id = 'ent-no-pref'").fetchall()
         ]
         assert no_pref_kinds == ["skos:prefLabel"]
         multi_pref_rows = {
@@ -593,9 +639,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         assert multi_pref_rows["secondary label"] == "skos:altLabel"
 
         # 2. ConceptShape/definition healed: ent-empty-def has a synthesized non-empty definition
-        empty_def_row = conn.execute(
-            "SELECT definition FROM entities WHERE entity_id = 'ent-empty-def'"
-        ).fetchone()
+        empty_def_row = conn.execute("SELECT definition FROM entities WHERE entity_id = 'ent-empty-def'").fetchone()
         assert empty_def_row is not None and str(empty_def_row[0]).strip() != ""
 
         # 3. ConceptShape/S13-disjointLabels healed: ent-s13 has only skos:prefLabel for 'caching layer'
@@ -626,8 +670,7 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         # 6. EdgeShape/closedWorld healed: dangling edge deleted, related+differentFrom conflict resolved,
         # asymmetric skos:related symmetrized
         assert (
-            conn.execute("SELECT 1 FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-missing'").fetchone()
-            is None
+            conn.execute("SELECT 1 FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-missing'").fetchone() is None
         )
         assert (
             conn.execute(
@@ -662,19 +705,18 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         assert (
             conn.execute(
                 "SELECT 1 FROM edges WHERE kind = 'skos:related' "
-                "AND src_id IN ('ent-cyc-a', 'ent-cyc-c') AND dst_id IN ('ent-cyc-a', 'ent-cyc-c')"
+                "AND src_id IN ('ent-cyc-a', 'ent-cyc-b') AND dst_id IN ('ent-cyc-a', 'ent-cyc-b')"
             ).fetchone()
             is None
         )
 
-        # 8a. Pure literal node (ent-lit-port) is preserved in entities with its 0.5 fact edge,
-        # while its illegal skos:broader and skos:related edges were stripped
+        # 8a. Pure literal node (ent-lit-port) is removed from entities along with its edges
         port_ent = conn.execute("SELECT entity_id FROM entities WHERE entity_id = 'ent-lit-port'").fetchone()
-        assert port_ent is not None
+        assert port_ent is None
         port_fact_edge = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-lit-port' AND kind = 'fact'"
         ).fetchone()
-        assert port_fact_edge is not None and abs(float(port_fact_edge[0]) - 0.5) < 1e-6
+        assert port_fact_edge is None
         port_skos_edges = conn.execute(
             "SELECT 1 FROM edges WHERE (src_id = 'ent-lit-port' OR dst_id = 'ent-lit-port') "
             "AND kind IN ('skos:broader', 'skos:related')"
@@ -684,15 +726,18 @@ def test_shacl_auto_healing_complete(tmp_path: Path) -> None:
         # 8b. Orphan scalar entity (ent-date) was removed from entities and fact-date-1 converted to literal
         date_ent = conn.execute("SELECT entity_id FROM entities WHERE entity_id = 'ent-date'").fetchone()
         assert date_ent is None
-        fact_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])
-        assert fact_meta["fact-date-1"]["obj_kind"] == "literal"
-        assert fact_meta["fact-date-1"]["obj_id"] is None
-        assert fact_meta["fact-date-1"]["obj_literal_lex"] == "2026-10-25"
+        date_fid_row = conn.execute(
+            "SELECT fact_id FROM facts WHERE subj_id = 'ent-sys' AND pred = 'released on'"
+        ).fetchone()
+        assert date_fid_row is not None
+        date_fid = str(date_fid_row[0])
+        assert tuple(
+            conn.execute("SELECT obj_kind,obj_id,obj_literal_lex FROM facts WHERE fact_id=?", (date_fid,)).fetchone()
+        ) == ("literal", None, "2026-10-25")
 
         # 9. Inverted broader edge was inverted: security engineering -> engineering
         eng_broader = conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader' "
-            "AND src_id IN ('ent-eng', 'ent-sec-eng')"
+            "SELECT src_id, dst_id FROM edges WHERE kind = 'skos:broader' AND src_id IN ('ent-eng', 'ent-sec-eng')"
         ).fetchall()
         assert len(eng_broader) == 1
         assert (str(eng_broader[0][0]), str(eng_broader[0][1])) == ("ent-sec-eng", "ent-eng")
@@ -802,10 +847,10 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
             ],
         )
 
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         ttl = serialize_graph_turtle(conn)
         assert 'rdf:object "2026-10-25"^^xsd:date' in ttl
-        assert '^^<xsd:date>' not in ttl
+        assert "^^<xsd:date>" not in ttl
         assert 'rdf:object "42.5"^^<http://example.org/datatypes#millisecond>' in ttl
         assert 'rdf:object "fast graph retrieval"@en' in ttl
         assert 'rdf:object "8080" ;' in ttl
@@ -815,9 +860,9 @@ def test_serialize_graph_turtle_literal_datatypes_and_lang_tags(tmp_path: Path) 
         conn.close()
 
 
-def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_edge_weight(tmp_path: Path) -> None:
-    """Verify Heal 8 converts obj_kind='entity' to 'literal' while retaining obj_id and updating
-    the fact edge weight from 1.0 to 0.5 when the scalar node is grounded by a passage edge."""
+def test_heal_8_scalar_entity_converts_to_literal_and_prunes_edges(tmp_path: Path) -> None:
+    """Verify remove_scalar_entity converts obj_kind='entity' to 'literal' with obj_id=None
+    and removes all graph edges connected to the scalar entity."""
     conn = open_yaw_db(tmp_path / "test_heal8_passage_scalar.db")
     try:
         upsert_chunk_pointers(
@@ -862,29 +907,36 @@ def test_heal_8_scalar_entity_with_passage_edge_retains_obj_id_and_updates_fact_
             "INSERT INTO edge_sources (src_id, dst_id, kind, chunk_id) VALUES ('ent-sys', 'ent-date', 'fact', 'c1')"
         )
 
-        pre_v = lint_graph_shacl(conn, auto_heal=False)
+        pre_v = lint_graph_shacl(conn)
         assert any(v.shape == "ConceptShape/noScalarLiterals" and v.focus_node == "ent-date" for v in pre_v)
 
-        rem_v = lint_graph_shacl(conn, auto_heal=True)
+        apply_shacl_repairs(
+            conn,
+            [{"focus_node": "ent-date", "action": "remove_scalar_entity", "target_node": "", "value": ""}],
+        )
+        rem_v = lint_graph_shacl(conn)
         assert rem_v == []
 
-        f_meta = get_facts_with_meta_by_ids(conn, ["fact-date-1"])["fact-date-1"]
-        assert f_meta["obj_kind"] == "literal"
-        assert f_meta["obj_id"] == "ent-date"
-        assert f_meta["obj_literal_lex"] == "2026-10-25"
+        date_fid_row = conn.execute(
+            "SELECT fact_id FROM facts WHERE subj_id = 'ent-sys' AND pred = 'released on'"
+        ).fetchone()
+        assert date_fid_row is not None
+        date_fid = str(date_fid_row[0])
+        assert tuple(
+            conn.execute("SELECT obj_kind,obj_id,obj_literal_lex FROM facts WHERE fact_id=?", (date_fid,)).fetchone()
+        ) == ("literal", None, "2026-10-25")
 
         edge_row = conn.execute(
             "SELECT weight FROM edges WHERE src_id = 'ent-sys' AND dst_id = 'ent-date' AND kind = 'fact'"
         ).fetchone()
-        assert edge_row is not None
-        assert abs(float(edge_row[0]) - 0.5) < 1e-6
+        assert edge_row is None
     finally:
         conn.close()
 
 
 def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> None:
     """Verify punctuated surface names ('Apple Inc.', 'Python 3.10') preserve canonical
-    text_processing norms across upsert_entity_labels, apply_shacl_repairs, Heal 1, and inspect_focus_node."""
+    text_processing norms across upsert_entity_labels, apply_shacl_repairs, and inspect_focus_node."""
     conn = open_yaw_db(tmp_path / "yaw_punct_repairs.db")
     try:
         upsert_chunk_pointers(
@@ -907,7 +959,7 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
                 ("apple inc", "entity-apple", "skos:prefLabel", "Apple Inc", "c1"),
             ],
         )
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
         apple_kinds = {
             str(r[0]): str(r[1])
             for r in conn.execute(
@@ -933,9 +985,9 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
             [{"focus_node": "entity-apple", "action": "demote_to_alt_label", "target_node": "", "value": ""}],
         )
         assert applied == 1
-        assert lint_graph_shacl(conn, auto_heal=False) == []
+        assert lint_graph_shacl(conn) == []
 
-        # 4. Heal 1 promotes 'python 3.10' over alphabetically earlier 'a_alias' and preserves 'Python 3.10'
+        # 4. demote_to_alt_label promotes 'python 3.10' over 'a_alias' and preserves 'Python 3.10'
         upsert_entities(
             conn,
             [
@@ -947,7 +999,11 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
             "('a_alias', 'entity-py', 'skos:altLabel', 'a_alias', 'c1'), "
             "('python 3.10', 'entity-py', 'skos:altLabel', 'Python 3.10', 'c1')"
         )
-        assert lint_graph_shacl(conn, auto_heal=True) == []
+        apply_shacl_repairs(
+            conn,
+            [{"focus_node": "entity-py", "action": "demote_to_alt_label", "target_node": "", "value": ""}],
+        )
+        assert lint_graph_shacl(conn) == []
         py_name = conn.execute("SELECT name FROM entities WHERE entity_id = 'entity-py'").fetchone()
         assert py_name is not None and str(py_name[0]) == "Python 3.10"
         py_pref = conn.execute(
@@ -961,7 +1017,7 @@ def test_punctuated_surface_name_repairs_and_label_priority(tmp_path: Path) -> N
 def test_identical_definition_duplicate_concepts_merged_deterministically_and_pair_inspection_dossier(
     tmp_path: Path,
 ) -> None:
-    """Verify identical-definition duplicate concepts sharing skos:prefLabel are merged deterministically
+    """Verify identical-definition duplicate concepts sharing skos:prefLabel are merged via apply_shacl_repairs
     (even if an erroneous owl:differentFrom edge was present), and inspect_focus_node('a|b') renders
     the full SKOS/RDF/OWL Markdown dossier with optional 1-hop upward AST context."""
     doc_file = tmp_path / "arch.md"
@@ -1028,11 +1084,22 @@ def test_identical_definition_duplicate_concepts_merged_deterministically_and_pa
         assert "[AST Parent Header] # Global Cloud Architecture" in pair_info_1["markdown_dossier"]
 
         # Pre-heal scan flags identical-definition duplicates
-        pre_v = lint_graph_shacl(conn, auto_heal=False)
+        pre_v = lint_graph_shacl(conn)
         assert any(v.shape == "ConceptShape/homographDifferentFrom" for v in pre_v)
 
-        # Pre-RLM heal (heal_homographs=False) deterministically merges identical-definition duplicates
-        rem_v = lint_graph_shacl(conn, auto_heal=True, heal_definitions=False, heal_homographs=False)
+        # Explicit repair merges identical-definition duplicates
+        apply_shacl_repairs(
+            conn,
+            [
+                {
+                    "focus_node": "entity-tgw-1|entity-tgw-2",
+                    "action": "merge_altLabel",
+                    "target_node": "entity-tgw-1",
+                    "value": "",
+                }
+            ],
+        )
+        rem_v = lint_graph_shacl(conn)
         assert rem_v == []
         surviving = conn.execute("SELECT entity_id, name FROM entities").fetchall()
         assert len(surviving) == 1

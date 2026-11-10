@@ -463,3 +463,133 @@ def test_hydrate_ast_parent_context_returns_empty_for_json_and_jsonl(tmp_path: P
     )
     assert hydrate_ast_parent_context(ptr, tmp_path, hops=1) == ""
     assert hydrate_ast_parent_context(ptr, tmp_path, hops=2) == ""
+
+
+def test_resolve_chunk_text_matches_split_and_projected_json_chunks(tmp_path: Path) -> None:
+    import json
+
+    from yaw.daemon.graph.storage import resolve_chunk_text
+    from yaw.daemon.ingestion import chunk_source_text
+
+    source = tmp_path / "split_records.jsonl"
+    source.write_text(
+        json.dumps({"title": "SplitDoc", "text": ("Paragraph alpha.\n\n" * 20) + ("Paragraph beta.\n\n" * 20)}) + "\n",
+        encoding="utf-8",
+    )
+    chunks = chunk_source_text(
+        source.read_text(encoding="utf-8"),
+        source.name,
+        chunk_size=180,
+        chunk_overlap=20,
+        min_chunk_size=20,
+    )
+    assert len(chunks) > 1
+    for ptr, expected_text in chunks:
+        resolved = resolve_chunk_text(
+            ptr,
+            tmp_path,
+            chunk_size=180,
+            chunk_overlap=20,
+            min_chunk_size=20,
+        )
+        assert resolved == expected_text
+
+
+def test_format_subgraph_for_qa_subgraph_assembly(tmp_path: Path) -> None:
+    """Verify format_subgraph_for_qa formats statements, taxonomy traces, and concepts from real SQLite."""
+    from yaw.daemon.graph.storage import (
+        format_subgraph_for_qa,
+        open_yaw_db,
+        upsert_entities,
+        upsert_entity_labels,
+        upsert_fact_sources,
+        upsert_facts,
+        upsert_semantic_edges,
+    )
+
+    conn = open_yaw_db(tmp_path / "yaw.db")
+    try:
+        # Entities & labels
+        upsert_entities(
+            conn,
+            [
+                ("e_maya", "Maya Patel", "Senior lead AI architect"),
+                ("e_sana", "Sana Patel", "Venture capital investor"),
+                ("e_lead_arch", "Lead AI Architect", "Principal engineering role"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("maya patel", "e_maya", "skos:prefLabel", "Maya Patel", "c1"),
+                ("maya", "e_maya", "skos:altLabel", "Maya", "c1"),
+                ("sana patel", "e_sana", "skos:prefLabel", "Sana Patel", "c2"),
+                ("lead ai architect", "e_lead_arch", "skos:prefLabel", "Lead AI Architect", "c1"),
+            ],
+        )
+
+        # Facts
+        # FactRow: fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
+        # obj_datatype, obj_lang, raw_triple_json, definition
+        upsert_facts(
+            conn,
+            [
+                (
+                    "f1",
+                    "e_maya",
+                    "employed_as",
+                    "entity",
+                    "e_lead_arch",
+                    None,
+                    "",
+                    "",
+                    '["Maya Patel", "employed as", "Lead AI Architect"]',
+                    "Maya Patel holds the position of Lead AI Architect.",
+                ),
+            ],
+        )
+        upsert_fact_sources(conn, [("f1", "c1")])
+
+        # Semantic edges with reasoning
+        upsert_semantic_edges(
+            conn,
+            [
+                (
+                    "e_maya",
+                    "e_sana",
+                    "owl:differentFrom",
+                    0.0,
+                    "Distinct individuals with shared surname Patel",
+                ),
+                (
+                    "e_maya",
+                    "e_lead_arch",
+                    "skos:related",
+                    0.8,
+                    "Person to corporate role link",
+                ),
+            ],
+        )
+
+        # Subgraph formatted with chunk c1
+        subgraph = format_subgraph_for_qa(
+            conn,
+            chunk_ids=["c1"],
+            seed_facts=[("Maya Patel", "employed_as", "Lead AI Architect")],
+            max_subgraph_chars=4000,
+        )
+
+        assert "### Knowledge Graph Statements (rdf:Statement)" in subgraph
+        assert "[Maya Patel, employed_as, Lead AI Architect]" in subgraph
+        assert "### Taxonomy & Disambiguation Trace (SKOS / OWL)" in subgraph
+        assert (
+            "[DISJOINT] Maya Patel owl:differentFrom Sana Patel" in subgraph
+            or "[DISJOINT] Sana Patel owl:differentFrom Maya Patel" in subgraph
+        )
+        assert "Distinct individuals with shared surname Patel" in subgraph
+        assert "Maya Patel: Senior lead AI architect" in subgraph
+        assert "Sana Patel: Venture capital investor" in subgraph
+        assert "### Concept Definitions & Aliases (skos:Concept)" in subgraph
+        assert "**Maya Patel** (altLabel: Maya): Senior lead AI architect" in subgraph
+    finally:
+        conn.close()

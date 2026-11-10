@@ -7,7 +7,6 @@ from scripts.evaluation import (
     QAExactMatch,
     QAF1Score,
     RetrievalRecall,
-    normalize_answer,
 )
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
@@ -58,7 +57,6 @@ def test_retrieval_deduplicates_gold_orders_ranks_and_averages_examples():
 
 
 def test_qa_aliases_aggregation_and_empty_examples_have_exact_scores():
-    assert normalize_answer(" THE,   Brown fox! ") == "brown fox"
     gold = [["the brown fox", "brown fox"], ["one two"], []]
     predicted = ["Brown fox!", "one three", "anything"]
     exact = QAExactMatch()

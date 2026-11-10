@@ -1,20 +1,30 @@
 """Unified yaw.db SQLite connection lifecycle, schema DDL, and metadata key-value store."""
 
-import json
+import re
 import sqlite3
 import time
+import uuid
 from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
+import cocoindex as coco
 import sqlite_vec
 from cocoindex.connectors.sqlite import ManagedConnection
 from cocoindex.connectors.sqlite import connect as coco_sqlite_connect
 
-from yaw.core import text_processing
+from yaw.core import resolve_coco_state_root as resolve_coco_state_root
 
 SQL_BATCH_SIZE = 500
-type YawConnection = sqlite3.Connection
+DEFAULT_VEC_DIMENSION = 768
+_VEC0_PK_COLUMNS: dict[str, str] = {
+    "chunk_vec": "chunk_id",
+    "entity_vec": "entity_id",
+    "fact_vec": "fact_id",
+}
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+_VEC0_DIM_RE = re.compile(r"USING\s+vec0\s*\(.*?\bfloat\[(\d+)\]", re.IGNORECASE | re.DOTALL)
+GRAPH_DB = coco.ContextKey[ManagedConnection]("yaw/graph_db")
 
 _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -47,18 +57,11 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS openie_chunks (
-        chunk_id TEXT PRIMARY KEY,
-        entities_json TEXT NOT NULL,
-        triples_json TEXT NOT NULL,
-        structured_triples_json TEXT NOT NULL DEFAULT '[]'
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS entities (
         entity_id TEXT PRIMARY KEY,
         name TEXT NOT NULL COLLATE NOCASE,
-        definition TEXT NOT NULL DEFAULT ''
+        definition TEXT NOT NULL DEFAULT '',
+        confidence REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)",
@@ -87,6 +90,7 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         obj_lang TEXT NOT NULL DEFAULT '',
         raw_triple_json TEXT NOT NULL,
         definition TEXT NOT NULL DEFAULT '',
+        confidence REAL,
         CHECK (
             (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
             OR (
@@ -105,6 +109,9 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS fact_sources (
         fact_id TEXT NOT NULL,
         chunk_id TEXT NOT NULL,
+        llm_prob REAL,
+        vec_coherence REAL,
+        atomic_confidence REAL,
         PRIMARY KEY (fact_id, chunk_id)
     )
     """,
@@ -122,8 +129,11 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS edges (
         src_id TEXT NOT NULL,
         dst_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')),
+        kind TEXT NOT NULL CHECK (
+            kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
+        ),
         weight REAL NOT NULL,
+        reasoning TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (src_id, dst_id, kind)
     )
     """,
@@ -135,29 +145,92 @@ _CREATE_SCHEMA_STATEMENTS: tuple[str, ...] = (
         dst_id TEXT NOT NULL,
         kind TEXT NOT NULL,
         chunk_id TEXT NOT NULL,
+        llm_prob REAL,
+        vec_coherence REAL,
+        atomic_confidence REAL,
         PRIMARY KEY (src_id, dst_id, kind, chunk_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_edge_sources_chunk ON edge_sources(chunk_id)",
     """
-    CREATE TABLE IF NOT EXISTS chunk_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
         chunk_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS entity_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS entity_vec USING vec0(
         entity_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS fact_vec (
+    CREATE VIRTUAL TABLE IF NOT EXISTS fact_vec USING vec0(
         fact_id TEXT PRIMARY KEY,
-        embedding BLOB NOT NULL
+        embedding float[768] distance_metric=cosine
     )
     """,
 )
+
+
+def _validate_identifier(value: str) -> str:
+    if _IDENTIFIER_RE.fullmatch(value) is None:
+        raise ValueError(f"Invalid SQLite identifier: {value!r}")
+    return value
+
+
+def vec0_table_dimension(conn: sqlite3.Connection, table_name: str) -> int | None:
+    """Return the float[N] dimension of an existing vec0 virtual table, or None if not a vec0 table."""
+    _validate_identifier(table_name)
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    match = _VEC0_DIM_RE.search(str(row[0]))
+    return int(match.group(1)) if match is not None else None
+
+
+def ensure_vec0_table(
+    conn: sqlite3.Connection,
+    table_name: str,
+    pk_col: str,
+    dim: int | None,
+    *,
+    column: str = "embedding",
+    metric: str = "cosine",
+) -> None:
+    """Ensure a sqlite-vec vec0 virtual table exists with the requested primary key and dimension."""
+    _validate_identifier(table_name)
+    _validate_identifier(pk_col)
+    _validate_identifier(column)
+    if metric != "cosine":
+        raise ValueError(f"Unsupported vec0 distance metric: {metric!r}")
+    if dim is not None and int(dim) <= 0:
+        raise ValueError(f"Invalid vec0 dimension: {dim}")
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    if row is not None and row[0]:
+        normalized = " ".join(str(row[0]).split())
+        if "USING VEC0(" in normalized.upper():
+            if dim is None:
+                return
+            if (
+                f"{pk_col} TEXT PRIMARY KEY" in normalized
+                and f"{column} float[{int(dim)}] distance_metric={metric}" in normalized
+            ):
+                return
+        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+
+    target_dim = int(dim) if dim is not None else DEFAULT_VEC_DIMENSION
+    conn.execute(
+        f'CREATE VIRTUAL TABLE IF NOT EXISTS "{table_name}" USING vec0('
+        f"{pk_col} TEXT PRIMARY KEY, {column} float[{target_dim}] distance_metric={metric})"
+    )
 
 
 def batched(items: Sequence[str], size: int = SQL_BATCH_SIZE) -> Iterator[Sequence[str]]:
@@ -197,6 +270,8 @@ def _configure_connection_pragmas(
     if enable_foreign_keys:
         conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA cache_size = -65536;")
+    conn.execute("PRAGMA mmap_size = 268435456;")
     conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)};")
 
 
@@ -207,6 +282,11 @@ def open_managed_yaw_db(db_path: Path | str) -> ManagedConnection:
         Path(db_str).parent.mkdir(parents=True, exist_ok=True)
 
     managed = coco_sqlite_connect(db_str, timeout=30.0, load_vec=True)
+    try:
+        validate_graph_schema(managed._conn)
+    except ValueError:
+        managed.close()
+        raise
     _configure_connection_pragmas(managed._conn)
     with managed.transaction() as conn:
         initialize_schema(conn)
@@ -220,6 +300,11 @@ def open_yaw_db(db_path: Path | str) -> sqlite3.Connection:
         Path(db_str).parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_str, timeout=30.0, check_same_thread=False)
+    try:
+        validate_graph_schema(conn)
+    except ValueError:
+        conn.close()
+        raise
     conn.isolation_level = None
     _configure_connection_pragmas(
         conn,
@@ -253,13 +338,17 @@ def open_readonly_yaw_db(
                 timeout=timeout,
                 check_same_thread=False,
             )
-            conn.row_factory = sqlite3.Row
-            conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
+            _configure_connection_pragmas(conn, busy_timeout_ms=busy_ms)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            validate_graph_schema(conn)
             return conn
+        except ValueError:
+            if conn is not None:
+                conn.close()
+            raise
         except sqlite3.Error:
             if conn is not None:
                 with suppress(sqlite3.Error):
@@ -270,209 +359,52 @@ def open_readonly_yaw_db(
     raise sqlite3.OperationalError(f"Failed to open read-only SQLite database: {resolved}")
 
 
+def validate_graph_schema(conn: sqlite3.Connection) -> None:
+    """Reject retired graph stores before any persistent database change."""
+    mention_columns = {row[1] for row in conn.execute("PRAGMA table_info(entity_mentions)")}
+    if mention_columns and "llm_prob" not in mention_columns:
+        raise ValueError("Source confidence schema changed; preserve this database and rebuild the index from source")
+    retired = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+        ("concept_schemes", "concept_scheme_members"),
+    ).fetchone()
+    if retired is not None:
+        raise ValueError("Obsolete graph schema: preserve this database and build a fresh scheme-free index")
+
+
+def resolve_db_identity(conn: sqlite3.Connection, db_path: Path | str | None = None) -> str:
+    """Return stable '<canonical_db_path>:<db_nonce>' stored in meta['db_identity']
+    so recreated SQLite files at the same path never collide with stale LMDB target state.
+    """
+    has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    if has_meta is not None:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'db_identity'").fetchone()
+        if row is not None and str(row[0]).strip():
+            return str(row[0])
+    if db_path is not None and str(db_path) != ":memory:":
+        canonical_path = Path(db_path).resolve().as_posix()
+    else:
+        db_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_file = next((str(r[2]) for r in db_rows if str(r[1]) == "main" and r[2]), "")
+        canonical_path = Path(main_file).resolve().as_posix() if main_file and main_file != ":memory:" else ":memory:"
+    identity = f"{canonical_path}:{uuid.uuid4().hex[:12]}"
+    with write_tx(conn):
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('db_identity', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (identity,),
+        )
+    return identity
+
+
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Initialize all unified schema tables and indices in yaw.db with in-place migrations."""
+    """Initialize all unified schema tables and indices in yaw.db."""
+    validate_graph_schema(conn)
     with write_tx(conn):
         for stmt in _CREATE_SCHEMA_STATEMENTS:
             conn.execute(stmt)
-
-        # Auto-migrate legacy content_hash column on chunks if present
-        chunk_cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
-        if "content_hash" in chunk_cols:
-            conn.execute("ALTER TABLE chunks DROP COLUMN content_hash")
-        if "ast_island_start" not in chunk_cols:
-            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_start INTEGER NOT NULL DEFAULT 0")
-        if "ast_island_end" not in chunk_cols:
-            conn.execute("ALTER TABLE chunks ADD COLUMN ast_island_end INTEGER NOT NULL DEFAULT 0")
-
-        # Auto-migrate openie_chunks.structured_triples_json
-        openie_cols = {row[1] for row in conn.execute("PRAGMA table_info(openie_chunks)").fetchall()}
-        if "structured_triples_json" not in openie_cols:
-            conn.execute("ALTER TABLE openie_chunks ADD COLUMN structured_triples_json TEXT NOT NULL DEFAULT '[]'")
-
-        # Auto-migrate entities.definition and drop legacy UNIQUE constraint on entities.name
-        entity_cols = {row[1] for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
-        if "definition" not in entity_cols:
-            conn.execute("ALTER TABLE entities ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
-        entity_ddl_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'entities'"
-        ).fetchone()
-        if entity_ddl_row is not None and (
-            "UNIQUE" in str(entity_ddl_row[0]).upper() or "COLLATE NOCASE" not in str(entity_ddl_row[0]).upper()
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _entities_migrated (
-                    entity_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL COLLATE NOCASE,
-                    definition TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            conn.execute(
-                "INSERT INTO _entities_migrated (entity_id, name, definition) SELECT entity_id, name, "
-                "definition FROM entities"
-            )
-            conn.execute("DROP TABLE entities")
-            conn.execute("ALTER TABLE _entities_migrated RENAME TO entities")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
-
-        # Auto-migrate facts table to support mutually exclusive entity vs literal objects
-        fact_cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
-        if "definition" not in fact_cols:
-            conn.execute("ALTER TABLE facts ADD COLUMN definition TEXT NOT NULL DEFAULT ''")
-        facts_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'").fetchone()
-        if facts_ddl_row is not None and (
-            "obj_kind" not in fact_cols
-            or "obj_literal_lex" not in str(facts_ddl_row[0])
-            or "obj_id != subj_id" not in str(facts_ddl_row[0])
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _facts_migrated (
-                    fact_id TEXT PRIMARY KEY,
-                    subj_id TEXT NOT NULL,
-                    pred TEXT NOT NULL,
-                    obj_kind TEXT NOT NULL DEFAULT 'entity' CHECK (obj_kind IN ('entity', 'literal')),
-                    obj_id TEXT,
-                    obj_literal_lex TEXT,
-                    obj_datatype TEXT NOT NULL DEFAULT '',
-                    obj_lang TEXT NOT NULL DEFAULT '',
-                    raw_triple_json TEXT NOT NULL,
-                    definition TEXT NOT NULL DEFAULT '',
-                    CHECK (
-                        (obj_kind = 'entity' AND obj_id IS NOT NULL AND TRIM(obj_id) != '' AND obj_literal_lex IS NULL)
-                        OR (
-                            obj_kind = 'literal'
-                            AND (obj_id IS NULL OR (TRIM(obj_id) != '' AND obj_id != subj_id))
-                            AND obj_literal_lex IS NOT NULL
-                            AND TRIM(obj_literal_lex) != ''
-                        )
-                    )
-                )
-                """
-            )
-            if "obj_kind" in fact_cols and "obj_literal_lex" in fact_cols:
-                conn.execute(
-                    """
-                    INSERT INTO _facts_migrated (
-                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
-                        obj_datatype, obj_lang, raw_triple_json, definition
-                    )
-                    SELECT
-                        fact_id, subj_id, pred, COALESCE(obj_kind, 'entity'), obj_id, obj_literal_lex,
-                        COALESCE(obj_datatype, ''), COALESCE(obj_lang, ''), raw_triple_json, COALESCE(definition, '')
-                    FROM facts
-                    """
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO _facts_migrated (
-                        fact_id, subj_id, pred, obj_kind, obj_id, obj_literal_lex,
-                        obj_datatype, obj_lang, raw_triple_json, definition
-                    )
-                    SELECT
-                        fact_id, subj_id, pred, 'entity', obj_id, NULL,
-                        '', '', raw_triple_json, COALESCE(definition, '')
-                    FROM facts
-                    WHERE obj_id IS NOT NULL
-                    """
-                )
-            conn.execute("DROP TABLE facts")
-            conn.execute("ALTER TABLE _facts_migrated RENAME TO facts")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_subj ON facts(subj_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_obj ON facts(obj_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_pair ON facts(subj_id, obj_id)")
-
-        # Auto-migrate edges CHECK constraint and legacy 'synonymy' kind -> 'skos:related', plus 'skos:broader'
-        edges_ddl_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'").fetchone()
-        if edges_ddl_row is not None and (
-            "skos:related" not in str(edges_ddl_row[0]) or "skos:broader" not in str(edges_ddl_row[0])
-        ):
-            conn.execute(
-                """
-                CREATE TABLE _edges_migrated (
-                    src_id TEXT NOT NULL,
-                    dst_id TEXT NOT NULL,
-                    kind TEXT NOT NULL CHECK (
-                        kind IN ('passage', 'fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
-                    ),
-                    weight REAL NOT NULL,
-                    PRIMARY KEY (src_id, dst_id, kind)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO _edges_migrated (src_id, dst_id, kind, weight)
-                SELECT
-                    src_id,
-                    dst_id,
-                    CASE WHEN kind = 'synonymy' THEN 'skos:related' ELSE kind END,
-                    weight
-                FROM edges
-                WHERE kind IN ('passage', 'fact', 'synonymy', 'skos:related', 'skos:broader', 'owl:differentFrom')
-                """
-            )
-            conn.execute("DROP TABLE edges")
-            conn.execute("ALTER TABLE _edges_migrated RENAME TO edges")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)")
-
-        # Auto-backfill fact_sources from edge_sources for legacy entity-object facts
-        fact_sources_cnt = int(conn.execute("SELECT COUNT(*) FROM fact_sources").fetchone()[0])
-        if fact_sources_cnt == 0:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO fact_sources (fact_id, chunk_id)
-                SELECT f.fact_id, es.chunk_id
-                FROM facts f
-                INNER JOIN edge_sources es
-                  ON es.kind = 'fact' AND es.src_id = f.subj_id AND es.dst_id = f.obj_id
-                WHERE f.obj_kind = 'entity' AND f.obj_id IS NOT NULL
-                """
-            )
-
-        # Auto-backfill entity_labels for any legacy entities without labels
-        missing_label_rows = conn.execute(
-            """
-            SELECT e.entity_id, e.name
-            FROM entities e
-            WHERE NOT EXISTS (
-                SELECT 1 FROM entity_labels el WHERE el.entity_id = e.entity_id
-            )
-            """
-        ).fetchall()
-        if missing_label_rows:
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO entity_labels (label_norm, entity_id, label_kind, raw_label, chunk_id)
-                VALUES (?, ?, 'skos:prefLabel', ?, '__legacy__')
-                """,
-                (
-                    (str(text_processing(r[1])) or str(r[1]).strip().lower(), str(r[0]), str(r[1]))
-                    for r in missing_label_rows
-                ),
-            )
-
-        # Auto-backfill fact_fts if facts exist but fact_fts is empty
-        fact_count = int(conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
-        if fact_count > 0:
-            fts_count = int(conn.execute("SELECT COUNT(*) FROM fact_fts").fetchone()[0])
-            if fts_count == 0:
-                rows = conn.execute("SELECT fact_id, pred, raw_triple_json FROM facts").fetchall()
-                fts_items: list[tuple[str, str]] = []
-                for row in rows:
-                    fid = str(row[0])
-                    pred = str(row[1])
-                    try:
-                        items = json.loads(row[2])
-                        fts_items.append((fid, f"{items[0]} {pred} {items[2]}"))
-                    except Exception:
-                        fts_items.append((fid, pred))
-                if fts_items:
-                    conn.executemany("INSERT INTO fact_fts (fact_id, text) VALUES (?, ?)", fts_items)
+        resolve_db_identity(conn)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

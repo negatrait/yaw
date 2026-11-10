@@ -17,15 +17,13 @@ from yaw.daemon.graph.inference.reflection import (
     ReflectionBudgetError,
     ReflectionLM,
     ServingTokenCounter,
-    deterministic_evidence,
     reflection_examples,
     resolve_evidence,
 )
 from yaw.daemon.graph.storage import (
-    CandidateCacheStore,
-    CandidatePayloadCodec,
-    CandidateStageCache,
+    get_meta,
     open_managed_yaw_db,
+    set_meta,
 )
 
 
@@ -143,7 +141,6 @@ def proposer(url, **kwargs):
         worker_lm=lm,
         orchestrator_lm=lm,
         token_counter=counter,
-        include_demos=False,
         enable_gbnf=False,
         **kwargs,
     )
@@ -170,32 +167,12 @@ def test_exact_evidence_and_training_answers():
         ]
     }
     assert resolve_evidence(examples, selection)[0]["evidence"] == "needle"
-    assert "Turing" in resolve_evidence(examples, deterministic_evidence(examples))[0]["evidence"]["Feedback"]
     selection["references"][0]["end"] = 10007
     with pytest.raises(ValueError, match="span"):
         resolve_evidence(examples, selection)
     selection["references"][0]["example_id"] = "invented"
     with pytest.raises(KeyError):
         resolve_evidence(examples, selection)
-
-
-def test_snapshot_hydrates_source_excerpts_without_copying_corpus(tmp_path):
-    source = "Original corpus passage. " * 100
-    codec = CandidatePayloadCodec(lambda: {"source-identity": source})
-    snapshot = {"examples": [{"Inputs": {"passage": source}, "evidence": source[150:300]}]}
-    encoded = codec.encode(snapshot)
-    assert source[150:300] not in encoded
-    db = open_managed_yaw_db(tmp_path / "snapshot.db")
-    try:
-        with db.transaction() as conn:
-            conn.execute("CREATE TABLE snapshots(value TEXT)")
-            conn.execute("INSERT INTO snapshots VALUES (?)", (encoded,))
-            stored = conn.execute("SELECT value FROM snapshots").fetchone()[0]
-        assert codec.decode(stored) == snapshot
-        with pytest.raises(KeyError):
-            CandidatePayloadCodec(lambda: {}).decode(stored)
-    finally:
-        db.close()
 
 
 def test_native_writer_and_complete_budget(provider):
@@ -209,7 +186,7 @@ def test_native_writer_and_complete_budget(provider):
     assert "source evidence" in result.new_instruction
     assert "Turing" in str(calls[-1])
     assert "qa.predict" in str(calls[-1])
-    assert prop.qwen_compressor.signature.output_fields.keys() == {"shortened_instruction"}
+    assert prop.llm_compressor.signature.output_fields.keys() == {"shortened_instruction"}
     prop.reflection_input_tokens = 10
     prop.worker_lm = prop.worker_lm.target
     prop.orchestrator_lm = prop.orchestrator_lm.target
@@ -246,7 +223,7 @@ def test_compression_and_demos_cannot_bypass_complete_request_budget(provider):
     with pytest.raises(ReflectionBudgetError):
         prop(component_name="qa.predict", current_instruction="OVERSIZED_DRAFT")
     assert len(calls) == 1  # The oversized compression request never reaches inference.
-    prop.qwen_proposer.demos = [
+    prop.llm_proposer.demos = [
         dspy.Example(
             current_instruction="Use evidence.",
             examples_with_feedback=[{"Feedback": "x" * 50000}],
@@ -280,23 +257,21 @@ def test_rlm_selects_original_evidence_in_real_sandbox(provider):
         )
     assert outer_trace == []
     assert "source evidence" in result
-    assert prop.telemetry[-1]["fallback"] is None
+    assert "fallback" not in prop.telemetry[-1]
     assert 2 <= len(calls) <= 3
     assert "Turing" in str(calls[-1])
 
 
 @pytest.mark.parametrize("instruction", ["RLM_FAILURE", "INVALID_REF"])
-def test_failed_selector_uses_original_evidence_with_native_writer(provider, instruction):
-    url, calls = provider
+def test_failed_selector_raises_without_fallback(provider, instruction):
+    url, _calls = provider
     prop = proposer(url, enable_simba=False, rlm_max_iters=2)
-    result = prop.propose_for_component(
-        "qa.predict",
-        instruction,
-        [{"Inputs": {"question": "Who?"}, "Feedback": "Expected=['Turing']"}],
-    )
-    assert "source evidence" in result
-    assert prop.telemetry[-1]["fallback"] is not None
-    assert "Turing" in str(calls[-1])
+    with pytest.raises((KeyError, ValueError, RuntimeError, Exception)):
+        prop.propose_for_component(
+            "qa.predict",
+            instruction,
+            [{"Inputs": {"question": "Who?"}, "Feedback": "Expected=['Turing']"}],
+        )
 
 
 def test_missing_tokenizer_and_legacy_state_rejected():
@@ -314,11 +289,10 @@ def test_proposal_checkpoint_survives_fresh_process(tmp_path, provider, interrup
     url, calls = provider
     prop = proposer(url, enable_simba=False)
     db = open_managed_yaw_db(tmp_path / "yaw.db")
-    with db.transaction() as conn:
-        store = CandidateCacheStore(conn)
-    cache = CandidateStageCache(store, db, "reflection", lambda: "test")
-    prop.checkpoint_get = lambda key: json.loads(cache.get((key,))) if cache.get((key,)) else None
-    prop.checkpoint_put = lambda key, value: cache.__setitem__((key,), json.dumps(value))
+    prop.checkpoint_get = lambda key: (
+        json.loads(raw) if (raw := get_meta(db._conn, f"reflection:{key}")) is not None else None
+    )
+    prop.checkpoint_put = lambda key, value: set_meta(db._conn, f"reflection:{key}", json.dumps(value))
     candidate = {"qa.predict": "Use evidence."}
     data = {"qa.predict": [{"Inputs": {"question": "Who?"}, "Feedback": "Expected Turing"}]}
     # Select and persist evidence through the actual DSPy sandbox first.
@@ -348,9 +322,7 @@ spec=importlib.util.spec_from_file_location('reflection_tests',sys.argv[1])
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 p=module.proposer(sys.argv[2],enable_simba=False)
 db=module.open_managed_yaw_db(Path(sys.argv[3]))
-with db.transaction() as conn: store=module.CandidateCacheStore(conn)
-cache=module.CandidateStageCache(store,db,'reflection',lambda:'test')
-p.checkpoint_get=lambda key: json.loads(cache.get((key,))) if cache.get((key,)) else None
+p.checkpoint_get=lambda k: json.loads(r) if (r:=module.get_meta(db._conn,f'reflection:{k}')) is not None else None
 try:
  candidate={'qa.predict':'Use evidence.'}
  data={'qa.predict':[{'Inputs':{'question':'Who?'},'Feedback':'Expected Turing'}]}
@@ -402,7 +374,7 @@ def test_repeated_native_proposals_release_inputs_and_histories(provider):
     assert all(reference() is None for reference in retained)
     assert outer_trace == []
     assert prop.worker_lm.history == prop.worker_lm.target.history == []
-    assert prop.qwen_proposer.traces == prop.qwen_compressor.traces == []
+    assert prop.llm_proposer.traces == prop.llm_compressor.traces == []
     assert prop.worker_module.sub_telemetry == []
 
 
@@ -411,25 +383,21 @@ def test_completed_request_invalidates_when_learned_writer_changes(tmp_path, pro
     prop = proposer(url, enable_simba=False)
     db = open_managed_yaw_db(tmp_path / "yaw.db")
     try:
-        with db.transaction() as conn:
-            store = CandidateCacheStore(conn)
-        cache = CandidateStageCache(store, db, "reflection", lambda: "test")
 
-        # CandidateStageCache uses tuple keys consistently on disk.
         def get(key):
-            raw = cache.get((key,))
+            raw = get_meta(db._conn, f"reflection:{key}")
             return json.loads(raw) if raw is not None else None
 
         prop.checkpoint_get = get
-        prop.checkpoint_put = lambda key, value: cache.__setitem__((key,), json.dumps(value))
+        prop.checkpoint_put = lambda key, value: set_meta(db._conn, f"reflection:{key}", json.dumps(value))
         candidate = {"qa.predict": "Use evidence."}
         data = {"qa.predict": [{"Inputs": {"question": "Who?"}, "Feedback": "Expected Turing"}]}
         first = prop(candidate, data, ["qa.predict"])
         completed_calls = len(calls)
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls
-        prop.qwen_proposer.signature = prop.qwen_proposer.signature.with_instructions(
-            prop.qwen_proposer.signature.instructions + "\nPreserve exact source names in task outputs."
+        prop.llm_proposer.signature = prop.llm_proposer.signature.with_instructions(
+            prop.llm_proposer.signature.instructions + "\nPreserve exact source names in task outputs."
         )
         assert prop(candidate, data, ["qa.predict"]) == first
         assert len(calls) == completed_calls + 1  # Evidence is reused; the new writer runs once.

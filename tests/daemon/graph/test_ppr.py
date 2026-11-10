@@ -35,12 +35,13 @@ def test_build_transition_matrix_symmetry_and_max_weights() -> None:
     chunks = ["chunk-1", "chunk-2"]
     entities = ["entity-A", "entity-B", "entity-C"]
 
-    # Edges with duplicates across kinds and directions
+    # Parallel edges compound strictly via bayesian_noisy_or:
+    # 1 - (1 - 0.8) * (1 - 0.6) = 1 - 0.08 = 0.92
     edges = [
         ("chunk-1", "entity-A", "passage", 1.0),
         ("entity-A", "chunk-1", "passage", 1.0),
-        ("entity-A", "entity-B", "fact", 2.0),
-        ("entity-A", "entity-B", "synonymy", 0.9),  # Parallel kind: max is 2.0
+        ("entity-A", "entity-B", "fact", 0.8),
+        ("entity-A", "entity-B", "skos:related", 0.6),
         ("entity-B", "chunk-2", "passage", 1.0),
     ]
 
@@ -65,21 +66,10 @@ def test_build_transition_matrix_symmetry_and_max_weights() -> None:
     pt = graph.transition_t.toarray()
 
     # Out-degree of entity-A before normalization:
-    # connected to chunk-1 (weight 1.0) and entity-B (weight 2.0) -> total deg = 3.0
-    # In P, P[ea, c1] = 1/3, P[ea, eb] = 2/3
-    # In P^T, row c1 col ea is 1/3, row eb col ea is 2/3
-    assert np.isclose(pt[idx_c1, idx_ea], 1.0 / 3.0)
-    assert np.isclose(pt[idx_eb, idx_ea], 2.0 / 3.0)
-
-    # Pre-aggregated 3-tuple edges from load_graph_topology must yield the exact same matrix
-    edges_3tuple = [
-        ("chunk-1", "entity-A", 1.0),
-        ("entity-A", "chunk-1", 1.0),
-        ("entity-A", "entity-B", 2.0),
-        ("entity-B", "chunk-2", 1.0),
-    ]
-    graph_3 = build_transition_matrix(chunks, entities, edges_3tuple, beta=0.0)
-    np.testing.assert_allclose(graph_3.transition_t.toarray(), pt)
+    # connected to chunk-1 (weight 1.0) and entity-B (weight 0.92) -> total deg = 1.92
+    # In P^T, row c1 col ea is 1.0/1.92, row eb col ea is 0.92/1.92
+    assert np.isclose(pt[idx_c1, idx_ea], 1.0 / 1.92)
+    assert np.isclose(pt[idx_eb, idx_ea], 0.92 / 1.92)
 
 
 def test_run_ppr_mass_conservation_and_multi_hop() -> None:
@@ -331,33 +321,18 @@ def test_step11_relation_traversal_policy_broader_asymmetry_and_zero_diff_parity
     max_abs_diff = float(np.max(np.abs(g_none.transition_t.toarray() - g_def.transition_t.toarray())))
     assert max_abs_diff == 0.0
 
-    # 2. Parallel-edge aggregation modes: max vs sum vs capped_sum
+    # 2. Parallel-edge aggregation strictly via Bayesian Noisy-OR:
+    # 1 - (1 - 0.8) * (1 - 0.8) = 0.96
     par_edges: list[tuple[str, str, str, float]] = [
         ("c-child", "ent-child", "passage", 1.0),
-        ("ent-child", "ent-parent", "fact", 1.0),
+        ("ent-child", "ent-parent", "fact", 0.8),
         ("ent-child", "ent-parent", "skos:related", 0.8),
     ]
-    g_max = build_transition_matrix(
-        chunks, entities, par_edges, beta=0.0, policy=RelationTraversalPolicy(parallel_aggregation="max")
-    )
-    g_sum = build_transition_matrix(
-        chunks, entities, par_edges, beta=0.0, policy=RelationTraversalPolicy(parallel_aggregation="sum")
-    )
-    g_cap = build_transition_matrix(
-        chunks,
-        entities,
-        par_edges,
-        beta=0.0,
-        policy=RelationTraversalPolicy(parallel_aggregation="capped_sum", parallel_cap=1.2),
-    )
-    idx_ec = g_max.node_to_idx["ent-child"]
-    idx_ep = g_max.node_to_idx["ent-parent"]
-    # Under max: weight(ec->ep) = 1.0, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.0 / 2.0 = 0.5
-    assert np.isclose(g_max.transition_t.toarray()[idx_ep, idx_ec], 0.5)
-    # Under sum: weight(ec->ep) = 1.8, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.8 / 2.8
-    assert np.isclose(g_sum.transition_t.toarray()[idx_ep, idx_ec], 1.8 / 2.8)
-    # Under capped_sum(1.2): weight(ec->ep) = 1.2, weight(ec->c-child) = 1.0 -> P[ep | ec] = 1.2 / 2.2
-    assert np.isclose(g_cap.transition_t.toarray()[idx_ep, idx_ec], 1.2 / 2.2)
+    g_par = build_transition_matrix(chunks, entities, par_edges, beta=0.0, policy=RelationTraversalPolicy())
+    idx_ec = g_par.node_to_idx["ent-child"]
+    idx_ep = g_par.node_to_idx["ent-parent"]
+    # Compounded: 0.96. Outbound from ec: passage(1.0) + compounded(0.96) = 1.96
+    assert np.isclose(g_par.transition_t.toarray()[idx_ep, idx_ec], 0.96 / 1.96)
 
     # 3. Asymmetric skos:broader upward (1.0) vs downward (0.25) and column-stochastic normalization at beta=0.0
     broader_edges: list[tuple[str, str, str, float]] = [

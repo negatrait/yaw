@@ -8,7 +8,7 @@ from dspy.evaluate.metrics import F1
 from dspy.teleprompt.gepa.gepa_utils import _extract_score_and_objective_scores
 
 from yaw.daemon.graph.inference import compute_qa_em_f1, compute_task_quality_score
-from yaw.daemon.graph.inference.reflection import deterministic_evidence, reflection_examples, resolve_evidence
+from yaw.daemon.graph.inference.reflection import reflection_examples, resolve_evidence
 
 
 def test_all_seven_quality_metrics_have_equal_arithmetic_weight():
@@ -37,7 +37,9 @@ def test_tokens_repairs_and_integrity_do_not_change_reward_or_pareto_frontier(to
         em=0.5,
         f1=0.7,
         tokens=tokens,
-        synonym_judge_tokens=tokens,
+        label_judge_tokens=tokens,
+        hierarchy_judge_tokens=tokens,
+        related_judge_tokens=tokens,
         shacl_healer_tokens=tokens,
         shacl_conformance=0.0,
         shacl_violations_initial=100,
@@ -134,11 +136,15 @@ def test_partial_answer_is_not_promoted_to_exact_match():
     assert compute_qa_em_f1("Eiffel Tower", ["the Eiffel Tower"]) == (1.0, 1.0)
 
 
-def test_reflection_fallback_reads_quality_feedback_to_select_failures_and_contrasts():
+def test_reflection_evidence_resolves_quality_feedback():
     examples = reflection_examples(
         [{"Feedback": compute_task_quality_score(value, tokens=0).feedback} for value in (0.9, 0.2, 0.8, 0.4, 0.1, 0.6)]
     )
-    resolved = resolve_evidence(examples, deterministic_evidence(examples))
+    selection = {
+        "diagnosis": "Contrast lower-scoring failures with higher-scoring examples.",
+        "references": [{"example_id": examples[i]["evidence_id"], "path": []} for i in (4, 1, 3, 0, 2)],
+    }
+    resolved = resolve_evidence(examples, selection)
     feedbacks = [item["evidence"]["Feedback"] for item in resolved]
     for actual, expected in zip(feedbacks, (0.1, 0.2, 0.4, 0.9, 0.8), strict=True):
         assert f"Task quality arithmetic mean={expected:.6f}" in actual

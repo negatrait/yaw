@@ -1,7 +1,16 @@
 """Inference leaf package: Native DSPy HippoRAG 2 engine, GBNF grammars, and legacy baseline adapters."""
 
 import importlib
+import os
+from pathlib import Path
 from typing import Any
+
+# Configure provider resources before lazy imports load DSPy/LiteLLM.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_TELEMETRY", "False")
+_workspace_deno = Path(__file__).resolve().parents[4] / ".yaw" / "deno_dir"
+if _workspace_deno.exists():
+    os.environ.setdefault("DENO_DIR", str(_workspace_deno))
 
 # Single source of truth: only these symbols are exposed as the public package contract.
 _PUBLIC_API: dict[str, str] = {
@@ -28,7 +37,10 @@ _PUBLIC_API: dict[str, str] = {
     "serialize_predictor_surface": ".optimizer",
     "shacl_fingerprint": ".optimizer",
     "sync_pareto_telemetry_siblings": ".optimizer",
-    "synonym_fingerprint": ".optimizer",
+    "judge_stage_fingerprint": ".optimizer",
+    "label_judge_fingerprint": ".optimizer",
+    "hierarchy_judge_fingerprint": ".optimizer",
+    "related_judge_fingerprint": ".optimizer",
     "validate_active_checkpoint": ".reflection",
     "validate_request_checkpoint": ".reflection",
     "validate_simba_state": ".reflection",
@@ -44,6 +56,8 @@ _PUBLIC_API: dict[str, str] = {
     "DSPyEmbeddingAdapter": ".embedding",
     "resolve_embedding_profile": ".embedding",
     "EmbeddingProfile": ".embedding",
+    "EmbeddingRequest": ".embedding",
+    "EmbeddingResult": ".embedding",
     "PROFILES": ".embedding",
     "MODEL": ".embedding",
     "GEMMA_TASK_MODES": ".embedding",
@@ -65,12 +79,12 @@ _PUBLIC_API: dict[str, str] = {
     "text_processing": ".parsers",
     "extract_entity_definitions": ".parsers",
     "extract_structured_triples": ".parsers",
-    "filter_invalid_triples": ".parsers",
-    "normalize_answer": ".parsers",
-    "parse_synonym_decisions": ".parsers",
+    "parse_hierarchy_decisions": ".parsers",
+    "parse_label_decisions": ".parsers",
+    "parse_related_decisions": ".parsers",
     "parse_shacl_repairs": ".parsers",
     # Native DSPy Program & 12 Canonical Signatures
-    "HippoRAGProgram": ".program",
+    "YawProgram": ".program",
     "RLMInstructionProposer": ".proposer",
     "ServingTokenCounter": ".reflection",
     "YawGBNFAdapter": ".adapter",
@@ -83,7 +97,10 @@ _PUBLIC_API: dict[str, str] = {
     "ExtractQueryIntent": ".prompts",
     "ExtractTriples": ".prompts",
     "DefineMissingEntities": ".prompts",
-    "JudgeSynonyms": ".prompts",
+    "JudgeHierarchy": ".prompts",
+    "JudgeLabels": ".prompts",
+    "JudgeRelated": ".prompts",
+    "SEMANTIC_JUDGE_STAGE_NAMES": ".prompts",
     "ProposeSHACLRepairs": ".prompts",
     "HealSHACLViolations": ".prompts",
     "FilterTriples": ".prompts",
@@ -91,12 +108,30 @@ _PUBLIC_API: dict[str, str] = {
     "ReflectiveInnerDistillerSignature": ".prompts",
     "ProposeInstructionSignature": ".prompts",
     "CompressInstructionSignature": ".prompts",
-    "FactList": ".prompts",
+    "EntitySensePair": ".prompts",
+    "FactTriple": ".prompts",
+    "ObjectPropertyPredicate": ".prompts",
+    "DatatypePropertyPredicate": ".prompts",
+    "LiteralObject": ".prompts",
+    "ObjectPropertyStatement": ".prompts",
+    "DatatypePropertyStatement": ".prompts",
+    "ReifiedStatement": ".prompts",
+    "EquivalentLabelDecision": ".prompts",
+    "DistinctLabelDecision": ".prompts",
+    "LabelDecision": ".prompts",
+    "HierarchyDecision": ".prompts",
+    "RelatedDecision": ".prompts",
+    "SHACLRepairAction": ".prompts",
+    "SHACLRepair": ".prompts",
+    "DistillerReference": ".prompts",
+    "DistillerSelection": ".prompts",
     # Pure-JSON Context-Free Grammars
     "build_dspy_ner_grammar": ".grammars",
     "build_dspy_triples_grammar": ".grammars",
     "build_dspy_missing_entity_defs_grammar": ".grammars",
-    "build_dspy_synonym_judge_grammar": ".grammars",
+    "build_dspy_hierarchy_judge_grammar": ".grammars",
+    "build_dspy_label_judge_grammar": ".grammars",
+    "build_dspy_related_judge_grammar": ".grammars",
     "build_dspy_shacl_repair_grammar": ".grammars",
     "build_dspy_rerank_grammar": ".grammars",
     "build_dspy_qa_grammar": ".grammars",
@@ -105,7 +140,6 @@ _PUBLIC_API: dict[str, str] = {
     "DSPY_NER_GBNF_GRAMMAR": ".grammars",
     "DSPY_TRIPLES_GBNF_GRAMMAR": ".grammars",
     "DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR": ".grammars",
-    "DSPY_SYNONYM_JUDGE_GBNF_GRAMMAR": ".grammars",
     "DSPY_SHACL_REPAIR_GBNF_GRAMMAR": ".grammars",
     "DSPY_RERANK_GBNF_GRAMMAR": ".grammars",
     "DSPY_QA_GBNF_GRAMMAR": ".grammars",

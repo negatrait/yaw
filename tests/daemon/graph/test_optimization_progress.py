@@ -114,7 +114,7 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
     import yaw.daemon.graph.inference.optimizer as optimizer_mod
     from yaw.daemon.graph.inference import (
         GraphOptimizationHooks,
-        HippoRAGProgram,
+        YawProgram,
         evaluate_program,
         evolve_program_prompts,
     )
@@ -186,21 +186,17 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2)
 
     dummy_lm = dspy.LM("openai/dummy", api_base="http://127.0.0.1:9/v1", api_key="none")
-    prog = HippoRAGProgram(orchestrator_lm=dummy_lm, rlm_sub_lm=dummy_lm)
+    prog = YawProgram(orchestrator_lm=dummy_lm, rlm_sub_lm=dummy_lm)
     hooks = GraphOptimizationHooks(
         config=None,
         dspy_cache_dir=None,
         get_meta=lambda k: None,
         set_meta=lambda k, v: None,
         commit_active_checkpoint=None,
-        encode_payload=lambda v: b"",
+        encode_payload=lambda v: "",
         decode_payload=lambda b: {},
-        open_checkpoint_cache=lambda ctx: {},
-        ensure_candidate_indexed=lambda p: None,
-        reset_sandbox_graph=lambda: None,
-        index_chunks=lambda c: None,
-        candidate_cache_namespace=lambda: {},
-        candidate_cache_sources=lambda: [],
+        embedding_cache_namespace=lambda: "",
+        corpus_sources=lambda: {},
         prepare_optimization_pools=None,
         hydrate_top_chunks=lambda cids, p: {
             cid: (short_false_positive if cid == "chunk-short" else cropped_chunk) for cid in cids
@@ -224,9 +220,10 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
         reflection_worker_lm=dummy_lm,
         reflection_token_counter=lambda text: len(text.split()),
     )
-    audit_path = tmp_path / "compiled_graph_rlm_audit.json"
+    audit_path = tmp_path / "compiled_audit.json"
     assert audit_path.exists()
     audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert set(audit_data.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
     assert len(audit_data["eval_records"]) == 1
     rec = audit_data["eval_records"][0]
     # chunk-short (<60 chars prefix) must not match at rank 1, while chunk-cropped matches at rank 2:

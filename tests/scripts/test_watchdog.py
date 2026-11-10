@@ -3,12 +3,50 @@
 import sqlite3
 from contextlib import closing
 
+from daemon.native_inference import publish_inference
+
+from scripts import watchdog
 from scripts.watchdog import (
     generate_graph_projection_svg,
     generate_report_markdown,
     largest_one_hop_neighborhood,
     recent_relation_assertions,
 )
+from yaw.core import OpenIERecord
+
+
+def test_watchdog_reads_native_artifacts_and_empty_withdrawal(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(watchdog, "ARTIFACT_DIR", tmp_path / "dashboard")
+    path = tmp_path / ".yaw" / "optimize_yaw.db"
+    records = [
+        OpenIERecord(chunk_id=cid, entities=("Mercury", "Sun"), triples=(("Mercury", "orbits", "Sun"),))
+        for cid in ("first", "second")
+    ]
+    publish_inference(path, records)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('optimization_run', ?)",
+            (json.dumps({"started_at": "2026-11-08T08:00:00+00:00"}),),
+        )
+        conn.commit()
+    populated = watchdog.get_active_sandbox_info()
+    assert "error" not in populated
+    assert populated["datestamp"] == "canonical"
+    assert populated["start_time"] == "2026-11-08T08:00:00+00:00"
+    assert populated["counts"]["chunk_inference"] == 2
+    assert "openie_chunks" not in populated["counts"]
+    assert populated["indexed_chunk_ids"] == {"first", "second"}
+    assert populated["kg_metrics"]["total_entities"] == 4
+    assert (tmp_path / ".yaw" / "optimize_telemetry.json").is_file()
+
+    publish_inference(path, [])
+    empty = watchdog.get_active_sandbox_info()
+    assert "error" not in empty
+    assert empty["counts"]["chunk_inference"] == 0
+    assert empty["indexed_chunk_ids"] == set()
 
 
 def test_largest_neighborhood_keeps_both_seeds_and_only_one_hop():
@@ -76,7 +114,7 @@ def test_recent_related_assertions_are_active_canonical_pairs(tmp_path):
         {"cand": 1, "n": 100, "val_score": 0.4, "f1": 0.8, "r5": 0.9},
         {"cand": 2, "n": 110, "val_score": 0.5, "f1": 0.1, "r5": 0.8},
     ]
-    generate_report_markdown(report, {"kg_graph": graph}, candidates, 210, False, ("TEST", "#38bdf8"))
+    generate_report_markdown(report, {"kg_graph": graph}, candidates, 210, ("TEST", "#38bdf8"))
     text = report.read_text(encoding="utf-8")
     assert text.index("![Fig. 2:") < text.index("### Graph Assertions")
     assert text.index("### Graph Assertions") < text.index("### Most Recent `skos:related`")
@@ -99,6 +137,58 @@ def test_projection_renders_only_largest_seeded_component(tmp_path):
     assert "Largest 1-hop component" in output.read_text(encoding="utf-8")
 
 
+def test_watchdog_preserves_directed_fact_edges_and_word_boundary_truncation(tmp_path, monkeypatch):
+    import json
+    import os
+
+    from yaw.daemon.graph.storage import open_yaw_db
+
+    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
+    yaw_dir = tmp_path / ".yaw"
+    yaw_dir.mkdir(parents=True, exist_ok=True)
+    db_path = yaw_dir / "optimize_yaw.db"
+    status_path = yaw_dir / "optimize_status.json"
+    pools_path = yaw_dir / "optimize_program_pools.json"
+    status_path.write_text(
+        json.dumps({"status": {"lifecycle": "ready", "pid": os.getpid(), "active_op": "indexing: stale"}}),
+        encoding="utf-8",
+    )
+    pools_path.write_text(
+        json.dumps({"train_queries": 7, "val_queries": 13, "val_chunk_ids": ["c1"]}),
+        encoding="utf-8",
+    )
+    with closing(open_yaw_db(db_path)) as conn:
+        conn.executemany(
+            "INSERT INTO entities(entity_id, name, definition) VALUES (?, ?, ?)",
+            [
+                ("entity-z", "Zeta", "A very long definition that should truncate cleanly on a word boundary " * 3),
+                ("entity-a", "Alpha", "Short definition"),
+                ("entity-m", "Mu", "Connected only via directed fact where src_id > dst_id"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO edges(src_id, dst_id, kind, weight) VALUES (?, ?, ?, 1.0)",
+            [
+                ("entity-a", "entity-z", "owl:differentFrom"),
+                ("entity-z", "entity-a", "owl:differentFrom"),
+                ("entity-z", "entity-m", "fact"),
+            ],
+        )
+        conn.commit()
+
+    info = watchdog.get_active_sandbox_info()
+    assert info["datestamp"] == "canonical"
+    assert info["optimizer_alive"] is False
+    assert info["pools"]["train_queries"] == 7
+    assert ("entity-z", "entity-m", "fact") in info["kg_graph"]["edges"]
+    assert largest_one_hop_neighborhood(info["kg_graph"]["edges"]) == {"entity-a", "entity-z", "entity-m"}
+
+    report = tmp_path / "report.md"
+    generate_report_markdown(report, info, [], 0, ("TEST", "#38bdf8"))
+    report_text = report.read_text(encoding="utf-8")
+    assert any(tok in report_text for tok in ("boundary…", "cleanly…", "truncate…", "should…"))
+
+
 def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
     import threading
     import time
@@ -118,14 +208,15 @@ def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
         with closing(open_yaw_db(missing_db)):
             pass
 
-    writer = threading.Thread(target=_create_delayed)
+    writer = threading.Thread(target=_create_delayed, daemon=True)
     writer.start()
     ro_conn = open_readonly_yaw_db(missing_db, timeout=1.0, backoff=(0.04, 0.08, 0.12))
     try:
         assert get_graph_counts(ro_conn) == (0, 0, 0, 0, 0)
     finally:
         ro_conn.close()
-        writer.join(timeout=2.0)
+        writer.join(timeout=5.0)
+        assert not writer.is_alive()
 
     cands = [
         {
@@ -151,7 +242,73 @@ def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
     ]
     score_svg = tmp_path / "score.svg"
     qual_svg = tmp_path / "qual.svg"
-    generate_candidate_score_svg(score_svg, cands, False, ("RUNNING", "#10b981"), {})
-    generate_candidate_quality_svg(qual_svg, cands, False, ("RUNNING", "#10b981"), {})
+    generate_candidate_score_svg(score_svg, cands, ("RUNNING", "#10b981"), {})
+    generate_candidate_quality_svg(qual_svg, cands, ("RUNNING", "#10b981"), {})
     assert "<svg" in score_svg.read_text(encoding="utf-8")
     assert "<svg" in qual_svg.read_text(encoding="utf-8")
+
+
+def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from scripts.watchdog import generate_kg_dashboard_svg
+
+    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
+    kg_svg = tmp_path / "kg_dashboard.svg"
+    sandbox_fig1 = {
+        "counts": {"chunk_inference": 10},
+        "kg_metrics": {"total_entities": 60, "total_triples": 45},
+        "timeseries_samples": [
+            {
+                "time_sec": 360.0,
+                "time_hours": 0.1,
+                "passages": 5,
+                "entities": 30,
+                "triples": 20,
+                "rolling_latency": 28.5,
+                "entities_per_chunk": 6.0,
+            },
+            {
+                "time_sec": 720.0,
+                "time_hours": 0.2,
+                "passages": 10,
+                "entities": 60,
+                "triples": 45,
+                "rolling_latency": 24.0,
+                "entities_per_chunk": 6.0,
+            },
+        ],
+    }
+    generate_kg_dashboard_svg(kg_svg, sandbox_fig1)
+    svg_text = kg_svg.read_text(encoding="utf-8")
+    assert "Throughput (s/chunk)" in svg_text
+    assert "Extraction (entities/chunk)" in svg_text
+    assert "Entities / chunk" in svg_text
+
+    apng_dest = tmp_path / "knowledge_graph_2d_projection.png"
+    sandbox_step1 = {
+        "datestamp": "canonical",
+        "counts": {"chunk_inference": 1},
+        "kg_graph": {
+            "edges": [("a", "b", "skos:related")],
+            "entities": {"a": ("Alpha", "Def A", 1), "b": ("Beta", "Def B", 1)},
+        },
+    }
+    sandbox_step2 = {
+        "datestamp": "canonical",
+        "counts": {"chunk_inference": 2},
+        "kg_graph": {
+            "edges": [("a", "b", "skos:related"), ("b", "c", "fact")],
+            "entities": {
+                "a": ("Alpha", "Def A", 1),
+                "b": ("Beta", "Def B", 1),
+                "c": ("Gamma", "Def C", 1),
+            },
+        },
+    }
+    generate_graph_projection_svg(apng_dest, sandbox_step1, ("STEP 1", "#38bdf8"), layout_iterations=30)
+    generate_graph_projection_svg(apng_dest, sandbox_step2, ("STEP 2", "#38bdf8"), layout_iterations=30)
+    assert (tmp_path / ".yaw" / "optimize_kg_frames").is_dir()
+    with Image.open(apng_dest) as img:
+        assert getattr(img, "is_animated", False) is True
+        assert getattr(img, "n_frames", 1) == 2

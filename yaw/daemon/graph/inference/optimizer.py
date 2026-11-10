@@ -17,11 +17,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 import dspy
+from cocoindex.connectorkits.fingerprint import fingerprint_object
 from gepa.core.callbacks import CompositeCallback
 
 from yaw.core import ChunkPointer, YawRuntimeError, compute_mdhash_id, write_text_atomic
 
 from .chat import configure_yaw_dspy_cache, set_yaw_sleep_seconds
+from .diagnostics import (
+    extract_named_trace_entries,
+    hierarchy_judge_fingerprint,
+    judge_stage_fingerprint,
+    label_judge_fingerprint,
+    related_judge_fingerprint,
+    serialize_predictor_surface,
+)
 from .embedding import FACT_INSTRUCTION
 from .parsers import (
     compute_answer_passage_match,
@@ -30,7 +39,7 @@ from .parsers import (
     compute_task_quality_score,
     doc_matches_gold,
 )
-from .program import HippoRAGProgram
+from .program import YawProgram
 from .proposer import RLMInstructionProposer
 from .reflection import (
     ActiveReflectionCheckpoint,
@@ -40,6 +49,10 @@ from .reflection import (
     validate_request_checkpoint,
     validate_simba_state,
 )
+
+# Extraction/validation contract version (native graph spec §5.3). Bump whenever a grammar, parser
+# or SHACL rule changes so memoized artifacts produced under the old contract are not reused.
+SCHEMA_VERSION = "skos-shacl-v7-source-logprobs"
 
 
 def _optimization_history_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -181,18 +194,13 @@ class GepaProgress:
 class GraphOptimizationHooks:
     """Explicit callback contract passed by `YawGraphEngine` into `optimizer.py` (zero horizontal imports)."""
 
-    ensure_candidate_indexed: Callable[[HippoRAGProgram, Sequence[str] | None], list[str]]
-    reset_sandbox_graph: Callable[[bool], None]
-    index_chunks: Callable[[Sequence[tuple[ChunkPointer, str]], HippoRAGProgram], int]
-    persist_trails: Callable[[HippoRAGProgram], None]
+    persist_trails: Callable[[YawProgram], None]
     get_meta: Callable[[str], str | None]
     set_meta: Callable[[str, str | None], None]
-    candidate_cache_namespace: Callable[[], str]
-    candidate_cache_sources: Callable[[], dict[str, str]]
+    embedding_cache_namespace: Callable[[], str] = field(default=lambda: "")
+    corpus_sources: Callable[[], dict[str, str]] = field(default=dict)
     retrieval_settings: Mapping[str, Any] = field(default_factory=dict)
-    bind_program_hooks: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
-    open_score_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
-    open_checkpoint_cache: Callable[[str], Any] = field(default=lambda _ctx: {})
+    bind_program_hooks: Callable[[YawProgram], None] = field(default=lambda _prog: None)
     encode_payload: Callable[[Any], str] = field(
         default=lambda val: json.dumps(val, sort_keys=True, ensure_ascii=False, default=str)
     )
@@ -212,59 +220,18 @@ class GraphOptimizationHooks:
         ]
         | None
     ) = None
-    hydrate_top_chunks: Callable[[Sequence[str], HippoRAGProgram], dict[str, str]] = field(
-        default=lambda _cids, _prog: {}
-    )
+    hydrate_top_chunks: Callable[[Sequence[str], YawProgram], dict[str, str]] = field(default=lambda _cids, _prog: {})
     query_rlm_stats: Callable[[Sequence[str] | None], dict[str, Any]] = field(default=lambda _docs: {})
     graph_rlm_stats: Callable[[], dict[str, Any]] = field(default=dict)
-    last_hook_program: Callable[[], HippoRAGProgram | None] = field(default=lambda: None)
+    last_hook_program: Callable[[], YawProgram | None] = field(default=lambda: None)
     clear_progress_callback: Callable[[], None] = field(default=lambda: None)
-    finalize_compiled_program: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
-    rehydrate_sandbox_after_optimization: Callable[[HippoRAGProgram], None] = field(default=lambda _prog: None)
+    finalize_compiled_program: Callable[[YawProgram], None] = field(default=lambda _prog: None)
+    rehydrate_sandbox_after_optimization: Callable[[YawProgram], None] = field(default=lambda _prog: None)
     dspy_cache_dir: Path | None = None
     config: Any = None
 
 
-def serialize_predictor_surface(pred: Any) -> dict[str, Any]:
-    """Serialize a DSPy predictor's instruction, demos, field types, config, and LM cache identity."""
-    sig = getattr(pred, "signature", None)
-    instructions = str(getattr(sig, "instructions", "") or "")
-    in_fields = set(getattr(sig, "input_fields", {}) or {})
-    out_fields = set(getattr(sig, "output_fields", {}) or {})
-    demos_raw = getattr(pred, "demos", None) or ()
-    demos_repr: list[str] = []
-    for d in demos_raw:
-        d_dict = d.toDict() if hasattr(d, "toDict") else (dict(d) if isinstance(d, Mapping) else None)
-        if isinstance(d_dict, dict) and in_fields and out_fields:
-            if not (in_fields.issubset(d_dict.keys()) and out_fields.issubset(d_dict.keys())):
-                continue
-            filtered = {k: d_dict[k] for k in sorted(in_fields | out_fields)}
-            demos_repr.append(json.dumps(filtered, sort_keys=True, ensure_ascii=False, default=str))
-        else:
-            demos_repr.append(str(d_dict) if d_dict is not None else str(d))
-    lm = getattr(pred, "lm", None) or dspy.settings.lm
-    identity = getattr(lm, "cache_identity", None)
-    return {
-        "instructions": instructions,
-        "demos": demos_repr,
-        "fields": {name: str(f.annotation) for name, f in sig.fields.items()} if sig else {},
-        "config": getattr(pred, "config", {}),
-        "lm": identity()
-        if callable(identity)
-        else {
-            "model": getattr(lm, "model", None),
-            "model_type": getattr(lm, "model_type", None),
-            "context_window_tokens": getattr(lm, "_yaw_context_window_tokens", None),
-            "kwargs": {
-                key: value
-                for key, value in (getattr(lm, "kwargs", {}) or {}).items()
-                if key not in {"api_key", "api_token"}
-            },
-        },
-    }
-
-
-def prune_mismatching_demos(program: HippoRAGProgram) -> None:
+def prune_mismatching_demos(program: YawProgram) -> None:
     """Remove any few-shot demos whose keys do not cover their predictor's input and output fields."""
     if not hasattr(program, "named_predictors"):
         return
@@ -296,21 +263,10 @@ def embed_fingerprint(program: Any, instruction: str = "") -> str:
     else:
         prefix = query_prefix
     payload = {"prefix": prefix}
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
-def synonym_fingerprint(program: HippoRAGProgram) -> str:
-    """Compute SHA-256 fingerprint for Stage 6 synonym judgment predictor surface."""
-    named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
-    payload = serialize_predictor_surface(named["synonym_judge"]) if "synonym_judge" in named else {}
-    payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-    payload["schema_version"] = "skos-shacl-v3"
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def shacl_fingerprint(program: HippoRAGProgram) -> str:
+def shacl_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for SHACL repair and RLM healer predictor surfaces."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     shacl_keys = (
@@ -324,12 +280,11 @@ def shacl_fingerprint(program: HippoRAGProgram) -> str:
         name: getattr(healer, name, None) for name in ("max_iters", "max_llm_calls", "max_output_chars")
     }
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
-    payload["schema_version"] = "skos-shacl-v3"
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    payload["schema_version"] = SCHEMA_VERSION
+    return fingerprint_object(payload).hex()
 
 
-def openie_fingerprint(program: HippoRAGProgram) -> str:
+def openie_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for OpenIE extraction predictor surfaces."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -339,20 +294,21 @@ def openie_fingerprint(program: HippoRAGProgram) -> str:
         "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
-def extraction_fingerprint(program: HippoRAGProgram) -> str:
+def extraction_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint across all graph extraction, synonym, SHACL, and document embedding stages."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     graph_stage_keys = (
         "ner",
         "triples",
         "entity_definer",
-        "synonym_judge",
+        "label_judge",
+        "hierarchy_judge",
+        "related_judge",
         "shacl_repair",
         "shacl_healer_rlm.generate_action",
         "shacl_healer_rlm.extract",
@@ -363,13 +319,12 @@ def extraction_fingerprint(program: HippoRAGProgram) -> str:
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return fingerprint_object(payload).hex()
 
 
-def candidate_fingerprint(program: HippoRAGProgram) -> str:
+def candidate_fingerprint(program: YawProgram) -> str:
     """Identify an optimizer candidate by hashing every predictor surface and embedding prefix."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -378,13 +333,12 @@ def candidate_fingerprint(program: HippoRAGProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
-        "schema_version": "skos-shacl-v3",
+        "schema_version": SCHEMA_VERSION,
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
-def query_retrieval_fingerprint(program: HippoRAGProgram) -> str:
+def query_retrieval_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for query-time retrieval predictor surfaces (`query_intent`, `triple_filter`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
@@ -393,11 +347,10 @@ def query_retrieval_fingerprint(program: HippoRAGProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
-def _query_qa_fingerprint(program: HippoRAGProgram) -> str:
+def _query_qa_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for query-time + QA predictor surfaces (`query_intent`, `triple_filter`, `qa`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     qa_keys = ("query_intent", "triple_filter", "qa", "qa.predict")
@@ -407,21 +360,20 @@ def _query_qa_fingerprint(program: HippoRAGProgram) -> str:
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
     }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return fingerprint_object(payload).hex()[:16]
 
 
 def select_pareto_frontier_programs(
-    compiled: HippoRAGProgram,
+    compiled: YawProgram,
     *,
     max_programs: int = 3,
     program_path: Path | str | None = None,
-) -> list[HippoRAGProgram]:
+) -> list[YawProgram]:
     """Select up to `max_programs` strictly non-dominated Pareto programs covering both `recall@N` and `QA (F1, EM)`."""
     if max_programs <= 1:
         return [compiled]
 
-    selected: list[HippoRAGProgram] = [compiled]
+    selected: list[YawProgram] = [compiled]
     seen_fps: set[str] = {_query_qa_fingerprint(compiled)}
 
     details = getattr(compiled, "detailed_results", None)
@@ -435,7 +387,7 @@ def select_pareto_frontier_programs(
         subscores_by_idx: dict[int, dict[str, float]] = {}
         scores_by_idx: dict[int, float] = {}
         for idx, cand in enumerate(raw_candidates):
-            if not isinstance(cand, HippoRAGProgram):
+            if not isinstance(cand, YawProgram):
                 continue
             sc = raw_scores[idx] if idx < len(raw_scores) else 0.0
             if sc <= 0.0 and idx != best_idx:
@@ -531,16 +483,13 @@ def select_pareto_frontier_programs(
             for member_file in sorted(telem_dir.glob("pareto_member_*.json")):
                 if len(selected) >= max_programs:
                     break
-                try:
-                    sibling = copy.deepcopy(compiled)
-                    sibling.load(str(member_file))
-                    compiled.copy_runtime_hooks_to(sibling)
-                    fp = _query_qa_fingerprint(sibling)
-                    if fp not in seen_fps:
-                        seen_fps.add(fp)
-                        selected.append(sibling)
-                except Exception:
-                    continue
+                sibling = copy.deepcopy(compiled)
+                sibling.load(str(member_file))
+                compiled.copy_runtime_hooks_to(sibling)
+                fp = _query_qa_fingerprint(sibling)
+                if fp not in seen_fps:
+                    seen_fps.add(fp)
+                    selected.append(sibling)
 
     return selected
 
@@ -712,7 +661,7 @@ def promote_compiled_program(
 
 
 def compile_pareto_ensemble(
-    compiled: HippoRAGProgram,
+    compiled: YawProgram,
     *,
     max_programs: int = 3,
     program_path: Path | str | None = None,
@@ -726,49 +675,10 @@ def compile_pareto_ensemble(
     return dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)
 
 
-def extract_named_trace_entries(
-    program: HippoRAGProgram,
-    raw_trace: Sequence[Any],
-    *,
-    allowed_names: set[str] | None = None,
-) -> list[tuple[str, dict[str, Any], Any]]:
-    """Map raw DSPy trace tuples back to their named predictor names on `program`."""
-    named_preds = list(program.named_predictors()) if hasattr(program, "named_predictors") else []
-    captured: list[tuple[str, dict[str, Any], Any]] = []
-    for item in raw_trace:
-        if not isinstance(item, (list, tuple)) or len(item) < 3:
-            continue
-        pred_inst, inp, out = item[0], item[1], item[2]
-        matched_name: str | None = None
-        pred_sig = getattr(pred_inst, "signature", None)
-        for name, cand_pred in named_preds:
-            if pred_inst is cand_pred:
-                matched_name = name
-                break
-        if matched_name is None and pred_sig is not None:
-            pred_fields = tuple(getattr(pred_sig, "fields", {}).keys())
-            for name, cand_pred in named_preds:
-                cand_sig = getattr(cand_pred, "signature", None)
-                if cand_sig is not None:
-                    is_eq = cand_sig.equals(pred_sig) if hasattr(cand_sig, "equals") else cand_sig == pred_sig
-                    cand_fields = tuple(getattr(cand_sig, "fields", {}).keys())
-                    if is_eq or (pred_fields and pred_fields == cand_fields):
-                        matched_name = name
-                        break
-        if matched_name is not None:
-            if allowed_names is not None and not (
-                matched_name in allowed_names or any(matched_name.startswith(f"{a}.") for a in allowed_names)
-            ):
-                continue
-            inp_dict = dict(inp) if isinstance(inp, Mapping) else {"input": inp}
-            captured.append((matched_name, inp_dict, out))
-    return captured
-
-
 class ActiveTraceComponentSelector:
     """GEPA component selector that dynamically prioritizes predictors with active execution traces."""
 
-    def __init__(self, program: HippoRAGProgram) -> None:
+    def __init__(self, program: YawProgram) -> None:
         self.program = program
         self.cursor = 0
 
@@ -820,7 +730,7 @@ class ActiveTraceComponentSelector:
 
 def configure_simba_task_learning(
     proposer: RLMInstructionProposer,
-    template: HippoRAGProgram,
+    template: YawProgram,
     trainset: Sequence[Any],
     metric: Callable[[Any, Any], float],
     hooks: GraphOptimizationHooks,
@@ -841,12 +751,12 @@ def configure_simba_task_learning(
         "version": 1,
         "metric": "task-quality-arithmetic-mean-v2",
         "reflection_deployment": proposer.cache_identity(),
-        "namespace": hooks.candidate_cache_namespace(),
+        "namespace": hooks.embedding_cache_namespace(),
         "retrieval": dict(hooks.retrieval_settings),
         "template": candidate_fingerprint(template),
         "trainset": [{"data": ex.toDict(), "inputs": sorted(ex.inputs())} for ex in trainset],
-        "corpus": sorted(hooks.candidate_cache_sources()),
-        "worker": serialize_predictor_surface(proposer.qwen_proposer),
+        "corpus": sorted(hooks.corpus_sources()),
+        "worker": serialize_predictor_surface(proposer.llm_proposer),
         "orchestrator": serialize_predictor_surface(proposer.inner_rlm.generate_action),
         "settings": [
             proposer.simba_bsize,
@@ -866,13 +776,15 @@ def configure_simba_task_learning(
     context = hashlib.sha256(
         json.dumps(identity, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    scores = hooks.open_score_cache(context)
 
     def score_candidate(instructions: Mapping[str, str]) -> float:
-        key = (json.dumps(dict(instructions), sort_keys=True, ensure_ascii=False),)
-        cached = scores.get(key)
+        score_digest = hashlib.sha256(
+            json.dumps([context, dict(instructions)], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        score_key = f"simba_task_score:{score_digest}"
+        cached = hooks.get_meta(score_key)
         if cached is not None:
-            return float(cached)
+            return float(json.loads(cached))
         task = template.deepcopy()
         named = dict(task.named_predictors())
         for name, instruction in instructions.items():
@@ -887,7 +799,7 @@ def configure_simba_task_learning(
                 prediction = task(**gold.inputs())
                 total += float(metric(gold, prediction))
         result = total / len(calibration)
-        scores[key] = result
+        hooks.set_meta(score_key, json.dumps(result))
         return result
 
     run = str(Path(save_path).resolve()) if save_path is not None else "default"
@@ -904,7 +816,6 @@ def configure_simba_task_learning(
             if saved.get("context") != context:
                 raise ValueError("SIMBA checkpoint does not match this run's task/model/data")
             saved_state = validate_simba_state(saved.get("state"))
-    checkpoints = hooks.open_checkpoint_cache(context)
     active_key = state_key + ":active_reflection"
     active_raw = hooks.get_meta(active_key) if resume else None
     active: ActiveReflectionCheckpoint | None = (
@@ -915,17 +826,23 @@ def configure_simba_task_learning(
     if saved_state is not None:
         proposer.load_simba_state(saved_state)
 
+    def _checkpoint_meta_key(key: str) -> str:
+        digest = hashlib.sha256(
+            json.dumps([context, key], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        return f"reflection_checkpoint:{digest}"
+
     def get_checkpoint(key: str) -> Any:
         if active is not None and key in active["records"]:
             return active["records"][key]
-        raw = checkpoints.get((key,))
+        raw = hooks.get_meta(_checkpoint_meta_key(key))
         return hooks.decode_payload(raw) if raw is not None else None
 
     def put_checkpoint(key: str, value: dict[str, Any]) -> None:
         nonlocal active
         if key.startswith("request:"):
             value = validate_request_checkpoint(value)
-        checkpoints[(key,)] = hooks.encode_payload(value)
+        hooks.set_meta(_checkpoint_meta_key(key), hooks.encode_payload(value))
         next_active: ActiveReflectionCheckpoint
         if key.startswith("request:") and value["phase"] == "collecting":
             next_active = {"context": context, "request": key, "records": {key: value}}
@@ -933,7 +850,6 @@ def configure_simba_task_learning(
             next_active = {**active, "records": {**active["records"], key: value}}
         else:
             return
-        # Pin only the active request, outside FIFO candidate-cache eviction.
         # Request state and the learned worker are committed in one transaction.
         encoded_active = hooks.encode_payload(next_active)
         encoded_state = (
@@ -1056,7 +972,7 @@ def evaluate_program(
 
 @_optimization_history_scope
 def evolve_program_prompts(
-    program: HippoRAGProgram,
+    program: YawProgram,
     trainset: Sequence[Any],
     valset: Sequence[Any] | None = None,
     *,
@@ -1074,7 +990,7 @@ def evolve_program_prompts(
     sleep_seconds: float = 0.0,
     max_bootstrapped_demos: int | None = None,
     max_labeled_demos: int | None = None,
-) -> HippoRAGProgram:
+) -> YawProgram:
     """Evolve DSPy prompts via MIPROv2, GEPA, or two-phase hybrid with composite Sizecoding feedback."""
     if not trainset:
         return program
@@ -1142,7 +1058,7 @@ def evolve_program_prompts(
     opt_phase = "gepa" if mode == "gepa" else "miprov2"
     last_eval_fp: str | None = None
     last_event_eval_count = 0
-    active_program_ref: HippoRAGProgram = program
+    active_program_ref: YawProgram = program
     _metric_keys = ("score", "r1", "r2", "r5", "r10", "r20", "em", "f1", "s_per_it", "tokens")
 
     def _record_candidate_eval(rec: dict[str, Any]) -> None:
@@ -1189,12 +1105,11 @@ def evolve_program_prompts(
             "candidate_records": _candidate_records(),
             "eval_records": eval_history[-500:],
             "gepa_progress": gepa_progress.snapshot(),
-            **active_program_ref.dump_audit_trails(bounded=True, telemetry_key="program_telemetry"),
         }
         # Diagnostic write failures must not change optimization decisions.
         with contextlib.suppress(OSError):
             write_text_atomic(
-                p_inc.parent / f"{p_inc.stem}_graph_rlm_audit.json",
+                p_inc.parent / f"{p_inc.stem}_audit.json",
                 json.dumps(inc_payload, ensure_ascii=False, indent=2),
             )
 
@@ -1246,6 +1161,7 @@ def evolve_program_prompts(
         record: bool = True,
     ) -> dspy.Prediction:
         nonlocal eval_count, last_eval_ts, last_eval_fp
+        cand_prog = hooks.last_hook_program() or active_program_ref
         if record and pred_name is None:
             eval_count += 1
         gold_answers_raw = getattr(gold, "gold_answers", getattr(gold, "answer", None))
@@ -1275,7 +1191,7 @@ def evolve_program_prompts(
         has_retrieval_labels = gold_docs_raw is not None and len(gold_docs_raw) > 0
         if gold_docs_raw is not None and len(gold_docs_raw) > 0:
             top_20_cids = [c for c in retrieved_seq[:20] if c.startswith("chunk-")]
-            hydrated_by_cid = hooks.hydrate_top_chunks(top_20_cids, active_program_ref) if top_20_cids else {}
+            hydrated_by_cid = hooks.hydrate_top_chunks(top_20_cids, cand_prog) if top_20_cids else {}
             n_ranks = min(20, max(len(retrieved_seq), len(retrieved_texts_seq)))
             ranked_docs = [
                 hydrated_by_cid.get(retrieved_seq[i] if i < len(retrieved_seq) else "")
@@ -1319,17 +1235,15 @@ def evolve_program_prompts(
                         )
                     elif isinstance(model_usage, (int, float)):
                         usage_tokens += int(model_usage)
-        if usage_tokens <= 0 and hasattr(active_program_ref, "telemetry") and active_program_ref.telemetry:
+        if usage_tokens <= 0 and hasattr(cand_prog, "telemetry") and cand_prog.telemetry:
             usage_tokens = sum(
-                int(entry.get("tokens_used", 0))
-                for entry in active_program_ref.telemetry[-20:]
-                if isinstance(entry, dict)
+                int(entry.get("tokens_used", 0)) for entry in cand_prog.telemetry[-20:] if isinstance(entry, dict)
             )
         apm_hit: bool | None = None
         if gold_answers is not None and len(gold_answers) > 0:
             apm_hit = compute_answer_passage_match(gold_answers, context_str)
 
-        gold_item_docs = getattr(gold, "item_docs", None)
+        gold_item_docs = getattr(gold, "item_docs", None) or getattr(gold, "gold_docs", None)
         q_stats = hooks.query_rlm_stats(gold_item_docs)
         usage_tokens += int(q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens", 0)))
         score_pred = compute_task_quality_score(
@@ -1341,7 +1255,9 @@ def evolve_program_prompts(
             em=em_score,
             f1=f1_score,
             tokens=usage_tokens,
-            synonym_judge_tokens=int(q_stats.get("synonym_judge_tokens", 0)),
+            label_judge_tokens=int(q_stats.get("label_judge_tokens", 0)),
+            hierarchy_judge_tokens=int(q_stats.get("hierarchy_judge_tokens", 0)),
+            related_judge_tokens=int(q_stats.get("related_judge_tokens", 0)),
             shacl_healer_tokens=int(q_stats.get("shacl_healer_tokens", 0)),
             shacl_violations_initial=int(
                 q_stats.get(
@@ -1410,7 +1326,7 @@ def evolve_program_prompts(
                     f"F1={f1_val:.2f}, EM={em_val:.2f}, dt={dt_eval:.1f}s, tok={usage_tokens}"
                 )
         if record and pred_name is None:
-            hooks.persist_trails(active_program_ref)
+            hooks.persist_trails(cand_prog)
             _publish_optimization_audit()
         return score_pred
 
@@ -1460,7 +1376,7 @@ def evolve_program_prompts(
                 else getattr(
                     hooks.config,
                     "optimize_max_bootstrapped_demos",
-                    0,
+                    1,
                 )
             )
             eff_labeled_demos = (
@@ -1469,7 +1385,7 @@ def evolve_program_prompts(
                 else getattr(
                     hooks.config,
                     "optimize_max_labeled_demos",
-                    0,
+                    1,
                 )
             )
             optimizer_kwargs: dict[str, Any] = {
@@ -1697,7 +1613,7 @@ def evolve_program_prompts(
                 account_cached_usage=True,
             )
 
-    assert isinstance(compiled, HippoRAGProgram)
+    assert isinstance(compiled, YawProgram)
     active_program_ref = compiled
 
     if save_path is not None:
@@ -1738,20 +1654,12 @@ def evolve_program_prompts(
 
     if save_path is not None:
         p = Path(save_path)
-        if proposer.telemetry:
-            telemetry_path = p.parent / f"{p.stem}_proposer_telemetry.json"
-            write_text_atomic(
-                telemetry_path,
-                json.dumps(proposer.telemetry, ensure_ascii=False, indent=2),
-            )
-        audit_path = p.parent / f"{p.stem}_graph_rlm_audit.json"
+        audit_path = p.parent / f"{p.stem}_audit.json"
         audit_payload = {
             "graph_rlm_stats": dict(hooks.graph_rlm_stats()),
             "candidate_records": _candidate_records(),
             "eval_records": eval_history[-500:],
             "gepa_progress": gepa_progress.snapshot(),
-            **compiled.dump_audit_trails(bounded=False, telemetry_key="program_telemetry"),
-            "proposer_simba_telemetry": list(getattr(proposer, "simba_telemetry", ())),
         }
         write_text_atomic(audit_path, json.dumps(audit_payload, ensure_ascii=False, indent=2))
         if valset:
@@ -1774,15 +1682,18 @@ __all__ = [
     "evolve_program_prompts",
     "extract_named_trace_entries",
     "extraction_fingerprint",
+    "hierarchy_judge_fingerprint",
+    "judge_stage_fingerprint",
+    "label_judge_fingerprint",
     "openie_fingerprint",
     "promote_compiled_program",
     "prune_mismatching_demos",
     "query_retrieval_fingerprint",
     "reduce_pareto_predictions",
+    "related_judge_fingerprint",
     "rrf_fuse_passage_lists",
     "select_pareto_frontier_programs",
     "serialize_predictor_surface",
     "shacl_fingerprint",
     "sync_pareto_telemetry_siblings",
-    "synonym_fingerprint",
 ]

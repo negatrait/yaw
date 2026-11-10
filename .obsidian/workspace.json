@@ -4,24 +4,39 @@
     "type": "split",
     "children": [
       {
-        "id": "db11024016b78be3",
+        "id": "d06d7de956ad4cd1",
         "type": "tabs",
         "children": [
           {
-            "id": "e8e0d511a8b3182d",
+            "id": "4281216c0e61954a",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "FOUNDATIONAL.md",
+                "file": ".agents/skills/dspy-gepa-optimizer/reference.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "FOUNDATIONAL"
+              "title": "reference"
+            }
+          },
+          {
+            "id": "d559fa159cf3c425",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "docs/native-cocoindex-graph.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "native-cocoindex-graph"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -188,11 +203,47 @@
       "bases:Create new base": false
     }
   },
-  "active": "e8e0d511a8b3182d",
+  "active": "d559fa159cf3c425",
   "lastOpenFiles": [
-    "audit_report.md",
-    "FOUNDATIONAL.md",
+    "docs/native-cocoindex-indexing.md",
+    "docs/native-cocoindex-graph.md",
+    ".agents/skills/dspy-gepa-optimizer/reference.md",
+    ".agents/skills/dspy-rlm-module/reference.md",
+    ".agents/skills/engineering-real-tests/SKILL.md",
     "AGENTS.md",
+    ".agents/skills/owl/03-OWL-CLASSES.md",
+    ".agents/skills/skos/SKILL.md",
+    ".agents/skills/skos/references/02-CONCEPT-SCHEMES.md",
+    ".agents/skills/skos/README.md",
+    ".agents/skills/skos/references",
+    "outputs/gepa-audit-20261023/benchmark_mobile_report.md",
+    ".yaw/kg_frames_20261101_172330/frame_00023_00047_00025_00037_00000_00000.png",
+    "outputs/dashboard/pareto_frontier_progress.svg",
+    "outputs/dashboard/knowledge_graph_extraction_dashboard.svg",
+    "outputs/dashboard/knowledge_graph_2d_projection.png",
+    "outputs/dashboard/candidate_score_progress.svg",
+    "outputs/dashboard/candidate_quality_metrics.svg",
+    "outputs/dashboard/benchmark_mobile_report.md",
+    ".yaw/dspy_cache/014/cache.db-shm",
+    ".yaw/dspy_cache/014/cache.db-wal",
+    ".yaw/dspy_cache/004/cache.db-shm",
+    ".yaw/dspy_cache/004/cache.db-wal",
+    ".yaw/dspy_cache/003/cache.db-shm",
+    ".yaw/dspy_cache/003/cache.db-wal",
+    ".yaw/dspy_cache/009/cache.db-shm",
+    ".yaw/dspy_cache/009/cache.db-wal",
+    ".yaw/dspy_cache/001/cache.db-shm",
+    ".yaw/kg_frames_20261103_121807/frame_00797_00182_00116_00091_00012_00024.png",
+    ".yaw/kg_frames_20261103_121807/.frame_00797_00182_00116_00091_00012_00024.20324_1793780066866462400.tmp.png",
+    "outputs/commit-review/evaluation-ingestion.md",
+    "outputs/commit-review/evaluation-preflight.md",
+    "outputs/commit-review/README-preflight.md",
+    "outputs/preflight/20261023T112454Z-34312/report.md",
+    "scratch/test_universe.svg",
+    "scratch/test_550.svg",
+    "outputs/benchmarks/paper_parity_gate.md",
+    "FOUNDATIONAL.md",
+    "audit_report.md",
     "LEAN-CTX.md",
     "GEMINI.md"
   ]

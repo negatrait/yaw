@@ -4,9 +4,16 @@ Practical design patterns, lessons learned, and future architecture investigatio
 
 ---
 
-## 1. Zero-Shot Optimization on Local Silicon (Active Epic 1 Rule)
+## 1. Zero-Shot Optimization, Reward Contract & Runtime Binding (Active Epic 1 Rules)
 
-- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`) causes prompt bloat ($3,500+$ tokens), generation timeouts and repetition loops. Historical token penalties were removed on 2026-10-24: GEPA now rewards the unweighted arithmetic mean of labeled retrieval recall (`Recall@1, 2, 5, 10, 20`) and QA `EM`/`F1` (`task-quality-arithmetic-mean-v2`). See [the reward contract](gepa-reflection-repair.md#scope).
+- **The Issue**: Bootstrapping few-shot demonstrations on local 4B models (`Qwen3-4B-Instruct`, `Gemma-4-E4B`) causes prompt bloat ($3,500+$ tokens), generation timeouts and repetition loops. Historical token penalties were removed on 2026-10-24: GEPA now rewards the unweighted arithmetic mean of labeled retrieval recall (`Recall@1, 2, 5, 10, 20`) and QA `EM`/`F1` (`task-quality-arithmetic-mean-v2`):
+  $$\text{score} = \frac{1}{|M|}\sum_{m \in M} m \quad \text{for } M \subseteq \{\text{Recall@1}, \text{Recall@2}, \text{Recall@5}, \text{Recall@10}, \text{Recall@20}, \text{EM}, \text{F1}\}$$
+  while preserving all 7 raw metrics in `objective_scores` for the GEPA Pareto frontier.
+- **SIMBA Counterfactual Delta Reward & Checkpoint State**: Native DSPy SIMBA instruction evaluation scores candidates on the first two training queries using the bounded delta reward:
+  $$\text{reward} = 0.5 + 0.5 \cdot \frac{\Delta}{1 + |\Delta|}$$
+  and persists worker state (version 2) and counterfactual task-score cache entries atomically in `yaw.db` metadata.
+- **Reflection Serving Tokenizer Budget**: Reflection requests (`training traces -> sandbox evidence selection -> native DSPy InstructionProposer -> downstream task scoring`) measure the complete rendered prompt against `inference.reflection_input_tokens` using the resident llama.cpp chat template and `/tokenize` endpoint (`ServingTokenCounter`).
+- **Native `YawGBNFAdapter` & Deployment-Owned LM Binding**: Task predictors bind their actual `dspy.LM` directly (no `BaseLM` proxy). `YawGBNFAdapter` subclasses `dspy.JSONAdapter` without custom fallback parsing shims and fails hard on missing/invalid fields. Loading a compiled program JSON preserves deployment-owned endpoints, credentials, and context capacities rather than letting serialized prompt metadata overwrite them.
 - **The Rule**: Always set `max_bootstrapped_demos = 0` and `max_labeled_demos = 0` in `yaw.toml`. Optimize pure instructions zero-shot.
 - **Fresh program policy (2026-10-24)**: Task and reflection constructors default to `include_demos=False`, so a fresh GEPA-only run also starts without fixed examples. Existing example sets require explicit opt-in; loaded compiled demonstrations are preserved. Their generalization has not been established by a paired benchmark.
 
@@ -21,7 +28,7 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
 1. **Compile-Time Pareto Evolution & System-Aware Merging (`dspy.GEPA`)**:
    - `dspy.GEPA(metric=..., candidate_selection_strategy="pareto", use_merge=True, track_stats=True, gepa_kwargs={"frontier_type": "hybrid"})` maintains a multi-objective and per-instance Pareto frontier across validation evaluations and uses `MergeProposer` (`use_merge=True`) during compilation to splice complementary predictor instructions from Pareto-frontier parents into a single merged candidate.
    - `gepa.compile()` returns one single `dspy.Module` (`new_prog = adapter.build_program(gepa_result.best_candidate)`), saved directly via `compiled.save("compiled_program.json", save_program=False)` (`FOUNDATIONAL.md` Rule 6), and attaches `new_prog.detailed_results` (`DspyGEPAResult`) containing:
-     - `candidates: list[dspy.Module]` — all candidate `HippoRAGProgram` instances built via `adapter.build_program(c)`
+     - `candidates: list[dspy.Module]` — all candidate `YawProgram` instances built via `adapter.build_program(c)`
      - `val_aggregate_scores: list[float]` — per-candidate scalar validation score (`task-quality-arithmetic-mean-v2`)
      - `val_aggregate_subscores: list[dict[str, float]]` — per-candidate objective scores (`recall_at_1`, `recall_at_2`, `recall_at_5`, `recall_at_10`, `recall_at_20`, `em`, `f1`)
      - `per_objective_best_candidates: dict[str, set[int]]` — candidate indices achieving the best validation score per objective
@@ -33,18 +40,18 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
      ```python
      ensemble = dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs[:3])
      ```
-   - It wraps a list of whole compiled `dspy.Module` (`HippoRAGProgram`) instances **from the outside** into an `EnsembledProgram(dspy.Module)` whose `forward(*args, **kwargs)` executes `outputs = [prog(*args, **kwargs) for prog in programs]` and passes `outputs` to `reduce_fn(outputs)`.
+   - It wraps a list of whole compiled `dspy.Module` (`YawProgram`) instances **from the outside** into an `EnsembledProgram(dspy.Module)` whose `forward(*args, **kwargs)` executes `outputs = [prog(*args, **kwargs) for prog in programs]` and passes `outputs` to `reduce_fn(outputs)`.
    - **Why `reduce_pareto_predictions` dispatches between `dspy.majority` and RRF fusion**:
      - When `outputs` contain non-empty `answer` values (`any(str(getattr(p, "answer", "") or "").strip() for p in predictions)`), `reduce_pareto_predictions(outputs)` delegates directly to DSPy's built-in `dspy.majority(list(predictions))` ([`dspy/predict/aggregation.py:9-54`](file:///c:/Users/Harri.Ahokas/Documents/yaw/.venv/Lib/site-packages/dspy/predict/aggregation.py#L9-L54)).
      - When all predictions have `answer == ""` (`retrieve_only=True`), plain `dspy.majority` would normalize every empty answer to `None` and fail to fuse the retrieved passage lists. Instead, `reduce_pareto_predictions(outputs)` fuses `retrieved_chunk_ids`, `retrieved_passages`, and `retrieved_scores` across all member `dspy.Prediction`s via Reciprocal Rank Fusion (`rrf_fuse_passage_lists`, $\sum_{m} \frac{1}{60 + r_m(c)} + \hat{s}_m(c)$), returning the fused `dspy.Prediction(context=fused_context, reasoning="", retrieved_passages=fused_passages, retrieved_scores=fused_score_tuple, retrieved_chunk_ids=fused_pids, answer="")`.
 
 ### 2.2. Four Non-Negotiable Engineering Rules for `dspy.Ensemble` + `dspy.GEPA` in YAW
 
-1. **`HippoRAGProgram` Is a Pure Single `dspy.Module` (External `dspy.Ensemble` Only)**:
-   - A `dspy.Module` (`HippoRAGProgram`) **never** attaches an ensemble of clones onto itself (`self.pareto_ensemble`, `self.qa_ensemble`, `self._in_ensemble`), **never** stuffs duplicate predictor states into `compiled_program.json` (`yaw_surface["pareto_frontier_states"]` or `yaw_surface["qa_ensemble_states"]`), and **never** implements bespoke per-stage reducers (`ParetoProgramEnsemble`).
-   - Instead, `dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs[:3])` wraps whole `HippoRAGProgram` instances from the outside. When saving `<stem>.json` (`compiled_program.json`), any non-dominated Pareto sibling programs (`programs[1:]`) are saved as standalone `HippoRAGProgram.save("<stem>_telemetry/pareto_member_{i}.json", save_program=False)` artifacts so `compile_pareto_ensemble` can reconstruct the external `dspy.Ensemble` both in-memory after `gepa.compile()` and when loading `<stem>.json` in `YawRuntime` / `yaw dspy benchmark`.
+1. **`YawProgram` Is a Pure Single `dspy.Module` (External `dspy.Ensemble` Only)**:
+   - A `dspy.Module` (`YawProgram`) **never** attaches an ensemble of clones onto itself (`self.pareto_ensemble`, `self.qa_ensemble`, `self._in_ensemble`), **never** stuffs duplicate predictor states into `compiled_program.json` (`yaw_surface["pareto_frontier_states"]` or `yaw_surface["qa_ensemble_states"]`), and **never** implements bespoke per-stage reducers (`ParetoProgramEnsemble`).
+   - Instead, `dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs[:3])` wraps whole `YawProgram` instances from the outside. When saving `<stem>.json` (`compiled_program.json`), any non-dominated Pareto sibling programs (`programs[1:]`) are saved as standalone `YawProgram.save("<stem>_telemetry/pareto_member_{i}.json", save_program=False)` artifacts so `compile_pareto_ensemble` can reconstruct the external `dspy.Ensemble` both in-memory after `gepa.compile()` and when loading `<stem>.json` in `YawRuntime` / `yaw dspy benchmark`.
 
-2. **`dspy.Prediction` Final-Field Invariant in `HippoRAGProgram.forward` for `dspy.majority`**:
+2. **`dspy.Prediction` Final-Field Invariant in `YawProgram.forward` for `dspy.majority`**:
    - In [`dspy/predict/aggregation.py:30-35`](file:///c:/Users/Harri.Ahokas/Documents/yaw/.venv/Lib/site-packages/dspy/predict/aggregation.py#L30-L35), when `dspy.majority(outputs)` is called with `field=None`:
      ```python
      if not field:
@@ -53,8 +60,8 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
          else:
              field = list(completions[0].keys())[-1]
      ```
-   - On `HippoRAGProgram.forward(context=..., question=...)`, `AnswerQuestion` has `signature.output_fields` ending in `"answer"`.
-   - On `HippoRAGProgram.forward(question=...)` ([`program.py:1347-1354`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L1347-L1354)), the returned `dspy.Prediction` is constructed manually (`signature=None`), so `answer=getattr(pred, "answer", "")` **must** be the **final** keyword argument:
+   - On `YawProgram.forward(context=..., question=...)`, `AnswerQuestion` has `signature.output_fields` ending in `"answer"`.
+   - On `YawProgram.forward(question=...)` ([`program.py:1347-1354`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/inference/program.py#L1347-L1354)), the returned `dspy.Prediction` is constructed manually (`signature=None`), so `answer=getattr(pred, "answer", "")` **must** be the **final** keyword argument:
      ```python
      res = dspy.Prediction(
          context=hydrated_ctx,
@@ -65,11 +72,11 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
          answer=getattr(pred, "answer", ""),
      )
      ```
-   - This guarantees both bare `dspy.Ensemble(reduce_fn=dspy.majority)` and `dspy.Ensemble(reduce_fn=reduce_pareto_predictions)` work out-of-the-box on `HippoRAGProgram`.
+   - This guarantees both bare `dspy.Ensemble(reduce_fn=dspy.majority)` and `dspy.Ensemble(reduce_fn=reduce_pareto_predictions)` work out-of-the-box on `YawProgram`.
 
 3. **Dual-Perspective (`recall@N` + `QA (F1, EM)`) Strictly Non-Dominated Pareto Frontier Selection (`select_pareto_frontier_programs`)**:
    - Because `compute_task_quality_score` averages 5 retrieval metrics (`recall_at_1`, `recall_at_2`, `recall_at_5`, `recall_at_10`, `recall_at_20` — $5/7$ of the scalar score) and 2 QA metrics (`em`, `f1` — $2/7$ of the scalar score), ranking a $>3$-candidate Pareto frontier solely by `val_aggregate_scores[i]` would over-select retrieval-heavy candidates and drop the `QA (F1, EM)` Pareto specialist.
-   - `select_pareto_frontier_programs(compiled, max_programs=3) -> list[HippoRAGProgram]` inspects `compiled.detailed_results` (`DspyGEPAResult`) and enforces:
+   - `select_pareto_frontier_programs(compiled, max_programs=3) -> list[YawProgram]` inspects `compiled.detailed_results` (`DspyGEPAResult`) and enforces:
      1. **Strict multi-objective non-dominance**: A candidate $i$ (`val_aggregate_scores[i] > 0.0`) is eligible if and only if no candidate $j \ne i$ Pareto-dominates $i$ across `val_aggregate_subscores` ($\forall m: \text{sub}_j[m] \ge \text{sub}_i[m] - 10^{-9}$ and $\exists m: \text{sub}_j[m] > \text{sub}_i[m] + 10^{-9}$).
      2. **Never backfill dominated losers**: If `best_candidate` (`best_idx`) dominates all other candidates, `select_pareto_frontier_programs` returns `[compiled]` (length `1`).
      3. **Query-time predictor deduplication**: Deduplicate surviving non-dominated programs by their query-time predictor states (`query_intent`, `triple_filter`, `qa.predict`) so identical query/QA prompts never cast duplicate votes.
@@ -84,7 +91,7 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
    - During `gepa.compile()`, `GraphEngine._canonical_retrieval_hook` runs `_ensure_candidate_chunks_indexed(active_program)` while `_in_optimization` is `True` so each candidate's OpenIE/synonym/SHACL prompts are evaluated.
    - Once `hooks.rehydrate_sandbox_after_optimization(compiled)` finalizes `yaw.db` to `best_candidate`'s graph index (`_in_optimization = False`), `YawGraphEngine` holds a single external `ensemble = compile_pareto_ensemble(compiled)` (`dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs[:3])`).
    - **All runtime consumers (including FastMCP's `retrieve` and `rag_qa` tools in [`docs/epic-2-fastmcp-http.md`](epic-2-fastmcp-http.md)) route through this single `dspy.Ensemble`**, which dynamically judges and fuses the 3 Pareto specialists per query:
-     1. **Recall API (`runtime.retrieve` / FastMCP `retrieve` / `benchmark --mode retrieval`)**: Invokes `ensemble(question=query, retrieve_only=True, k=top_k)`. `HippoRAGProgram.forward(..., retrieve_only=True)` runs only `prog.retriever(question, k=k)` (`query_intent` $\to$ `triple_filter` $\to$ PPR) and **skips `prog.answer_question` (`qa`) completely**, while `reduce_pareto_predictions` fuses the member rankings via Reciprocal Rank + normalized PPR score fusion (`rrf_fuse_passage_lists`).
+     1. **Recall API (`runtime.retrieve` / FastMCP `retrieve` / `benchmark --mode retrieval`)**: Invokes `ensemble(question=query, retrieve_only=True, k=top_k)`. `YawProgram.forward(..., retrieve_only=True)` runs only `prog.retriever(question, k=k)` (`query_intent` $\to$ `triple_filter` $\to$ PPR) and **skips `prog.answer_question` (`qa`) completely**, while `reduce_pareto_predictions` fuses the member rankings via Reciprocal Rank + normalized PPR score fusion (`rrf_fuse_passage_lists`).
      2. **QA API (`runtime.rag_qa` / FastMCP `rag_qa` / `evaluate_program` / `benchmark --mode eval`)**: Invokes `ensemble(question=question)`, executing retrieval + QA across the Pareto members and delegating to `dspy.majority(list(predictions))` to return the winning `dspy.Prediction`.
      3. **Per-Query Retrieval Surface Memoization**: Within a query, `_canonical_retrieval_hook` memoizes retrieval results by `(question, k, query_retrieval_fingerprint(prog))` (`query_intent` + `triple_filter` surface) so if two Pareto members share identical retrieval prompts and differ only in `qa.predict`, retrieval runs only once.
 
@@ -94,7 +101,7 @@ Per the official DSPy 3.2.x documentation (`https://dspy.ai/current/api/optimize
 
 - **The Idea**: `EmbeddingGemma` uses asymmetric task prefixes (e.g. `task: search query | query: `).
 - **The Leverage**: Mutating query prefixes only affects search-time encoding ($\sim 0.05\text{s}$ per query). It avoids re-embedding the corpus while allowing `dspy.GEPA` to align dense retrieval with the reasoning prompts.
-- **Implementation**: Expose `query_embedding_prefix` as a `dspy.Predict` signature in `HippoRAGProgram.named_predictors()`, syncing instructions into `DSPyEmbeddingAdapter.update_prefixes()`.
+- **Implementation**: Expose `query_embedding_prefix` as a `dspy.Predict` signature in `YawProgram.named_predictors()`, syncing instructions into `DSPyEmbeddingAdapter.update_prefixes()`.
 
 ---
 
@@ -154,8 +161,8 @@ The real leverage of `dspy.Flex` is **arbitrary code and tool execution**, not p
   - `dspy.Flex` defaults to an internal `dspy.RLM` over these tools.
   - `dspy.GEPA` rewrites the Python orchestrator class (`module_src`), allowing the model to write arbitrary multi-step retrieval loops, adaptive backtrack heuristics, and custom graph traversal logic.
   - All generated code executes isolated inside `BridgeRuntime` (fresh sandbox per query).
-- **Status**: Deferred for investigation **after Epic 2** (FastMCP HTTP transport).
+- **Status**: Deferred for investigation **after Epic 2** (FastMCP HTTP transport) under [Epic 3](epic-3-performance.md).
 - **Open Questions**:
-  - Which parts of the current `HippoRAGProgram` could be replaced by `dspy.Flex` + Python tools?
+  - Which parts of the current `YawProgram` could be replaced by `dspy.Flex` + Python tools?
   - What is the highest leverage MVP, the "ask question" part of the retrieval pipeline (F1, EM scores) or the recall pipeline (Recall@N scores)?
   - How does this tie in into the existing `dspy.RLM` modules, what is the scope of refactoring and removal?

@@ -1,7 +1,8 @@
 import logging
 import os
+import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,15 @@ class _UsageAccountingCache:
         return str(request.get("_fn_identifier", "")).startswith(("dspy.clients.lm.", "dspy.clients.lm15."))
 
     @staticmethod
+    def _is_truncated(record: Any) -> bool:
+        choices = record.get("choices") if isinstance(record, Mapping) else getattr(record, "choices", None)
+        if not isinstance(choices, Sequence) or not choices:
+            return False
+        first = choices[0]
+        reason = first.get("finish_reason") if isinstance(first, Mapping) else getattr(first, "finish_reason", None)
+        return reason == "length"
+
+    @staticmethod
     def _ignored(ignored: list[str] | None) -> list[str]:
         # DSPy excludes endpoints by default; local servers may serve different
         # weights under the same model name. Retain endpoints in YAW cache keys.
@@ -74,7 +84,11 @@ class _UsageAccountingCache:
     def _get(self, request: dict[str, Any], ignored_args_for_cache_key: list[str] | None) -> Any:
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         record = self.backend.get(request, ignored_args_for_cache_key)
-        if record is None or not self.account_cached_usage or not self._is_lm_request(request):
+        if record is None or not self._is_lm_request(request):
+            return record
+        if self._is_truncated(record):
+            return None
+        if not self.account_cached_usage:
             return record
         if isinstance(record, dict) and "_dspy_format" in record:
             usage = record.get("usage")
@@ -120,6 +134,8 @@ class _UsageAccountingCache:
         ignored_args_for_cache_key: list[str] | None,
         enable_memory_cache: bool,
     ) -> None:
+        if self._is_lm_request(request) and self._is_truncated(value):
+            return
         ignored_args_for_cache_key = self._ignored(ignored_args_for_cache_key)
         self.backend.put(request, value, ignored_args_for_cache_key, enable_memory_cache)
         if not self.account_cached_usage or not self._is_lm_request(request):
@@ -156,6 +172,16 @@ __all__ = [
 ]
 
 
+_THINKING_CHANNEL_RE = re.compile(r"<\|channel\>thought.*?<channel\|>", re.DOTALL)
+
+
+def strip_thinking_channel(text: str) -> str:
+    """Strip Gemma 4 / thinking control blocks from model completions."""
+    if "<|channel>thought" in text:
+        text = _THINKING_CHANNEL_RE.sub("", text)
+    return text.lstrip()
+
+
 class YawDSPyLM(dspy.LM):
     """Native dspy.LM wrapper preserving recipe metadata across copies without overriding BaseLM.forward."""
 
@@ -165,6 +191,10 @@ class YawDSPyLM(dspy.LM):
 
     def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
         res = super().__call__(prompt=prompt, messages=messages, **kwargs)
+        if isinstance(res, list):
+            res = [strip_thinking_channel(item) if isinstance(item, str) else item for item in res]
+        elif isinstance(res, str):
+            res = strip_thinking_channel(res)
         sleep_sec = get_yaw_sleep_seconds()
         if sleep_sec > 0:
             time.sleep(sleep_sec)
@@ -198,6 +228,10 @@ def configure_yaw_dspy_cache(
         if enable_disk_cache:
             p.mkdir(parents=True, exist_ok=True)
         resolved_dir = str(p)
+    elif enable_disk_cache:
+        p = Path(".yaw") / "dspy_cache"
+        p.mkdir(parents=True, exist_ok=True)
+        resolved_dir = str(p)
     kwargs: dict[str, Any] = {
         "enable_disk_cache": bool(enable_disk_cache),
         "enable_memory_cache": bool(enable_memory_cache),
@@ -225,20 +259,22 @@ def create_dspy_lm(
     provider: str = "openai",
     role: str = "extraction",
     temperature: float | None = None,
+    top_p: float | None = None,
+    top_k: int | None = None,
     max_tokens: int | None = None,
     context_window_tokens: int | None = None,
     cache: bool = True,
-    num_retries: int = 1,
     timeout: float = 240.0,
     **kwargs: Any,
 ) -> YawDSPyLM:
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
 
     Applies recipe-aware and role-aware defaults for our local hardware stack:
-    - Gemma-4-E4B-it-GGUF (llamacpp GPU): default chat/reflection model;
+    - gemma-4-E4B-it-qat-q4_0-gguf-Q4_0 (llamacpp GPU): default chat/reflection model;
       direct/worker roles support GBNF, while RLM orchestrators generate plain code.
+      Standardized Gemma 4 sampling: temperature=1.0, top_p=0.95, top_k=64.
     - Qwen3-4B-Instruct-2507-GGUF (llamacpp on Vulkan GPU, 16384 ctx): supports GBNF for direct/worker
-      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.2, freq_penalty=0.5, and runs
+      roles (`extraction`, `qa`, `reflection_worker`) with temp=0.35, and runs
       unconstrained Python REPL code generation (`_yaw_supports_gbnf=False`) for RLM orchestrator roles
       (`rlm`, `reflection`).
     - gemma4-it-12b-FLM (flm): extra_body={"think": False}.
@@ -262,7 +298,12 @@ def create_dspy_lm(
         elif role in ("qa", "rlm") and profile is not None and profile.qa_temperature > 0:
             temperature = profile.qa_temperature
         else:
-            temperature = 0.0
+            temperature = profile.default_temperature if profile is not None else 0.35
+
+    if top_p is None and profile is not None and profile.top_p is not None:
+        top_p = profile.top_p
+    if top_k is None and profile is not None and profile.top_k is not None:
+        top_k = profile.top_k
 
     context_tokens = (
         context_window_tokens if context_window_tokens is not None else profile.expected_context if profile else None
@@ -277,14 +318,17 @@ def create_dspy_lm(
         raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
-    if role == "extraction" and profile is not None and profile.frequency_penalty > 0:
-        lm_kwargs.setdefault("frequency_penalty", profile.frequency_penalty)
-    elif role == "reflection_worker":
-        freq = profile.reflection_frequency_penalty if profile is not None else 0.3
-        if freq > 0:
-            lm_kwargs.setdefault("frequency_penalty", freq)
+    if top_p is not None:
+        lm_kwargs.setdefault("top_p", top_p)
+    if top_k is not None:
+        lm_kwargs.setdefault("top_k", top_k)
+        extra = dict(lm_kwargs.get("extra_body") or {})
+        extra.setdefault("top_k", top_k)
+        lm_kwargs["extra_body"] = extra
     if recipe == "flm":
-        lm_kwargs.setdefault("extra_body", {"think": False})
+        extra = dict(lm_kwargs.get("extra_body") or {})
+        extra.setdefault("think", False)
+        lm_kwargs["extra_body"] = extra
 
     if provider == "ollama" or model_name.startswith(("ollama_chat/", "ollama/")):
         litellm_model = (
@@ -296,7 +340,6 @@ def create_dspy_lm(
             temperature=temperature,
             max_tokens=max_tokens,
             cache=cache,
-            num_retries=num_retries,
             api_base=base_url,
             timeout=timeout,
             **lm_kwargs,
@@ -309,7 +352,6 @@ def create_dspy_lm(
             temperature=temperature,
             max_tokens=max_tokens,
             cache=cache,
-            num_retries=num_retries,
             api_base=base_url,
             api_key=api_key,
             timeout=timeout,
@@ -331,7 +373,6 @@ def create_dspy_rlm_pair(
     provider: str = "openai",
     reflection: bool = False,
     cache: bool = True,
-    num_retries: int = 0,
     context_window_tokens: int | None = None,
     max_tokens: int | None = None,
 ) -> tuple[YawDSPyLM, YawDSPyLM]:
@@ -340,7 +381,7 @@ def create_dspy_rlm_pair(
     - `orchestrator_lm` (`role="rlm"` or `"reflection"`): runs `dspy.RLM` Python REPL code
       generation without GBNF (`_yaw_supports_gbnf=False`).
     - `sub_lm` (`role="extraction"` or `"reflection_worker"`): runs inner `llm_query`,
-      `synthesize_instruction`, and GBNF-constrained `qwen_*` worker calls (`_yaw_supports_gbnf=True`).
+      `synthesize_instruction`, and GBNF-constrained `llm_*` worker calls (`_yaw_supports_gbnf=True`).
     - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
       and `sub_lm` with `role="reflection_worker"`; sampling follows each model profile.
     """
@@ -351,7 +392,6 @@ def create_dspy_rlm_pair(
         provider=provider,
         role="reflection" if reflection else "rlm",
         cache=cache,
-        num_retries=num_retries,
         context_window_tokens=context_window_tokens,
         max_tokens=max_tokens,
     )
@@ -362,7 +402,6 @@ def create_dspy_rlm_pair(
         provider=provider,
         role="reflection_worker" if reflection else "extraction",
         cache=cache,
-        num_retries=num_retries,
         context_window_tokens=context_window_tokens,
         max_tokens=max_tokens,
     )

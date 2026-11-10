@@ -8,11 +8,12 @@ import pytest
 import scripts.watchdog as watchdog
 
 
-def audit_file(tmp_path, monkeypatch, payload):
+def audit_file(tmp_path, monkeypatch, payload, tag: str = "canonical"):
     monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
     folder = tmp_path / ".yaw"
     folder.mkdir(exist_ok=True)
-    path = folder / "compiled_program_optimize_test_graph_rlm_audit.json"
+    name = "optimize_program_audit.json" if tag in {"", "canonical"} else f"optimize_program_{tag}_audit.json"
+    path = folder / name
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -29,22 +30,27 @@ def test_candidate_audit_keeps_run_identity_and_last_good_snapshot_on_torn_reads
             ]
         },
     )
-    assert watchdog.load_candidate_records({}) == ([], 0, False)
-    assert watchdog.load_candidate_records({"datestamp": "missing"}) == ([], 0, False)
-    rows, evaluations, legacy = watchdog.load_candidate_records({"datestamp": "test"})
-    assert evaluations == 6 and legacy is False
+    assert watchdog.load_candidate_records({}) == ([], 0)
+    assert watchdog.load_candidate_records({"datestamp": "missing"}) == ([], 0)
+    rows, evaluations = watchdog.load_candidate_records({"datestamp": "canonical"})
+    assert evaluations == 6
     assert [row["cand"] for row in rows] == [1, 2]
     assert [row["eff_score"] for row in rows] == [0.6, 0.5]
     assert [row["best_so_far"] for row in rows] == [0.6, 0.6]
-    assert watchdog.load_candidate_records({"datestamp": "test"}) == (rows, evaluations, legacy)
+    assert watchdog.load_candidate_records({"datestamp": "canonical"}) == (rows, evaluations)
     for malformed in ("invalid JSON", "[]"):
         path.write_text(malformed, encoding="utf-8")
-        assert watchdog.load_candidate_records({"datestamp": "test"}) == (rows, evaluations, legacy)
+        assert watchdog.load_candidate_records({"datestamp": "canonical"}) == (rows, evaluations)
     path.write_text(json.dumps({"eval_records": [{"score": 0.4}, "bad", {"score": 0.8}]}), encoding="utf-8")
-    restored, evaluations, legacy = watchdog.load_candidate_records({"datestamp": "test"})
-    assert evaluations == 2 and legacy is True
-    assert [row["cand"] for row in restored] == [1, 2]
-    assert [row["score"] for row in restored] == [0.4, 0.8]
+    assert watchdog.load_candidate_records({"datestamp": "canonical"}) == ([], 0)
+    audit_file(
+        tmp_path,
+        monkeypatch,
+        {"candidate_records": [{"cand": 1, "n": 3, "score": 0.8}]},
+        tag="custom",
+    )
+    custom_rows, custom_evals = watchdog.load_candidate_records({"datestamp": "custom"})
+    assert len(custom_rows) == 1 and custom_evals == 3
 
 
 def test_pool_telemetry_uses_observed_progress_and_labels_missing_values_honestly():
@@ -60,7 +66,7 @@ def test_pool_telemetry_uses_observed_progress_and_labels_missing_values_honestl
     assert len(empty.badge(2, 10, True, "x" * 100)[0]) <= 96
     telemetry = watchdog.PoolTelemetry.from_sandbox(
         {
-            "counts": {"openie_chunks": 11},
+            "counts": {"chunk_inference": 11},
             "indexed_chunk_ids": {"a", "b"},
             "pools": {"val_chunk_ids": ["a", "c", "d"], "train_chunk_ids": ["b"], "train_queries": 150},
             "timeseries_samples": [{"time_sec": 0, "passages": 1}, {"time_sec": 600, "passages": 11}],
@@ -86,15 +92,15 @@ def test_individual_evaluations_update_within_the_same_candidate(tmp_path, monke
         ],
     }
     audit = audit_file(tmp_path, monkeypatch, payload)
-    rows, total, legacy = watchdog.load_candidate_records({"datestamp": "test"})
-    assert total == 22 and not legacy
+    rows, total = watchdog.load_candidate_records({"datestamp": "canonical"})
+    assert total == 22
     assert rows[0]["evaluations"] == []
     assert rows[1]["evaluations"] == [
         {"eval": 21, "score": 0.2},
         {"eval": 22, "score": 0.8},
     ]
     path = tmp_path / "scores.svg"
-    watchdog.generate_candidate_score_svg(path, rows, legacy, ("TEST", "#38bdf8"), {})
+    watchdog.generate_candidate_score_svg(path, rows, ("TEST", "#38bdf8"), {})
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     assert "eval #22" in text and "candidate #2" in text
     assert "score 80.0%" in text and "mean 50.0%" in text
@@ -105,9 +111,9 @@ def test_individual_evaluations_update_within_the_same_candidate(tmp_path, monke
     payload["candidate_records"][1].update(n=3, score=0.4)
     payload["eval_records"].append({"eval": 23, "cand": 2, "score": 0.2})
     audit.write_text(json.dumps(payload), encoding="utf-8")
-    rows, total, legacy = watchdog.load_candidate_records({"datestamp": "test"})
+    rows, total = watchdog.load_candidate_records({"datestamp": "canonical"})
     assert len(rows) == 2 and total == 23
-    watchdog.generate_candidate_score_svg(path, rows, legacy, ("TEST", "#38bdf8"), {})
+    watchdog.generate_candidate_score_svg(path, rows, ("TEST", "#38bdf8"), {})
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     assert "eval #23" in text and "score 20.0%" in text and "mean 40.0%" in text
     assert "recent 3 recorded" in text
@@ -136,9 +142,9 @@ def test_native_gepa_chart_uses_validation_coverage_and_exact_membership(tmp_pat
     }
     audit = audit_file(tmp_path, monkeypatch, payload)
     path = tmp_path / "native.svg"
-    sandbox = {"datestamp": "test", "optimizer_alive": True}
+    sandbox = {"datestamp": "canonical", "optimizer_alive": True}
     # No dashboard candidate aggregates are needed, including after checkpoint restoration.
-    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), sandbox)
+    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), sandbox)
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     for expected in (
         "Seed baseline (0.0%)",
@@ -155,7 +161,7 @@ def test_native_gepa_chart_uses_validation_coverage_and_exact_membership(tmp_pat
     assert "Latency" not in text and "GM quality" not in text and "Archive size" not in text
     payload["gepa_progress"].update(phase="minibatch evaluation", phase_evaluations=2, phase_expected=10)
     audit.write_text(json.dumps(payload), encoding="utf-8")
-    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), sandbox)
+    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), sandbox)
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     assert "Metric evaluations since phase began: 2/10" in text
     assert not watchdog.plt.get_fignums()
@@ -164,14 +170,13 @@ def test_native_gepa_chart_uses_validation_coverage_and_exact_membership(tmp_pat
 def test_gepa_chart_does_not_invent_native_frontier_for_older_audits(tmp_path, monkeypatch):
     audit_file(tmp_path, monkeypatch, {"candidate_records": [{"cand": 1, "n": 10, "score": 0.9}]})
     path = tmp_path / "old.svg"
-    watchdog.generate_pareto_svg(path, [], False, ("TEST", "#38bdf8"), {"datestamp": "test"})
+    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), {"datestamp": "canonical"})
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     assert "Native GEPA telemetry unavailable" in text
     assert "cannot reconstruct GEPA's frontier" in text
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_candidate_plots_render_real_audit_metrics_and_close_figures(tmp_path, monkeypatch, legacy):
+def test_candidate_plots_render_real_audit_metrics_and_close_figures(tmp_path, monkeypatch):
     candidates = [
         {
             "cand": 1,
@@ -194,14 +199,14 @@ def test_candidate_plots_render_real_audit_metrics_and_close_figures(tmp_path, m
         {"cand": 3, "n": 1, "score": 0.2, "s_per_it": 5.0},
     ]
     audit_file(tmp_path, monkeypatch, {"candidate_records": candidates})
-    rows, _, _ = watchdog.load_candidate_records({"datestamp": "test"})
+    rows, _ = watchdog.load_candidate_records({"datestamp": "canonical"})
     for render in (
         watchdog.generate_candidate_score_svg,
         watchdog.generate_candidate_quality_svg,
         watchdog.generate_pareto_svg,
     ):
         path = tmp_path / f"{render.__name__}.svg"
-        render(path, rows, legacy, ("TEST", "#38bdf8"), {})
+        render(path, rows, ("TEST", "#38bdf8"), {})
         root = ElementTree.parse(path).getroot()
         text = " ".join(root.itertext())
         assert "Fig." in text and "TEST" in text
@@ -217,7 +222,7 @@ def test_missing_candidates_render_honest_status_placeholders(tmp_path, sandbox)
         watchdog.generate_pareto_svg,
     ):
         path = tmp_path / f"{render.__name__}.svg"
-        render(path, [], False, ("TEST", "#38bdf8"), sandbox)
+        render(path, [], ("TEST", "#38bdf8"), sandbox)
         text = " ".join(ElementTree.parse(path).getroot().itertext())
         assert "No optimization sandbox" in text if not sandbox else "candidate" in text.lower()
 
@@ -227,11 +232,11 @@ def test_indexing_dashboard_renders_measured_throughput_and_empty_state(tmp_path
     sandbox = {}
     if populated:
         sandbox = {
-            "counts": {"openie_chunks": 11},
+            "counts": {"chunk_inference": 11},
             "kg_metrics": {"total_entities": 20, "total_triples": 15},
             "indexed_chunk_ids": {"a"},
             "pools": {"val_chunk_ids": ["a", "b"], "corpus_chunk_ids": ["a", "b", "c"]},
-            "lemonade_metrics": {"server_up": True, "qwen_tps": 20.0},
+            "lemonade_metrics": {"server_up": True, "llm_tps": 20.0},
             "timeseries_samples": [
                 {
                     "time_sec": 0,
@@ -254,17 +259,7 @@ def test_indexing_dashboard_renders_measured_throughput_and_empty_state(tmp_path
             ],
         }
     path = tmp_path / "indexing.svg"
-    watchdog.generate_kg_dashboard_svg(path, sandbox, {})
+    watchdog.generate_kg_dashboard_svg(path, sandbox)
     text = " ".join(ElementTree.parse(path).getroot().itertext())
     assert "Fig. 1" in text
     assert "Val-pool projection" in text if populated else "Not enough samples yet" in text
-
-
-def test_config_reader_uses_real_toml_and_explicit_missing_fallback(tmp_path, monkeypatch):
-    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
-    assert watchdog.read_config_info()["mode"] == "hybrid"
-    config = tmp_path / "yaw.toml"
-    config.write_text('[optimization]\nmode="gepa"\n', encoding="utf-8")
-    assert watchdog.read_config_info() == {"mode": "gepa"}
-    config.write_text("invalid = [", encoding="utf-8")
-    assert watchdog.read_config_info()["mode"] == "hybrid"

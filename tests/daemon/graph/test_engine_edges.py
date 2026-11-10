@@ -5,24 +5,65 @@ import json
 import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import dspy
 import numpy as np
 import pytest
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import HippoRAGProgram
+from yaw.daemon.graph.inference import YawProgram
 from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, create_dspy_embedder, resolve_embedding_profile
+from yaw.daemon.indexing import bind_native_indexing
 
 
 @pytest.fixture
-def indexing_provider():
+def indexing_provider(request):
     calls = []
+    empty_decisions = getattr(request, "param", False)
 
     class Handler(BaseHTTPRequestHandler):
+        def send_json(self, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path.endswith("health"):
+                assert isinstance(self.server, ThreadingHTTPServer)
+                self.send_json(
+                    {
+                        "all_models_loaded": [
+                            {
+                                "id": "indexing-contract",
+                                "backend_url": f"http://127.0.0.1:{self.server.server_port}",
+                                "launch_command": ["-m", "indexing-contract.gguf"],
+                            }
+                        ]
+                    }
+                )
+            else:
+                self.send_json(
+                    {
+                        "model_path": "indexing-contract.gguf",
+                        "chat_template": "bytes",
+                        "default_generation_settings": {"n_ctx": 131072},
+                    }
+                )
+
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path.endswith("apply-template"):
+                self.send_json({"prompt": json.dumps(request["messages"])})
+                return
+            if self.path.endswith("tokenize"):
+                self.send_json({"tokens": list(request["content"].encode())})
+                return
             if self.path.endswith("/embeddings"):
                 texts = request["input"] if isinstance(request["input"], list) else [request["input"]]
                 raw = json.dumps(
@@ -51,10 +92,18 @@ def indexing_provider():
                 stage, result = "intent", {"query_intent": "Who wrote Notes?"}
             elif "fact_before_filter" in prompt:
                 stage, result = "filter", {"fact": [["ada", "wrote", "notes"]]}
+            elif "candidate_pairs" in prompt or "synonym-evidence" in prompt:
+                text = request["messages"][-1]["content"]
+                stage, result = (
+                    "synonyms",
+                    {
+                        "decisions": []
+                        if empty_decisions
+                        else complete_decisions(candidate_rows(text), [], stage_text=prompt)
+                    },
+                )
             elif "reasoning" in prompt.lower():
                 stage, result = "qa", {"reasoning": "The source states Ada wrote Notes.", "answer": "Answer: 'Ada'"}
-            elif "candidate_pairs" in prompt:
-                stage, result = "synonyms", {"decisions": []}
             elif "missing_entities" in prompt:
                 stage, result = (
                     "definitions",
@@ -117,7 +166,7 @@ def indexing_provider():
 
 def make_engine(tmp_path, url) -> YawGraphEngine:
     lm = dspy.LM("openai/indexing-contract", api_base=url, api_key="test", cache=False, num_retries=0)
-    program = HippoRAGProgram(include_demos=False, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
 
     def embed(texts):
         return np.array(
@@ -128,45 +177,24 @@ def make_engine(tmp_path, url) -> YawGraphEngine:
         replace(resolve_embedding_profile(), dimensions=8),
         create_dspy_embedder(embed, caching=False),
     )
-    return YawGraphEngine(db_path=tmp_path / "yaw.db", workspace_root=tmp_path, program=program, embedder=embedder)
+    return bind_native_indexing(
+        YawGraphEngine(db_path=tmp_path / "yaw.db", workspace_root=tmp_path, program=program, embedder=embedder)
+    )
 
 
-@pytest.mark.parametrize(
-    "checkpoint_kind", ["structured", "triples-only", "missing-definitions", "structured-only", "invalid-statement"]
-)
-def test_committed_openie_survives_stage_cache_eviction_and_engine_restart(
-    tmp_path, indexing_provider, checkpoint_kind
-):
+def test_native_inference_survives_query_cache_clear_and_engine_restart(tmp_path, indexing_provider):
     url, calls = indexing_provider
     source = "Ada wrote Notes."
     (tmp_path / "source.txt").write_text(source, encoding="utf-8")
     pointer = ChunkPointer("source", "source.txt", 1, 1, "Source")
     first = make_engine(tmp_path, url)
     try:
-        assert first.index_chunks([]) == 0
         assert first.index_chunks([(pointer, source)]) == 1
-        assert calls.count("ner") == 1 and calls.count("triples") == 1
         assert first.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
-        fingerprints = [
-            tuple(row) for row in first.conn.execute("SELECT key,value FROM meta WHERE key LIKE '%fp:%' ORDER BY key")
-        ]
-        with first.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM candidate_stage_cache")
-            if checkpoint_kind in ("triples-only", "missing-definitions"):
-                conn.execute("UPDATE openie_chunks SET structured_triples_json='[]'")
-            if checkpoint_kind == "missing-definitions":
-                conn.execute("UPDATE openie_chunks SET entities_json=?", (json.dumps(["Ada", "Notes"]),))
-            if checkpoint_kind == "structured-only":
-                conn.execute("UPDATE openie_chunks SET entities_json='[]'")
-            if checkpoint_kind == "invalid-statement":
-                saved = json.loads(conn.execute("SELECT structured_triples_json FROM openie_chunks").fetchone()[0])
-                conn.execute(
-                    "UPDATE openie_chunks SET structured_triples_json=?",
-                    (json.dumps([{"subj": "", "pred": "invalid", "obj": "Notes"}, *saved]),),
-                )
+        first._encode_cached_text.cache_clear()
         checkpoint = tuple(
             first.conn.execute(
-                "SELECT entities_json,triples_json,structured_triples_json FROM openie_chunks"
+                "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"
             ).fetchone()
         )
     finally:
@@ -175,22 +203,15 @@ def test_committed_openie_survives_stage_cache_eviction_and_engine_restart(
     second = make_engine(tmp_path, url)
     try:
         second.index_chunks([(pointer, source)])
-        assert calls.count("ner") == before.count("ner")
-        assert calls.count("triples") == before.count("triples")
-        assert calls.count("definitions") - before.count("definitions") == (
-            1 if checkpoint_kind == "missing-definitions" else 0
-        )
+        assert calls == before
         assert (
             tuple(
                 second.conn.execute(
-                    "SELECT entities_json,triples_json,structured_triples_json FROM openie_chunks"
+                    "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"
                 ).fetchone()
             )
             == checkpoint
         )
-        assert [
-            tuple(row) for row in second.conn.execute("SELECT key,value FROM meta WHERE key LIKE '%fp:%' ORDER BY key")
-        ] == fingerprints
         assert second.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
         assert second.retrieve_dpr("Ada", top_k=0) == []
     finally:
@@ -208,28 +229,24 @@ def test_empty_engine_operations_do_not_call_inference_or_create_graph_rows(tmp_
         assert engine.retrieve_dpr("question") == []
         assert engine.rag_qa([]) == []
         assert engine.format_qa_context([]) == ""
-        engine.delete_chunks([])
+        assert engine.index_chunks([]) == 0
         assert calls == []
         assert engine.conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
     finally:
         engine.close()
 
 
-def test_unadjudicated_synonym_candidates_below_16_emit_skos_related_fallback(tmp_path, indexing_provider):
+@pytest.mark.parametrize("indexing_provider", [True], indirect=True)
+def test_unadjudicated_synonym_candidates_abort_graph_publication(tmp_path, indexing_provider):
     url, calls = indexing_provider
     engine = make_engine(tmp_path, url)
-    engine.synonymy_threshold = 0.1
+    engine.candidate_dense_threshold = 0.1
     try:
-        assert engine.index(["Ada wrote Notes."]) == 1
+        with pytest.raises(ValueError, match="Missing synonym pairs|Empty decisions"):
+            engine.index(["Ada wrote Notes."])
         assert "synonyms" in calls
-        relations = [
-            tuple(row)
-            for row in engine.conn.execute(
-                "SELECT src_id, dst_id, kind FROM edges WHERE kind = 'skos:related' ORDER BY src_id"
-            )
-        ]
-        assert len(relations) == 2
-        assert all(rel == "skos:related" for _, _, rel in relations)
+        for table in ("chunks", "entities", "facts", "edges", "edge_sources", "chunk_fts"):
+            assert engine.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         resolved = engine._resolve_chunks_for_docs(["Ada wrote Notes."])
         assert len(resolved) == 1
         pointer, _ = resolved[0]
@@ -245,9 +262,17 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
     assert not hasattr(YawGraphEngine, "_materialize_doc_chunk")
     engine = make_engine(tmp_path, url)
     try:
-        # 1. Incremental index() into passages.json preserves existing line spans and never creates corpus/chunk-*.md
+        # 1. Complete raw-document snapshots preserve unchanged spans without materializing corpus/chunk-*.md.
         assert engine.index(["First Title\nAda wrote Notes on the Analytical Engine."]) == 1
-        assert engine.index(["Second Title\nAda wrote Notes on Babbage's machine."]) == 1
+        assert (
+            engine.index(
+                [
+                    "First Title\nAda wrote Notes on the Analytical Engine.",
+                    "Second Title\nAda wrote Notes on Babbage's machine.",
+                ]
+            )
+            == 2
+        )
         assert not (tmp_path / "corpus").exists()
         passages_path = tmp_path / "passages.json"
         assert passages_path.is_file()
@@ -282,8 +307,6 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         assert not (tmp_path / "corpus").exists()
 
         # 3. Shared-corpus (>64 chunks) pool preservation in _prepare_optimization_pools & _ensure_candidate_chunks
-        from yaw.daemon.graph.inference import extraction_fingerprint, openie_fingerprint
-        from yaw.daemon.graph.storage import set_meta, upsert_chunk_pointers
 
         shared_records = [
             {
@@ -304,8 +327,6 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         engine._opt_val_chunks_pool.clear()
         # Leave _resolved_docs_cache populated so _prepare_optimization_pools is verified to clear it
         assert len(engine._resolved_docs_cache) > 0
-        ext_fp = extraction_fingerprint(engine.program)
-        oie_fp = openie_fingerprint(engine.program)
         shared_pairs: list[tuple[ChunkPointer, str]] = []
         curr_ln = 2
         for rec, item_s in zip(shared_records, rendered, strict=True):
@@ -314,20 +335,10 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
             curr_ln = e_ln + 1
             ptr = ChunkPointer(rec["id"], "shared_corpus.json", s_ln, e_ln, rec["title"], s_ln, e_ln)
             shared_pairs.append((ptr, rec["text"]))
-            engine._opt_chunks_pool.append((ptr, rec["text"]))
-            engine._opt_indexed_cids.add(rec["id"])
-            engine._chunk_indexed_ext_fp[rec["id"]] = ext_fp
 
-        with engine.managed_conn.transaction() as conn:
-            conn.execute("DELETE FROM chunks")
-            upsert_chunk_pointers(conn, shared_pairs)
-            for ptr, _ in shared_pairs:
-                set_meta(conn, f"indexed_fp:{ptr.chunk_id}", ext_fp)
-                set_meta(conn, f"openie_fp:{ptr.chunk_id}", oie_fp)
+        engine.index_chunks(shared_pairs)
 
-        shared_train = [
-            dspy.Example(question=f"Question {i}?", item_docs=[]).with_inputs("question") for i in range(3)
-        ]
+        shared_train = [dspy.Example(question=f"Question {i}?", item_docs=[]).with_inputs("question") for i in range(3)]
         shared_val = [
             dspy.Example(question=f"Val Question {i}?", item_docs=[]).with_inputs("question") for i in range(2)
         ]
@@ -359,5 +370,145 @@ def test_slice5_passages_json_shared_corpus_pools_and_unbounded_eval_hydration(t
         hydrated = engine._hydrate_top_chunks_for_eval(top_20, engine.program)
         assert len(hydrated) == 20
         assert all(f"Shared corpus passage number {i}" in hydrated[f"chunk-shared-{i:03d}"] for i in range(20))
+
+        # 5. When examples have item_docs=[] and non-empty gold_docs (Enterprise RAG contract),
+        #    _prepare_optimization_pools narrows val_pool and train_pool to gold_docs and maps questions.
+        gold_train = [
+            dspy.Example(
+                question=f"Gold Train Q{i}?",
+                item_docs=[],
+                gold_docs=[shared_records[i]["text"]],
+            ).with_inputs("question", "item_docs")
+            for i in range(3)
+        ]
+        gold_val = [
+            dspy.Example(
+                question=f"Gold Val Q{i}?",
+                item_docs=[],
+                gold_docs=[shared_records[10 + i]["text"]],
+            ).with_inputs("question", "item_docs")
+            for i in range(2)
+        ]
+        save_gold_target = tmp_path / "opt_gold_out.json"
+        engine._prepare_optimization_pools(
+            gold_train,
+            gold_val,
+            None,
+            mode="gepa",
+            save_path=save_gold_target,
+            progress_callback=None,
+        )
+        assert len(engine._opt_val_chunks_pool) == 2
+        assert engine._graph_rlm_stats["val_pool_size"] == 2
+        assert engine._graph_rlm_stats["train_pool_size"] == 3
+        assert engine._graph_rlm_stats["corpus_pool_size"] == 75
+        assert engine._opt_docs_by_question["Gold Train Q0?"] == [shared_records[0]["text"]]
+        assert engine._opt_docs_by_question["Gold Val Q1?"] == [shared_records[11]["text"]]
+        ensured_q0 = engine._ensure_candidate_chunks_indexed(
+            engine.program,
+            item_docs=engine._opt_docs_by_question["Gold Train Q0?"],
+        )
+        assert ensured_q0 == ["chunk-shared-000"]
+    finally:
+        engine.close()
+
+
+def test_format_qa_context_subgraph_and_dpr_separation(tmp_path: Path, indexing_provider) -> None:
+    """Verify format_qa_context prepends induced subgraph when enabled and preserves flat passages when disabled."""
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.storage import (
+        upsert_chunk_pointers,
+        upsert_entities,
+        upsert_entity_labels,
+        upsert_fact_sources,
+        upsert_facts,
+        upsert_semantic_edges,
+    )
+
+    url, _ = indexing_provider
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir(parents=True)
+    doc_file = corpus_dir / "notes.txt"
+    doc_file.write_text("Line 1\nLine 2: Ada Lovelace wrote the first computer algorithm.\nLine 3\n", encoding="utf-8")
+
+    engine = make_engine(tmp_path, url)
+    try:
+        conn = engine.conn
+        assert conn is not None
+
+        ptr = ChunkPointer(
+            chunk_id="c_ada",
+            rel_posix_path="corpus/notes.txt",
+            start_line=2,
+            end_line=2,
+            title="Ada Notes",
+            ast_island_start=1,
+            ast_island_end=3,
+        )
+        upsert_chunk_pointers(conn, [(ptr, "Ada Lovelace wrote the first computer algorithm.")])
+        upsert_entities(
+            conn,
+            [
+                ("e_ada", "Ada Lovelace", "English mathematician and writer"),
+                ("e_algo", "Computer Algorithm", "Computational instruction sequence"),
+            ],
+        )
+        upsert_entity_labels(
+            conn,
+            [
+                ("ada lovelace", "e_ada", "skos:prefLabel", "Ada Lovelace", "c_ada"),
+                ("computer algorithm", "e_algo", "skos:prefLabel", "Computer Algorithm", "c_ada"),
+            ],
+        )
+        upsert_facts(
+            conn,
+            [
+                (
+                    "f_ada",
+                    "e_ada",
+                    "authored",
+                    "entity",
+                    "e_algo",
+                    None,
+                    "",
+                    "",
+                    '["Ada Lovelace", "authored", "Computer Algorithm"]',
+                    "Ada authored the algorithm.",
+                ),
+            ],
+        )
+        upsert_fact_sources(conn, [("f_ada", "c_ada")])
+        upsert_semantic_edges(
+            conn,
+            [
+                ("e_ada", "e_algo", "skos:related", 0.9, "Creator to invention association"),
+            ],
+        )
+
+        hits = [(ptr, 0.95, "Line 2: Ada Lovelace wrote the first computer algorithm.")]
+
+        # 1. GraphRAG QA Context (include_subgraph=True, default)
+        ctx_graph = engine.format_qa_context(
+            hits,
+            seed_facts=[("Ada Lovelace", "authored", "Computer Algorithm")],
+            include_subgraph=True,
+        )
+        assert "### Knowledge Graph Statements (rdf:Statement)" in ctx_graph
+        assert "[Ada Lovelace, authored, Computer Algorithm]" in ctx_graph
+        assert "### Taxonomy & Disambiguation Trace (SKOS / OWL)" in ctx_graph
+        assert "skos:related" in ctx_graph
+        assert "Creator to invention association" in ctx_graph
+        assert "### Retrieved Passages" in ctx_graph
+        assert "Ada Lovelace wrote the first computer algorithm" in ctx_graph
+
+        # 2. DPR QA Context (include_subgraph=False)
+        ctx_dpr = engine.format_qa_context(
+            hits,
+            include_subgraph=False,
+        )
+        assert "### Knowledge Graph Statements" not in ctx_dpr
+        assert "### Taxonomy & Disambiguation Trace" not in ctx_dpr
+        assert "### Retrieved Passages" not in ctx_dpr
+        assert "Ada Lovelace wrote the first computer algorithm" in ctx_dpr
     finally:
         engine.close()

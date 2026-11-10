@@ -7,12 +7,13 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import urllib.request
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,10 +33,33 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from yaw.core import write_text_atomic  # noqa: E402
+from yaw.core.config import write_text_atomic, write_via_temp_atomic  # noqa: E402
+from yaw.core.logger import configure_logging, get_logger  # noqa: E402
 from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db  # noqa: E402
+from yaw.daemon.runtime import is_file_locked  # noqa: E402
 
-ARTIFACT_DIR = Path(os.environ.get("YAW_ARTIFACT_DIR") or (WORKSPACE_ROOT / "outputs" / "dashboard"))
+logger = get_logger("yaw.watchdog")
+
+
+def _resolve_artifact_dir() -> Path:
+    if custom := os.environ.get("YAW_ARTIFACT_DIR"):
+        return Path(custom)
+    try:
+        brain = Path.home() / ".gemini" / "antigravity" / "brain"
+        if brain.exists():
+            reports = sorted(
+                brain.glob("*/benchmark_mobile_report.md"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if reports:
+                return reports[0].parent
+    except Exception:
+        pass
+    return WORKSPACE_ROOT / "outputs" / "dashboard"
+
+
+ARTIFACT_DIR = _resolve_artifact_dir()
 # Report figure order (Fig 1..5). Fig. 3 includes evaluation and candidate axes.
 FIG_FILES = (
     "knowledge_graph_extraction_dashboard.svg",
@@ -43,14 +67,6 @@ FIG_FILES = (
     "candidate_score_progress.svg",
     "candidate_quality_metrics.svg",
     "pareto_frontier_progress.svg",
-)
-# Superseded wall-clock figures; removed once so stale images cannot be mistaken for live data.
-LEGACY_FIG_FILES = (
-    "knowledge_graph_2d_projection.svg",  # 5 MB; replaced by a compact PNG for mobile
-    "candidate_pareto_metric_vs_time.svg",
-    "benchmark_optimization_progress.svg",
-    "recall_em_f1_vs_time.svg",
-    "quality_metrics_vs_time.svg",
 )
 
 plt.rcParams.update(
@@ -100,24 +116,29 @@ def get_gpu_temperature() -> float | None:
 class PoolTelemetry:
     """Progress figures with a real source; any value without one stays None (rendered "n/a")."""
 
-    openie_cnt: int  # OpenIE-extracted chunks in the sandbox DB (openie_chunks)
+    openie_cnt: int  # OpenIE-extracted chunks in the sandbox DB (chunk_inference)
     train_queries: int | None  # from the engine's <stem>_pools.json manifest
     val_queries: int | None
     gepa_val_queries: int | None
-    val_done: int | None  # manifest val chunk ids ∩ openie_chunks
+    val_done: int | None  # manifest val chunk ids ∩ chunk_inference
     val_pool: int | None
     train_done: int | None
     train_pool: int | None
+    train_val_done: int | None
+    train_val_pool: int | None
+    background_done: int | None  # corpus chunks not in train or val query gold sets
+    background_pool: int | None
     corpus_done: int | None
     corpus_pool: int | None
     elapsed_hours: float  # wall-clock since the sandbox DB was created
     velocity: float | None  # chunks/min over the last measured window (telemetry samples)
     sec_per_chunk: float | None
     val_eta_min: float | None  # only while upfront val indexing is still running
+    corpus_eta_min: float | None  # ETA to index remaining corpus chunks
 
     @classmethod
     def from_sandbox(cls, sandbox: dict[str, Any]) -> PoolTelemetry:
-        cnt = int(sandbox.get("counts", {}).get("openie_chunks", 0))
+        cnt = int(sandbox.get("counts", {}).get("chunk_inference", 0))
         pools = sandbox.get("pools") or {}
         indexed: set[str] = sandbox.get("indexed_chunk_ids") or set()
 
@@ -129,7 +150,29 @@ class PoolTelemetry:
 
         val_done, val_pool = _split("val_chunk_ids")
         train_done, train_pool = _split("train_chunk_ids")
-        corpus_done, corpus_pool = _split("corpus_chunk_ids")
+        val_ids = pools.get("val_chunk_ids")
+        train_ids = pools.get("train_chunk_ids")
+        if isinstance(val_ids, list) and isinstance(train_ids, list) and (val_ids or train_ids):
+            train_val_union = set(val_ids) | set(train_ids)
+            train_val_done, train_val_pool = len(indexed.intersection(train_val_union)), len(train_val_union)
+        else:
+            train_val_done, train_val_pool = None, None
+
+        corpus_ids = pools.get("corpus_chunk_ids")
+        if isinstance(corpus_ids, list) and corpus_ids:
+            corpus_done, corpus_pool = len(indexed.intersection(set(corpus_ids))), len(corpus_ids)
+        elif train_val_pool is not None:
+            corpus_done, corpus_pool = train_val_done, train_val_pool
+        else:
+            corpus_done, corpus_pool = _split("corpus_chunk_ids")
+        if corpus_done is None:
+            corpus_done = cnt
+
+        background_done = None
+        background_pool = None
+        if corpus_pool is not None and train_val_pool is not None:
+            background_pool = max(0, corpus_pool - train_val_pool)
+            background_done = max(0, cnt - (train_val_done or 0))
 
         samples = sandbox.get("timeseries_samples", [])
         el_sec = max(
@@ -146,6 +189,9 @@ class PoolTelemetry:
         val_eta = None
         if vel and val_pool is not None and val_done is not None and val_done < val_pool:
             val_eta = (val_pool - val_done) / vel
+        corpus_eta = None
+        if vel and corpus_pool is not None and cnt < corpus_pool:
+            corpus_eta = (corpus_pool - cnt) / vel
 
         def _opt_int(key: str) -> int | None:
             v = pools.get(key)
@@ -160,12 +206,17 @@ class PoolTelemetry:
             val_pool=val_pool,
             train_done=train_done,
             train_pool=train_pool,
+            train_val_done=train_val_done,
+            train_val_pool=train_val_pool,
+            background_done=background_done,
+            background_pool=background_pool,
             corpus_done=corpus_done,
             corpus_pool=corpus_pool,
             elapsed_hours=el_sec / 3600.0,
             velocity=vel,
             sec_per_chunk=(60.0 / vel) if vel else None,
             val_eta_min=val_eta,
+            corpus_eta_min=corpus_eta,
         )
 
     @staticmethod
@@ -200,75 +251,28 @@ def get_lemonade_server_metrics() -> dict[str, Any]:
                 for line in resp.read().decode("utf-8", errors="ignore").splitlines()
                 if not line.startswith("#") and len(p := line.split()) == 2
             }
-
-        def pick(sub: str) -> float:
-            for pref in ("Gemma", "Qwen3-4B"):
-                for k, v in m.items():
-                    if pref in k and sub in k:
-                        return v
-            return next((v for k, v in m.items() if sub in k), 0.0)
-
-        return {
-            "server_up": True,
-            "qwen_tps": round(pick("tokens_per_second"), 1),
-            "qwen_ttft_sec": round(pick("time_to_first_token"), 3),
-            "qwen_latest_prompt_tokens": int(pick("model_input_tokens{")),
-            "qwen_latest_output_tokens": int(pick("model_output_tokens{")),
-            "cpu_usage_pct": round(m.get("lemonade_cpu_usage_percent", 0.0), 1),
-            "memory_used_gb": round(m.get("lemonade_memory_used_gb", 0.0), 1),
-            "requests_total": int(m.get("lemonade_requests_total", 0)),
-            "prompt_tokens_total": int(m.get("lemonade_llamacpp_prompt_tokens_total", 0)),
-            "tokens_predicted_total": int(m.get("lemonade_llamacpp_tokens_predicted_total", 0)),
-        }
+        tps = next(
+            (v for pref in ("Gemma", "Qwen3-4B", "") for k, v in m.items() if pref in k and "tokens_per_second" in k),
+            0.0,
+        )
+        return {"server_up": True, "llm_tps": round(tps, 1)}
     except Exception:
         return {"server_up": False}
 
 
 def get_pipeline_resource_metrics() -> dict[str, Any]:
-    procs: list[tuple[str, psutil.Process, Any]] = []
+    rss = 0
     for p in psutil.process_iter(["pid", "name", "cmdline"]):
         with contextlib.suppress(psutil.Error, OSError):
             n, cmd = (p.info["name"] or "").lower(), " ".join(p.info["cmdline"] or []).lower()
-            role = (
-                "lemonade"
-                if "lemonade" in n or "lemonade-server" in cmd
-                else "llama"
-                if "llama-server" in n
-                else "yaw"
-                if "yaw" in cmd
-                else None
-            )
-            if role:
-                procs.append((role, p, p.cpu_times()))
-
-    t1 = time.time()
-    time.sleep(0.25)
-    dt, ncpu = max(1e-4, time.time() - t1), psutil.cpu_count() or 1
-    ram, cpu = Counter(), Counter()
-    for role, p, ct1 in procs:
-        with contextlib.suppress(psutil.Error, OSError):
-            ram[role] += p.memory_info().rss
-            ct2 = p.cpu_times()
-            cpu[role] += ((ct2.user - ct1.user + ct2.system - ct1.system) / dt) / ncpu * 100.0
-
-    gpu = _nvidia_smi("memory.used,memory.total,utilization.gpu")
-    vram_used, vram_tot, gpu_util = gpu[:3] if len(gpu) >= 3 else (None, None, None)
-    vm = psutil.virtual_memory()
+            if any(k in n or k in cmd for k in ("lemonade", "llama-server", "yaw")):
+                rss += p.memory_info().rss
+    gpu = _nvidia_smi("memory.used,memory.total")
+    vram_used, vram_tot = gpu[:2] if len(gpu) >= 2 else (None, None)
     return {
-        "pipeline_ram_gb": round(sum(ram.values()) / 1024**3, 2),
-        "llama_ram_gb": round(ram["llama"] / 1024**3, 2),
-        "yaw_ram_gb": round(ram["yaw"] / 1024**3, 2),
-        "lemonade_ram_mb": round(ram["lemonade"] / 1024**2, 1),
+        "pipeline_ram_gb": round(rss / 1024**3, 2),
         "pipeline_vram_gb": round(vram_used / 1024.0, 2) if vram_used is not None else None,
         "total_vram_gb": round(vram_tot / 1024.0, 2) if vram_tot is not None else None,
-        "pipeline_cpu_pct": round(sum(cpu.values()), 1),
-        "llama_cpu_pct": round(cpu["llama"], 1),
-        "yaw_cpu_pct": round(cpu["yaw"], 1),
-        "lemonade_cpu_pct": round(cpu["lemonade"], 1),
-        "gpu_util_pct": round(gpu_util, 0) if gpu_util is not None else None,
-        "host_ram_used_gb": round(vm.used / 1024**3, 1),
-        "host_ram_total_gb": round(vm.total / 1024**3, 1),
-        "host_cpu_pct": round(psutil.cpu_percent(), 1),
     }
 
 
@@ -278,9 +282,12 @@ def get_empirical_telemetry_timeseries(
     current_passages: int,
     current_entities: int,
     current_triples: int,
-    db_stem: str = "sidecar",
+    db_stem: str = "",
 ) -> list[dict[str, Any]]:
-    t_file = WORKSPACE_ROOT / ".yaw" / f"{db_stem}_telemetry.json"
+    suffix = db_stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+    if suffix == "canonical":
+        suffix = ""
+    t_file = WORKSPACE_ROOT / ".yaw" / (f"optimize_telemetry_{suffix}.json" if suffix else "optimize_telemetry.json")
     cps: list[dict[str, Any]] = []
     if t_file.exists():
         with contextlib.suppress(Exception):
@@ -315,14 +322,20 @@ def get_empirical_telemetry_timeseries(
 
     # Interval rate/latency between consecutive real samples only; no seeded defaults.
     samples: list[dict[str, Any]] = []
-    prev: tuple[float, int] | None = None
+    prev: tuple[float, int, int] | None = None
     for i, cp in enumerate(deduped):
-        t_s, p_c = float(cp["time_sec"]), int(cp["passages"])
+        t_s, p_c, e_c = float(cp["time_sec"]), int(cp["passages"]), int(cp.get("entities", 0))
         vel = lat = None
         if prev is not None and t_s - prev[0] > 10:
             dt, dp = t_s - prev[0], max(0, p_c - prev[1])
             vel = round(dp / dt * 60.0, 2)
             lat = round(dt / dp, 1) if dp else None
+        if prev is not None and p_c - prev[1] > 0:
+            epc: float | None = round(max(0, e_c - prev[2]) / (p_c - prev[1]), 1)
+        elif p_c > 0:
+            epc = round(e_c / p_c, 1)
+        else:
+            epc = None
         samples.append(
             {
                 "index": i + 1,
@@ -333,9 +346,10 @@ def get_empirical_telemetry_timeseries(
                 "triples": cp["triples"],
                 "rolling_velocity": vel,
                 "rolling_latency": lat,
+                "entities_per_chunk": epc,
             }
         )
-        prev = (t_s, p_c)
+        prev = (t_s, p_c, e_c)
     return samples
 
 
@@ -353,42 +367,49 @@ def _read_status(status_file: Path) -> dict[str, Any]:
     return {}
 
 
-def _pid_alive(pid: Any) -> bool:
-    with contextlib.suppress(TypeError, ValueError, psutil.Error):
-        return int(pid) > 0 and psutil.pid_exists(int(pid))
-    return False
-
-
 def get_active_sandbox_info() -> dict[str, Any]:
     yaw_dir = WORKSPACE_ROOT / ".yaw"
-    dbs = (
-        sorted(yaw_dir.glob("yaw_optimize_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if yaw_dir.exists()
-        else []
+    seen_paths: set[Path] = set()
+    candidates: list[Path] = []
+    if yaw_dir.exists():
+        for p in [yaw_dir / "optimize_yaw.db", *yaw_dir.glob("optimize_yaw_*.db")]:
+            if p.is_file() and (rp := p.resolve()) not in seen_paths:
+                seen_paths.add(rp)
+                candidates.append(p)
+    dbs = sorted(
+        candidates,
+        key=lambda p: (is_file_locked(Path(f"{p}.lock")), p.stat().st_mtime, p.name),
+        reverse=True,
     )
     if not dbs:
         return {}
-    latest_db, sz = dbs[0], dbs[0].stat().st_size
-    ds_str = latest_db.stem.removeprefix("yaw_optimize_")
-    status = _read_status(yaw_dir / f"status_optimize_{ds_str}.json")
+    latest_db, st = dbs[0], dbs[0].stat()
+    sz = st.st_size
+    suffix = latest_db.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+    run_tag = suffix or "canonical"
+    status = _read_status(yaw_dir / (f"optimize_status_{suffix}.json" if suffix else "optimize_status.json"))
     active_op = str(status.get("active_op") or "")
-    optimizer_alive = _pid_alive(status.get("pid")) and status.get("lifecycle") not in (
+    optimizer_alive = is_file_locked(Path(f"{latest_db}.lock")) and status.get("lifecycle") not in (
         "stopped",
         "failed",
     )
 
-    def _parse_ts(p: Path) -> datetime | None:
-        with contextlib.suppress(Exception):
-            return datetime.strptime(p.stem[13:28], "%Y%m%d_%H%M%S").replace(tzinfo=UTC)
-        return None
+    pools_obj = _read_audit(_pools_path(run_tag))
+    start_dt = datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime), tz=UTC)
+    conn = _open_ro_sqlite(latest_db)
+    if conn is not None:
+        with contextlib.suppress(sqlite3.Error, ValueError, TypeError):
+            row = conn.execute("SELECT value FROM meta WHERE key = 'optimization_run'").fetchone()
+            if row and row[0]:
+                meta_run = json.loads(row[0])
+                if isinstance(meta_run, dict) and meta_run.get("started_at"):
+                    parsed_dt = datetime.fromisoformat(str(meta_run["started_at"]))
+                    start_dt = parsed_dt if parsed_dt.tzinfo else parsed_dt.replace(tzinfo=UTC)
 
-    pools_obj = _read_audit(_pools_path(ds_str))
-
-    start_dt = _parse_ts(latest_db) or datetime.now(UTC)
     info: dict[str, Any] = {
         "db_name": latest_db.name,
         "db_path": str(latest_db),
-        "datestamp": ds_str,
+        "datestamp": run_tag,
         "active_op": active_op,
         "optimizer_alive": optimizer_alive,
         "pools": pools_obj,
@@ -402,7 +423,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
         **_CACHE.get(str(latest_db), {}),
     }
 
-    conn = _open_ro_sqlite(latest_db)
     if not conn:
         return info
 
@@ -411,14 +431,12 @@ def get_active_sandbox_info() -> dict[str, Any]:
         with contextlib.suppress(sqlite3.Error):
             counts = dict(
                 zip(
-                    ("chunks", "entities", "facts", "edges", "openie_chunks"),
+                    ("chunks", "entities", "facts", "edges", "chunk_inference"),
                     get_graph_counts(conn),
                     strict=True,
                 )
             )
         diff_from_rows: list[tuple[str, str, str, str, str, str]] = []
-        related_rows: list[tuple[str, str]] = []
-        broader_rows: list[tuple[str, str]] = []
         related_assertions: list[tuple[str, str, str, str, str, str]] = []
         broader_assertions: list[tuple[str, str, str, str, str, str]] = []
         entity_details: dict[str, tuple[str, str, int]] = {}
@@ -426,44 +444,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
         alt_label_cnt = 0
         largest_label_info: dict[str, Any] = {}
         with contextlib.suppress(sqlite3.Error):
-            diff_from_rows = [
-                (str(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]))
-                for r in conn.execute(
-                    """
-                    SELECT a.entity_id, a.name, COALESCE(a.definition, ''),
-                           b.entity_id, b.name, COALESCE(b.definition, '')
-                    FROM edges e
-                    JOIN entities a ON a.entity_id = e.src_id
-                    JOIN entities b ON b.entity_id = e.dst_id
-                    WHERE e.kind = 'owl:differentFrom' AND e.src_id < e.dst_id
-                    ORDER BY e.rowid DESC
-                    """
-                ).fetchall()
-            ]
-            related_rows = [
-                (str(r[0]), str(r[1]))
-                for r in conn.execute(
-                    """
-                    SELECT a.name, b.name
-                    FROM edges e
-                    JOIN entities a ON a.entity_id = e.src_id
-                    JOIN entities b ON b.entity_id = e.dst_id
-                    WHERE e.kind = 'skos:related' AND e.src_id < e.dst_id
-                    """
-                ).fetchall()
-            ]
-            broader_rows = [
-                (str(r[0]), str(r[1]))
-                for r in conn.execute(
-                    """
-                    SELECT a.name, b.name
-                    FROM edges e
-                    JOIN entities a ON a.entity_id = e.src_id
-                    JOIN entities b ON b.entity_id = e.dst_id
-                    WHERE e.kind = 'skos:broader'
-                    """
-                ).fetchall()
-            ]
+            diff_from_rows = recent_relation_assertions(conn, "owl:differentFrom", limit=100000)
             alt_label_cnt = int(
                 (
                     conn.execute(
@@ -494,18 +475,16 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 """
             ).fetchone()
             if largest_label_row:
-                top_eid = str(largest_label_row[0])
-                top_name = str(largest_label_row[1])
-                top_cnt = int(largest_label_row[2])
+                top_eid, top_name, top_cnt = (
+                    str(largest_label_row[0]),
+                    str(largest_label_row[1]),
+                    int(largest_label_row[2]),
+                )
                 labels_for_node = [
                     (str(r[0]), str(r[1]))
                     for r in conn.execute(
-                        """
-                        SELECT label_kind, raw_label
-                        FROM entity_labels
-                        WHERE entity_id = ?
-                        ORDER BY label_kind ASC, raw_label ASC
-                        """,
+                        "SELECT label_kind, raw_label FROM entity_labels WHERE entity_id = ? "
+                        "ORDER BY label_kind ASC, raw_label ASC",
                         (top_eid,),
                     ).fetchall()
                 ]
@@ -522,82 +501,46 @@ def get_active_sandbox_info() -> dict[str, Any]:
                     SELECT src_id, dst_id, kind
                     FROM edges
                     WHERE kind IN ('fact', 'skos:related', 'skos:broader', 'owl:differentFrom')
-                      AND (kind = 'skos:broader' OR src_id < dst_id)
+                      AND (kind IN ('fact', 'skos:broader') OR src_id < dst_id)
                     """
                 ).fetchall()
             ]
             related_assertions = recent_relation_assertions(conn, "skos:related")
             broader_assertions = recent_relation_assertions(conn, "skos:broader", limit=5)
-        rows = conn.execute(
-            "SELECT chunk_id, entities_json, triples_json, structured_triples_json "
-            "FROM openie_chunks ORDER BY rowid ASC"
-        ).fetchall()
 
+        indexed_ids: set[str] = set()
         cum_e = cum_t = 0
-        uniq_e, uniq_edges, preds, recent, raw_counts, triples_raw = (
-            set(),
-            set(),
-            Counter(),
-            [],
-            Counter(),
-            [],
-        )
-        for idx, (cid, ej, tj, _stj) in enumerate(rows):
-            ents = json.loads(ej or "[]") if ej else []
-            trips = json.loads(tj or "[]") if tj else []
-            cum_e, cum_t = cum_e + len(ents), cum_t + len(trips)
-            for e in ents:
-                if name := str(e[0] if isinstance(e, (list, tuple)) else e).strip():
-                    uniq_e.add(name)
-                    raw_counts[name] += 1
-            for t in trips:
-                if isinstance(t, (list, tuple)) and len(t) >= 3:
-                    s, p, o = (
-                        str(t[0][0] if isinstance(t[0], (list, tuple)) else t[0]).strip(),
-                        str(t[1]).strip(),
-                        str(t[2][0] if isinstance(t[2], (list, tuple)) else t[2]).strip(),
-                    )
-                    if p:
-                        preds[p] += 1
-                    if s and o and s != o:
-                        uniq_edges.add(tuple(sorted((s, o))))
-                    if s and p and o:
-                        triples_raw.append((s, p, o, str(cid)))
-                        raw_counts[s] += 1
-                        raw_counts[o] += 1
-            if idx >= len(rows) - 4:
-                recent.append({"chunk_id": cid, "entity_count": len(ents), "triple_count": len(trips)})
+        with contextlib.suppress(sqlite3.Error):
+            for cid, ext_raw in conn.execute("SELECT chunk_id, extraction_json FROM chunk_inference"):
+                indexed_ids.add(str(cid))
+                ext = json.loads(ext_raw or "{}")
+                cum_e += len(ext.get("entities") or ())
+                cum_t += len(ext.get("triples") or ())
 
         info["counts"] = counts
-        info["indexed_chunk_ids"] = {str(r[0]) for r in rows}
+        info["indexed_chunk_ids"] = indexed_ids
         info["kg_metrics"] = {
             "total_entities": cum_e,
-            "unique_entities": len(uniq_e),
-            "avg_entities_per_chunk": round(cum_e / max(1, len(rows)), 1),
             "total_triples": cum_t,
-            "unique_edges": len(uniq_edges),
-            "avg_triples_per_chunk": round(cum_t / max(1, len(rows)), 1),
-            "unique_predicates": len(preds),
-            "top_predicates": preds.most_common(6),
-            "recent_extractions": recent,
             "different_from_pairs": len(diff_from_rows),
-            "related_pairs": len(related_rows),
-            "broader_pairs": len(broader_rows),
+            "related_pairs": sum(
+                1 for u, v, k in graph_edges if k == "skos:related" and u in entity_details and v in entity_details
+            ),
+            "broader_pairs": sum(
+                1 for u, v, k in graph_edges if k == "skos:broader" and u in entity_details and v in entity_details
+            ),
             "synonym_merges": alt_label_cnt,
         }
-        info["graph_cache"] = (raw_counts, triples_raw, diff_from_rows, related_rows, broader_rows)
         info["kg_graph"] = {
             "entities": entity_details,
             "edges": graph_edges,
             "diff_from_rows": diff_from_rows,
-            "related_rows": related_rows,
-            "broader_rows": broader_rows,
             "related_assertion_rows": related_assertions,
             "broader_assertion_rows": broader_assertions,
             "largest_label_node": largest_label_info,
         }
         info["timeseries_samples"] = get_empirical_telemetry_timeseries(
-            start_dt, info["elapsed_seconds"], len(rows), cum_e, cum_t, latest_db.stem
+            start_dt, info["elapsed_seconds"], len(indexed_ids), cum_e, cum_t, suffix
         )
         _CACHE.clear()
         _CACHE[str(latest_db)] = {
@@ -606,7 +549,6 @@ def get_active_sandbox_info() -> dict[str, Any]:
                 "counts",
                 "indexed_chunk_ids",
                 "kg_metrics",
-                "graph_cache",
                 "kg_graph",
                 "timeseries_samples",
             )
@@ -623,13 +565,15 @@ _AUDIT_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 _CAND_METRICS = ("r1", "r2", "r5", "r10", "r20", "em", "f1")
 
 
-def _audit_path(datestamp: str) -> Path:
-    return WORKSPACE_ROOT / ".yaw" / f"compiled_program_optimize_{datestamp}_graph_rlm_audit.json"
+def _audit_path(tag: str) -> Path:
+    name = "optimize_program_audit.json" if tag in {"", "canonical"} else f"optimize_program_{tag}_audit.json"
+    return WORKSPACE_ROOT / ".yaw" / name
 
 
-def _pools_path(datestamp: str) -> Path:
+def _pools_path(tag: str) -> Path:
     """Split/pool manifest the engine writes as soon as the optimization pools are built."""
-    return WORKSPACE_ROOT / ".yaw" / f"compiled_program_optimize_{datestamp}_pools.json"
+    name = "optimize_program_pools.json" if tag in {"", "canonical"} else f"optimize_program_{tag}_pools.json"
+    return WORKSPACE_ROOT / ".yaw" / name
 
 
 def _read_audit(path: Path) -> dict[str, Any]:
@@ -652,27 +596,18 @@ def _read_audit(path: Path) -> dict[str, Any]:
     return obj
 
 
-def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]], int, bool]:
-    """Return (per-candidate rows, total evals, legacy) for the ACTIVE run only.
-
-    Rows come from the engine's `candidate_records` (one row per distinct predictor-surface
-    fingerprint, numbered in first-evaluation order). Audits written before candidate tagging
-    only carry per-eval rows; those are returned one-per-eval with `legacy=True` so the x-axis
-    is labelled honestly. No other run's files and no synthesized metrics are ever used.
-    """
+def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """Return (per-candidate rows, total evals) for the ACTIVE run only."""
     ds = sandbox.get("datestamp")
     if not ds:
-        return [], 0, False
+        return [], 0
     obj = _read_audit(_audit_path(str(ds)))
     evals = [r for r in (obj.get("eval_records") or []) if isinstance(r, dict)]
     raw = [r for r in (obj.get("candidate_records") or []) if isinstance(r, dict)]
-    legacy = not raw and bool(evals)
-    if legacy:
-        raw = [dict(r, cand=i + 1, n=1) for i, r in enumerate(evals)]
     n_evals = sum(int(r.get("n", 1)) for r in raw)
     evaluations_by_candidate: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for i, evaluation in enumerate(evals):
-        candidate = i + 1 if legacy else evaluation.get("cand")
+        candidate = evaluation.get("cand")
         if candidate is None:
             continue
         evaluations_by_candidate[int(candidate)].append(
@@ -708,54 +643,21 @@ def load_candidate_records(sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]
     for row in rows:
         best = max(best, row["eff_score"])
         row["best_so_far"] = best
-    return rows, n_evals, legacy
-
-
-def read_config_info() -> dict[str, Any]:
-    with contextlib.suppress(Exception):
-        import tomllib
-
-        return tomllib.loads((WORKSPACE_ROOT / "yaw.toml").read_text("utf-8")).get("optimization", {})
-    return {
-        "mode": "hybrid",
-        "datasets": ["enterprise_rag_bench"],
-        "max_queries": 250,
-        "train_queries": 150,
-        "auto": "light",
-    }
-
-
-def _atomic_write(path: Path, write: Any) -> None:
-    """Render to a unique temp file and rename with retries to withstand Windows file watchers."""
-    tmp = path.with_name(f".{path.stem}.{os.getpid()}_{time.time_ns()}.tmp{path.suffix}")
-    try:
-        write(tmp)
-        for attempt in range(6):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                if attempt == 5:
-                    write(path)
-                    return
-                time.sleep(0.04 * (2**attempt))
-    finally:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+    return rows, n_evals
 
 
 def _save(fig: plt.Figure, *paths: Path) -> None:
     try:
         for p in paths:
             if p.suffix == ".png":
-                _atomic_write(p, lambda t: fig.savefig(t, format="png", dpi=110))
+                write_via_temp_atomic(p, lambda t: fig.savefig(t, format="png", dpi=110))
             else:
-                _atomic_write(p, fig.savefig)
+                write_via_temp_atomic(p, fig.savefig)
     finally:
         plt.close(fig)
 
 
-def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str, Any]) -> None:
+def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any]) -> None:
     pt, kg, lem, samples = (
         PoolTelemetry.from_sandbox(sandbox),
         sandbox.get("kg_metrics", {}),
@@ -781,14 +683,16 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         fontweight="bold",
     )
     rate = f"{pt.velocity:.2f}/m" if pt.velocity is not None else "n/a"
-    tps = f"{lem['qwen_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
+    tps = f"{lem['llm_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
+    eta_str = pt.duration(pt.corpus_eta_min if pt.corpus_eta_min is not None else pt.val_eta_min)
     fig.text(
         0.04,
         0.91,
-        f"Val chunks: {pt.frac(pt.val_done, pt.val_pool)} | "
-        f"Train chunks: {pt.frac(pt.train_done, pt.train_pool)} | "
-        f"Indexed: {pt.openie_cnt} | Rate (20 min): {rate} | {tps} | "
-        f"Val ETA: {pt.duration(pt.val_eta_min)}",
+        f"Corpus: {pt.frac(pt.openie_cnt, pt.corpus_pool)} | "
+        f"Train: {pt.frac(pt.train_done, pt.train_pool)} | "
+        f"Val: {pt.frac(pt.val_done, pt.val_pool)} | "
+        f"Rate (20 min): {rate} | {tps} | "
+        f"ETA: {eta_str}",
         fontsize=9,
         color="#38bdf8",
         fontweight="bold",
@@ -806,7 +710,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         label=f"Indexed chunks ({pt.openie_cnt})",
     )
     proj_end = pt.elapsed_hours
-    if pt.val_eta_min is not None and pt.val_pool is not None and pt.val_done is not None:
+    if pt.val_eta_min is not None and pt.val_pool is not None and pt.val_done is not None and pt.val_done < pt.val_pool:
         # Projection uses the measured 20-minute rate; it only covers the upfront val pool.
         proj_end = pt.elapsed_hours + pt.val_eta_min / 60.0
         ax1.plot(
@@ -817,12 +721,25 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
             ls="--",
             label="Val-pool projection",
         )
+    elif pt.corpus_eta_min is not None and pt.corpus_pool is not None and pt.openie_cnt < pt.corpus_pool:
+        proj_end = pt.elapsed_hours + pt.corpus_eta_min / 60.0
+        ax1.plot(
+            [pt.elapsed_hours, proj_end],
+            [pt.openie_cnt, pt.corpus_pool],
+            color="#38bdf8",
+            lw=1.0,
+            ls="--",
+            label="Corpus projection",
+        )
     y_top = max(10.0, float(pt.openie_cnt))
+    seen_pools: set[int] = set()
     for pool, col, lbl in (
         (pt.val_pool, "#10b981", "Val pool"),
-        (pt.corpus_pool, "#f59e0b", "Train + val pool"),
+        (pt.train_val_pool, "#f59e0b", "Train + val pool"),
+        (pt.corpus_pool, "#64748b", "Full corpus"),
     ):
-        if pool:
+        if pool and pool not in seen_pools:
+            seen_pools.add(pool)
             ax1.axhline(pool, color=col, ls="--", lw=1.0, label=f"{lbl} ({pool})")
             y_top = max(y_top, float(pool))
     ax1_r.plot(
@@ -853,32 +770,32 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
         fontsize=8,
     )
 
-    rv = [(float(s["time_hours"]), s["rolling_velocity"]) for s in samples]
-    rv = [(t, v) for t, v in rv if v is not None]
-    rl = [(float(s["time_hours"]), s["rolling_latency"]) for s in samples]
+    rl = [(float(s["time_hours"]), s.get("rolling_latency")) for s in samples]
     rl = [(t, v) for t, v in rl if v is not None]
-    if rv:
+    epc = [(float(s["time_hours"]), s.get("entities_per_chunk")) for s in samples]
+    epc = [(t, v) for t, v in epc if v is not None]
+    if rl:
         ax2.plot(
-            *zip(*rv, strict=True),
+            *zip(*rl, strict=True),
             color="#10b981",
             lw=1.0,
             marker="o",
             ms=2.5,
-            label="Interval rate (chunks/min)",
+            label="Throughput (s/chunk)",
         )
-        ax2.set_ylim(0.0, max(1.0, max(v for _, v in rv) * 1.25))
-    if rl:
+        ax2.set_ylim(0.0, max(1.0, max(v for _, v in rl) * 1.25))
+    if epc:
         ax2_r.plot(
-            *zip(*rl, strict=True),
+            *zip(*epc, strict=True),
             color="#fbbf24",
             lw=1.0,
             ls="--",
             marker="o",
             ms=2.5,
-            label="Interval latency (s/chunk)",
+            label="Extraction (entities/chunk)",
         )
-        ax2_r.set_ylim(0.0, max(1.0, max(v for _, v in rl) * 1.25))
-    if not rv and not rl:
+        ax2_r.set_ylim(0.0, max(1.0, max(v for _, v in epc) * 1.25))
+    if not rl and not epc:
         ax2.text(
             0.5,
             0.5,
@@ -889,8 +806,8 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
             color="#94a3b8",
         )
     ax2_r.grid(False)
-    ax2.set_ylabel("Rate (/min)", color="#10b981", fontweight="bold")
-    ax2_r.set_ylabel("Latency (s)", color="#fbbf24", fontweight="bold")
+    ax2.set_ylabel("Throughput (s/chunk)", color="#10b981", fontweight="bold")
+    ax2_r.set_ylabel("Entities / chunk", color="#fbbf24", fontweight="bold")
     ax2.set_xlabel("Wall-clock time since sandbox creation (hours) →", fontweight="bold")
     handles = ax2.get_legend_handles_labels()[0] + ax2_r.get_legend_handles_labels()[0]
     if handles:
@@ -905,15 +822,15 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any], cfg: dict[str
 
 
 def largest_one_hop_neighborhood(edges: list[tuple[str, str, str]]) -> set[str]:
-    """Largest induced component one hop from related/differentFrom endpoints."""
+    """Largest induced component one hop from semantic/taxonomic endpoints."""
     adjacency: dict[str, set[str]] = defaultdict(set)
     seeds: set[str] = set()
     for u, v, kind in edges:
-        if kind not in {"fact", "skos:related", "owl:differentFrom"} or u == v:
+        if kind not in {"fact", "skos:related", "owl:differentFrom", "skos:broader"} or u == v:
             continue
         adjacency[u].add(v)
         adjacency[v].add(u)
-        if kind in {"skos:related", "owl:differentFrom"}:
+        if kind in {"skos:related", "owl:differentFrom", "skos:broader"}:
             seeds.update((u, v))
     selected = seeds | {node for seed in seeds for node in adjacency[seed]}
     remaining = set(selected)
@@ -959,16 +876,7 @@ def generate_graph_projection_svg(
 ) -> dict[str, Any]:
     if layout_iterations < 1:
         raise ValueError("layout_iterations must be positive")
-    kg_g = sandbox.get("kg_graph")
-    if not kg_g:
-        _placeholder_svg(
-            dest,
-            "Fig. 2: Knowledge Graph Network & Disambiguation",
-            badge,
-            f"No extracted entities yet in {sandbox.get('db_name', 'the active sandbox')}",
-        )
-        return {}
-
+    kg_g = sandbox.get("kg_graph") or {}
     entities: dict[str, tuple[str, str, int]] = kg_g.get("entities", {})
     all_edges: list[tuple[str, str, str]] = kg_g.get("edges", [])
     diff_from_rows: list[tuple[str, str, str, str, str, str]] = kg_g.get("diff_from_rows", [])
@@ -982,11 +890,11 @@ def generate_graph_projection_svg(
         )
         return {}
 
-    # Slice to 1000 edges to limit graph size
-    all_edges_tail = all_edges[-1000:]
-    selected = largest_one_hop_neighborhood(all_edges_tail)
+    selected = largest_one_hop_neighborhood(all_edges)
     # Counts and colors describe only the connected neighborhood actually shown.
-    all_edges_tail = [(u, v, k) for u, v, k in all_edges_tail if u in selected and v in selected]
+    all_edges_tail = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected][-1000:]
+    if len(all_edges_tail) == 1000:
+        selected = {u for u, v, _ in all_edges_tail} | {v for u, v, _ in all_edges_tail}
     diff_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "owl:differentFrom"} | {
         v for u, v, k in all_edges_tail if k == "owl:differentFrom"
     }
@@ -1007,7 +915,12 @@ def generate_graph_projection_svg(
 
     nodes = sorted(
         selected,
-        key=lambda x: (x in diff_nodes, x in broader_nodes, x in rel_nodes, len(inc_fact[x])),
+        key=lambda x: (
+            x in diff_nodes,
+            x in broader_nodes,
+            x in rel_nodes,
+            len(inc_fact[x]),
+        ),
         reverse=True,
     )
     if not nodes:
@@ -1137,57 +1050,23 @@ def generate_graph_projection_svg(
         fontweight="bold",
     )
 
-    # 1. Fact Triple Edges (solid slate)
-    if fact_segs:
-        ax.add_collection(
-            LineCollection(
-                [[pos[u], pos[v]] for u, v in fact_segs],
-                colors="#475569",
-                linewidths=1,
-                linestyles="solid",
-                alpha=0.8,
-                zorder=1,
+    for segs, col, lw, alpha, z in (
+        (fact_segs, "#475569", 1, 0.8, 1),
+        (rel_segs, "#c084fc", 1, 0.8, 2),
+        (broader_segs, "#eab308", 1.2, 0.85, 2),
+        (diff_segs, "#f43f5e", 1, 0.8, 3),
+    ):
+        if segs:
+            ax.add_collection(
+                LineCollection(
+                    [[pos[u], pos[v]] for u, v in segs],
+                    colors=col,
+                    linewidths=lw,
+                    linestyles="solid",
+                    alpha=alpha,
+                    zorder=z,
+                )
             )
-        )
-
-    # 2. skos:related Edges (purple / violet)
-    if rel_segs:
-        ax.add_collection(
-            LineCollection(
-                [[pos[u], pos[v]] for u, v in rel_segs],
-                colors="#c084fc",
-                linewidths=1,
-                linestyles="solid",
-                alpha=0.8,
-                zorder=2,
-            )
-        )
-
-    # 3. skos:broader Edges (warm amber/yellow)
-    if broader_segs:
-        ax.add_collection(
-            LineCollection(
-                [[pos[u], pos[v]] for u, v in broader_segs],
-                colors="#eab308",
-                linewidths=1.2,
-                linestyles="solid",
-                alpha=0.85,
-                zorder=2,
-            )
-        )
-
-    # 4. owl:differentFrom Edges (crimson)
-    if diff_segs:
-        ax.add_collection(
-            LineCollection(
-                [[pos[u], pos[v]] for u, v in diff_segs],
-                colors="#f43f5e",
-                linewidths=1,
-                linestyles="solid",
-                alpha=0.8,
-                zorder=3,
-            )
-        )
 
     # Compute node cardinality (degree of active edges in the view)
     deg_map: dict[str, int] = defaultdict(int)
@@ -1235,16 +1114,19 @@ def generate_graph_projection_svg(
             edgecolors.append("#0f172a")
             lws.append(0.5)
 
-    ax.scatter(pos[:, 0], pos[:, 1], s=sizes, c=colors, edgecolors=edgecolors, linewidths=lws, zorder=4)
+    ax.scatter(
+        pos[:, 0],
+        pos[:, 1],
+        s=sizes,
+        c=colors,
+        edgecolors=edgecolors,
+        linewidths=lws,
+        zorder=4,
+    )
 
     # Entity Name Labels:
     # Show entity names exclusively for both ends of owl:differentFrom disambiguation;
     # other entity names are suppressed per user request.
-    diff_peer_map: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
-    for ea, na, da, eb, nb, db in diff_from_rows:
-        diff_peer_map[ea].append((eb, nb, db))
-        diff_peer_map[eb].append((ea, na, da))
-
     label_nodes: set[str] = set()
     label_pairs = 0
     for ea, _na, _da, eb, _nb, _db in diff_from_rows:
@@ -1257,19 +1139,7 @@ def generate_graph_projection_svg(
         if eid not in idx:
             continue
         i = idx[eid]
-        name, defn, _ = entities.get(eid, (eid, "", 1))
-        # Could well be possible to just show the name to save space
-        #        peers = diff_peer_map.get(eid, [])
-        #        has_homograph = any(
-        #            p_name.strip().lower() == name.strip().lower() for _, p_name, _ in peers
-        #        )
-        #        if has_homograph:
-        #            words = [w for w in defn.replace(";", " ").replace(".", " ").split() if len(w) > 2]
-        #            hint = " ".join(words[:2]) if words else eid[-4:]
-        #            disp_label = f"{name} [{hint}]"
-        #        else:
-        disp_label = name
-
+        disp_label = entities.get(eid, (eid, "", 1))[0]
         ax.text(
             pos[i, 0],
             pos[i, 1] + 4.0,
@@ -1285,77 +1155,23 @@ def generate_graph_projection_svg(
 
     # Legend explaining edge types and node sizing
     legend_elements = [
-        Line2D(
-            [0],
-            [0],
-            color="#f43f5e",
-            lw=1.0,
-            ls="-",
-            label=f"owl:differentFrom ({len(diff_segs)} active \u2260)",
+        *(
+            Line2D([0], [0], color=c, lw=lw, ls="-", label=lbl)
+            for c, lw, lbl in (
+                ("#f43f5e", 1.0, f"owl:differentFrom ({len(diff_segs)} active \u2260)"),
+                ("#eab308", 1.2, f"skos:broader ({len(broader_segs)} hierarchy)"),
+                ("#c084fc", 1.0, f"skos:related ({len(rel_segs)} links)"),
+                ("#475569", 1.0, f"Fact relationships ({len(fact_segs)} edges)"),
+            )
         ),
-        Line2D(
-            [0],
-            [0],
-            color="#eab308",
-            lw=1.2,
-            ls="-",
-            label=f"skos:broader ({len(broader_segs)} hierarchy)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color="#c084fc",
-            lw=1.0,
-            ls="-",
-            label=f"skos:related ({len(rel_segs)} links)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color="#475569",
-            lw=1.0,
-            ls="-",
-            label=f"Fact relationships ({len(fact_segs)} edges)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="w",
-            markerfacecolor="#fef08a",
-            markeredgecolor="#eab308",
-            markersize=7,
-            label=f"skos:broader concept ({len(broader_nodes)} warm yellow)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="w",
-            markerfacecolor="#8b5cf6",
-            markeredgecolor="#a3e635",
-            markersize=6,
-            label="Cardinality: violet (low) \u2192 lime (high)",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="w",
-            markerfacecolor="#f43f5e",
-            markeredgecolor="w",
-            markersize=8,
-            label="owl:differentFrom assertions",
-        ),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="w",
-            markerfacecolor="#818cf8",
-            markeredgecolor="#0f172a",
-            markersize=6,
-            label="Node size ~ skos:*Label count",
+        *(
+            Line2D([0], [0], marker="o", color="w", markerfacecolor=fc, markeredgecolor=ec, markersize=ms, label=lbl)
+            for fc, ec, ms, lbl in (
+                ("#fef08a", "#eab308", 7, f"skos:broader concept ({len(broader_nodes)} warm yellow)"),
+                ("#8b5cf6", "#a3e635", 6, "Cardinality: violet (low) \u2192 lime (high)"),
+                ("#f43f5e", "w", 8, "owl:differentFrom assertions"),
+                ("#818cf8", "#0f172a", 6, "Node size ~ skos:*Label count"),
+            )
         ),
     ]
     ax.legend(
@@ -1370,13 +1186,73 @@ def generate_graph_projection_svg(
 
     ax.set_xticks([])
     ax.set_yticks([])
-    _save(fig, dest)
+    if dest.suffix == ".png":
+        from PIL import Image
+
+        tag = str(sandbox.get("datestamp") or "")
+        if sandbox.get("frame_dir"):
+            frame_dir = Path(sandbox["frame_dir"])
+        elif tag in {"", "canonical"}:
+            frame_dir = WORKSPACE_ROOT / ".yaw" / "optimize_kg_frames"
+        else:
+            frame_dir = WORKSPACE_ROOT / ".yaw" / f"optimize_kg_frames_{tag}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        state_key = (
+            n_cnt,
+            len(fact_segs),
+            len(rel_segs),
+            len(broader_segs),
+            len(diff_segs),
+            int(sandbox.get("counts", {}).get("chunk_inference", 0)),
+        )
+        frame_name = (
+            f"frame_{state_key[5]:05d}_{state_key[0]:05d}_{state_key[1]:05d}_"
+            f"{state_key[2]:05d}_{state_key[3]:05d}_{state_key[4]:05d}.png"
+        )
+        frame_path = frame_dir / frame_name
+        try:
+            if not frame_path.exists():
+                write_via_temp_atomic(frame_path, lambda t: fig.savefig(t, format="png", dpi=110))
+            for stale_f in frame_dir.glob(f"frame_{state_key[5]:05d}_*.png"):
+                if stale_f != frame_path:
+                    with contextlib.suppress(OSError):
+                        stale_f.unlink(missing_ok=True)
+        finally:
+            plt.close(fig)
+        frame_files = sorted(frame_dir.glob("frame_*.png"))
+        if len(frame_files) > 24:
+            for old_f in frame_files[:-24]:
+                with contextlib.suppress(OSError):
+                    old_f.unlink(missing_ok=True)
+            frame_files = frame_files[-24:]
+        frames: list[Image.Image] = []
+        for fp in frame_files:
+            with Image.open(fp) as im:
+                frames.append(im.convert("RGBA"))
+        if len(frames) >= 2:
+            durations = [450] * (len(frames) - 1) + [1800]
+            write_via_temp_atomic(
+                dest,
+                lambda t: frames[0].save(
+                    t,
+                    format="PNG",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=0,
+                ),
+            )
+        elif frames:
+            write_via_temp_atomic(dest, lambda t: frames[0].save(t, format="PNG"))
+    else:
+        _save(fig, dest)
     return {
         "nodes_rendered": n_cnt,
         "diff_nodes": len(diff_nodes),
         "active_edges": len(active_edge_arr),
         "diff_edges": len(diff_segs),
         "related_edges": len(rel_segs),
+        "broader_edges": len(broader_segs),
         "fact_edges": len(fact_segs),
         "layout_iterations": layout_iterations,
     }
@@ -1428,17 +1304,12 @@ def _create_dark_figure(
     return fig, axes
 
 
-def _candidate_xaxis(ax: plt.Axes, cands: list[dict[str, Any]], legacy: bool) -> None:
+def _candidate_xaxis(ax: plt.Axes, cands: list[dict[str, Any]]) -> None:
     """Integer candidate axis with fixed padding so 1..N candidates never autoscale oddly."""
     hi = max(int(c["cand"]) for c in cands)
     ax.set_xlim(0.4, hi + 0.6)
-    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=14, min_n_ticks=1))
-    ax.set_xlabel(
-        "Evaluation # (legacy audit without candidate tags) →"
-        if legacy
-        else "Candidate # (order of first evaluation) →",
-        fontweight="bold",
-    )
+    ax.xaxis.set_major_locator(ticker.MultipleLocator(1) if hi < 14 else ticker.MaxNLocator(integer=True, nbins=14))
+    ax.set_xlabel("Candidate # (order of first evaluation) →", fontweight="bold")
 
 
 def _no_candidates_message(sandbox: dict[str, Any]) -> str:
@@ -1449,14 +1320,13 @@ def _no_candidates_message(sandbox: dict[str, Any]) -> str:
     db = sandbox.get("db_name")
     if not sandbox.get("optimizer_alive"):
         return f"No candidate evaluations recorded for {db}\n(optimizer stopped)"
-    prog = f"Upfront Indexing: {pt.frac(pt.val_done, pt.val_pool)} validation chunks"
+    prog = f"Corpus Indexing: {pt.frac(pt.openie_cnt, pt.corpus_pool)} (Val: {pt.frac(pt.val_done, pt.val_pool)})"
     return f"{prog} • Candidate evolution begins once indexed\nActive: {op}"
 
 
 def generate_candidate_score_svg(
     dest: Path,
     cands: list[dict[str, Any]],
-    legacy: bool,
     badge: tuple[str, str],
     sandbox: dict[str, Any],
 ) -> None:
@@ -1503,6 +1373,11 @@ def generate_candidate_score_svg(
             color="#cbd5e1",
         )
         ax_eval.set_xlim(min(eval_x) - 0.5, max(eval_x) + 0.5)
+        ax_eval.xaxis.set_major_locator(
+            ticker.MultipleLocator(1)
+            if (max(eval_x) - min(eval_x)) < 14
+            else ticker.MaxNLocator(integer=True, nbins=14)
+        )
         ax_eval.legend(loc="upper left", fontsize=8)
         ax_eval.set_xlabel(f"Evaluation # → (recent {len(evaluations)} recorded; older points may be evicted)")
     else:
@@ -1515,8 +1390,8 @@ def generate_candidate_score_svg(
             color="#cbd5e1",
         )
         ax_eval.set_xlabel("Evaluation # →")
+        ax_eval.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax_eval.set_ylim(-3, 105)
-    ax_eval.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax_eval.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
     ax_eval.set_ylabel("Score (%)")
 
@@ -1567,7 +1442,7 @@ def generate_candidate_score_svg(
     ax1.yaxis.set_major_formatter(ticker.PercentFormatter(decimals=0))
     ax1.set_ylabel("Score (%)", color="#10b981", fontweight="bold")
     ax1.legend(loc="upper left", ncol=2, fontsize=8)
-    _candidate_xaxis(ax1, cands, legacy)
+    _candidate_xaxis(ax1, cands)
 
     lat = np.array([c["s_per_it"] for c in cands])
     ax2.bar(x, lat, width=0.6, color="#f43f5e", alpha=0.75, label="Mean latency per eval")
@@ -1577,14 +1452,13 @@ def generate_candidate_score_svg(
             ax2.text(c["cand"], li, f"n={c['n']}", ha="center", va="bottom", fontsize=7, color="#cbd5e1")
     ax2.set_ylabel("Latency (s / eval)", color="#f43f5e", fontweight="bold")
     ax2.legend(loc="upper left", fontsize=8)
-    _candidate_xaxis(ax2, cands, legacy)
+    _candidate_xaxis(ax2, cands)
     _save(fig, dest)
 
 
 def generate_candidate_quality_svg(
     dest: Path,
     cands: list[dict[str, Any]],
-    legacy: bool,
     badge: tuple[str, str],
     sandbox: dict[str, Any],
 ) -> None:
@@ -1644,14 +1518,13 @@ def generate_candidate_quality_svg(
     ax2.plot(x, [c["em"] * 100.0 for c in cands], color="#fbbf24", lw=1.0, marker="s", ms=ms, label="EM")
     ax2.set_ylabel("Mean QA Score", color="#f43f5e", fontweight="bold")
     ax2.legend(loc="lower right", bbox_to_anchor=(1.0, 1.0), ncol=2, fontsize=8)
-    _candidate_xaxis(ax2, cands, legacy)
+    _candidate_xaxis(ax2, cands)
     _save(fig, dest)
 
 
 def generate_pareto_svg(
     dest: Path,
     cands: list[dict[str, Any]],
-    legacy: bool,
     badge: tuple[str, str],
     sandbox: dict[str, Any],
 ) -> None:
@@ -1769,12 +1642,21 @@ def generate_pareto_svg(
     _save(fig, dest)
 
 
+def _truncate_def(text: str, limit: int = 120) -> str:
+    s = " ".join(text.strip().split())
+    if not s:
+        return "n/a"
+    if len(s) <= limit:
+        return s
+    cut = s[: max(1, limit - 1)].rsplit(" ", 1)[0].rstrip(".,;:")
+    return f"{cut or s[: max(1, limit - 1)]}…"
+
+
 def generate_report_markdown(
     dest: Path,
     sandbox: dict[str, Any],
     cands: list[dict[str, Any]],
     n_evals: int,
-    legacy: bool,
     badge: tuple[str, str],
 ) -> None:
     """Every value below is read from the run's DB, its engine manifests, or live probes."""
@@ -1801,19 +1683,19 @@ def generate_report_markdown(
         ("Dataset Split", split),
         (
             "Indexing (OpenIE)",
-            f"Val chunks **`{pt.frac(pt.val_done, pt.val_pool)}`** • "
-            f"Train chunks **`{pt.frac(pt.train_done, pt.train_pool)}`** • "
-            f"Indexed **`{pt.openie_cnt}`** of `{_v(pt.corpus_pool)}` train+val chunks • "
-            f"Val ETA `{pt.duration(pt.val_eta_min)}`",
+            f"Corpus **`{pt.frac(pt.openie_cnt, pt.corpus_pool)}`** "
+            f"(Train gold **`{pt.frac(pt.train_done, pt.train_pool)}`** • "
+            f"Val gold **`{pt.frac(pt.val_done, pt.val_pool)}`** • "
+            f"Background **`{pt.frac(pt.background_done, pt.background_pool)}`**) • "
+            f"ETA `{pt.duration(pt.corpus_eta_min if pt.corpus_eta_min is not None else pt.val_eta_min)}`",
         ),
     ]
     if cands:
         last = cands[-1]
-        unit = "evals (legacy, untagged)" if legacy else "candidates"
         rows.append(
             (
                 "Optimizer Candidates",
-                f"**`{len(cands)}` {unit}** (`{n_evals}` evals) • "
+                f"**`{len(cands)}` candidates** (`{n_evals}` evals) • "
                 f"Latest `#{last['cand']}` (n=`{last['n']}`): "
                 f"R@5 `{last['r5'] * 100:.0f}%`, F1 `{last['f1'] * 100:.1f}%`",
             )
@@ -1838,7 +1720,7 @@ def generate_report_markdown(
             "Throughput",
             f"**`{_v(pt.velocity, '{:.2f}')}` chunks/min** (last 20 min, "
             f"`{_v(pt.sec_per_chunk, '{:.1f}')}` s/chunk) • LLM "
-            f"**`{_v(lem.get('qwen_tps') if lem.get('server_up') else None, '{:.1f}')}` tok/s**",
+            f"**`{_v(lem.get('llm_tps') if lem.get('server_up') else None, '{:.1f}')}` tok/s**",
         ),
         (
             "GPU / Memory",
@@ -1869,8 +1751,8 @@ def generate_report_markdown(
         # Mobile-friendly: a narrow bullet list instead of a wide multi-column table.
         items = []
         for _ea, na, da, _eb, nb, db in diff_from_rows[:10]:
-            da_s = da.strip()[:110] or "n/a"
-            db_s = db.strip()[:110] or "n/a"
+            da_s = _truncate_def(da)
+            db_s = _truncate_def(db)
             items.append(f"- **`{na}`** ≠ **`{nb}`**\n  - A: *{da_s}*\n  - B: *{db_s}*")
         total_pairs = len(diff_from_rows)
         trunc = f"\n*(Showing 10 of {total_pairs} active disambiguation pairs)*\n" if total_pairs > 10 else "\n"
@@ -1882,8 +1764,8 @@ def generate_report_markdown(
     if broader_assertions:
         broader_items = []
         for _ea, na, da, _eb, nb, db in broader_assertions[:5]:
-            da_s = da.strip()[:110] or "n/a"
-            db_s = db.strip()[:110] or "n/a"
+            da_s = _truncate_def(da)
+            db_s = _truncate_def(db)
             broader_items.append(
                 f"- **`{na}`** (narrower) → **`{nb}`** (broader)\n  - Narrower: *{da_s}*\n  - Broader: *{db_s}*"
             )
@@ -1897,7 +1779,7 @@ def generate_report_markdown(
         related_items = []
         for _ea, na, da, _eb, nb, db in related_assertions:
             related_items.append(
-                f"- **`{na}`** ↔ **`{nb}`**\n  - A: *{da.strip()[:110] or 'n/a'}*\n  - B: *{db.strip()[:110] or 'n/a'}*"
+                f"- **`{na}`** ↔ **`{nb}`**\n  - A: *{_truncate_def(da)}*\n  - B: *{_truncate_def(db)}*"
             )
         assertions_md += (
             "### Most Recent `skos:related` Assertions\n\n"
@@ -1909,26 +1791,18 @@ def generate_report_markdown(
     if largest_label_node and largest_label_node.get("labels"):
         top_name = largest_label_node["name"]
         top_cnt = largest_label_node["count"]
-        labels_list = largest_label_node["labels"]
         by_kind: dict[str, list[str]] = defaultdict(list)
-        for k_label, l_label in labels_list:
+        for k_label, l_label in largest_label_node["labels"]:
             by_kind[k_label].append(l_label)
-        label_lines = []
-        for k_label in ("skos:prefLabel", "skos:altLabel", "skos:hiddenLabel"):
-            if k_label in by_kind:
-                uniq_labels = sorted(set(by_kind[k_label]))
-                label_lines.append(f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in uniq_labels)}")
-        for k_label, vals in by_kind.items():
-            if k_label not in ("skos:prefLabel", "skos:altLabel", "skos:hiddenLabel"):
-                uniq_labels = sorted(set(vals))
-                label_lines.append(f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in uniq_labels)}")
+        label_lines = [
+            f"  - `{k_label}`: {', '.join(f'`{raw}`' for raw in sorted(set(vals)))}"
+            for k_label in ("skos:prefLabel", "skos:altLabel", "skos:hiddenLabel", *list(by_kind))
+            if (vals := by_kind.pop(k_label, None))
+        ]
         assertions_md += (
             "### Audit Trail: Largest Concept by SKOS Labels\n\n"
-            f"**`{top_name}`** ({top_cnt} total unique labels):\n"
-            + "\n".join(label_lines)
-            + "\n\n"
+            f"**`{top_name}`** ({top_cnt} total unique labels):\n" + "\n".join(label_lines) + "\n\n"
         )
-
     # Small image files referenced by path (no inline base64: that made the report multi-MB and
     # unrenderable on mobile). Fig. 2 is a compact PNG; the others are small SVGs.
     fig_titles = [
@@ -1958,11 +1832,7 @@ def generate_report_markdown(
 def _suspended_llama(reason: str):
     targets = [p for p in psutil.process_iter(["pid", "name"]) if "llama-server" in (p.info.get("name") or "").lower()]
     if targets:
-        ts = f"{datetime.now(UTC):%H:%M:%S}"
-        print(
-            f"[{ts}] Suspending {len(targets)} llama-server process(es) ({reason})...",
-            flush=True,
-        )
+        logger.info("Suspending %d llama-server process(es) (%s)...", len(targets), reason)
         for p in targets:
             with contextlib.suppress(psutil.Error, OSError):
                 p.suspend()
@@ -1998,20 +1868,19 @@ def run_once(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int, tuple[str, str]]:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     sb = get_active_sandbox_info()
-    cfg = read_config_info()
-    cands, n_evals, legacy = load_candidate_records(sb)
+    cands, n_evals = load_candidate_records(sb)
     badge = PoolTelemetry.from_sandbox(sb).badge(
         len(cands), n_evals, bool(sb.get("optimizer_alive")), sb.get("active_op", "")
     )
     jobs = (
-        (FIG_FILES[0], lambda d: generate_kg_dashboard_svg(d, sb, cfg)),
+        (FIG_FILES[0], lambda d: generate_kg_dashboard_svg(d, sb)),
         (
             FIG_FILES[1],
             lambda d: generate_graph_projection_svg(d, sb, badge, layout_iterations=layout_iterations),
         ),
-        (FIG_FILES[2], lambda d: generate_candidate_score_svg(d, cands, legacy, badge, sb)),
-        (FIG_FILES[3], lambda d: generate_candidate_quality_svg(d, cands, legacy, badge, sb)),
-        (FIG_FILES[4], lambda d: generate_pareto_svg(d, cands, legacy, badge, sb)),
+        (FIG_FILES[2], lambda d: generate_candidate_score_svg(d, cands, badge, sb)),
+        (FIG_FILES[3], lambda d: generate_candidate_quality_svg(d, cands, badge, sb)),
+        (FIG_FILES[4], lambda d: generate_pareto_svg(d, cands, badge, sb)),
     )
     for name, job in jobs:
         # Isolate figures: one failing renderer must not leave the others stale.
@@ -2019,11 +1888,40 @@ def run_once(
             job(ARTIFACT_DIR / name)
         except Exception as exc:  # noqa: BLE001 - surfaced in the log; the watch loop must survive
             plt.close("all")
-            print(
-                f"[{datetime.now(UTC):%H:%M:%S}] {name} failed: {type(exc).__name__}: {exc}",
-                flush=True,
-            )
-    generate_report_markdown(ARTIFACT_DIR / "benchmark_mobile_report.md", sb, cands, n_evals, legacy, badge)
+            logger.warning("%s failed: %s: %s", name, type(exc).__name__, exc)
+    generate_report_markdown(ARTIFACT_DIR / "benchmark_mobile_report.md", sb, cands, n_evals, badge)
+
+    # Mirror artifacts so both the active brain artifact directory and repo dashboard stay in sync
+    mirror_dirs: list[Path] = []
+    default_dir = WORKSPACE_ROOT / "outputs" / "dashboard"
+    if ARTIFACT_DIR.resolve() != default_dir.resolve():
+        mirror_dirs.append(default_dir)
+    try:
+        brain = Path.home() / ".gemini" / "antigravity" / "brain"
+        if brain.exists():
+            for r in brain.glob("*/benchmark_mobile_report.md"):
+                bp = r.parent
+                if bp.resolve() != ARTIFACT_DIR.resolve() and bp not in mirror_dirs:
+                    mirror_dirs.append(bp)
+    except Exception:
+        pass
+
+    for md in mirror_dirs:
+        with contextlib.suppress(Exception):
+            md.mkdir(parents=True, exist_ok=True)
+            for fname in FIG_FILES:
+                src_f = ARTIFACT_DIR / fname
+                if src_f.exists():
+                    shutil.copy2(src_f, md / fname)
+            rep_src = ARTIFACT_DIR / "benchmark_mobile_report.md"
+            if rep_src.exists():
+                content = rep_src.read_text(encoding="utf-8")
+                old_prefix = f"/{ARTIFACT_DIR.as_posix()}/"
+                new_prefix = f"/{md.as_posix()}/"
+                if old_prefix != new_prefix:
+                    content = content.replace(old_prefix, new_prefix)
+                write_text_atomic(md / "benchmark_mobile_report.md", content)
+
     return sb, cands, n_evals, badge
 
 
@@ -2043,10 +1941,7 @@ def main() -> int:
     args = ap.parse_args()
     if args.layout_iterations < 1:
         ap.error("--layout-iterations must be positive")
-
-    for name in LEGACY_FIG_FILES:
-        with contextlib.suppress(OSError):
-            (ARTIFACT_DIR / name).unlink(missing_ok=True)
+    configure_logging("INFO", log_file_path=WORKSPACE_ROOT / ".yaw" / "yaw.log")
 
     while True:
         try:
@@ -2065,13 +1960,16 @@ def main() -> int:
                     f"#{last['cand']} R@5 {last['r5'] * 100:.0f}% F1 {last['f1'] * 100:.0f}%"
                 )
             pct_str = f"{pt.openie_cnt / pt.corpus_pool * 100:.1f}%" if pt.corpus_pool else "n/a"
-            print(
-                f"[{datetime.now(UTC):%H:%M:%S}] [{badge[0]}] "
-                f"Passages: {pt.openie_cnt}/{pt.corpus_pool or 'n/a'} ({pct_str}){cand_info}",
-                flush=True,
+            logger.info(
+                "[%s] Passages: %d/%s (%s)%s",
+                badge[0],
+                pt.openie_cnt,
+                pt.corpus_pool or "n/a",
+                pct_str,
+                cand_info,
             )
         except Exception as exc:  # noqa: BLE001 - the watch loop must survive transient failures
-            print(f"[{datetime.now(UTC):%H:%M:%S}] Error in run_once: {exc}", flush=True)
+            logger.warning("Error in run_once: %s", exc)
         if args.thermal_guard:
             with contextlib.suppress(Exception):
                 check_thermal_guard(args.crisis_temp, args.target_temp)

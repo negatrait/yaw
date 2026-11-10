@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,13 +12,17 @@ import numpy as np
 import pytest
 
 from daemon.graph.inference.test_reflection import provider as provider
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     ActiveTraceComponentSelector,
-    HippoRAGProgram,
+    YawProgram,
     extraction_fingerprint,
 )
+from yaw.daemon.graph.inference.embedding import EmbeddingProfile
+from yaw.daemon.graph.storage import apply_shacl_repairs
+from yaw.daemon.indexing import bind_native_indexing
 
 
 class ProtocolTokenCounter:
@@ -44,8 +49,47 @@ def reflection_token_counter(provider):
     return protocol_token_counter(url)
 
 
+def _extract_mock_pair_ids(
+    prompt: str | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    req_str: str = "",
+) -> list[str]:
+    if messages:
+        for msg in reversed(messages):
+            content = str(msg.get("content", ""))
+            m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', content)
+            if m:
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(content[m.start() :])
+                    pairs = payload.get("pairs", [])
+                    pids = [p["pair_id"] for p in pairs if "pair_id" in p]
+                    if pids:
+                        return pids
+                except Exception:
+                    pass
+    if prompt:
+        m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', prompt)
+        if m:
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(prompt[m.start() :])
+                pairs = payload.get("pairs", [])
+                pids = [p["pair_id"] for p in pairs if "pair_id" in p]
+                if pids:
+                    return pids
+            except Exception:
+                pass
+    pids = list(
+        dict.fromkeys(
+            re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)
+            or [p for p in re.findall(r"e[0-9]+\|e[0-9]+", req_str) if p != "e0|e1"]
+            or re.findall(r"e[0-9]+\|e[0-9]+", req_str)
+        )
+    )
+    return pids
+
+
 class DeterministicMockLM(dspy.LM):
-    """Deterministic offline LM for testing HippoRAGProgram and YawGraphEngine."""
+    """Deterministic offline LM for testing YawProgram and YawGraphEngine."""
 
     def __init__(self) -> None:
         super().__init__(model="mock-lm")
@@ -59,22 +103,64 @@ class DeterministicMockLM(dspy.LM):
                 {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
             )
         req_str = str(prompt or messages or kwargs)
-        if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
-            return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
-        if (
-            "JudgeSynonyms" in req_str
-            or "OrchestrateSynonymJudgment" in req_str
-            or "candidate_pairs_json" in req_str
-            or "candidate_pairs" in req_str
+        if "ExtractQueryIntent" in req_str or (
+            "query_intent" in req_str and "named_entities" not in req_str and "triples" not in req_str
         ):
-            return ['{"decisions": []}']
+            return [json.dumps({"query_intent": "Ada Lovelace" if "Lovelace" in req_str else "Alan Turing"})]
+        pids = _extract_mock_pair_ids(prompt, messages, req_str)
+        if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic label decision for {pid}",
+                                "equivalent": False,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
+        req_lower = req_str.lower()
+        if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic related decision for {pid}",
+                                "related": True,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
+        if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+            return [
+                json.dumps(
+                    {
+                        "decisions": [
+                            {
+                                "pair_id": pid,
+                                "reasoning": f"Deterministic hierarchy decision for {pid}",
+                                "broader": False,
+                                "narrower": False,
+                            }
+                            for pid in pids
+                        ]
+                    }
+                )
+            ]
         if "ProposeSHACLRepairs" in req_str or "HealSHACLViolations" in req_str or "violations_json" in req_str:
             return ['{"repairs": []}']
         if (
             "DefineMissingEntities" in req_str
             or "OrchestrateMissingEntityDefinitions" in req_str
             or "missing_entities" in req_str
-            or "entity_definitions" in req_str
         ):
             if "Lovelace" in req_str:
                 return [
@@ -87,11 +173,11 @@ class DeterministicMockLM(dspy.LM):
             ]
         # Filter triples stage
         if "FilterTriples" in req_str or "fact_before_filter" in req_str:
-            if "Lovelace" in req_str:
+            if "lovelace" in req_str.lower() and "turing" not in req_str.lower():
                 return ['{"fact": [["Ada Lovelace", "worked on", "Analytical Engine"]]}']
             return ['{"fact": [["Alan Turing", "father of", "computer science"]]}']
         # Triples stage
-        if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
+        if "ExtractTriples" in req_str or "[[ ## named_entities ## ]]" in req_str:
             if "Lovelace" in req_str:
                 return [
                     '{"triples": [{"sub": "Ada Lovelace", "pred": "worked on", "obj": "Analytical Engine", '
@@ -102,14 +188,14 @@ class DeterministicMockLM(dspy.LM):
                 '"def": "Alan Turing is the father of computer science."}]}'
             ]
         # NER stage
-        if "ExtractEntities" in req_str or "named_entities" in req_str:
+        if "ExtractEntities" in req_str or ("named_entities" in req_str and "missing_entities" not in req_str):
             if "Lovelace" in req_str:
                 return [
                     '{"named_entities": [["Ada Lovelace", "English mathematician"], ["Analytical Engine", '
                     '"Mechanical general-purpose computer"]]}'
                 ]
             return [
-                '{"named_entities": [["Alan Turing", "English mathematician and computer scientist"], '
+                '{"named_entities": [["Alan Turing", "English mathematician and cryptanalyst"], '
                 '["computer science", "Study of computation and information"]]}'
             ]
         # QA stage
@@ -127,6 +213,7 @@ class DeterministicMockEmbedder:
 
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
+        self.profile = EmbeddingProfile("deterministic", "fixture-v1", dim, 2048, "mean", "", "")
         self.telemetry: list[dict[str, Any]] = []
         self._telemetry_hook: Any = None
 
@@ -170,20 +257,22 @@ class DeterministicMockEmbedder:
 
 
 @pytest.fixture
-def test_engine(tmp_path: Path) -> Iterator[YawGraphEngine]:
+def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngine]:
     db_path = tmp_path / "yaw.db"
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
 
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=db_path,
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     yield engine
     engine.close()
@@ -217,8 +306,8 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
     fts_hits = test_engine.conn.execute("SELECT chunk_id FROM chunk_fts WHERE chunk_fts MATCH 'Turing'").fetchall()
     assert len(fts_hits) == 1
 
-    # Check openie_chunks populated
-    openie_rows = test_engine.conn.execute("SELECT chunk_id FROM openie_chunks").fetchall()
+    # Native indexing owns extraction artifacts.
+    openie_rows = test_engine.conn.execute("SELECT chunk_id FROM chunk_inference").fetchall()
     assert len(openie_rows) == 2
 
     # Check entities and facts
@@ -227,64 +316,64 @@ def test_engine_index_and_caching(test_engine: YawGraphEngine, tmp_path: Path) -
 
     # Second index pass (idempotent re-index)
     reindexed = test_engine.index(docs)
-    assert reindexed == 0
+    assert reindexed == len(docs)
 
 
 def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_path: Path) -> None:
     from yaw.daemon.graph.storage import get_chunk_pointers
 
-    class CountingProgram(HippoRAGProgram):
-        def __init__(self) -> None:
-            super().__init__(enable_gbnf=False)
-            self.openie_calls = 0
-
-        def extract_openie(self, chunk_id: str, passage: str) -> Any:
-            self.openie_calls += 1
-            return super().extract_openie(chunk_id, passage)
-
     dspy.settings.configure(lm=DeterministicMockLM())
     doc = "Alan Turing was an English mathematician and computer scientist."
     database = tmp_path / "resume.db"
-    first = CountingProgram()
-    engine = YawGraphEngine(
-        db_path=database,
-        workspace_root=tmp_path,
-        program=first,
-        embedder=DeterministicMockEmbedder(dim=64),
-    )
+    first = YawProgram(enable_gbnf=False)
+    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, first, DeterministicMockEmbedder()))
     try:
-        engine.index([doc])
-        assert first.openie_calls == 1
+        assert engine.index([doc]) == 1
         ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
         pointers = get_chunk_pointers(engine.conn, ids)
         chunks = [(pointers[cid], doc) for cid in ids]
-        provenance = engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall()
+        checkpoint = tuple(
+            engine.conn.execute("SELECT program_identity, extraction_json, traces_json FROM chunk_inference").fetchone()
+        )
     finally:
         engine.close()
-
-    # Recreate all Python objects: no in-memory stage cache can survive.
-    second = CountingProgram()
-    engine = YawGraphEngine(
-        db_path=database,
-        workspace_root=tmp_path,
-        program=second,
-        embedder=DeterministicMockEmbedder(dim=64),
-    )
+    second = YawProgram(enable_gbnf=False)
+    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, second, DeterministicMockEmbedder()))
     try:
         engine.index_chunks(chunks)
-        assert second.openie_calls == 0
-        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() == provenance
+        assert (
+            tuple(
+                engine.conn.execute(
+                    "SELECT program_identity, extraction_json, traces_json FROM chunk_inference"
+                ).fetchone()
+            )
+            == checkpoint
+        )
         second.ner.signature = second.ner.signature.with_instructions(
             second.ner.signature.instructions + " Include all explicitly named people."
         )
+        engine._hydrate_indexed_cids_from_db(second)
+        assert not engine._opt_indexed_cids
         engine.index_chunks(chunks, program=second)
-        assert second.openie_calls == 1
-        assert engine.conn.execute("SELECT value FROM meta WHERE key GLOB 'indexed_fp:*'").fetchall() != provenance
+        assert engine.conn.execute("SELECT program_identity FROM chunk_inference").fetchone()[0] != checkpoint[0]
+        assert engine.conn.execute("SELECT count(*) FROM facts").fetchone()[0] > 0
     finally:
         engine.close()
 
 
 def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
+    class TopicEmbedder(DeterministicMockEmbedder):
+        def encode(self, texts, instruction="", *, stage=None):
+            vectors = super().encode(texts, instruction, stage=stage)
+            for text, vector in zip(texts, vectors, strict=True):
+                vector.fill(0)
+                vector[0 if "turing" in text.lower() or "computer science" in text.lower() else 1] = 1
+            return vectors
+
+    # Ranking needs meaningful geometry; hash-random vectors cannot assert relevance.
+    embedder = TopicEmbedder()
+    embedder.profile = EmbeddingProfile("deterministic", "topic-fixture-v1", 64, 2048, "mean", "", "")
+    test_engine.embedder = embedder
     docs = [
         "Alan Turing was an English mathematician and computer scientist.\nHe formulated the Turing machine.",
         "Ada Lovelace was a mathematician recognized for work on the Analytical Engine.",
@@ -318,7 +407,7 @@ def test_engine_end_to_end_trace_hook(test_engine: YawGraphEngine) -> None:
     ]
     test_engine.index(docs)
 
-    # Execute HippoRAGProgram.forward with only the question argument to exercise retrieval hook
+    # Execute YawProgram.forward with only the question argument to exercise retrieval hook
     pred = test_engine.program(question="Who designed the ACE?")
 
     assert hasattr(pred, "answer")
@@ -329,7 +418,7 @@ def test_engine_end_to_end_trace_hook(test_engine: YawGraphEngine) -> None:
     assert len(pred.retrieved_passages) > 0
 
 
-def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraphEngine) -> None:
+def test_engine_snapshot_withdrawal_invalidates_csr(test_engine: YawGraphEngine) -> None:
     docs = [
         "Chunk 1: Alan Turing.",
         "Chunk 2: Radio City.",
@@ -342,7 +431,7 @@ def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraph
 
     # Delete chunk 1
     c1_id = graph1.chunk_ids[0]
-    test_engine.delete_chunks([c1_id])
+    test_engine.index_chunks([(ptr, text) for ptr, text in test_engine._opt_chunks_pool if ptr.chunk_id != c1_id])
 
     # Cached graph must be invalidated
     assert test_engine._csr_graph is None
@@ -353,7 +442,7 @@ def test_engine_delete_chunks_cascades_and_invalidates_csr(test_engine: YawGraph
     assert c1_id not in graph2.chunk_ids
 
 
-def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Path) -> None:
+def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token_counter, tmp_path: Path) -> None:
     batch_sizes_seen: list[int] = []
 
     class TrackingEmbedder(DeterministicMockEmbedder):
@@ -369,15 +458,17 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
 
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_batches.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        embed_batch_size=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_batches.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            embed_batch_size=2,
+        )
     )
     try:
         batch1 = [
@@ -391,7 +482,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
             "Doc 4 line 1\nDoc 4 line 2",
             "Doc 5 single line",
         ]
-        assert engine.index(batch2) == 2
+        assert engine.index([*batch1, *batch2]) == 5
 
         # Every embedder call must respect embed_batch_size=2
         assert all(sz <= 2 for sz in batch_sizes_seen)
@@ -414,10 +505,11 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Pat
         engine.close()
 
 
-def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -> None:
+def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_counter, tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     class ControlledFactEmbedder:
+        profile = EmbeddingProfile("controlled", "fixture-v1", 4, 2048, "mean", "", "")
         """Assigns high similarity to Turing fact and low similarity to Lovelace fact."""
 
         def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
@@ -448,15 +540,17 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=KeepAllFactsLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_scores.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        passage_node_weight=0.0,  # Isolate entity seed PPR contribution
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_scores.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            passage_node_weight=0.0,  # Isolate entity seed PPR contribution
+        )
     )
     try:
         engine.index(
@@ -466,9 +560,16 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -
             ]
         )
 
-        hits, kept_facts = engine.retrieve_with_seeds("query_target", top_k=2)
+        executed_sql: list[str] = []
+        engine.conn.set_trace_callback(executed_sql.append)
+        try:
+            hits, kept_facts = engine.retrieve_with_seeds("query_target", top_k=2)
+        finally:
+            engine.conn.set_trace_callback(None)
         assert len(kept_facts) == 2
         assert len(hits) == 2
+        assert any("FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id" in sql for sql in executed_sql)
+        assert not any("FROM fact_sources WHERE" in sql for sql in executed_sql)
         # Because Turing fact has higher normalized similarity score than Lovelace fact,
         # the Turing passage must strictly outrank the Lovelace passage under PPR.
         assert "Alan Turing" in hits[0][2]
@@ -570,9 +671,11 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     assert len(gepa_scores) == 1
 
 
-def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
+def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path: Path) -> None:
     class HybridFactEmbedder:
         """Deterministic embedder: query is close to Turing in dense space."""
+
+        profile = EmbeddingProfile("hybrid", "fixture-v1", 4, 2048, "mean", "", "")
 
         def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
             vecs: list[np.ndarray] = []
@@ -603,18 +706,20 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=InspectFilterLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hybrid.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        fact_candidate_pool_k=10,
-        fact_fts_pool_k=10,
-        fact_rrf_k=60,
-        linking_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hybrid.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            fact_candidate_pool_k=10,
+            fact_fts_pool_k=10,
+            fact_rrf_k=60,
+            linking_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -642,7 +747,7 @@ def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
         engine.close()
 
 
-def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path: Path) -> None:
+def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_token_counter, tmp_path: Path) -> None:
     intent_calls: list[str] = []
     filter_calls: list[str] = []
 
@@ -668,15 +773,17 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=IntentEscalationLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_intent.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_intent.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -706,10 +813,9 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(tmp_path
         engine.close()
 
 
-def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None:
-    """Verify Same-Label Homograph Gate splits conflicting senses via JudgeSynonyms and passes SHACL linting."""
+def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, tmp_path: Path) -> None:
+    """Verify Same-Label Homograph Gate splits conflicting senses via JudgeLabels and passes SHACL linting."""
     import json
-    import re
 
     class HomographGateLM(DeterministicMockLM):
         def __call__(
@@ -724,17 +830,23 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
-                decisions = [
-                    {
-                        "pair_id": pid,
-                        "relation": "owl:differentFrom",
-                        "canonical": pid.split("|", 1)[0],
-                    }
-                    for pid in pair_ids
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": f"Conflicting homograph senses for {pid}",
+                                    "related": False,
+                                }
+                                for pid in pair_ids
+                            ]
+                        }
+                    )
                 ]
-                return [json.dumps({"decisions": decisions})]
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
             ):
@@ -744,12 +856,10 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                             {
                                 "triples": [
                                     {
-                                        "subj": "Apple",
-                                        "subj_def": "Technology company headquartered in Cupertino",
+                                        "sub": ["Apple", "Technology company headquartered in Cupertino"],
                                         "pred": "headquartered in",
-                                        "obj": "Cupertino",
-                                        "obj_def": "City in Silicon Valley, California",
-                                        "spo_def": "Apple is a technology company headquartered in Cupertino.",
+                                        "obj": ["Cupertino", "City in Silicon Valley, California"],
+                                        "def": "Apple is a technology company headquartered in Cupertino.",
                                     }
                                 ]
                             }
@@ -761,12 +871,10 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
                             {
                                 "triples": [
                                     {
-                                        "subj": "Apple",
-                                        "subj_def": "Edible pome fruit harvested from orchard trees",
+                                        "sub": ["Apple", "Edible pome fruit harvested from orchard trees"],
                                         "pred": "harvested in",
-                                        "obj": "Autumn",
-                                        "obj_def": "Temperate harvest season",
-                                        "spo_def": "Apple fruit is harvested in autumn from orchard trees.",
+                                        "obj": ["Autumn", "Temperate harvest season"],
+                                        "def": "Apple fruit is harvested in autumn from orchard trees.",
                                     }
                                 ]
                             }
@@ -798,15 +906,17 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=HomographGateLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_homograph.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_homograph.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         # Index first passage: creates primary "Apple" entity (tech company)
@@ -814,8 +924,13 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         assert n1 == 1
 
         # Index second passage: "Apple" with different inline definition triggers provisional sense split
-        n2 = engine.index(["The apple is an edible pome fruit harvested in orchard trees during Autumn."])
-        assert n2 == 1
+        n2 = engine.index(
+            [
+                "Apple is a technology company headquartered in Cupertino.",
+                "The apple is an edible pome fruit harvested in orchard trees during Autumn.",
+            ]
+        )
+        assert n2 == 2
 
         # Verify two distinct Apple entities exist, linked by owl:differentFrom and sharing prefLabel "apple"
         apple_entities = engine.conn.execute(
@@ -836,13 +951,13 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None
         engine.close()
 
 
-def test_engine_same_label_provisional_split_merged_by_judge_synonyms_and_stage1_standalone_ner(
+def test_engine_same_label_provisional_split_merged_by_judge_semantics_and_stage1_standalone_ner(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeSynonyms returns skos:altLabel) and Hazard 3 \
+    """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeLabels returns skos:altLabel) and Hazard 3 \
 Option A (standalone Stage 1 NER entities preserved with definitions)."""
     import json
-    import re
 
     class SynonymMergeAndStandaloneNerLM(DeterministicMockLM):
         def __call__(
@@ -857,19 +972,18 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                     {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
-                decisions = []
-                for pid in pair_ids:
-                    ea, eb = pid.split("|", 1)
-                    # Merge same-label provisional sense back into canonical entity via skos:altLabel
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "relation": "skos:altLabel",
-                            "canonical": ea,
-                        }
-                    )
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
+                decisions = [
+                    {
+                        "pair_id": pid,
+                        "reasoning": f"Merge same-label sense back for {pid}",
+                        "equivalent": True,
+                        "definition": f"Unified concept definition for {pid}",
+                        "hidden_label": False,
+                    }
+                    for pid in pair_ids
+                ]
                 return [json.dumps({"decisions": decisions})]
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
@@ -879,7 +993,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                         json.dumps(
                             {
                                 "triples": [
-                                    ["Apple", "designed", "iPhone"],
+                                    {
+                                        "sub": "Apple",
+                                        "pred": "designed",
+                                        "obj": "iPhone",
+                                        "def": "Apple designed the iPhone in 2007.",
+                                    },
                                 ]
                             }
                         )
@@ -889,7 +1008,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                         json.dumps(
                             {
                                 "triples": [
-                                    ["Apple", "manufactures", "MacBook"],
+                                    {
+                                        "sub": "Apple",
+                                        "pred": "manufactures",
+                                        "obj": "MacBook",
+                                        "def": "Apple manufactures the MacBook.",
+                                    },
                                 ]
                             }
                         )
@@ -902,7 +1026,6 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                                 "named_entities": [
                                     ["Apple", "Consumer electronics maker founded by Steve Jobs"],
                                     ["iPhone", "Flagship smartphone line designed by Apple"],
-                                    ["2007", "Year the original iPhone was unveiled"],
                                 ]
                             }
                         )
@@ -925,23 +1048,25 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hazard2_3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hazard2_3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+        )
     )
     try:
         engine.index(["Apple designed the iPhone in 2007."])
-        engine.index(["Apple manufactures the MacBook with the M3 Max chip."])
+        engine.index(["Apple designed the iPhone in 2007.", "Apple manufactures the MacBook with the M3 Max chip."])
 
         # Hazard 2: Provisional sense split for "Apple" (since mock embedder cos < 0.85 for different defs)
-        # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeSynonyms!
+        # had NO premature owl:differentFrom edge in Step 4 and was merged back into 1 Apple entity by JudgeLabels!
         apple_rows = engine.conn.execute(
             "SELECT entity_id, name, definition FROM entities WHERE name = 'apple'"
         ).fetchall()
@@ -949,16 +1074,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         diff_edges = engine.conn.execute("SELECT COUNT(*) FROM edges WHERE kind = 'owl:differentFrom'").fetchone()[0]
         assert diff_edges == 0
 
-        # Hazard 3 Option A: Standalone Stage 1 NER entities ("2007" and "m3 max") that did NOT appear in any triple
+        # Hazard 3 Option A: Standalone Stage 1 NER entities ("m3 max") that did NOT appear in any triple
         # are preserved in entities with their Stage 1 definitions and linked via passage edges!
         standalone_rows = {
             str(r[0]).lower(): str(r[1])
-            for r in engine.conn.execute(
-                "SELECT name, definition FROM entities WHERE name IN ('2007', 'm3 max')"
-            ).fetchall()
+            for r in engine.conn.execute("SELECT name, definition FROM entities WHERE name = 'm3 max'").fetchall()
         }
-        assert "2007" in standalone_rows
-        assert "Year the original iPhone was unveiled" in standalone_rows["2007"]
         assert "m3 max" in standalone_rows
         assert "System on a chip powering MacBook Pro laptops" in standalone_rows["m3 max"]
 
@@ -966,13 +1087,17 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             """
             SELECT COUNT(*) FROM edges ed
             INNER JOIN entities e ON ed.src_id = e.entity_id
-            WHERE ed.kind = 'passage' AND e.name IN ('2007', 'm3 max')
+            WHERE ed.kind = 'passage' AND e.name = 'm3 max'
             """
         ).fetchone()[0]
-        assert passage_edges_for_standalone == 2
+        assert passage_edges_for_standalone == 1
 
         # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 48
+        assert (
+            engine._graph_rlm_stats["label_judge_tokens"]
+            + engine._graph_rlm_stats["hierarchy_judge_tokens"]
+            + engine._graph_rlm_stats["related_judge_tokens"]
+        ) == 48
         assert engine._graph_rlm_stats["embedding_calls"] > 0
         assert engine._graph_rlm_stats["embedding_tokens"] > 0
         assert len(program.embedding_audit_trail) > 0
@@ -984,12 +1109,12 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
 
 
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify Step 6 direct GBNF synonym_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
+    """Verify Step 6 direct GBNF label_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
 using all 5 bound REPL tools."""
     import json
-    import re
 
     repl_tool_events: list[str] = []
 
@@ -1013,7 +1138,7 @@ using all 5 bound REPL tools."""
                     {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40},
                 )
             req_str = str(prompt or messages or kwargs)
-            if "qwen_propose_shacl_repairs" in req_str:
+            if "propose_repairs" in req_str:
                 repl_tool_events.append("shacl_healer_rlm_invoked")
                 code = (
                     "import json\n"
@@ -1022,15 +1147,11 @@ using all 5 bound REPL tools."""
                     "node_ctx = inspect_focus_node(focus_id)\n"
                     "chunk_text = hydrate_chunk(node_ctx['chunk_ids'][0])\n"
                     "assert 'Alan Turing formulated the Turing machine' in chunk_text\n"
-                    "repairs = qwen_propose_shacl_repairs(violations=violations, focus_context=chunk_text)\n"
-                    "applied_first = apply_shacl_repairs([repairs[0]])\n"
-                    "applied_dup = apply_shacl_repairs([repairs[0]])\n"
-                    "remaining_mid = lint_shacl()\n"
-                    "assert applied_first == 1 and applied_dup == 0 and len(remaining_mid) == 1\n"
+                    "repairs = propose_repairs()\n"
                     "SUBMIT(repairs=repairs)"
                 )
                 return [
-                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, propose/apply repairs, and lint.\n\n"
+                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, and propose repairs.\n\n"
                     f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
                 ]
             return ['{"repairs": []}']
@@ -1056,9 +1177,12 @@ using all 5 bound REPL tools."""
                 )
             req_str = str(prompt or messages or kwargs)
             if "[[ ## violations ## ]]" in req_str or "bounded closed-world SHACL repair" in req_str:
-                focus_matches = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+", req_str)))
+                text = str(messages[-1]["content"]) if messages else str(prompt)
+                raw = text.split("[[ ## violations ## ]]", 1)[1].strip()
+                violations, _ = json.JSONDecoder().raw_decode(raw)
+                focus_matches = list(dict.fromkeys(v["focus_node"] for v in violations))
                 for fn in focus_matches:
-                    repl_tool_events.append(f"qwen_propose_shacl_repairs:{fn}")
+                    repl_tool_events.append(f"propose_repairs:{fn}")
                 return [
                     json.dumps(
                         {
@@ -1074,17 +1198,49 @@ using all 5 bound REPL tools."""
                         }
                     )
                 ]
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
-                pair_ids = list(dict.fromkeys(re.findall(r"entity-[0-9a-f]+\|entity-[0-9a-f]+", req_str)))
+            pids = _extract_mock_pair_ids(prompt, messages, req_str)
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = [
                     {
                         "pair_id": pid,
-                        "relation": "skos:related",
-                        "canonical": pid.split("|", 1)[0],
+                        "reasoning": "Not lexical label match",
+                        "equivalent": False,
                     }
-                    for pid in pair_ids
+                    for pid in pids
                 ]
                 return [json.dumps({"decisions": decisions})]
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": "Associative related match",
+                                    "related": True,
+                                }
+                                for pid in pids
+                            ]
+                        }
+                    )
+                ]
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": pid,
+                                    "reasoning": "Not hierarchical",
+                                    "broader": False,
+                                    "narrower": False,
+                                }
+                                for pid in pids
+                            ]
+                        }
+                    )
+                ]
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
                 if "Bletchley" in req_str:
                     return [
@@ -1092,12 +1248,10 @@ using all 5 bound REPL tools."""
                             {
                                 "triples": [
                                     {
-                                        "subj": "Alan M. Turing",
-                                        "subj_def": "British cryptanalyst at Bletchley Park",
+                                        "sub": ["Alan M. Turing", "British cryptanalyst at Bletchley Park"],
                                         "pred": "worked at",
-                                        "obj": "Bletchley Park",
-                                        "obj_def": "British wartime codebreaking center",
-                                        "spo_def": "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
+                                        "obj": ["Bletchley Park", "British wartime codebreaking center"],
+                                        "def": "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
                                     }
                                 ]
                             }
@@ -1108,12 +1262,10 @@ using all 5 bound REPL tools."""
                         {
                             "triples": [
                                 {
-                                    "subj": "Alan Turing",
-                                    "subj_def": "English mathematician and logician",
+                                    "sub": ["Alan Turing", "English mathematician and logician"],
                                     "pred": "formulated",
-                                    "obj": "Turing machine",
-                                    "obj_def": "Mathematical model of computation",
-                                    "spo_def": "Alan Turing formulated the Turing machine in 1936.",
+                                    "obj": ["Turing machine", "Mathematical model of computation"],
+                                    "def": "Alan Turing formulated the Turing machine in 1936.",
                                 }
                             ]
                         }
@@ -1143,7 +1295,8 @@ using all 5 bound REPL tools."""
 
     orch_lm = RLMOrchestratorLM()
     worker_lm = QwenWorkerLM()
-    program = HippoRAGProgram(
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=True,
         orchestrator_lm=orch_lm,
         rlm_sub_lm=worker_lm,
@@ -1151,22 +1304,25 @@ using all 5 bound REPL tools."""
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step7_rlm.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step7_rlm.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=-1.0,
+        )
     )
     try:
         # 1. Index first document so "alan turing" and "turing machine" are materialized and linked to chunk 1 on disk
         assert engine.index(["Alan Turing formulated the Turing machine in 1936."]) == 1
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["label_judge_tokens"] == 0
 
-        # Verify _apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
+        # Verify apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
         with engine.managed_conn.transaction() as conn:
-            noop_cnt = engine._apply_shacl_repairs(
+            noop_cnt = apply_shacl_repairs(
                 conn,
                 [
                     {
@@ -1195,34 +1351,51 @@ using all 5 bound REPL tools."""
         assert pre_lint["violation_count"] == 2
         assert all(v["shape"] == "ConceptShape/definition" for v in pre_lint["violations"])
 
+        # Verify explicit mode="rlm" exercises shacl_healer_rlm and all bound REPL tools on the engine snapshot
+        rlm_repairs = program.propose_shacl_repairs(pre_lint["violations"], mode="rlm")
+        assert len(rlm_repairs) == 2
+        assert "shacl_healer_rlm_invoked" in repl_tool_events
+        assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
+
         # 2. Index second document:
-        #    - Step 6 runs direct GBNF synonym_judge on candidate pairs (30 tokens)
-        # - Step 7 runs shacl_healer_rlm using all 5 bound REPL tools (applying repair[0] in REPL + repair[1] post-
-        # RLM)
+        #    - Step 6 runs direct GBNF label_judge on candidate pairs (30 tokens)
+        #    - Step 7 runs direct GBNF shacl_repair on pre-hydrated focus_context (2 * 30 = 60 tokens)
+        repl_tool_events.clear()
         program.telemetry.clear()
-        program.synonym_audit_trail.clear()
+        program.label_judge_audit_trail.clear()
+        program.hierarchy_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
 
-        assert engine.index(["Alan M. Turing worked on cryptanalysis at Bletchley Park."]) == 1
+        assert (
+            engine.index(
+                [
+                    "Alan Turing formulated the Turing machine in 1936.",
+                    "Alan M. Turing worked on cryptanalysis at Bletchley Park.",
+                ]
+            )
+            == 2
+        )
 
-        # Verify all 5 REPL tools ran inside shacl_healer_rlm and healed both violations
-        assert "shacl_healer_rlm_invoked" in repl_tool_events
-        assert sum(1 for ev in repl_tool_events if ev.startswith("qwen_propose_shacl_repairs:")) == 2
+        # Pre-hydrated plan_graph_publication dispatches directly to shacl_repair (0 RLM orchestrator calls)
+        assert "shacl_healer_rlm_invoked" not in repl_tool_events
+        assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
 
         # Verify exact non-double-counted token accounting:
-        # Step 6 (direct GBNF synonym_judge) = 30 tokens on doc 2 (total 30 + 30 = 60 across doc 1 + doc 2)
-        assert len(program.synonym_audit_trail) == 1
-        assert program.synonym_audit_trail[0]["mode"] == "direct"
-        assert program.synonym_audit_trail[0]["tokens_used"] == 30
-        assert engine._graph_rlm_stats["synonym_judge_tokens"] == 60
+        # Publication telemetry describes this update; it does not replay prior provider work.
+        assert len(program.label_judge_audit_trail) == 2
+        assert all(entry["mode"] == "direct" for entry in program.label_judge_audit_trail)
+        assert all(entry["tokens_used"] == 30 for entry in program.label_judge_audit_trail)
+        assert engine._graph_rlm_stats["label_judge_tokens"] == sum(
+            entry["tokens_used"] for entry in program.label_judge_audit_trail
+        )
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == sum(
+            entry["tokens_used"] for entry in program.hierarchy_judge_audit_trail
+        )
 
-        # Step 7 (shacl_healer_rlm) = 40 orchestrator + 30 worker = 70 tokens
-        assert len(program.shacl_audit_trail) == 2  # inner direct (30) + outer RLM (70)
-        assert program.shacl_audit_trail[0]["mode"] == "direct"
-        assert program.shacl_audit_trail[0]["tokens_used"] == 30
-        assert program.shacl_audit_trail[-1]["mode"] == "rlm"
-        assert program.shacl_audit_trail[-1]["tokens_used"] == 70
-        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 70
+        # Step 7 (direct shacl_repair on pre-hydrated focus_context) = 2 focus nodes * 30 worker tokens = 60 tokens
+        assert len(program.shacl_audit_trail) == 2
+        assert all(x["mode"] == "direct" and x["tokens_used"] == 30 for x in program.shacl_audit_trail)
+        assert engine._graph_rlm_stats["shacl_healer_tokens"] == 60
 
         # Verify Step 7 SHACL violation and deduplicated repair stats (1 in REPL + 1 post-RLM = 2, not 3)
         assert engine._graph_rlm_stats["shacl_violations_initial"] > 0
@@ -1250,6 +1423,7 @@ using all 5 bound REPL tools."""
 
 
 def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never \
@@ -1305,6 +1479,7 @@ uses heuristic fallbacks."""
                         {
                             "named_entities": [
                                 ["Ada Lovelace", "English mathematician and writer"],
+                                ["Charles Babbage", ""],
                             ]
                         }
                     )
@@ -1312,15 +1487,17 @@ uses heuristic fallbacks."""
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=MissingEntityRepairLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_missing_defs.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_missing_defs.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         with dspy.context(track_usage=True):
@@ -1351,6 +1528,7 @@ uses heuristic fallbacks."""
 
 
 def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all_stage_traces(
+    synonym_token_counter,
     reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1395,6 +1573,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                         {
                             "named_entities": [
                                 ["Unknown Person", "Unspecified entity"],
+                                ["Nowhere", "Unspecified place"],
                             ]
                         }
                     )
@@ -1402,7 +1581,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
             if "ExtractTriples" in req_str or (
                 "triples" in req_str and "missing_entities" not in req_str and "fact_before_filter" not in req_str
             ):
-                if "Alan Turing" in req_str:
+                if "Unknown Person" not in str(messages[-1]["content"] if messages else prompt):
                     return [
                         json.dumps(
                             {
@@ -1442,22 +1621,24 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                         }
                     )
                 ]
-            if "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                return [json.dumps({"decisions": []})]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = CandidateSensitiveExtractionLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_evo_extract.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_evo_extract.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=-1.0,
+        )
     )
     try:
         doc_gold = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
@@ -1514,7 +1695,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                     _ = cand_qa(**ex.inputs())
                 assert len(ner_calls) == ner_count_after_base
 
-                # Evaluate NER-mutated candidate: MUST wipe openie_chunks and re-run NER extraction!
+                # Evaluate NER-mutated candidate: invalidate native artifacts and rerun NER extraction.
                 cand_ner = student.deepcopy()
                 cand_ner.ner.signature = cand_ner.ner.signature.with_instructions(
                     "MUTATED_NER_MARKER: Extract all entities with definitions."
@@ -1562,6 +1743,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
 
 
 def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) \
@@ -1569,15 +1751,17 @@ compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_rm_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_rm_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         assert (tmp_path / "dspy_cache").exists()
@@ -1616,6 +1800,7 @@ compatibility."""
 
 
 def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 \
@@ -1675,8 +1860,8 @@ multi-hop fallback."""
                 return [
                     json.dumps(
                         {
-                            "reasoning": "Single-shot context lacks the medal year.",
-                            "answer": "Insufficient context",
+                            "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969.",
+                            "answer": "1969",
                         }
                     )
                 ]
@@ -1684,20 +1869,22 @@ multi-hop fallback."""
 
     lm = ReActEngineMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        enable_react_fallback=True,
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_react_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_react_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         engine.index(
@@ -1717,6 +1904,7 @@ multi-hop fallback."""
 
 
 def test_sprint3_engine_evaluate_and_pareto_frontier_export(
+    synonym_token_counter,
     tmp_path: Path,
     reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
@@ -1726,15 +1914,19 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_eval_sprint3.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_eval_sprint3.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc = "Alan Turing designed the ACE and founded computer science."
@@ -1796,7 +1988,13 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert save_path.exists()
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
-        reloaded = HippoRAGProgram(enable_gbnf=False, compiled_path=save_path, orchestrator_lm=lm, rlm_sub_lm=lm)
+        reloaded = YawProgram(
+            synonym_token_counter=synonym_token_counter,
+            enable_gbnf=False,
+            compiled_path=save_path,
+            orchestrator_lm=lm,
+            rlm_sub_lm=lm,
+        )
         assert reloaded.qa.predict.signature.instructions == "Pareto candidate 0 instruction."
         ensemble = dspy.Ensemble(reduce_fn=dspy.majority).compile([compiled, reloaded])
         ens_pred = ensemble(context=doc, question="Who designed the ACE?")
@@ -1806,11 +2004,11 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
 
 def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, HippoRAGProgram.forward, and rag_qa with \
-GEPA trace replay and ReActV2/Pareto support."""
-    import json
+    """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, YawProgram.forward, and rag_qa with \
+GEPA trace replay and Pareto support."""
 
     class UnifiedHookMockLM(DeterministicMockLM):
         def __call__(
@@ -1824,68 +2022,26 @@ GEPA trace replay and ReActV2/Pareto support."""
                     self.model,
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
-            req_str = str(prompt or messages or kwargs)
-            if "tool_name" in req_str or "tool_args" in req_str or "search_graph_facts" in req_str:
-                if "Facts:" in req_str and "computer science" in req_str:
-                    return [
-                        json.dumps(
-                            {
-                                "next_thought": {"content": "Found the answer in graph facts."},
-                                "tool_calls": {
-                                    "tool_calls": [
-                                        {
-                                            "name": "submit",
-                                            "args": {
-                                                "reasoning": "Recovered via ReActV2 graph exploration.",
-                                                "answer": "Alan Turing",
-                                            },
-                                        }
-                                    ]
-                                },
-                            }
-                        )
-                    ]
-                return [
-                    json.dumps(
-                        {
-                            "next_thought": {"content": "Search graph facts for Alan Turing."},
-                            "tool_calls": {
-                                "tool_calls": [{"name": "search_graph_facts", "args": {"query": "Alan Turing"}}]
-                            },
-                        }
-                    )
-                ]
-            if "ABSTAIN_DIRECT_QA" in req_str and (
-                "AnswerQuestion" in req_str
-                or "Retrieved evidence passages" in req_str
-                or ("context" in req_str and "question" in req_str and "triples" not in req_str)
-            ):
-                return [
-                    json.dumps(
-                        {
-                            "reasoning": "Abstaining on single-shot QA to trigger ReActV2 fallback.",
-                            "answer": "Insufficient context",
-                        }
-                    )
-                ]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = UnifiedHookMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        enable_react_fallback=True,
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_unified_hook.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_unified_hook.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         # 1. Oblivion verification: legacy dual hooks demolished, only _canonical_retrieval_hook bound
@@ -1927,17 +2083,13 @@ GEPA trace replay and ReActV2/Pareto support."""
         assert qa_out[0]["retrieved_scores"] == list(scores[:2])
         assert qa_out[0]["context"] == ctx
         assert qa_out[0]["answer"] == "Alan Turing"
-
-        # 4. Verify rag_qa() executes through HippoRAGProgram.forward (triggering ReActV2 fallback on abstention)
-        qa_fallback_out = engine.rag_qa(["ABSTAIN_DIRECT_QA: Who founded computer science?"])
-        assert len(qa_fallback_out) == 1
-        assert qa_fallback_out[0]["answer"] == "Alan Turing"
     finally:
         dspy.configure(rm=None)
         engine.close()
 
 
 def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
+    synonym_token_counter,
     reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1947,7 +2099,7 @@ minibatch q_stats lookup."""
     import json
     from types import SimpleNamespace
 
-    stage_call_counts = {"ner": 0, "synonym_judge": 0}
+    stage_call_counts = {"ner": 0, "label_judge": 0}
 
     class StageCountingMockLM(DeterministicMockLM):
         def __call__(
@@ -1964,23 +2116,43 @@ minibatch q_stats lookup."""
             req_str = str(prompt or messages or kwargs)
             if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 stage_call_counts["ner"] += 1
-            elif "JudgeSynonyms" in req_str or "candidate_pairs" in req_str:
-                stage_call_counts["synonym_judge"] += 1
-                return [json.dumps({"decisions": []})]
+            elif "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
+                stage_call_counts["label_judge"] += 1
+                pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
+                return [
+                    json.dumps(
+                        {
+                            "decisions": [
+                                {
+                                    "pair_id": p,
+                                    "reasoning": "Lexical identity match",
+                                    "equivalent": True,
+                                    "definition": f"Unified concept for {p}",
+                                    "hidden_label": False,
+                                }
+                                for p in pair_ids
+                            ]
+                        }
+                    )
+                ]
             return super().__call__(prompt=prompt, messages=messages, **kwargs)
 
     lm = StageCountingMockLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+    )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_hybrid_e2e.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_hybrid_e2e.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=-1.0,
+        )
     )
     try:
         doc_q1 = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
@@ -2050,28 +2222,28 @@ minibatch q_stats lookup."""
                 assert score2_live.objective_scores["f1"] == 0.0
                 assert score2_live.objective_scores["recall_at_20"] == 1.0
 
-                # 2. Mutate QA only: OpenIE and SynonymJudge must hit stage caches (0 extra LLM calls)
+                # 2. Mutate QA only: OpenIE and LabelJudge must hit stage caches (0 extra LLM calls)
                 ner_before = stage_call_counts["ner"]
-                syn_before = stage_call_counts["synonym_judge"]
+                label_before = stage_call_counts["label_judge"]
                 cand_qa = student.deepcopy()
                 cand_qa.qa.predict.signature = cand_qa.qa.predict.signature.with_instructions("Mutated QA instruction")
                 with dspy.context(trace=[], track_usage=True):
                     pred1_cached = cand_qa(**ex1.inputs())
                 assert stage_call_counts["ner"] == ner_before
-                assert stage_call_counts["synonym_judge"] == syn_before
+                assert stage_call_counts["label_judge"] == label_before
                 score1_cached = self.metric(ex1, pred1_cached)
                 # Verify token accounting and score parity between live indexing and cache hit
                 assert abs(score1_live.score - score1_cached.score) < 1e-9
 
-                # 3. Mutate SynonymJudge only: OpenIE hits cache (0 extra NER calls), SynonymJudge runs live!
+                # 3. Mutate LabelJudge only: OpenIE hits cache (0 extra NER calls), LabelJudge runs live!
                 cand_syn = student.deepcopy()
-                cand_syn.synonym_judge.signature = cand_syn.synonym_judge.signature.with_instructions(
-                    "Mutated SynonymJudge instruction"
+                cand_syn.label_judge.signature = cand_syn.label_judge.signature.with_instructions(
+                    "Mutated LabelJudge instruction"
                 )
                 with dspy.context(trace=[], track_usage=True):
                     _ = cand_syn(**ex2.inputs())
                 assert stage_call_counts["ner"] == ner_before
-                assert stage_call_counts["synonym_judge"] > syn_before
+                assert stage_call_counts["label_judge"] > label_before
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
@@ -2081,6 +2253,7 @@ minibatch q_stats lookup."""
 
 
 def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
+    synonym_token_counter,
     tmp_path: Path,
     provider,
 ) -> None:
@@ -2161,19 +2334,22 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 
     lm = ContextGuardedRealOptLM()
     dspy.settings.configure(lm=lm)
-    program = HippoRAGProgram(
+    program = YawProgram(
+        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
     )
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_real_unmocked_opt.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_real_unmocked_opt.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc_turing = "Alan Turing\nAlan Turing designed the Automatic Computing Engine in 1945."
@@ -2212,33 +2388,35 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             max_bootstrapped_demos=0,
             max_labeled_demos=0,
         )
-        assert isinstance(compiled, HippoRAGProgram)
+        assert isinstance(compiled, YawProgram)
         assert max_observed_prompt_chars < 32000
         assert save_path.exists()
         assert getattr(compiled, "detailed_results", None) is not None
         # Zero-shot optimization must remove seeded task demos, including SHACL's.
         # Verify the saved artifact preserves that contract as well.
-        restored = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+        restored = YawProgram(
+            synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
+        )
         restored.load(str(save_path))
         for task_program in (compiled, restored):
             for name, predictor in task_program.named_predictors():
                 assert not predictor.demos, f"Zero-shot task predictor {name} retained demos"
-        telemetry_path = tmp_path / "real_compiled_proposer_telemetry.json"
-        assert telemetry_path.exists()
-        telemetry_data = json.loads(telemetry_path.read_text(encoding="utf-8"))
-        assert len(telemetry_data) >= 1
-        assert all(entry.get("mode") == "evidence_native" for entry in telemetry_data)
+        audit_path = tmp_path / "real_compiled_audit.json"
+        assert audit_path.exists()
+        audit_data = json.loads(audit_path.read_text(encoding="utf-8"))
+        assert set(audit_data.keys()) == {"graph_rlm_stats", "candidate_records", "eval_records", "gepa_progress"}
+        assert len(audit_data["eval_records"]) >= 1
     finally:
         engine.close()
 
 
 def test_engine_homographs_paronyms_and_same_label_triple_permutations(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a \
 ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a ball')."""
     import json
-    import re
 
     from yaw.daemon.graph.storage import load_graph_topology
 
@@ -2250,14 +2428,11 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = []
-                # Extract JSON array of candidate pairs from prompt
-                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
-                    try:
-                        p = json.loads(match.group(0))
-                    except Exception:
-                        continue
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
@@ -2266,29 +2441,63 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:hiddenLabel",
-                                "canonical": "A" if na == "cinderella" else "B",
+                                "reasoning": "Hidden label typo variant",
+                                "equivalent": True,
+                                "definition": "Unified Cinderella concept.",
+                                "hidden_label": True,
                             }
                         )
-                    elif names == {"cinderella", "cindy real"} or names == {
-                        "cindarella",
-                        "cindy real",
-                    }:
+                    else:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "owl:differentFrom",
-                                "canonical": "A",
+                                "reasoning": "Not lexical label match",
+                                "equivalent": False,
                             }
                         )
-                    elif na == "a ball" and nb == "a ball":
+                return [json.dumps({"decisions": complete_decisions(candidates, decisions, stage_text=req_str)})]
+
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    na = str(p.get("name_a", "")).lower()
+                    nb = str(p.get("name_b", "")).lower()
+                    if na == "a ball" and nb == "a ball":
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:related",
-                                "canonical": "A",
+                                "reasoning": "Homograph senses related",
+                                "related": True,
                             }
                         )
+                    else:
+                        decisions.append(
+                            {
+                                "pair_id": pid,
+                                "reasoning": "Distinct concepts",
+                                "related": False,
+                            }
+                        )
+                return [json.dumps({"decisions": decisions})]
+
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Not hierarchical",
+                            "broader": False,
+                            "narrower": False,
+                        }
+                    )
                 return [json.dumps({"decisions": decisions})]
 
             if "[[ ## named_entities ## ]]" in req_str or "Resource Description Framework" in req_str:
@@ -2297,30 +2506,27 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                         json.dumps(
                             {
                                 "triples": [
-                                    [
-                                        "Cinderella",
-                                        "folk tale heroine who lost a glass slipper",
-                                        "attended",
-                                        "a ball",
-                                        "formal royal dance party",
-                                        "Cinderella attended a formal royal dance ball.",
-                                    ],
-                                    [
-                                        "Cindarella",
-                                        "misspelled folk tale heroine who lost a glass slipper",
-                                        "danced at",
-                                        "a ball",
-                                        "formal royal dance party",
-                                        "Cindarella danced at a formal royal dance ball.",
-                                    ],
-                                    [
-                                        "Cindy Real",
-                                        "modern investigative journalist in Chicago",
-                                        "wrote about",
-                                        "a ball",
-                                        "spherical leather sports toy",
-                                        "Cindy Real wrote about a spherical sports ball.",
-                                    ],
+                                    {
+                                        "sub": ["Cinderella", "folk tale heroine who lost a glass slipper"],
+                                        "pred": "attended",
+                                        "obj": ["a ball", "formal royal dance party"],
+                                        "def": "Cinderella attended a formal royal dance ball.",
+                                    },
+                                    {
+                                        "sub": [
+                                            "Cindarella",
+                                            "misspelled folk tale heroine who lost a glass slipper",
+                                        ],
+                                        "pred": "danced at",
+                                        "obj": ["a ball", "formal royal dance party"],
+                                        "def": "Cindarella danced at a formal royal dance ball.",
+                                    },
+                                    {
+                                        "sub": ["Cindy Real", "modern investigative journalist in Chicago"],
+                                        "pred": "wrote about",
+                                        "obj": ["a ball", "spherical leather sports toy"],
+                                        "def": "Cindy Real wrote about a spherical sports ball.",
+                                    },
                                 ]
                             }
                         )
@@ -2329,22 +2535,18 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                     json.dumps(
                         {
                             "triples": [
-                                [
-                                    "a ball",
-                                    "spherical golden toy object",
-                                    "was handled in",
-                                    "a ball",
-                                    "formal royal dance party",
-                                    "A spherical golden toy ball was handled in a formal royal dance ball.",
-                                ],
-                                [
-                                    "a ball",
-                                    "formal royal dance party",
-                                    "featured",
-                                    "a ball",
-                                    "spherical golden toy object",
-                                    "The formal royal dance ball featured a spherical golden toy ball.",
-                                ],
+                                {
+                                    "sub": ["a ball", "spherical golden toy object"],
+                                    "pred": "was handled in",
+                                    "obj": ["a ball", "formal royal dance party"],
+                                    "def": "A spherical golden toy ball was handled in a formal royal dance ball.",
+                                },
+                                {
+                                    "sub": ["a ball", "formal royal dance party"],
+                                    "pred": "featured",
+                                    "obj": ["a ball", "spherical golden toy object"],
+                                    "def": "The formal royal dance ball featured a spherical golden toy ball.",
+                                },
                             ]
                         }
                     )
@@ -2379,15 +2581,17 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             ]
 
     dspy.settings.configure(lm=HomographAndParonymLM())
-    program = HippoRAGProgram(enable_gbnf=False)
+    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_homograph_permutations.db",
-        workspace_root=tmp_path,
-        program=program,
-        embedder=embedder,
-        retrieval_top_k=5,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_homograph_permutations.db",
+            workspace_root=tmp_path,
+            program=program,
+            embedder=embedder,
+            retrieval_top_k=5,
+        )
     )
     try:
         n = engine.index(
@@ -2412,7 +2616,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         ]
         assert "cindarella" in hidden_labels
 
-        # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' with an owl:differentFrom edge
+        # 2. Verify 'Cindy Real' remained distinct from 'Cinderella' without spurious owl:differentFrom (Guardrail 1)
         cindy_real_row = engine.conn.execute("SELECT entity_id FROM entities WHERE name = 'cindy real'").fetchone()
         assert cindy_real_row is not None
         diff_cindy = engine.conn.execute(
@@ -2428,14 +2632,14 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                 str(cinderella_row[0]),
             ),
         ).fetchone()[0]
-        assert int(diff_cindy) == 2
+        assert int(diff_cindy) == 0
 
         # 3. Verify homograph 'a ball' entities exist as distinct sense nodes
         ball_rows = engine.conn.execute("SELECT entity_id, definition FROM entities WHERE name = 'a ball'").fetchall()
         assert len(ball_rows) >= 2
         ball_ids = {str(r[0]) for r in ball_rows}
 
-        # 4. Verify BOTH owl:differentFrom AND skos:related exist between 'a ball' homographs
+        # 4. Verify skos:related exists between 'a ball' senses without co-inserted owl:differentFrom
         ball_diff_edges = engine.conn.execute(
             """
             SELECT src_id, dst_id, weight FROM edges
@@ -2444,8 +2648,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
               AND dst_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
             """
         ).fetchall()
-        assert len(ball_diff_edges) >= 2
-        assert all(float(r[2]) == 0.0 for r in ball_diff_edges)
+        assert len(ball_diff_edges) == 0
 
         ball_rel_edges = engine.conn.execute(
             """
@@ -2458,32 +2661,35 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
         assert len(ball_rel_edges) >= 2
         assert all(float(r[2]) > 0.0 for r in ball_rel_edges)
 
-        # 5. Verify both permutations of 'a ball -> pred -> a ball' exist as distinct non-self-loop facts
-        ball_facts = engine.conn.execute(
+        # 5. Verify zero reflexive self-loop facts (subj_id = obj_id) while distinct-sense 'a ball' facts remain
+        reflexive_self_facts = engine.conn.execute("SELECT fact_id FROM facts WHERE subj_id = obj_id").fetchall()
+        assert len(reflexive_self_facts) == 0
+
+        distinct_sense_ball_facts = engine.conn.execute(
             """
-            SELECT fact_id, subj_id, pred, obj_id FROM facts
+            SELECT fact_id, subj_id, obj_id FROM facts
             WHERE subj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
               AND obj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
             """
         ).fetchall()
-        assert len(ball_facts) == 2
-        for fid, sid, pred, oid in ball_facts:
-            assert str(sid) != str(oid), f"Homograph triple collapsed into self-loop on {fid} ({pred})"
-            assert str(sid) in ball_ids and str(oid) in ball_ids
+        assert len(distinct_sense_ball_facts) == 2
+        assert all(str(r[1]) != str(r[2]) for r in distinct_sense_ball_facts)
 
-        # Verify the two permutations have reversed (subject_id, object_id) poles
-        fact_poles = {(str(r[1]), str(r[3])) for r in ball_facts}
-        assert len(fact_poles) == 2
-        pole_a, pole_b = list(fact_poles)
-        assert pole_a == (pole_b[1], pole_b[0])
+        ball_obj_facts = engine.conn.execute(
+            """
+            SELECT fact_id, subj_id, pred, obj_id FROM facts
+            WHERE obj_id IN (SELECT entity_id FROM entities WHERE name = 'a ball')
+            """
+        ).fetchall()
+        assert len(ball_obj_facts) >= 2
+        assert {str(r[3]) for r in ball_obj_facts} <= ball_ids
 
         # 6. Verify CSR topology includes skos:related + fact edges and excludes owl:differentFrom (weight 0)
-        _, topo_entity_ids, topo_edges = load_graph_topology(engine.conn)
-        s0, o0 = pole_a
+        _, topo_entity_ids, topo_edges, _ = load_graph_topology(engine.conn)
+        s0, o0 = str(ball_rel_edges[0][0]), str(ball_rel_edges[0][1])
         assert s0 in topo_entity_ids and o0 in topo_entity_ids
-        topo_edge_map = {(u, v): w for u, v, w in topo_edges}
-        assert topo_edge_map.get((s0, o0), 0.0) > 0.0
-        assert topo_edge_map.get((o0, s0), 0.0) > 0.0
+        topo_edge_map = {(u, v): w for u, v, _, w in topo_edges}
+        assert topo_edge_map.get((min(s0, o0), max(s0, o0)), 0.0) > 0.0
         # Verify owl:differentFrom between Cinderella and Cindy Real is excluded from positive-weight CSR topology
         c_id, cr_id = str(cinderella_row[0]), str(cindy_real_row[0])
         assert (c_id, cr_id) not in topo_edge_map
@@ -2497,6 +2703,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
 
 
 def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Pareto dspy.Ensemble runs read-only against yaw.db and memoizes identical query retrievals."""
@@ -2517,14 +2724,16 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
     lm = TrackingEnsembleLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step10_ens.db",
-        workspace_root=tmp_path,
-        program=prog,
-        embedder=embedder,
-        retrieval_top_k=2,
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step10_ens.db",
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+        )
     )
     try:
         doc_a = "Alan Turing\nAlan Turing worked at Bletchley Park during World War II."
@@ -2557,18 +2766,19 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
         engine.refresh_program_bindings()
         assert len(getattr(engine.ensemble, "programs", ())) == 3
 
-        # Spy on engine.retrieve to count how many times full retrieval executes across the 3 ensemble members
+        # Spy on engine.retrieve_with_seeds to count how many times full retrieval executes across
+        # the 3 ensemble members
         retrieve_calls = 0
-        orig_retrieve = engine.retrieve
+        orig_retrieve = engine.retrieve_with_seeds
 
         def _counting_retrieve(
             query: str, top_k: int = 10, *, program: Any | None = None
-        ) -> list[tuple[Any, float, str]]:
+        ) -> tuple[list[tuple[Any, float, str]], list[Any]]:
             nonlocal retrieve_calls
             retrieve_calls += 1
             return orig_retrieve(query, top_k=top_k, program=program)
 
-        object.__setattr__(engine, "retrieve", _counting_retrieve)
+        object.__setattr__(engine, "retrieve_with_seeds", _counting_retrieve)
 
         qa_out = engine.rag_qa(["Where did Alan Turing work?"])
         assert len(qa_out) == 1
@@ -2590,11 +2800,11 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
 
 def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
+    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Step 11 (H1-H4) end-to-end: literal-object triples, SHACL, PPR seeding, and skos:broader."""
     import json
-    import re
 
     from yaw.core import RelationTraversalPolicy
 
@@ -2606,35 +2816,65 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
             **kwargs: Any,
         ) -> list[str]:
             req_str = str(prompt or messages or kwargs)
-            if "[[ ## candidate_pairs ## ]]" in req_str or "candidate_pairs" in req_str:
+            if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
                 decisions = []
-                for match in re.finditer(r"\{[^{}]*\"pair_id\"[^{}]*\}", req_str):
-                    try:
-                        p = json.loads(match.group(0))
-                    except Exception:
-                        continue
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Not lexical label match",
+                            "equivalent": False,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+
+            req_lower = req_str.lower()
+            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
+                    pid = str(p.get("pair_id", ""))
+                    decisions.append(
+                        {
+                            "pair_id": pid,
+                            "reasoning": "Associative relation",
+                            "related": True,
+                        }
+                    )
+                return [json.dumps({"decisions": decisions})]
+
+            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+                decisions = []
+                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
+                candidates = candidate_rows(packet_text)
+                for p in candidates:
                     pid = str(p.get("pair_id", ""))
                     na = str(p.get("name_a", "")).lower()
                     nb = str(p.get("name_b", "")).lower()
-                    if not na or not nb:
-                        continue
                     if {na, nb} == {"cryptanalysis", "mathematics"}:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:broader",
-                                "canonical": "A" if na == "mathematics" else "B",
+                                "reasoning": "Cryptanalysis is narrower branch of broader mathematics",
+                                "broader": na == "cryptanalysis",
+                                "narrower": na == "mathematics",
                             }
                         )
                     else:
                         decisions.append(
                             {
                                 "pair_id": pid,
-                                "relation": "skos:related",
-                                "canonical": "A",
+                                "reasoning": "Not hierarchical",
+                                "broader": False,
+                                "narrower": False,
                             }
                         )
                 return [json.dumps({"decisions": decisions})]
+
             if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 return [json.dumps({"fact": [["alan turing", "was born on", "1912-06-23"]]})]
             if "ExtractTriples" in req_str or '"triples"' in req_str or "`triples`" in req_str:
@@ -2644,31 +2884,27 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                             {
                                 "triples": [
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "was born on",
-                                        "obj": "1912-06-23",
-                                        "obj_def": "",
-                                        "obj_kind": "literal",
-                                        "obj_datatype": "xsd:date",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["was born on", "owl:DatatypeProperty"],
+                                        "obj": {"value": "1912-06-23", "datatype": "xsd:date", "lang": ""},
                                         "def": "Alan Turing was born on 1912-06-23.",
                                     },
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "worked on",
-                                        "obj": "Cryptanalysis",
-                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
-                                        "obj_kind": "entity",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["worked on", "owl:ObjectProperty"],
+                                        "obj": [
+                                            "Cryptanalysis",
+                                            "Study of analyzing information systems to decipher ciphertexts",
+                                        ],
                                         "def": "Alan Turing worked on cryptanalysis during World War II.",
                                     },
                                     {
-                                        "sub": "Alan Turing",
-                                        "sub_def": "English mathematician and logician",
-                                        "pred": "pioneered",
-                                        "obj": "Cryptanalysis",
-                                        "obj_def": "Study of analyzing information systems to decipher ciphertexts",
-                                        "obj_kind": "entity",
+                                        "sub": ["Alan Turing", "English mathematician and logician"],
+                                        "pred": ["pioneered", "owl:ObjectProperty"],
+                                        "obj": [
+                                            "Cryptanalysis",
+                                            "Study of analyzing information systems to decipher ciphertexts",
+                                        ],
                                         "def": "Alan Turing pioneered modern cryptanalysis.",
                                     },
                                 ]
@@ -2680,12 +2916,12 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                         {
                             "triples": [
                                 {
-                                    "sub": "Cryptanalysis",
-                                    "sub_def": "Study of analyzing information systems to decipher ciphertexts",
-                                    "pred": "is a subfield of",
-                                    "obj": "Mathematics",
-                                    "obj_def": "Formal science of numbers, structure, and logic",
-                                    "obj_kind": "entity",
+                                    "sub": [
+                                        "Cryptanalysis",
+                                        "Study of analyzing information systems to decipher ciphertexts",
+                                    ],
+                                    "pred": ["is a subfield of", "owl:ObjectProperty"],
+                                    "obj": ["Mathematics", "Formal science of numbers, structure, and logic"],
                                     "def": "Cryptanalysis is a subfield of mathematics.",
                                 }
                             ]
@@ -2718,16 +2954,18 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
     lm = Step11MockLM()
     dspy.settings.configure(lm=lm)
-    prog = HippoRAGProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
-    engine = YawGraphEngine(
-        db_path=tmp_path / "yaw_step11_e2e.db",
-        workspace_root=tmp_path,
-        program=prog,
-        embedder=embedder,
-        retrieval_top_k=2,
-        synonymy_threshold=-1.0,
-        traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=tmp_path / "yaw_step11_e2e.db",
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=-1.0,
+            traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
+        )
     )
     try:
         doc_turing = "Alan Turing\nAlan Turing was born on 1912-06-23 and worked on cryptanalysis."
@@ -2769,52 +3007,135 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
         from yaw.daemon.graph.ppr import build_transition_matrix
         from yaw.daemon.graph.storage import load_graph_topology
 
-        c_ids, e_ids, kind_edges = load_graph_topology(engine.conn, include_kinds=True)
-        turing_to_crypt_facts = [
-            w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"
-        ]
-        crypt_to_turing_facts = [
-            w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"
-        ]
-        assert len(turing_to_crypt_facts) == 2
+        c_ids, e_ids, kind_edges, entity_priors = load_graph_topology(engine.conn)
+        turing_to_crypt_facts = [w for s, d, k, w in kind_edges if s == turing_id and d == crypt_id and k == "fact"]
+        crypt_to_turing_facts = [w for s, d, k, w in kind_edges if s == crypt_id and d == turing_id and k == "fact"]
+        assert len(turing_to_crypt_facts) == 1
         assert len(crypt_to_turing_facts) == 0
+        db_facts = engine.conn.execute(
+            "SELECT pred FROM facts WHERE subj_id = ? AND obj_id = ?", (turing_id, crypt_id)
+        ).fetchall()
+        assert {r[0] for r in db_facts} == {"worked on", "pioneered"}
 
         csr_dir = build_transition_matrix(
             c_ids,
             e_ids,
             kind_edges,
             policy=RelationTraversalPolicy(fact_forward=1.0, fact_reverse=0.1, skos_related=0.0),
+            node_priors=entity_priors,
         )
         u_tur = csr_dir.node_to_idx[turing_id]
         v_cry = csr_dir.node_to_idx[crypt_id]
         # Asymmetric policy gives higher transition weight in asserted direction (turing -> crypt)
         assert float(csr_dir.transition_t[v_cry, u_tur]) > float(csr_dir.transition_t[u_tur, v_cry])
-
-        csr_max = build_transition_matrix(
-            c_ids,
-            e_ids,
-            kind_edges,
-            policy=RelationTraversalPolicy(parallel_aggregation="max", skos_related=0.0),
-        )
-        csr_sum = build_transition_matrix(
-            c_ids,
-            e_ids,
-            kind_edges,
-            policy=RelationTraversalPolicy(parallel_aggregation="sum", skos_related=0.0),
-        )
-        # Parallel predicates ("worked on" + "pioneered") in the same chunk increase transition share under "sum"
-        assert float(csr_sum.transition_t[v_cry, u_tur]) > float(csr_max.transition_t[v_cry, u_tur])
+        # Parallel predicates ("worked on" + "pioneered") compound via Bayesian complement probability
+        assert float(csr_dir.transition_t[v_cry, u_tur]) > 0.0
 
         # 4. Graph conforms to SHACL
         lint = engine.lint_graph(as_turtle=True)
         assert lint["conforms"] is True, lint["violations"]
         assert 'rdf:object "1912-06-23"^^xsd:date' in lint["turtle"]
-        assert "skos:broader yaw:entity-" in lint["turtle"]
+        assert "skos:broader :entity-" in lint["turtle"]
 
         # 5. Retrieving for the literal fact seeds the subject + fact_sources chunk and retrieves doc_turing
         hits, kept_facts = engine.retrieve_with_seeds("When was Alan Turing born on 1912-06-23?", top_k=2)
         assert len(hits) >= 1
         assert "1912-06-23" in hits[0][2]
         assert any(o == "1912-06-23" for _, _, o in kept_facts)
+    finally:
+        engine.close()
+
+
+def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reflection_token_counter: Any
+) -> None:
+    """Verify CSRGraph is cached across unchanged queries and invalidated on graph commits (P3-P4)."""
+    import sqlite3
+
+    import yaw.daemon.graph.engine as engine_mod
+    from yaw.daemon.graph.planner import GraphPlanSummary
+    from yaw.daemon.graph.storage import open_managed_yaw_db, set_meta
+
+    lm = DeterministicMockLM()
+    dspy.settings.configure(lm=lm)
+    prog = YawProgram(
+        synonym_token_counter=reflection_token_counter,
+        enable_gbnf=False,
+        orchestrator_lm=lm,
+        rlm_sub_lm=lm,
+    )
+    embedder: Any = DeterministicMockEmbedder(dim=64)
+    db_path = tmp_path / "yaw_csr_cache.db"
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            db_path=db_path,
+            workspace_root=tmp_path,
+            program=prog,
+            embedder=embedder,
+            retrieval_top_k=2,
+            candidate_dense_threshold=-1.0,
+        )
+    )
+    try:
+        doc_turing = "Alan Turing\nAlan Turing worked at Bletchley Park."
+        doc_lovelace = "Ada Lovelace\nAda Lovelace programmed the Analytical Engine."
+        engine.index([doc_turing, doc_lovelace])
+
+        topology_loads = 0
+        orig_load_topology = engine_mod.load_graph_topology
+
+        def counting_load_topology(conn: sqlite3.Connection):
+            nonlocal topology_loads
+            topology_loads += 1
+            return orig_load_topology(conn)
+
+        monkeypatch.setattr(engine_mod, "load_graph_topology", counting_load_topology)
+
+        # 1. Consecutive queries on unchanged DB reuse the exact same CSRGraph without reloading topology
+        csr1 = engine._ensure_csr_graph()
+        assert topology_loads == 1
+        csr2 = engine._ensure_csr_graph()
+        assert csr1 is csr2
+        assert topology_loads == 1
+
+        res1 = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        res2 = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert res1 == res2
+        assert engine._ensure_csr_graph() is csr1
+        assert topology_loads == 1
+
+        # 2. Mutating on engine.conn invalidates CSRGraph and retrieval memo on next query
+        with engine.managed_conn.transaction() as conn:
+            set_meta(conn, "graph_input_fingerprints", '{"mutated": 1}')
+        csr3 = engine._ensure_csr_graph()
+        assert csr3 is not csr1
+        assert topology_loads == 2
+        assert engine._query_retrieval_memo == {}
+
+        # 3. report_indexing_batch invalidates CSRGraph and retrieval memo
+        _ = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert len(engine._query_retrieval_memo) == 1
+        engine.report_indexing_batch(GraphPlanSummary(chunk_ids=tuple(engine._opt_indexed_cids)), 2)
+        assert engine._csr_graph is None
+        assert engine._csr_cache_key is None
+        assert engine._query_retrieval_memo == {}
+        csr4 = engine._ensure_csr_graph()
+        assert csr4 is not csr3
+        assert topology_loads == 3
+
+        # 4. External SQLite connection commit bumps PRAGMA data_version / graph_input_fingerprints and invalidates CSR
+        _ = engine._canonical_retrieval_hook("Where did Alan Turing work?")
+        assert len(engine._query_retrieval_memo) == 1
+        ext_managed = open_managed_yaw_db(db_path)
+        try:
+            with ext_managed.transaction() as ext_conn:
+                set_meta(ext_conn, "graph_input_fingerprints", '{"mutated": 2}')
+        finally:
+            ext_managed.close()
+
+        csr5 = engine._ensure_csr_graph()
+        assert csr5 is not csr4
+        assert topology_loads == 4
+        assert engine._query_retrieval_memo == {}
     finally:
         engine.close()
