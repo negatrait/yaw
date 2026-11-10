@@ -884,7 +884,9 @@ def test_incremental_indexing_recovers_from_interrupted_publication_and_emits_su
         events: list[str] = []
         assert engine.index_chunks(chunks[:2], progress_callback=events.append) == 2
         assert any("indexing: disambiguation candidate search" in ev for ev in events)
-        assert any("indexing: synonym adjudication (" in ev for ev in events)
+        assert any(
+            ("indexing: synonym adjudication (" in ev or "indexing: semantic adjudication (" in ev) for ev in events
+        )
         assert any("indexing: SHACL healing (" in ev for ev in events)
 
         # Indexing all 4 chunks must dynamically partition discovered chunks:

@@ -1423,6 +1423,8 @@ class YawGraphEngine:
         self._active_progress_callback = progress_callback
         self._last_hook_program = None
         self._hydrate_indexed_cids_from_db(self.program)
+        if not self._opt_chunks_pool and self._opt_indexed_cids:
+            self._hydrate_opt_chunks_pool_from_db()
         self._opt_docs_by_question.clear()
         use_gold_docs = len(self._opt_chunks_pool) > 64
         val_slice = list(valset or trainset)

@@ -1058,3 +1058,35 @@ This specification remediates the `6` CocoIndex `>= 1.1.0` (`uv.lock:330–331` 
   - Mandatory quality gates: `uv run --locked ty check` (`All checks passed!`), `uv run --locked ruff check --fix` (`All checks passed!`), `uv run --locked ruff format --check` (`174 files already formatted`), `git diff --check` (`0` errors).
 - **What it does not establish**:
   - Does not hot-reload any long-running daemon in memory until restarted; does not complete full-corpus GEPA optimization runs (separate user-initiated command).
+
+### Completed Unit: Checkpoint N6 (2026-11-10): Optimization Sandbox Fresh Lifecycle, Configurable Source Chunking, and Path Matcher Invariants
+
+- **Changed symbols & modules** (governing contracts: [native-cocoindex-indexing.md](../native-cocoindex-indexing.md) and [AGENTS.md](../../AGENTS.md)):
+  - `yaw/daemon/runtime.py`:
+    - In `_create_bound_engine`: constructed `SourceSettings` populated directly from `cfg` (`chunk_size`, `chunk_overlap`, `min_chunk_size`, `included_patterns`, `excluded_patterns`, `json_keys_whitelist`, `json_keys_blacklist`) and passed it to `bind_native_indexing(..., source_settings=src_settings)`.
+  - `yaw/daemon/indexing.py`:
+    - In `bind_native_indexing`: extracted `base_src = source_settings if source_settings is not None else SourceSettings((), ())` and passed `chunk_size`, `chunk_overlap`, `min_chunk_size` into `GraphPlanSettings` so graph planning matches source chunking.
+    - Preserved `included_patterns=("**/*",)` when `eff_included is not None` so explicit target file lists (e.g. dataset bundles) bypass directory pattern exclusions.
+  - `yaw/daemon/ingestion/source_targets.py`:
+    - Fixed `_SelectedFilesPathMatcher`: when `included_files` is specified, `is_file_included(path)` checks `path.as_posix() in self._included_files` directly without redundant pattern rejection; `is_dir_included` allows parent directories and workspace root `.`.
+  - `yaw/daemon/cli.py`:
+    - Added `optimize_coco` cleanup to `_clean_optimization_artifacts` so `--fresh` purges optimization state directories alongside SQLite databases.
+  - `yaw/daemon/graph/engine.py`:
+    - In `_setup_optimization_splits`: added hydration fallback `if not self._opt_chunks_pool and self._opt_indexed_cids: self._hydrate_opt_chunks_pool_from_db()` to ensure bare resume reconstitutes chunk pool metadata.
+  - `tests/daemon/graph/test_indexing_overlap.py`:
+    - Realigned substage progress assertion with `indexing: synonym adjudication (` emitted by planner.
+- **Gate results & evidence paths**:
+  - `uv run ty check` (`All checks passed!`).
+  - `uv run ruff check --fix` and `uv run ruff format` (`All checks passed!`, `187 files left unchanged`).
+  - `uv run pytest tests/daemon/test_runtime.py` (`7 passed`).
+  - `uv run pytest tests/daemon/graph/inference/test_parsers.py` (`11 passed`).
+  - `uv run pytest tests/daemon/graph/test_shacl_publication.py` (`9 passed`).
+  - `uv run pytest tests/daemon/graph/test_indexing_overlap.py` (`10 passed`).
+  - `uv run pytest tests/daemon/ingestion/test_source_targets.py` (`1 passed`).
+  - `git diff --check` (`0` errors).
+- **Discoveries during implementation**:
+  - `chunk_file_memo` in CocoIndex is keyed on `SourceSettings`. When `runtime._create_bound_engine` omitted `source_settings`, it defaulted to 1200 chars / 100 overlap, preventing user-configured `chunk_size = 1000` from taking effect.
+  - When callers provide `included_files`, `_SelectedFilesPathMatcher` must not conjoin with pattern filters that may only include `*.md`, allowing dataset bundles (`.json`) to be loaded when explicitly requested.
+  - Critic Audit Finding: Resource label SHACL repair actions must remain strictly `{"set_pref_label"}` to preserve three-layer parity with GBNF grammar (`actions == {"set_pref_label"}` activates `value_rule = "label"`). Restored strict mapping.
+- **What it does not establish**:
+  - Full-corpus overnight GEPA optimization run (separate long-running job).

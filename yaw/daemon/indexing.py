@@ -605,6 +605,7 @@ def bind_native_indexing(
                 progress_callback=engine.emit_indexing_progress,
             ),
         )
+        base_src = source_settings if source_settings is not None else SourceSettings((), ())
         settings = GraphPlanSettings(
             corpus_root=engine.workspace_root,
             program_identity=program_identity,
@@ -618,6 +619,9 @@ def bind_native_indexing(
             ast_context_hops=engine.ast_context_hops,
             context_window_tokens=active_program.context_window_tokens,
             max_output_tokens=active_program.max_output_tokens,
+            chunk_size=base_src.chunk_size,
+            chunk_overlap=base_src.chunk_overlap,
+            min_chunk_size=base_src.min_chunk_size,
         )
 
         if chunks:
@@ -684,7 +688,9 @@ def bind_native_indexing(
         base_src = source_settings if source_settings is not None else SourceSettings((), ())
         src_settings = replace(
             base_src,
-            included_patterns=("**/*",) if not base_src.included_patterns else base_src.included_patterns,
+            included_patterns=("**/*",)
+            if (not base_src.included_patterns or eff_included is not None)
+            else base_src.included_patterns,
             min_chunk_size=base_src.min_chunk_size if base_src.min_chunk_size is not None else 1,
             included_files=eff_included,
         )

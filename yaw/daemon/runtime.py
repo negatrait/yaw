@@ -374,6 +374,15 @@ class YawRuntime:
             program.load(str(comp_path))
 
         embedder = self._custom_embedder if self._custom_embedder is not None else DSPyEmbeddingAdapter.from_config(cfg)
+        src_settings = SourceSettings(
+            included_patterns=tuple(cfg.included_patterns),
+            excluded_patterns=tuple(cfg.excluded_patterns),
+            json_keys_whitelist=tuple(cfg.json_keys_whitelist),
+            json_keys_blacklist=tuple(cfg.json_keys_blacklist),
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            min_chunk_size=cfg.min_chunk_size,
+        )
         engine = bind_native_indexing(
             YawGraphEngine(
                 db_path=cfg.db_path,
@@ -393,6 +402,7 @@ class YawRuntime:
                 ast_context_hops=cfg.ast_context_hops,
             ),
             state_root=cfg.state_dir,
+            source_settings=src_settings,
         )
         return program, embedder, engine
 

@@ -113,10 +113,10 @@ class _SelectedFilesPathMatcher(FilePathMatcher):
         )
 
     def is_dir_included(self, path: PurePath) -> bool:
-        return path.as_posix() in self._included_dirs and self._pattern_matcher.is_dir_included(path)
+        return path.as_posix() in self._included_dirs or path.as_posix() == "."
 
     def is_file_included(self, path: PurePath) -> bool:
-        return path.as_posix() in self._included_files and self._pattern_matcher.is_file_included(path)
+        return path.as_posix() in self._included_files
 
 
 def build_source_path_matcher(settings: SourceSettings) -> FilePathMatcher:

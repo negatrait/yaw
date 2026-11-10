@@ -825,6 +825,8 @@ def _clean_optimization_artifacts(opt_config: YawConfig, out_override: str | Non
     telemetry_file.unlink(missing_ok=True)
     frame_dir = base_dir / (f"optimize_kg_frames_{suffix}" if suffix else "optimize_kg_frames")
     shutil.rmtree(frame_dir, ignore_errors=True)
+    coco_opt = base_dir / (f"optimize_coco_{suffix}" if suffix else "optimize_coco")
+    shutil.rmtree(coco_opt, ignore_errors=True)
     out_path = Path(out_override).resolve() if out_override else Path(opt_config.compiled_program_path)
     stem = out_path.stem
     parent = out_path.parent

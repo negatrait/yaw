@@ -270,7 +270,7 @@ YAW is engineered directly from principles and algorithms established in the fol
    - *Key Foundations:* Multi-stage instruction proposal and few-shot demonstration search with reflective, evolutionary Pareto optimization (`candidate_selection_strategy="pareto"`, compile-time system-aware `use_merge=True`) over unweighted arithmetic mean task quality (`compute_task_quality_score`: $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ across available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
 8. **Recursive Language Modeling for Long Context Reasoning (RLM)**
    - *Zhang, et al. (2025)* — [arXiv:2502.06733](https://arxiv.org/abs/2502.06733)
-   - *Key Foundations:* Decomposing complex multi-step reasoning, self-healing graph validation, and synonym adjudication into programmatic REPL tool loops with sandboxed Python evaluation.
+   - *Key Foundations:* Decomposing complex multi-step reasoning, self-healing graph validation, and semantic adjudication into programmatic REPL tool loops with sandboxed Python evaluation.
 
 ### Knowledge Representation & Semantic Web Standards (W3C Recommendations)
 
