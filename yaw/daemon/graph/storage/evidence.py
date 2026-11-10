@@ -20,6 +20,7 @@ from .db import batched, write_tx
 from .managed_sqlite import TableSpec
 
 EVIDENCE_INDEXES = {
+    "entity_candidate_vectors": (("entity_id",),),
     "entity_mentions": (("chunk_id",), ("entity_id",), ("sense_id",)),
     "fact_assertions": (("chunk_id",), ("fact_id",)),
 }
@@ -56,10 +57,24 @@ class FactAssertion:
     fact_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateVector:
+    sense_id: str
+    entity_id: str
+    name: str
+    definition: str
+    embedding: bytes
+
+
 async def evidence_schemas() -> tuple[TableSpec, ...]:
     from cocoindex.connectors import sqlite
 
     return (
+        TableSpec(
+            "entity_candidate_vectors",
+            await sqlite.TableSchema[CandidateVector].from_class(CandidateVector, primary_key=["sense_id"]),
+            indexes=EVIDENCE_INDEXES["entity_candidate_vectors"],
+        ),
         TableSpec(
             "entity_mentions",
             await sqlite.TableSchema[EntityMention].from_class(EntityMention, primary_key=["mention_id"]),

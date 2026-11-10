@@ -4,14 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 from daemon.native_inference import publish_inference
 
 from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     deserialize_f32_vector,
-    find_entity_disambiguation_candidates,
-    find_entity_synonym_candidates,
+    find_entity_candidates,
     get_chunk_pointer,
     get_chunk_pointers,
     get_entity_vectors,
@@ -288,7 +288,7 @@ def test_graph_upserts_preserve_chunk_vector_and_fact_owners(tmp_path: Path) -> 
         conn.close()
 
 
-def test_find_entity_synonym_candidates_in_db(tmp_path: Path) -> None:
+def test_find_entity_candidates_in_db(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "test_synonymy.db")
     try:
         upsert_entities(
@@ -309,19 +309,22 @@ def test_find_entity_synonym_candidates_in_db(tmp_path: Path) -> None:
         )
 
         # Full scan candidate discovery
-        candidates = find_entity_synonym_candidates(conn, threshold=0.8, top_k=5)
+        seed_candidate_vectors(conn)
+        candidates = find_entity_candidates(conn, dense_threshold=0.8)
         assert len(candidates) == 1
-        ent_a, ent_b, sim = candidates[0]
+        ent_a, ent_b, sim, _ = candidates[0]
         assert {ent_a, ent_b} == {"e1", "e2"}
         assert sim == pytest.approx(0.95, abs=1e-3)
 
         # Incremental scan for a single entity
-        inc_candidates = find_entity_synonym_candidates(conn, entity_ids=["e2"], threshold=0.8, top_k=5)
+        seed_candidate_vectors(conn)
+        inc_candidates = find_entity_candidates(conn, entity_ids=["e2"], dense_threshold=0.8)
         assert len(inc_candidates) == 1
         assert {inc_candidates[0][0], inc_candidates[0][1]} == {"e1", "e2"}
 
         # Incremental scan for orthogonal entity returns empty
-        assert find_entity_synonym_candidates(conn, entity_ids=["e3"], threshold=0.8) == []
+        seed_candidate_vectors(conn)
+        assert find_entity_candidates(conn, entity_ids=["e3"], dense_threshold=0.8) == []
     finally:
         conn.close()
 
@@ -532,9 +535,8 @@ def test_skos_labels_s13_disjointness_and_homograph_resolution(tmp_path: Path) -
         # 2-channel candidate generation finds lexical cousins even when cosine = 0.0
         upsert_entities(conn, [("ent-apple-corp", "Apple Corp.", "Record label founded by The Beatles")])
         upsert_entity_vectors(conn, [("ent-apple-corp", v_fruit)])
-        candidates = find_entity_disambiguation_candidates(
-            conn, ["ent-apple-inc"], dense_threshold=0.95, dense_top_k=5, lexical_threshold=0.6
-        )
+        seed_candidate_vectors(conn)
+        candidates = find_entity_candidates(conn, ["ent-apple-inc"], dense_threshold=0.95, lexical_threshold=0.45)
         pair_ids = {(a, b) for a, b, _, _ in candidates} | {(b, a) for a, b, _, _ in candidates}
         assert ("ent-apple-inc", "ent-apple-corp") in pair_ids
     finally:
@@ -971,7 +973,7 @@ def test_connection_pragmas_configured_across_open_modes(tmp_path: Path) -> None
         ro_conn.close()
 
 
-def test_find_entity_synonym_candidates_blas_vectorized_without_match_loops(tmp_path: Path) -> None:
+def test_find_entity_candidates_blas_vectorized_without_match_loops(tmp_path: Path) -> None:
     conn = open_yaw_db(tmp_path / "syn_blas.db")
     try:
         upsert_entities(
@@ -1001,33 +1003,26 @@ def test_find_entity_synonym_candidates_blas_vectorized_without_match_loops(tmp_
         executed_sql: list[str] = []
         conn.set_trace_callback(executed_sql.append)
         try:
-            inc_e1_k2 = find_entity_synonym_candidates(conn, entity_ids=["e1"], threshold=0.8, top_k=2)
-            inc_e1_k4 = find_entity_synonym_candidates(conn, entity_ids=["e1"], threshold=0.8, top_k=4)
-            full_k1 = find_entity_synonym_candidates(conn, entity_ids=None, threshold=0.8, top_k=1)
-            rev_e3 = find_entity_synonym_candidates(conn, entity_ids=["e3"], threshold=0.8, top_k=1)
-            rev_e2 = find_entity_synonym_candidates(conn, entity_ids=["e2"], threshold=0.8, top_k=4)
+            seed_candidate_vectors(conn)
+            inc_e1_k2 = find_entity_candidates(conn, entity_ids=["e1"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            inc_e1_k4 = find_entity_candidates(conn, entity_ids=["e1"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            full_k1 = find_entity_candidates(conn, entity_ids=None, dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            rev_e3 = find_entity_candidates(conn, entity_ids=["e3"], dense_threshold=0.8, lexical_threshold=2.0)
+            seed_candidate_vectors(conn)
+            rev_e2 = find_entity_candidates(conn, entity_ids=["e2"], dense_threshold=0.8, lexical_threshold=2.0)
         finally:
             conn.set_trace_callback(None)
 
         assert not any("MATCH" in sql.upper() for sql in executed_sql)
-        assert {(a, b) for a, b, _ in inc_e1_k2} == {("e1", "e3"), ("e1", "e4")}
-
-        # Boundary vector e2 ([0.8, 0.6, 0.0]) against e1 ([1.0, 0.0, 0.0]) passes threshold=0.8,
-        # while adjudicated owl:differentFrom pair (e1, e6) is excluded.
-        inc_e1_pairs = {(a, b) for a, b, _ in inc_e1_k4}
-        assert ("e1", "e2") in inc_e1_pairs
-        assert ("e1", "e6") not in inc_e1_pairs
-        assert ("e1", "e2") in {(a, b) for a, b, _ in rev_e2}
-
-        # Deterministic (distance ASC, entity_id ASC) tie-breaking for e1 at top_k=1 picks e3 over e4 ("e3" < "e4").
-        full_k1_pairs = {(a, b) for a, b, _ in full_k1}
-        assert ("e1", "e3") in full_k1_pairs
-        assert ("e1", "e4") not in full_k1_pairs
-
-        # Reverse top-k: e3's own top-1 is e4 (sim=1.0), but e1's top-1 is e3 (sim=0.9),
-        # so querying entity_ids=["e3"] with top_k=1 discovers both ("e3", "e4") and ("e1", "e3").
-        rev_e3_pairs = {(a, b) for a, b, _ in rev_e3}
-        assert rev_e3_pairs == {("e1", "e3"), ("e3", "e4")}
+        expected = {("e1", "e2"), ("e1", "e3"), ("e1", "e4")}
+        assert {(a, b) for a, b, _, _ in inc_e1_k2} == expected
+        assert inc_e1_k2 == inc_e1_k4
+        assert ("e1", "e3") in {(a, b) for a, b, _, _ in rev_e3}
+        assert ("e1", "e6") not in {(a, b) for a, b, _, _ in full_k1}
+        assert ("e1", "e2") in {(a, b) for a, b, _, _ in rev_e2}
     finally:
         conn.close()
 
@@ -1037,9 +1032,7 @@ def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
-    import difflib
 
-    import yaw.daemon.graph.storage.graph_ops as graph_ops
     from yaw.daemon.graph.storage.evidence import evidence_schemas
     from yaw.daemon.graph.storage.managed_sqlite import create_table
 
@@ -1086,25 +1079,13 @@ def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
             ],
         )
 
-        seq1_inputs: list[str] = []
-        orig_set_seq1 = difflib.SequenceMatcher.set_seq1
-
-        def tracking_set_seq1(self: difflib.SequenceMatcher, a: str) -> None:
-            seq1_inputs.append(str(a))
-            orig_set_seq1(self, a)
-
-        monkeypatch.setattr(difflib.SequenceMatcher, "set_seq1", tracking_set_seq1)
-
-        assert graph_ops._lexical_similarity_cascade("Ada", long_name, 0.70) == 0.0
-        assert seq1_inputs == []
-
-        cands = find_entity_disambiguation_candidates(
+        seed_candidate_vectors(conn)
+        cands = find_entity_candidates(
             conn,
             entity_ids=["e_short"],
             dense_threshold=0.99,
-            lexical_threshold=0.70,
+            lexical_threshold=0.50,
         )
-        assert long_name.lower() not in seq1_inputs
         assert {(a, b) for a, b, _, _ in cands} == {("e_match", "e_short")}
 
         # (c) Single-pass BLAS KNN seed discovery in load_affected_neighborhood without vec0 MATCH loops
@@ -1116,10 +1097,9 @@ def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
                 stage_conn,
                 seed_entity_ids=("e_short",),
                 seed_label_norms=("ada",),
-                delta_entity_vectors={"e_new": serialize_f32_vector([1.0, 0.0, 0.0])},
                 delta_entity_names={"e_new": "Ada"},
-                synonymy_threshold=0.8,
-                synonymy_top_k=2,
+                candidate_dense_threshold=0.8,
+                candidate_lexical_threshold=0.55,
             )
         finally:
             conn.set_trace_callback(None)
@@ -1130,7 +1110,7 @@ def test_quick_fixes_blas_neighborhood_lexical_pruning_and_zero_copy_vectors(
         entity_vec_selects = [
             sql.strip() for sql in ro_sql if sql.lstrip().upper().startswith("SELECT") and "ENTITY_VEC" in sql.upper()
         ]
-        assert any("ORDER BY ENTITY_ID ASC" in sql.upper() for sql in entity_vec_selects)
+        assert entity_vec_selects
         assert all("WHERE" in sql.upper() for sql in entity_vec_selects)
     finally:
         stage_conn.close()

@@ -43,8 +43,10 @@ linking_top_k = 8
 retrieval_top_k = 10
 damping = 0.5
 
-synonymy_threshold = 0.8
-synonymy_top_k = 100
+candidate_dense_threshold = 0.8
+candidate_lexical_threshold = 0.625
+auto_merge_threshold = 0.98
+candidate_volume_ratio = 1.0
 embed_batch_size = 64
 # Aggregate formatted-input budget per embedding request; tune for the provider.
 embed_batch_chars = 3500

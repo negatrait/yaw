@@ -483,7 +483,6 @@ def test_equivalent_decision_updates_merged_entity_definition() -> None:
             cand_meta,
             decisions,
             set(),
-            synonymy_threshold=0.75,
             rlm_stats=rlm_stats,
         )
         assert len(staged_merges) == 1

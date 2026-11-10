@@ -1,15 +1,15 @@
 """SKOS/RDF/OWL graph staging, entity merging, candidate mining, and topology reads."""
 
-import difflib
 import json
 import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from yaw.core import (
     LABEL_KIND_PRIORITY,
@@ -31,9 +31,8 @@ from yaw.core import (
 )
 
 from .db import batched, ensure_vec0_table, vec0_table_dimension, write_tx
-from .evidence import EntityMerge, fact_id
+from .evidence import CandidateVector, EntityMerge, fact_id
 from .hydration import normalize_json_passage_text, read_corpus_lines
-from .vectors import get_entity_vectors
 
 _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
     "chunk": ("chunks", "chunk_id"),
@@ -45,252 +44,147 @@ _EXISTING_ID_TABLES: dict[str, tuple[str, str]] = {
 }
 
 
-@lru_cache(maxsize=65536)
-def _lexical_name_parts(name: str) -> tuple[str, str]:
-    return (
-        name.strip().lower(),
-        str(text_processing(name)),
-    )
-
-
-def _lexical_similarity_cascade(
-    name_a: str,
-    name_b: str,
-    threshold: float,
-    *,
-    matcher: difflib.SequenceMatcher | None = None,
-) -> float:
-    """Run the 3-stage difflib.SequenceMatcher cascade (real_quick_ratio -> quick_ratio -> ratio)."""
-    norm_a, tok_a = _lexical_name_parts(name_a)
-    norm_b, tok_b = _lexical_name_parts(name_b)
-    if not norm_a or not norm_b:
-        return 0.0
-    if norm_a == norm_b or (tok_a and tok_a == tok_b):
-        return 1.0
-    if norm_a.isdigit() and norm_b.isdigit():
-        return 0.0
-    len_a = len(norm_a)
-    len_b = len(norm_b)
-    if 2.0 * (len_a if len_a < len_b else len_b) / (len_a + len_b) < threshold:
-        return 0.0
-
-    if matcher is None:
-        matcher = difflib.SequenceMatcher(autojunk=False)
-    matcher.set_seq2(norm_a)
-    matcher.set_seq1(norm_b)
-    if matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold:
-        ratio = matcher.ratio()
-        if ratio >= threshold:
-            return ratio
-    return 0.0
-
-
-def find_entity_synonym_candidates(
-    conn: sqlite3.Connection,
-    entity_ids: Sequence[str] | None = None,
-    threshold: float = 0.8,
-    top_k: int = 5,
-) -> list[tuple[str, str, float]]:
-    """Mine entity synonymy pairs via vectorized float32 BLAS cosine similarity with reverse top-k completeness."""
-    if top_k <= 0 or (entity_ids is not None and not entity_ids):
-        return []
-    rows = conn.execute("SELECT entity_id, embedding FROM entity_vec ORDER BY entity_id ASC").fetchall()
-    if len(rows) < 2:
-        return []
-
-    eids = [str(r[0]) for r in rows]
-    mat = np.frombuffer(b"".join(bytes(r[1]) for r in rows), dtype="<f4").reshape(len(rows), -1)
-    norms = np.sqrt(np.sum(mat * mat, axis=1, dtype=np.float32))
-    max_dist = max(0.0, 1.0 - threshold + 1e-6)
-    pair_scores: dict[tuple[str, str], float] = {}
-
-    adjudicated: set[tuple[str, str]] = {
-        (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
-        for r in conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')"
-        )
-    }
-
-    def _collect_top_k(
-        src_indices: Sequence[int],
-        allowed_target_mask: np.ndarray | None = None,
-    ) -> np.ndarray:
-        dot = mat[src_indices] @ mat.T
-        denom = norms[src_indices, None] * norms[None, :]
-        cos_sim = np.divide(dot, denom, out=np.zeros_like(dot, dtype=np.float32), where=denom > 0)
-        dists = np.float32(1.0) - cos_sim
-        dists[np.arange(len(src_indices)), src_indices] = np.inf
-        top_indices = np.argsort(dists, axis=1, kind="stable")[:, : int(top_k)]
-        for r_idx, src_idx in enumerate(src_indices):
-            src_id = eids[src_idx]
-            for dst_idx in top_indices[r_idx]:
-                if allowed_target_mask is not None and not allowed_target_mask[dst_idx]:
-                    continue
-                dist = float(dists[r_idx, dst_idx])
-                if dist > max_dist:
-                    break
-                sim = 1.0 - dist
-                if sim >= threshold:
-                    dst_id = eids[int(dst_idx)]
-                    key = (src_id, dst_id) if src_id < dst_id else (dst_id, src_id)
-                    if key not in adjudicated and sim > pair_scores.get(key, -1.0):
-                        pair_scores[key] = sim
-        return dists
-
-    if entity_ids is None:
-        _collect_top_k(range(len(eids)))
-    else:
-        target_set = {str(eid) for eid in entity_ids}
-        target_indices = [i for i, eid in enumerate(eids) if eid in target_set]
-        if not target_indices:
-            return []
-        target_mask = np.zeros(len(eids), dtype=bool)
-        target_mask[target_indices] = True
-        target_dists = _collect_top_k(target_indices)
-        rev_indices = np.flatnonzero((~target_mask) & (np.min(target_dists, axis=0) <= max_dist)).tolist()
-        if rev_indices:
-            _collect_top_k(rev_indices, allowed_target_mask=target_mask)
-
-    return [(a, b, sim) for (a, b), sim in sorted(pair_scores.items())]
-
-
-def find_entity_disambiguation_candidates(
+def find_entity_candidates(
     conn: sqlite3.Connection,
     entity_ids: Sequence[str] | None = None,
     *,
-    dense_threshold: float = 0.75,
-    dense_top_k: int = 5,
-    lexical_threshold: float = 0.70,
+    dense_threshold: float = 0.8,
+    lexical_threshold: float = 0.625,
+    exclude_adjudicated: bool = True,
+    candidate_vectors: Sequence[CandidateVector] = (),
 ) -> list[tuple[str, str, float, float]]:
-    """Two-channel candidate generation combining sqlite-vec dense kNN and 3-stage SequenceMatcher cascade."""
-    adjudicated: set[tuple[str, str]] = {
-        (str(r[0]), str(r[1])) if str(r[0]) < str(r[1]) else (str(r[1]), str(r[0]))
-        for r in conn.execute(
-            "SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')"
-        )
-    }
+    """Pair-local cosine/trigram candidates, with bounded native scoring blocks.
 
-    dense_pairs: dict[tuple[str, str], float] = {
-        (a, b): sim
-        for a, b, sim in find_entity_synonym_candidates(
-            conn, entity_ids=entity_ids, threshold=dense_threshold, top_k=dense_top_k
-        )
-    }
-
-    all_entities = [
-        (str(r[0]), str(r[1]), *_lexical_name_parts(str(r[1])))
-        for r in conn.execute("SELECT entity_id, name FROM entities ORDER BY entity_id ASC")
-    ]
-    entity_names = {eid: name for eid, name, _, _ in all_entities}
-    target_set = set(entity_ids) if entity_ids is not None else None
-
-    lexical_pairs: dict[tuple[str, str], float] = {}
-    # Enumerate only pairs incident to the changed entities. The previous
-    # triangular scan visited every graph pair even for a one-entity update.
-    # Keep canonical orientation: SequenceMatcher can be order-sensitive.
-    positions = {eid: i for i, (eid, _, _, _) in enumerate(all_entities)}
-    target_positions = (
-        sorted(positions[eid] for eid in target_set if eid in positions) if target_set is not None else None
-    )
-    indices = range(len(all_entities)) if target_positions is None else target_positions
-    matcher = difflib.SequenceMatcher(autojunk=False)
-    last_seq2_norm: str | None = None
-    for i in indices:
-        others = range(i + 1, len(all_entities)) if target_set is None else range(len(all_entities))
-        for j in others:
-            if j == i or (j < i and target_set is not None and all_entities[j][0] in target_set):
-                continue
-            a, b = sorted((i, j))
-            eid_a, _name_a, norm_a, tok_a = all_entities[a]
-            eid_b, _name_b, norm_b, tok_b = all_entities[b]
-            if not norm_a or not norm_b:
-                continue
-            key = (eid_a, eid_b)
-            if key in adjudicated:
-                continue
-            if norm_a == norm_b or (tok_a and tok_a == tok_b):
-                lexical_pairs[key] = 1.0
-                continue
-            if norm_a.isdigit() and norm_b.isdigit():
-                continue
-            len_a = len(norm_a)
-            len_b = len(norm_b)
-            if 2.0 * (len_a if len_a < len_b else len_b) / (len_a + len_b) < lexical_threshold:
-                continue
-            if norm_a != last_seq2_norm:
-                matcher.set_seq2(norm_a)
-                last_seq2_norm = norm_a
-            matcher.set_seq1(norm_b)
-            if matcher.real_quick_ratio() >= lexical_threshold and matcher.quick_ratio() >= lexical_threshold:
-                ratio = matcher.ratio()
-                if ratio >= lexical_threshold:
-                    lexical_pairs[key] = ratio
-
-    if target_set is None:
-        label_pair_rows = conn.execute(
-            """
-            SELECT DISTINCT a.entity_id, b.entity_id
-            FROM entity_labels a
-            INNER JOIN entity_labels b
-              ON a.label_norm = b.label_norm
-             AND a.entity_id < b.entity_id
-            """
-        ).fetchall()
-    elif target_set:
-        label_pair_rows = []
-        for batch in batched(sorted(target_set)):
-            placeholders = ",".join("?" for _ in batch)
-            b_tuple = tuple(batch)
-            label_pair_rows.extend(
-                conn.execute(
-                    f"""
-                    SELECT DISTINCT a.entity_id, b.entity_id
-                    FROM entity_labels a
-                    INNER JOIN entity_labels b
-                      ON a.label_norm = b.label_norm
-                     AND a.entity_id < b.entity_id
-                    WHERE a.entity_id IN ({placeholders}) OR b.entity_id IN ({placeholders})
-                    """,
-                    (*b_tuple, *b_tuple),
-                ).fetchall()
-            )
-    else:
-        label_pair_rows = []
-
-    for row in label_pair_rows:
-        ea, eb = str(row[0]), str(row[1])
-        key = (ea, eb)
-        if key not in adjudicated:
-            lexical_pairs[key] = 1.0
-
-    combined_keys = sorted(set(dense_pairs.keys()) | set(lexical_pairs.keys()))
-    if not combined_keys:
+    Supplied source records let neighborhood discovery use this same policy before
+    delta rows are staged. Exact names retain separate sense IDs for judging.
+    """
+    if entity_ids is not None and not entity_ids:
         return []
+    eids = sorted(
+        {str(row[0]) for row in conn.execute("SELECT DISTINCT entity_id FROM entity_candidate_vectors")}
+        | {row.entity_id for row in candidate_vectors}
+    )
+    if len(eids) < 2:
+        return []
+    positions = {eid: i for i, eid in enumerate(eids)}
+    targets = (
+        sorted({positions[eid] for eid in entity_ids if eid in positions})
+        if entity_ids is not None
+        else list(range(len(eids)))
+    )
+    if not targets:
+        return []
+    labels: list[str] = []
+    owners: list[int] = []
+    known: set[tuple[str, str]] = set()
+    for eid, name in chain(
+        conn.execute("SELECT entity_id,name FROM entity_candidate_vectors"),
+        ((row.entity_id, row.name) for row in candidate_vectors),
+    ):
+        if (eid, name) not in known:
+            known.add((eid, name))
+            owners.append(positions[eid])
+            labels.append(name)
+    owner = np.array(owners, dtype=np.int32)
+    vocabulary: dict[str, int] = {}
+    indices: list[int] = []
+    indptr = [0]
+    codes: dict[str, int] = {"": 0}
+    norm_ids = np.array([codes.setdefault(name, len(codes)) for name in labels], dtype=np.int32)
+    for name in labels:
+        padded = "  " + name + "  "
+        grams = {padded[i : i + 3] for i in range(len(padded) - 2)} if name else ()
+        indices.extend(vocabulary.setdefault(gram, len(vocabulary)) for gram in grams)
+        indptr.append(len(indices))
+    lexical = csr_matrix((np.ones(len(indices), dtype=np.int32), indices, indptr), shape=(len(labels), len(vocabulary)))
+    lexical.sort_indices()
+    lexical_t = lexical.T.tocsr()
+    lengths = np.diff(lexical.indptr)
+    # Source vectors, never canonical replacement vectors, define eligibility.
+    vector_rows = iter(conn.execute("SELECT entity_id,embedding FROM entity_candidate_vectors"))
+    first = next(vector_rows, None)
+    dimension = (
+        len(first[1]) // 4
+        if first is not None
+        else (len(candidate_vectors[0].embedding) // 4 if candidate_vectors else 0)
+    )
+    vector_count = conn.execute("SELECT count(*) FROM entity_candidate_vectors").fetchone()[0]
+    vectors = np.zeros((vector_count + len(candidate_vectors), dimension), dtype=np.float32)
+    vector_owners = []
+    for eid, blob in chain(
+        (first,) if first is not None else (), vector_rows, ((r.entity_id, r.embedding) for r in candidate_vectors)
+    ):
+        if eid in positions:
+            vectors[len(vector_owners)] = np.frombuffer(blob, dtype="<f4")
+            vector_owners.append(positions[eid])
+    vectors = vectors[: len(vector_owners)]
+    vector_owner = np.array(vector_owners, dtype=np.int32)
+    magnitudes = np.sqrt(np.einsum("ij,ij->i", vectors, vectors))[:, None]
+    np.divide(vectors, magnitudes, out=vectors, where=magnitudes > 0)
+    adjudicated = (
+        {
+            tuple(sorted((str(a), str(b))))
+            for a, b in conn.execute(
+                "SELECT src_id, dst_id FROM edges WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')"
+            )
+        }
+        if exclude_adjudicated
+        else set()
+    )
+    target_mask = np.zeros(len(eids), dtype=bool)
+    target_mask[targets] = True
+    pair_scores: dict[tuple[str, str], tuple[float, float]] = {}
+    query_vectors = np.flatnonzero(target_mask[vector_owner])
+    dense = np.empty((min(16, len(query_vectors)), len(vectors)), dtype=np.float32)
+    for start in range(0, len(query_vectors), 16):
+        source = query_vectors[start : start + 16]
+        count = len(source)
+        np.matmul(vectors[source], vectors.T, out=dense[:count])
+        for qi, j in zip(*np.nonzero(dense[:count] >= dense_threshold), strict=True):
+            i = source[qi]
+            a, b = sorted((eids[vector_owner[i]], eids[vector_owner[j]]))
+            if a == b or (a, b) in adjudicated:
+                continue
+            old_dense, old_lexical = pair_scores.get((a, b), (-1.0, 0.0))
+            pair_scores[a, b] = (max(old_dense, float(dense[qi, j])), old_lexical)
+    vectors_by_owner: dict[int, list[int]] = defaultdict(list)
+    for i, eid in enumerate(vector_owner):
+        vectors_by_owner[int(eid)].append(i)
 
-    missing_vec_ids: set[str] = set()
-    for a, b in combined_keys:
-        if (a, b) not in dense_pairs:
-            missing_vec_ids.add(a)
-            missing_vec_ids.add(b)
-    extra_vecs = get_entity_vectors(conn, list(missing_vec_ids)) if missing_vec_ids else {}
-
-    results: list[tuple[str, str, float, float]] = []
-    for a, b in combined_keys:
-        d_sim = dense_pairs.get((a, b))
-        if d_sim is None:
-            va = extra_vecs.get(a)
-            vb = extra_vecs.get(b)
-            if va is not None and vb is not None:
-                denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
-                d_sim = float(np.dot(va, vb) / denom) if denom > 1e-12 else 0.0
-            else:
-                d_sim = 0.0
-        l_sim = lexical_pairs.get((a, b))
-        if l_sim is None:
-            l_sim = _lexical_similarity_cascade(entity_names.get(a, ""), entity_names.get(b, ""), 0.0)
-        results.append((a, b, float(d_sim), float(l_sim)))
-
-    return results
+    # Fuzzy source labels survive canonical display-name changes. No dense
+    # B-by-label matrix: score only nonzero sparse overlaps in each small block.
+    query_labels = np.flatnonzero(target_mask[owner])
+    for start in range(0, len(query_labels), 16):
+        source = query_labels[start : start + 16]
+        overlap = (lexical[source] @ lexical_t).tocoo()
+        rows, cols = source[overlap.row], overlap.col
+        scores = (2 * overlap.data) / (lengths[rows] + lengths[cols])
+        selected = (scores >= lexical_threshold) | (norm_ids[rows] == norm_ids[cols])
+        for row, col, score in zip(rows[selected], cols[selected], scores[selected], strict=True):
+            i, j = owner[row], owner[col]
+            if i == j:
+                continue
+            a, b = (eids[i], eids[j]) if i < j else (eids[j], eids[i])
+            if (a, b) not in adjudicated and score > pair_scores.get((a, b), (0.0, -1.0))[1]:
+                indices_a, indices_b = vectors_by_owner[i], vectors_by_owner[j]
+                cosine = max((float(vectors[x] @ vectors[y]) for x in indices_a for y in indices_b), default=0.0)
+                pair_scores[a, b] = (cosine, float(score))
+    labels_by_owner: dict[int, list[int]] = defaultdict(list)
+    for i, eid in enumerate(owner):
+        labels_by_owner[int(eid)].append(i)
+    for (a, b), (dense_sim, score) in pair_scores.items():
+        if score == 0.0:
+            score = max(
+                (
+                    float(2 * lexical[i].multiply(lexical[j]).sum() / (lengths[i] + lengths[j]))
+                    for i in labels_by_owner[positions[a]]
+                    for j in labels_by_owner[positions[b]]
+                    if lengths[i] + lengths[j]
+                ),
+                default=0.0,
+            )
+            pair_scores[a, b] = (dense_sim, score)
+    return [(a, b, d, score) for (a, b), (d, score) in sorted(pair_scores.items())]
 
 
 def deserialize_openie_record(
@@ -846,6 +740,11 @@ def merge_entities(
 
     with write_tx(conn):
         requested_src, requested_dst = src_id, dst_id
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='entity_candidate_vectors'").fetchone():
+            conn.execute(
+                "UPDATE entity_candidate_vectors SET entity_id=? WHERE entity_id IN (?,?)",
+                (min(src_id, dst_id), src_id, dst_id),
+            )
         metadata = dict(
             (row[0], (row[1], row[2]))
             for row in conn.execute(
@@ -1559,17 +1458,20 @@ def load_affected_neighborhood(
     *,
     seed_entity_ids: Sequence[str],
     seed_label_norms: Sequence[str],
-    delta_entity_vectors: Mapping[str, bytes],
     delta_entity_names: Mapping[str, str],
-    synonymy_threshold: float = 0.8,
-    synonymy_top_k: int = 5,
+    candidate_dense_threshold: float = 0.8,
+    candidate_lexical_threshold: float = 0.625,
+    candidate_vectors: Sequence[CandidateVector] = (),
 ) -> set[str]:
-    """Seed stage_conn with the bounded affected neighborhood from ro_conn using only indexed queries."""
+    """Seed stage_conn with candidate partners and their affected semantic closure."""
     has_entities = (
         ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").fetchone() is not None
     )
     if not has_entities:
         return set()
+    has_entity_vec = (
+        ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_vec'").fetchone() is not None
+    )
 
     core_entity_ids: set[str] = set()
 
@@ -1585,11 +1487,8 @@ def load_affected_neighborhood(
     # 1b. Existing entities sharing a normalized label or token norm with the delta batch
     norm_candidates = {str(n) for n in seed_label_norms if n}
     for name in delta_entity_names.values():
-        norm_a, tok_a = _lexical_name_parts(name)
-        if norm_a:
-            norm_candidates.add(norm_a)
-        if tok_a:
-            norm_candidates.add(tok_a)
+        norm_candidates.add(name.strip().lower())
+        norm_candidates.add(str(text_processing(name)))
     for batch in batched(sorted(norm_candidates)):
         placeholders = ",".join("?" for _ in batch)
         for row in ro_conn.execute(
@@ -1598,82 +1497,26 @@ def load_affected_neighborhood(
         ):
             core_entity_ids.add(str(row[0]))
 
-    # 1c. Lexical similarity candidates (>= 0.70) with upper-bound length pruning
-    delta_lex = [
-        (name, norm_a, tok_a, len(norm_a))
-        for name in dict.fromkeys(delta_entity_names.values())
-        for norm_a, tok_a in (_lexical_name_parts(name),)
-        if norm_a and not norm_a.isdigit()
-    ]
-    if delta_lex:
-        matcher = difflib.SequenceMatcher(autojunk=False)
-        cand_rows = ro_conn.execute(
-            """
-            SELECT entity_id, name FROM entities WHERE entity_id != ''
-            UNION
-            SELECT entity_id, raw_label FROM entity_labels WHERE label_norm != ''
-            """
-        ).fetchall()
-        for row in cand_rows:
-            cand_eid = str(row[0])
-            if cand_eid in core_entity_ids:
-                continue
-            raw_lbl = str(row[1])
-            norm_b, tok_b = _lexical_name_parts(raw_lbl)
-            if not norm_b or norm_b.isdigit():
-                continue
-            len_b = len(norm_b)
-            for name, norm_a, tok_a, len_a in delta_lex:
-                if norm_a == norm_b or (tok_a and tok_a == tok_b):
-                    core_entity_ids.add(cand_eid)
-                    break
-                if 2.0 * (len_a if len_a < len_b else len_b) / (len_a + len_b) < 0.70:
-                    continue
-                if _lexical_similarity_cascade(name, raw_lbl, 0.70, matcher=matcher) >= 0.70:
-                    core_entity_ids.add(cand_eid)
-                    break
-
-    # 1d. Dense KNN candidate partners in ro_conn.entity_vec + reverse top-k neighbors
-    has_entity_vec = (
-        ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entity_vec'").fetchone() is not None
+    # 1c. Use the same pair-local policy before and after staging the delta.
+    for a, b, _, _ in find_entity_candidates(
+        ro_conn,
+        sorted(set(seed_entity_ids) | set(delta_entity_names)),
+        dense_threshold=candidate_dense_threshold,
+        lexical_threshold=candidate_lexical_threshold,
+        exclude_adjudicated=False,
+        candidate_vectors=candidate_vectors,
+    ):
+        core_entity_ids.update((a, b))
+    core_entity_ids.difference_update(
+        set(delta_entity_names)
+        - {
+            str(row[0])
+            for batch in batched(sorted(delta_entity_names))
+            for row in ro_conn.execute(
+                f"SELECT entity_id FROM entities WHERE entity_id IN ({','.join('?' for _ in batch)})", tuple(batch)
+            )
+        }
     )
-    if has_entity_vec and synonymy_top_k > 0 and (delta_entity_vectors or core_entity_ids):
-        eff_threshold = min(float(synonymy_threshold), 0.75)
-        max_dist = max(0.0, 1.0 - eff_threshold + 1e-6)
-        k_wide = 4096
-        vec_rows = ro_conn.execute(
-            "SELECT entity_id, embedding FROM entity_vec WHERE entity_id != '' ORDER BY entity_id ASC"
-        ).fetchall()
-        if vec_rows:
-            ro_eids = [str(r[0]) for r in vec_rows]
-            ro_mat = np.frombuffer(b"".join(bytes(r[1]) for r in vec_rows), dtype="<f4").reshape(len(vec_rows), -1)
-            ro_norms = np.sqrt(np.sum(ro_mat * ro_mat, axis=1, dtype=np.float32))
-
-            def _knn_hits_for_matrix(q_mat: np.ndarray, k_limit: int) -> set[str]:
-                q_norms = np.sqrt(np.sum(q_mat * q_mat, axis=1, dtype=np.float32))
-                dot = q_mat @ ro_mat.T
-                denom = q_norms[:, None] * ro_norms[None, :]
-                cos_sim = np.divide(dot, denom, out=np.zeros_like(dot, dtype=np.float32), where=denom > 0)
-                dists = np.float32(1.0) - cos_sim
-                if k_limit >= len(ro_eids):
-                    return {ro_eids[j] for j in np.flatnonzero(np.any(dists <= max_dist, axis=0)).tolist()}
-                top_idx = np.argsort(dists, axis=1, kind="stable")[:, :k_limit]
-                return {
-                    ro_eids[int(j)]
-                    for r_i in range(dists.shape[0])
-                    for j in top_idx[r_i]
-                    if float(dists[r_i, int(j)]) <= max_dist
-                }
-
-            delta_blobs = list(dict.fromkeys(bytes(b) for b in delta_entity_vectors.values() if b))
-            if delta_blobs:
-                d_mat = np.frombuffer(b"".join(delta_blobs), dtype="<f4").reshape(len(delta_blobs), -1)
-                core_entity_ids.update(_knn_hits_for_matrix(d_mat, k_wide))
-            if core_entity_ids:
-                seed_indices = [i for i, eid in enumerate(ro_eids) if eid in core_entity_ids]
-                if seed_indices:
-                    k_self = min(int(synonymy_top_k) + 1, 4096)
-                    core_entity_ids.update(_knn_hits_for_matrix(ro_mat[seed_indices], k_self))
 
     if not core_entity_ids:
         return set()
@@ -1880,6 +1723,12 @@ def load_affected_neighborhood(
                     "INSERT OR REPLACE INTO entities (entity_id, name, definition, confidence) VALUES (?, ?, ?, ?)",
                     ent_rows,
                 )
+            source_vectors = ro_conn.execute(
+                f"SELECT sense_id,entity_id,name,definition,embedding FROM entity_candidate_vectors "
+                f"WHERE entity_id IN ({placeholders})",
+                b_tuple,
+            ).fetchall()
+            stage_conn.executemany("INSERT OR REPLACE INTO entity_candidate_vectors VALUES (?,?,?,?,?)", source_vectors)
             if has_entity_vec:
                 evec_rows = ro_conn.execute(
                     f"SELECT entity_id, embedding FROM entity_vec WHERE entity_id IN ({placeholders})",

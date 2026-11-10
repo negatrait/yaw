@@ -182,7 +182,7 @@ async def process_chunk(
     )
 
 
-@coco.fn(memo=True, version=2)
+@coco.fn(memo=True, version=3)
 async def publish_graph(
     settings: GraphPlanSettings,
     chunk_outputs: tuple[ChunkProcessOutput, ...],
@@ -619,8 +619,9 @@ def bind_native_indexing(
             embedding_identity=embedding_identity,
             synonym_identity=synonym_identity,
             shacl_identity=shacl_identity,
-            synonymy_threshold=engine.synonymy_threshold,
-            synonymy_top_k=engine.synonymy_top_k,
+            candidate_dense_threshold=engine.candidate_dense_threshold,
+            candidate_lexical_threshold=engine.candidate_lexical_threshold,
+            auto_merge_threshold=engine.auto_merge_threshold,
             synonym_batch_size=engine.synonym_batch_size,
             ast_context_hops=engine.ast_context_hops,
             context_window_tokens=active_program.context_window_tokens,

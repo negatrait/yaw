@@ -6,6 +6,7 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,7 @@ from yaw.daemon.graph.storage import (
     canonicalize_entity_labels_edc,
     deserialize_f32_vector,
     deserialize_openie_record,
-    find_entity_disambiguation_candidates,
+    find_entity_candidates,
     get_entity_metadata_batch,
     get_meta,
     inspect_focus_node,
@@ -70,6 +71,7 @@ from yaw.daemon.graph.storage import (
 )
 from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.evidence import (
+    CandidateVector,
     EntityMention,
     EntityMerge,
     FactAssertion,
@@ -102,8 +104,9 @@ class GraphPlanSettings:
     embedding_identity: str
     synonym_identity: str = ""
     shacl_identity: str = ""
-    synonymy_threshold: float = 0.8
-    synonymy_top_k: int = 5
+    candidate_dense_threshold: float = 0.8
+    candidate_lexical_threshold: float = 0.625
+    auto_merge_threshold: float = 0.98
     synonym_batch_size: int = 4
     ast_context_hops: int = 1
     context_window_tokens: int = 32768
@@ -130,6 +133,7 @@ class PreparedGraphRows:
     fact_vectors: tuple[VectorRow, ...]
     mentions: tuple[EntityMention, ...]
     assertions: tuple[FactAssertion, ...]
+    candidate_vectors: tuple[CandidateVector, ...] = ()
     input_fingerprints: tuple[tuple[str, str], ...] = ()
 
 
@@ -149,6 +153,10 @@ def stage_graph_rows(conn: sqlite3.Connection, rows: PreparedGraphRows) -> None:
     upsert_fact_vectors(conn, rows.fact_vectors)
     upsert_edges_with_sources(conn, rows.edges)
     upsert_evidence(conn, rows.mentions, rows.assertions)
+    conn.executemany(
+        "INSERT OR REPLACE INTO entity_candidate_vectors VALUES (?,?,?,?,?)",
+        ((r.sense_id, r.entity_id, r.name, r.definition, r.embedding) for r in rows.candidate_vectors),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,89 +447,80 @@ def prepare_synonym_candidates(
     stage_conn: sqlite3.Connection,
     entity_nodes: Sequence[tuple[str, str, str]],
     *,
-    synonymy_threshold: float,
-    synonymy_top_k: int,
+    candidate_dense_threshold: float,
+    candidate_lexical_threshold: float,
+    auto_merge_threshold: float = 0.98,
     fact_linked_pairs: set[tuple[str, str]] | None = None,
     rlm_stats: dict[str, Any] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], int, list[EntityMerge]]:
-    """Filter valid SKOS concepts, consolidate same-norm senses above threshold, and rank remaining pairs."""
+    """Prepare sense-preserving candidates for the complete three-stage cascade."""
     valid_entity_ids = [eid for eid, name, _ in entity_nodes if bool(text_processing(name))]
     if not valid_entity_ids:
         return [], {}, 0, []
     if progress_callback is not None:
         progress_callback(f"indexing: disambiguation candidate search ({len(valid_entity_ids)} changed entities)")
-    raw_candidates = find_entity_disambiguation_candidates(
+    raw_candidates = find_entity_candidates(
         stage_conn,
         entity_ids=valid_entity_ids,
-        dense_threshold=synonymy_threshold,
-        dense_top_k=synonymy_top_k,
+        dense_threshold=candidate_dense_threshold,
+        lexical_threshold=candidate_lexical_threshold,
     )
     cand_eids = list({eid for ea, eb, _, _ in raw_candidates for eid in (ea, eb)})
     cand_meta = get_entity_metadata_batch(stage_conn, cand_eids)
 
-    merged_into: dict[str, str] = {}
-    auto_merges: list[EntityMerge] = []
-    active_fact_pairs = fact_linked_pairs or set()
+    merges: list[EntityMerge] = []
+    representatives: dict[str, str] = {}
 
-    def _resolve_active_eid(eid: str) -> str:
-        curr = eid
-        visited: set[str] = set()
-        while curr in merged_into and curr not in visited:
-            visited.add(curr)
-            curr = merged_into[curr]
-        return curr
+    def resolve(eid: str) -> str:
+        while eid in representatives:
+            eid = representatives[eid]
+        return eid
 
-    def _is_active_fact_pole(u: str, v: str) -> bool:
-        target_pair = (min(u, v), max(u, v))
-        for fa, fb in active_fact_pairs:
-            ra, rb = _resolve_active_eid(fa), _resolve_active_eid(fb)
-            if (min(ra, rb), max(ra, rb)) == target_pair:
-                return True
-        return False
-
-    with write_tx(stage_conn):
-        for raw_a, raw_b, d_sim, _l_sim in raw_candidates:
-            ea = _resolve_active_eid(raw_a)
-            eb = _resolve_active_eid(raw_b)
-            if ea == eb:
-                continue
-            name_a, def_a = cand_meta.get(ea, (ea, ""))
-            name_b, def_b = cand_meta.get(eb, (eb, ""))
-
-            if text_processing(name_a) != text_processing(name_b):
-                continue
-            if float(d_sim) < synonymy_threshold or _is_active_fact_pole(ea, eb):
-                continue
-
-            casing_a = 1 if any(c.isupper() for c in name_a) else 0
-            casing_b = 1 if any(c.isupper() for c in name_b) else 0
-            key_a = (casing_a, len(def_a), -len(name_a), ea)
-            key_b = (casing_b, len(def_b), -len(name_b), eb)
-            dst, src = (ea, eb) if key_a >= key_b else (eb, ea)
-            merged = merge_entities(stage_conn, src, dst, label_kind="skos:altLabel")
-            src, dst = merged.removed_id, merged.canonical_id
-            auto_merges.append(merged)
-            merged_into[src] = dst
-            cand_meta.update(get_entity_metadata_batch(stage_conn, [dst]))
-            if rlm_stats is not None:
-                rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + 1
-
-    dedup_remaining: dict[tuple[str, str], tuple[float, float]] = {}
-    for raw_a, raw_b, d_sim, l_sim in raw_candidates:
-        ea = _resolve_active_eid(raw_a)
-        eb = _resolve_active_eid(raw_b)
-        if ea == eb:
+    separations = {
+        tuple(sorted((str(a), str(b))))
+        for a, b in stage_conn.execute(
+            "SELECT src_id,dst_id FROM edges WHERE kind IN ('owl:differentFrom','skos:broader','skos:related','fact')"
+        )
+    }
+    blocked_pairs = separations | set(fact_linked_pairs or ())
+    # Only extreme candidate cosines pay for difflib; label AND definition must pass.
+    for a, b, dense_sim, _ in raw_candidates:
+        a, b = sorted((resolve(a), resolve(b)))
+        if a == b or dense_sim < auto_merge_threshold:
             continue
-        pkey = (min(ea, eb), max(ea, eb))
-        prev = dedup_remaining.get(pkey)
-        if prev is None:
-            dedup_remaining[pkey] = (float(d_sim), float(l_sim))
-        else:
-            dedup_remaining[pkey] = (max(prev[0], float(d_sim)), max(prev[1], float(l_sim)))
-
+        na, da = cand_meta[a]
+        nb, db = cand_meta[b]
+        if not da.strip() or not db.strip():
+            continue
+        if any({resolve(x), resolve(y)} == {a, b} for x, y in blocked_pairs):
+            continue
+        if any(
+            SequenceMatcher(None, str(text_processing(x)), str(text_processing(y)), autojunk=False).ratio()
+            < auto_merge_threshold
+            for x, y in ((na, nb), (da, db))
+        ):
+            continue
+        preferred = max(
+            (a, b), key=lambda eid: (any(c.isupper() for c in cand_meta[eid][0]), len(cand_meta[eid][1]), eid)
+        )
+        merged = merge_entities(stage_conn, b if preferred == a else a, preferred, label_kind="skos:altLabel")
+        representatives[merged.removed_id] = merged.canonical_id
+        merges.append(merged)
+        cand_meta.update(get_entity_metadata_batch(stage_conn, [merged.canonical_id]))
+    if rlm_stats is not None:
+        rlm_stats["merged_entities"] = int(rlm_stats.get("merged_entities", 0)) + len(merges)
+    raw_count = len(raw_candidates)
+    if merges:
+        # Complete scores from all retained members, including raw pairs below admission.
+        raw_candidates = find_entity_candidates(
+            stage_conn,
+            entity_ids=sorted({resolve(eid) for eid in valid_entity_ids}),
+            dense_threshold=candidate_dense_threshold,
+            lexical_threshold=candidate_lexical_threshold,
+        )
     candidates: list[dict[str, Any]] = []
-    for (ea, eb), (d_sim, l_sim) in dedup_remaining.items():
+    for ea, eb, d_sim, l_sim in raw_candidates:
         name_a, def_a = cand_meta.get(ea, (ea, ""))
         name_b, def_b = cand_meta.get(eb, (eb, ""))
         sim = max(float(d_sim), float(l_sim))
@@ -548,7 +547,7 @@ def prepare_synonym_candidates(
         ),
         reverse=True,
     )
-    return candidates, cand_meta, len(raw_candidates), auto_merges
+    return candidates, cand_meta, raw_count, merges
 
 
 def apply_synonym_adjudication(
@@ -558,13 +557,11 @@ def apply_synonym_adjudication(
     decisions: Sequence[Mapping[str, Any]],
     fact_linked_pairs: set[tuple[str, str]],
     *,
-    synonymy_threshold: float,
     rlm_stats: dict[str, Any],
     corpus_root: Path | str | None = None,
     touched_entity_ids: Sequence[str] | None = None,
 ) -> tuple[list[EntityMerge], list[tuple[str, str, str, float, str]]]:
     """Apply Stage 3 Gemma 4 synonym decisions on stage_conn with two-phase topological resolution."""
-    _ = synonymy_threshold
     cand_meta = dict(cand_meta)
     merged_into: dict[str, str] = {}
     hidden_label_norms: dict[str, set[str]] = defaultdict(set)
@@ -979,6 +976,11 @@ async def plan_graph_publication(
         record_structured.append((cid, normalized_sts, ner_entities))
 
     with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+        if (
+            incremental
+            and ro_conn.execute("SELECT 1 FROM sqlite_master WHERE name='entity_candidate_vectors'").fetchone() is None
+        ):
+            raise ValueError("Candidate source-vector schema changed; rebuild this index from source")
         existing_bindings = load_sense_bindings(ro_conn, all_norm_labels) if incremental else {}
     materialized = materialize_entities_and_facts(
         record_structured,
@@ -1000,10 +1002,27 @@ async def plan_graph_publication(
 
     entity_vec_by_id: dict[str, np.ndarray] = {}
     if entity_nodes:
-        e_texts = [fmt_entity(name, defn) for _, name, defn in entity_nodes]
+        e_texts = [fmt_entity(str(text_processing(name)), defn.strip().casefold()) for _, name, defn in entity_nodes]
         e_vecs = await _embed_strings(e_texts, stage="entity_embed")
         for (eid, _, _), vec in zip(entity_nodes, e_vecs, strict=True):
             entity_vec_by_id[eid] = vec
+
+    source_senses = {
+        mention.sense_id: (
+            mention.entity_id,
+            str(text_processing(mention.name)),
+            mention.resolved_definition.strip().casefold(),
+        )
+        for mention in mentions
+    }
+    source_embeddings = await _embed_strings(
+        [fmt_entity(name, definition) for _, name, definition in source_senses.values()],
+        stage="entity_embed",
+    )
+    candidate_vectors = tuple(
+        CandidateVector(sid, eid, name, definition, vector.astype("<f4", copy=False).tobytes())
+        for (sid, (eid, name, definition)), vector in zip(source_senses.items(), source_embeddings, strict=True)
+    )
 
     initial_rows = PreparedGraphRows(
         chunks=tuple(chunks),
@@ -1018,6 +1037,7 @@ async def plan_graph_publication(
         chunk_vectors=tuple(chunk_vec_pairs),
         entity_vectors=tuple(entity_vec_by_id.items()),
         fact_vectors=(),
+        candidate_vectors=candidate_vectors,
         mentions=tuple(mentions),
         assertions=tuple(assertions),
     )
@@ -1038,9 +1058,6 @@ async def plan_graph_publication(
                     *(eid for eid, _, _ in entity_nodes),
                 }
             )
-            delta_entity_vectors = {
-                eid: vec.astype("<f4", copy=False).tobytes() for eid, vec in entity_vec_by_id.items()
-            }
             delta_entity_names = {eid: name for eid, name, _ in entity_nodes}
             with coco.use_context(GRAPH_DB).readonly() as ro_conn:
                 load_affected_neighborhood(
@@ -1048,10 +1065,10 @@ async def plan_graph_publication(
                     staging_conn,
                     seed_entity_ids=seed_entity_ids,
                     seed_label_norms=tuple(all_norm_labels),
-                    delta_entity_vectors=delta_entity_vectors,
                     delta_entity_names=delta_entity_names,
-                    synonymy_threshold=settings.synonymy_threshold,
-                    synonymy_top_k=settings.synonymy_top_k,
+                    candidate_vectors=candidate_vectors,
+                    candidate_dense_threshold=settings.candidate_dense_threshold,
+                    candidate_lexical_threshold=settings.candidate_lexical_threshold,
                 )
             seeded_rows_by_table = snapshot_table_rows(staging_conn)
         elif published_inputs and has_chunks_table:
@@ -1078,8 +1095,9 @@ async def plan_graph_publication(
         candidates, cand_meta, raw_cand_count, merges = prepare_synonym_candidates(
             staging_conn,
             entity_nodes,
-            synonymy_threshold=settings.synonymy_threshold,
-            synonymy_top_k=settings.synonymy_top_k,
+            candidate_dense_threshold=settings.candidate_dense_threshold,
+            candidate_lexical_threshold=settings.candidate_lexical_threshold,
+            auto_merge_threshold=settings.auto_merge_threshold,
             fact_linked_pairs=materialized.fact_linked_pairs,
             rlm_stats=rlm_stats,
             progress_callback=extraction.progress_callback,
@@ -1155,7 +1173,6 @@ async def plan_graph_publication(
                 cand_meta,
                 decisions,
                 materialized.fact_linked_pairs,
-                synonymy_threshold=settings.synonymy_threshold,
                 rlm_stats=rlm_stats,
                 corpus_root=settings.corpus_root,
                 touched_entity_ids=touched_eids,
@@ -1315,6 +1332,9 @@ async def plan_graph_publication(
                 staging_conn,
                 [(f_row[0], vec) for f_row, vec in zip(reembed_facts, rf_vecs, strict=True)],
             )
+        staging_conn.execute(
+            "DELETE FROM entity_candidate_vectors WHERE sense_id NOT IN (SELECT sense_id FROM entity_mentions)"
+        )
         return GraphPlanResult(
             tables=graph_tables(
                 staging_conn,

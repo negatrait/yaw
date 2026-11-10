@@ -104,8 +104,9 @@ class YawGraphEngine:
         passage_node_weight: float = 0.05,
         fts_weight: float = 0.2,
         damping: float = 0.5,
-        synonymy_threshold: float = 0.8,
-        synonymy_top_k: int = 100,
+        candidate_dense_threshold: float = 0.8,
+        candidate_lexical_threshold: float = 0.625,
+        auto_merge_threshold: float = 0.98,
         synonym_batch_size: int = 4,
         retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
@@ -153,8 +154,9 @@ class YawGraphEngine:
         self.passage_node_weight = passage_node_weight
         self.fts_weight = fts_weight
         self.damping = damping
-        self.synonymy_threshold = synonymy_threshold
-        self.synonymy_top_k = synonymy_top_k
+        self.candidate_dense_threshold = candidate_dense_threshold
+        self.candidate_lexical_threshold = candidate_lexical_threshold
+        self.auto_merge_threshold = auto_merge_threshold
         self.synonym_batch_size = synonym_batch_size
         self.retrieval_top_k = retrieval_top_k
         self.embed_batch_size = embed_batch_size
@@ -1556,8 +1558,9 @@ class YawGraphEngine:
                     "passage_node_weight",
                     "fts_weight",
                     "damping",
-                    "synonymy_threshold",
-                    "synonymy_top_k",
+                    "candidate_dense_threshold",
+                    "candidate_lexical_threshold",
+                    "auto_merge_threshold",
                     "retrieval_top_k",
                     "activation",
                     "activation_param",

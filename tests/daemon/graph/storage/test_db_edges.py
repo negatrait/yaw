@@ -6,11 +6,12 @@ from contextlib import closing
 
 import numpy as np
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     deserialize_f32_vector,
-    find_entity_disambiguation_candidates,
+    find_entity_candidates,
     get_entity_metadata_batch,
     initialize_schema,
     open_readonly_yaw_db,
@@ -128,17 +129,18 @@ def test_label_priority_is_global_across_sources_even_before_entity_hydration(tm
     ("name_a", "name_b", "threshold", "lexical"),
     [
         ("", "Beta", 0.8, 0.0),
-        ("WHO", "World Health Organization", 0.8, 1 / 7),
-        ("United States of America", "USA", 0.8, 2 / 9),
-        ("alpha beta", "alphabeta", 0.8, 18 / 19),
-        ("alpha beta", "alphabeta", 0.98, 18 / 19),
+        ("WHO", "World Health Organization", 0.8, 1 / 16),
+        ("United States of America", "USA", 0.8, 4 / 31),
+        ("alpha beta", "alphabeta", 0.8, 18 / 23),
+        ("alpha beta", "alphabeta", 0.98, 18 / 23),
     ],
 )
 def test_disambiguation_keeps_dense_and_lexical_channels_independent(tmp_path, name_a, name_b, threshold, lexical):
     with closing(open_yaw_db(tmp_path / "candidate.db")) as conn:
         upsert_entities(conn, [("a", name_a), ("b", name_b)])
         upsert_entity_vectors(conn, [("a", np.array([1.0, 0.0])), ("b", np.array([1.0, 0.0]))])
-        pairs = find_entity_disambiguation_candidates(conn, lexical_threshold=threshold)
+        seed_candidate_vectors(conn)
+        pairs = find_entity_candidates(conn, lexical_threshold=threshold)
         assert len(pairs) == 1
         assert pairs[0][:2] == ("a", "b")
         assert pairs[0][2] == pytest.approx(1.0)

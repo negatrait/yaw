@@ -367,10 +367,28 @@ def provider():
                             [
                                 {
                                     "pair_id": p["pair_id"],
-                                    "relation": state.get("relation", "skos:related"),
+                                    "relation": "skos:exactMatch"
+                                    if state.get("same_name_equivalence")
+                                    and p["name_a"].casefold() == p["name_b"].casefold()
+                                    else state.get("relation", "skos:related"),
                                     "canonical": p["pair_id"].split("|")[0],
+                                    **(
+                                        {
+                                            "definition": max(
+                                                (
+                                                    pair[key]["definition"]
+                                                    for pair in packet["pairs"]
+                                                    if pair["pair_id"] == p["pair_id"]
+                                                    for key in ("entity_a", "entity_b")
+                                                ),
+                                                key=lambda definition: (len(definition), definition),
+                                            )
+                                        }
+                                        if state.get("same_name_equivalence")
+                                        else {}
+                                    ),
                                 }
-                                for p in packet["pairs"]
+                                for p in candidate_rows(text)
                             ],
                             stage_text=json.dumps(data["messages"]),
                         )
@@ -541,7 +559,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
         corpus_root=root,
         program_identity="fixture-v1",
         embedding_identity=embedder.profile.index_identity,
-        synonymy_top_k=0,
+        candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
     app = coco.App(
@@ -632,7 +650,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
         corpus_root=root,
         program_identity="fixture-v1",
         embedding_identity=embedder.profile.index_identity,
-        synonymy_top_k=0,
+        candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
     app = coco.App(
@@ -839,8 +857,8 @@ def test_incremental_indexing_recovers_from_interrupted_publication_and_emits_su
             tmp_path,
             program,
             embedder,
-            synonymy_top_k=5,
-            synonymy_threshold=-1.0,
+            candidate_lexical_threshold=0.55,
+            candidate_dense_threshold=-1.0,
         ),
         batch_size=2,
     )
@@ -997,8 +1015,8 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
             tmp_path,
             program,
             embedder,
-            synonymy_top_k=5,
-            synonymy_threshold=-1.0,
+            candidate_lexical_threshold=0.55,
+            candidate_dense_threshold=-1.0,
         ),
         batch_size=64,
     )
@@ -1030,8 +1048,8 @@ def test_shared_lmdb_cross_db_memo_reuse_and_target_isolation(tmp_path, provider
                 tmp_path,
                 program,
                 embedder,
-                synonymy_top_k=5,
-                synonymy_threshold=-1.0,
+                candidate_lexical_threshold=0.55,
+                candidate_dense_threshold=-1.0,
             ),
             batch_size=64,
         )
@@ -1089,7 +1107,7 @@ def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_pa
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     embedder = adapter(url)
     engine = bind_native_indexing(
-        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, embedder, synonymy_top_k=0),
+        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, embedder, candidate_lexical_threshold=0.55),
         batch_size=2,
     )
     t0 = "Ada studies Algebra."
@@ -1291,7 +1309,7 @@ def test_corpus_indexing_live_component_micro_batching_and_memo_hits(tmp_path, p
         corpus_root=root,
         program_identity="fixture-v1",
         embedding_identity=embedder.profile.index_identity,
-        synonymy_top_k=0,
+        candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
     app = coco.App(
@@ -1377,7 +1395,7 @@ def test_active_context_keys_override_constructor_defaults(tmp_path, provider):
         corpus_root=root,
         program_identity="active-v1",
         embedding_identity=embedder.profile.index_identity,
-        synonymy_top_k=0,
+        candidate_lexical_threshold=0.55,
     )
 
     context = coco.ContextProvider()

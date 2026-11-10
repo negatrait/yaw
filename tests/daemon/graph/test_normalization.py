@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 from yaw.core import OpenIERecord, StructuredTriple, text_processing
 from yaw.daemon.graph.normalization import normalize_openie_record
 from yaw.daemon.graph.planner import (
@@ -62,7 +63,7 @@ def test_homograph_definitions_remain_distinct_in_triples_and_mentions():
     assert normalized.surfaces["mercury"] == "Mercury"
 
 
-def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homographs_go_to_candidates(tmp_path: Path):
+def test_provisional_senses_require_definition_agreement_despite_high_cosine(tmp_path: Path):
     def1 = (
         "A metric used to confirm streaming degradation, specifically indicating "
         "the rate of duplicate data in the hedge process."
@@ -148,24 +149,29 @@ def test_provisional_senses_auto_merge_on_high_cosine_and_difflib_while_homograp
             for eid, _, defn in batch.entity_nodes
         ]
         upsert_entity_vectors(conn, vec_pairs)
+        seed_candidate_vectors(conn)
         candidates, _meta, _raw_cnt, auto_merges = prepare_synonym_candidates(
             conn,
             batch.entity_nodes,
-            synonymy_threshold=0.8,
-            synonymy_top_k=5,
+            candidate_dense_threshold=0.8,
+            candidate_lexical_threshold=0.55,
             fact_linked_pairs=batch.fact_linked_pairs,
         )
-        assert len(auto_merges) == 1
+        assert auto_merges == []
         remaining_defs = {
             str(r[0])
             for r in conn.execute("SELECT definition FROM entities WHERE name = 'Hedge-duplicate-rate'").fetchall()
         }
-        assert remaining_defs == {def1, def3}
+        assert remaining_defs == {def1, def2, def3}
         homograph_cands = [
             c for c in candidates if c["name_a"] == "Hedge-duplicate-rate" and c["name_b"] == "Hedge-duplicate-rate"
         ]
-        assert len(homograph_cands) == 1
-        assert {homograph_cands[0]["def_a"], homograph_cands[0]["def_b"]} == {def1, def3}
+        assert len(homograph_cands) == 3
+        assert {definition for pair in homograph_cands for definition in (pair["def_a"], pair["def_b"])} == {
+            def1,
+            def2,
+            def3,
+        }
 
 
 def test_clean_surface_label_and_single_surface_pref_label_alignment(tmp_path: Path):

@@ -56,7 +56,6 @@ def test_apply_synonym_adjudication_directed_broader(tmp_path: Path) -> None:
             cand_meta,
             decisions,
             fact_linked_pairs=set(),
-            synonymy_threshold=0.5,
             rlm_stats=rlm_stats,
             corpus_root=tmp_path,
         )
@@ -128,7 +127,6 @@ def test_apply_synonym_adjudication_hidden_label_and_edc_canonicalization(tmp_pa
             cand_meta,
             decisions,
             fact_linked_pairs=set(),
-            synonymy_threshold=0.5,
             rlm_stats=rlm_stats,
             corpus_root=tmp_path,
         )
@@ -205,7 +203,6 @@ def test_apply_synonym_adjudication_related_and_different_from(tmp_path: Path) -
             cand_meta,
             decisions,
             fact_linked_pairs=set(),
-            synonymy_threshold=0.5,
             rlm_stats=rlm_stats,
             corpus_root=tmp_path,
         )

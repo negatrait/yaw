@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.core.types import detect_scalar_literal
 from yaw.daemon.graph.ppr import build_transition_matrix, run_ppr
@@ -521,7 +522,6 @@ def test_w3c_guardrail_1_homograph_only_different_from(tmp_path: Path) -> None:
             cand_meta,
             decisions,
             fact_linked_pairs=set(),
-            synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
 
@@ -620,7 +620,6 @@ def test_canonical_gemma4_ssot_no_python_token_overrides_in_planner(tmp_path: Pa
             cand_meta,
             decisions,
             fact_linked_pairs={("e1", "e3")},
-            synonymy_threshold=0.7,
             rlm_stats=rlm_stats,
         )
 
@@ -677,17 +676,17 @@ def test_w3c_guardrail_3_case_insensitive_consolidation(tmp_path: Path) -> None:
             ("e2", "Canary", "Deployment pattern test"),
         ]
         rlm_stats: dict[str, Any] = {"merged_entities": 0}
+        seed_candidate_vectors(conn)
         cands, cand_meta, _, auto_merges = prepare_synonym_candidates(
             conn,
             entity_nodes,
-            synonymy_threshold=0.8,
-            synonymy_top_k=5,
+            candidate_dense_threshold=0.8,
+            candidate_lexical_threshold=0.55,
             rlm_stats=rlm_stats,
         )
 
-        # Auto-merged under Guardrail 3
-        assert len(auto_merges) == 1
-        assert rlm_stats["merged_entities"] == 1
-        # Prefers properly capitalized "Canary"
-        dst_id = auto_merges[0].canonical_id
-        assert cand_meta[dst_id][0] == "Canary"
+        # Case equality and high cosine cannot bypass the definition gate.
+        assert auto_merges == []
+        assert rlm_stats["merged_entities"] == 0
+        assert len(cands) == 1
+        assert cand_meta["e2"][0] == "Canary"

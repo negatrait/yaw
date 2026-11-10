@@ -34,8 +34,7 @@ _PUBLIC_API: dict[str, str] = {
     # Chunk metadata, OpenIE checkpoints, SKOS/RDF/OWL graph CRUD & candidate mining
     "canonicalize_entity_labels_edc": ".graph_ops",
     "deserialize_openie_record": ".graph_ops",
-    "find_entity_synonym_candidates": ".graph_ops",
-    "find_entity_disambiguation_candidates": ".graph_ops",
+    "find_entity_candidates": ".graph_ops",
     "upsert_chunk_pointers": ".chunks",
     "get_chunk_pointer": ".chunks",
     "get_chunk_pointers": ".chunks",

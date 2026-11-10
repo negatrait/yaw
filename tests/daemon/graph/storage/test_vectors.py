@@ -9,9 +9,10 @@ from pathlib import Path
 import cocoindex as coco
 import numpy as np
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.daemon.graph.storage import (
-    find_entity_synonym_candidates,
+    find_entity_candidates,
     open_managed_yaw_db,
     open_yaw_db,
     search_chunk_vectors_knn,
@@ -23,7 +24,7 @@ from yaw.daemon.graph.storage import (
     upsert_fact_vectors,
 )
 from yaw.daemon.graph.storage.db import GRAPH_DB, ensure_vec0_table, vec0_table_dimension
-from yaw.daemon.graph.storage.evidence import EntityMention, FactAssertion, fact_id, sense_id
+from yaw.daemon.graph.storage.evidence import CandidateVector, EntityMention, FactAssertion, fact_id, sense_id
 from yaw.daemon.graph.storage.graph_ops import rekey_facts, upsert_entities, upsert_fact_sources, upsert_facts
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import (
@@ -116,6 +117,22 @@ def _build_valid_desired_tables(
         "entity_vec": (
             EntityVector(ent_a, serialize_f32_vector(entity_a_vec)),
             EntityVector(ent_b, serialize_f32_vector(entity_b_vec)),
+        ),
+        "entity_candidate_vectors": (
+            CandidateVector(
+                ent_a,
+                ent_a,
+                "ada lovelace",
+                "first computer programmer",
+                serialize_f32_vector(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+            ),
+            CandidateVector(
+                ent_b,
+                ent_b,
+                "analytical engine",
+                "mechanical computer",
+                serialize_f32_vector(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)),
+            ),
         ),
         "fact_vec": (FactVector(fid, serialize_f32_vector(fact_vec)),),
         "entity_mentions": (
@@ -268,7 +285,7 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
         env.close()
         managed.close()
 
-    # 5. Verify rekey_facts on vec0 and exact cosine parity for _search_knn and find_entity_synonym_candidates
+    # 5. Verify rekey_facts on vec0 and exact cosine parity for _search_knn and find_entity_candidates
     knn_conn = open_yaw_db(tmp_path / "knn_parity.db")
     try:
         rng = np.random.default_rng(42)
@@ -313,7 +330,7 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
             for _, sim in tie_hits:
                 assert sim == pytest.approx(1.0, abs=1e-6)
 
-            # Verify find_entity_synonym_candidates parity with exact cosine reference
+            # Verify find_entity_candidates parity with exact cosine reference
             v_x = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             v_y = np.array([0.92, float(np.sqrt(1.0 - 0.92**2)), 0.0, 0.0], dtype=np.float32)
             v_z = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
@@ -321,7 +338,8 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
             upsert_entity_vectors(tie_conn, [("x", v_x), ("y", v_y), ("z", v_z)])
             # Clean out ent-a/b/c so only x, y, z remain
             tie_conn.execute("DELETE FROM entity_vec WHERE entity_id IN ('ent-a', 'ent-b', 'ent-c')")
-            cands = find_entity_synonym_candidates(tie_conn, threshold=0.8, top_k=5)
+            seed_candidate_vectors(tie_conn)
+            cands = find_entity_candidates(tie_conn, dense_threshold=0.8, lexical_threshold=2.0)
             assert len(cands) == 1
             assert (cands[0][0], cands[0][1]) == ("x", "y")
             assert cands[0][2] == pytest.approx(_exact_cosine_similarity(v_x, v_y), abs=1e-6)

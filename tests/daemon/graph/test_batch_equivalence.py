@@ -83,6 +83,7 @@ def canonical_graph(conn):
         "extractions": "SELECT chunk_id, extraction_json FROM chunk_inference ORDER BY chunk_id",
         "chunk_vectors": "SELECT * FROM chunk_vec ORDER BY chunk_id",
         "entity_vectors": "SELECT * FROM entity_vec ORDER BY entity_id",
+        "candidate_vectors": "SELECT * FROM entity_candidate_vectors ORDER BY sense_id",
         "fact_vectors": "SELECT * FROM fact_vec ORDER BY fact_id",
     }
     return {name: conn.execute(sql).fetchall() for name, sql in queries.items()}
@@ -240,6 +241,116 @@ def test_incremental_publication_without_memory_clone_or_full_survivor_scan(tmp_
         engine.close()
 
 
+def test_ball_senses_reach_distinctness_across_64_plus_64_and_128(tmp_path, provider):
+    url, state = provider
+    state.update(delay=0, relation="owl:differentFrom", embedding_vector=lambda _: [1.0, 0.0, 0.0, 0.0])
+    chunks, extractions = frozen_document(tmp_path)
+    for index, owner, predicate, definition in (
+        (63, "Cinderella", "attended", "A formal dance event attended by Cinderella."),
+        (64, "Cindy Real", "played with", "A spherical toy owned by Cindy Real."),
+    ):
+        old_pointer, old_text = chunks[index]
+        del extractions[old_text]
+        text = f"Evidence {index}: {owner} {predicate} a ball."
+        pointer = ChunkPointer(
+            compute_chunk_id(old_pointer.rel_posix_path, 1, 1, text), old_pointer.rel_posix_path, 1, 1
+        )
+        chunks[index] = pointer, text
+        (tmp_path / pointer.rel_posix_path).write_text(text + "\n", encoding="utf-8")
+        extractions[text] = {
+            "named_entities": [[owner, f"The person named {owner}."], ["ball", definition]],
+            "triples": [
+                {
+                    "sub": owner,
+                    "pred": [predicate, "owl:ObjectProperty"],
+                    "obj": "ball",
+                    "def": f"{owner} {predicate} the ball.",
+                }
+            ],
+        }
+    state["extractions"] = extractions
+    results = {}
+    for arm, batch_size in (("incremental", 64), ("reference", 128)):
+        lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, max_tokens=512)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+        engine = bind_native_indexing(
+            YawGraphEngine(tmp_path / arm / "yaw.db", tmp_path, program, adapter(url)),
+            batch_size=batch_size,
+        )
+        try:
+            if arm == "incremental":
+                engine.index_chunks(chunks[:64])
+            engine.index_chunks(chunks)
+            ball_ids = [row[0] for row in engine.conn.execute("SELECT entity_id FROM entities WHERE name='ball'")]
+            assert len(ball_ids) == 2
+            assert (
+                engine.conn.execute(
+                    "SELECT count(*) FROM edges WHERE src_id IN (?,?) AND dst_id IN (?,?) AND kind='owl:differentFrom'",
+                    (*ball_ids, *ball_ids),
+                ).fetchone()[0]
+                > 0
+            )
+            assert engine.lint_graph()["conforms"]
+            results[arm] = canonical_graph(engine.conn)
+        finally:
+            engine.close()
+    assert_same_graph(results["incremental"], results["reference"])
+
+
+def test_merged_member_vector_preserves_late_relation_64_plus_64_equals_128(tmp_path, provider):
+    import math
+
+    from yaw.daemon.graph.storage.evidence import sense_id
+
+    url, state = provider
+    state.update(delay=0, relation="skos:related")
+    definition = "A common definition for the same service processor."
+    labels = sorted(
+        [
+            "The exceptionally long canonical service Processor A",
+            "the exceptionally long canonical service processor b",
+        ],
+        key=lambda name: sense_id(name, definition),
+    )
+    geometry = {
+        labels[0].casefold(): [1.0, 0.0, 0.0, 0.0],
+        labels[1].casefold(): [0.98, math.sqrt(1 - 0.98**2), 0.0, 0.0],
+        "orthogonal unrelated surface": [0.67, math.sqrt(1 - 0.67**2), 0.0, 0.0],
+    }
+    state["embedding_vector"] = lambda text: next(
+        vector for name, vector in geometry.items() if name in text.casefold()
+    )
+    state["extractions"] = {}
+    chunks = []
+    for index in range(128):
+        label = labels[1] if index == 63 else "Orthogonal unrelated surface" if index == 64 else labels[0]
+        defn = definition if index != 64 else "A related domain object."
+        text = f"Evidence {index}: {label}."
+        path = f"member_{index:03d}.md"
+        (tmp_path / path).write_text(text + "\n", encoding="utf-8")
+        chunks.append((ChunkPointer(compute_chunk_id(path, 1, 1, text), path, 1, 1), text))
+        state["extractions"][text] = {"named_entities": [[label, defn]], "triples": []}
+    results = {}
+    for arm, batch_size in (("incremental", 64), ("reference", 128)):
+        lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, max_tokens=512)
+        program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
+        engine = bind_native_indexing(
+            YawGraphEngine(tmp_path / arm / "yaw.db", tmp_path, program, adapter(url)), batch_size=batch_size
+        )
+        try:
+            if arm == "incremental":
+                engine.index_chunks(chunks[:64])
+                assert engine.conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 1
+            engine.index_chunks(chunks)
+            assert engine.conn.execute("SELECT count(*) FROM entities").fetchone()[0] == 2
+            assert engine.conn.execute("SELECT count(*) FROM entity_candidate_vectors").fetchone()[0] == 3
+            assert engine.conn.execute("SELECT count(*) FROM edges WHERE kind='skos:related'").fetchone()[0] > 0
+            results[arm] = canonical_graph(engine.conn)
+        finally:
+            engine.close()
+    assert_same_graph(results["incremental"], results["reference"])
+
+
 def test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128(tmp_path, provider):
     """Verify reverse top-k candidate completeness when e_old is excluded from e_new's forward top-k (U3)."""
     import math
@@ -342,8 +453,8 @@ def test_reverse_top_k_asymmetric_candidate_completeness_64_plus_64_equals_128(t
                 tmp_path,
                 program,
                 adapter(url),
-                synonymy_threshold=0.80,
-                synonymy_top_k=5,
+                candidate_dense_threshold=0.80,
+                candidate_lexical_threshold=0.55,
             ),
             batch_size=batch_size,
         )
@@ -477,8 +588,8 @@ def test_passive_endpoint_homograph_preserves_edges_and_facts_across_batches(tmp
                 tmp_path,
                 program,
                 adapter(url),
-                synonymy_threshold=0.80,
-                synonymy_top_k=5,
+                candidate_dense_threshold=0.80,
+                candidate_lexical_threshold=0.55,
             ),
             batch_size=batch_size,
         )
@@ -589,8 +700,8 @@ def test_suffix_lexical_match_on_passive_endpoint_preserves_closed_world_across_
                 tmp_path,
                 program,
                 adapter(url),
-                synonymy_threshold=0.80,
-                synonymy_top_k=5,
+                candidate_dense_threshold=0.80,
+                candidate_lexical_threshold=0.55,
             ),
             batch_size=batch_size,
         )
@@ -751,7 +862,7 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
             "incremental_s": round(trial_timings["incremental"], 6),
             "reference_s": round(trial_timings["reference"], 6),
             "ratio": round(ratio, 6),
-            "canonical_15_table_parity": True,
+            "canonical_graph_parity": True,
         }
         if regime == "cold_memo":
             cold_trials.append(record)
@@ -830,7 +941,7 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
             "within_0_80_to_1_25": 0.80 <= r_graph_mean <= 1.25,
         },
         "invariants": {
-            "canonical_15_table_parity_trials_passed": 20,
+            "canonical_graph_parity_trials_passed": 20,
             "shacl_conforms": True,
             "batch2_reembedded_batch1_chunks": total_reembedded_b1,
             "batch2_unindexed_readonly_selects": total_unindexed_selects,

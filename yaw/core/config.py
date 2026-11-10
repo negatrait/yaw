@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import json
+import math
 import os
 import time
 import tomllib
@@ -225,8 +226,10 @@ class YawConfig:
     retrieval_top_k: int = 10
     damping: float = 0.5
 
-    synonymy_threshold: float = 0.8
-    synonymy_top_k: int = 100
+    candidate_dense_threshold: float = 0.8
+    candidate_lexical_threshold: float = 0.625
+    auto_merge_threshold: float = 0.98
+    candidate_volume_ratio: float = 1.0
     synonym_batch_size: int = 4
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
@@ -260,6 +263,14 @@ class YawConfig:
                 attr,
                 _resolve_path(ws, getattr(self, attr) or "", default_rel),
             )
+        if not all(
+            math.isfinite(value) for value in (self.candidate_dense_threshold, self.candidate_lexical_threshold)
+        ):
+            raise YawRuntimeError("INVALID_INPUT", "Candidate admission thresholds must be finite")
+        if not 0 < self.auto_merge_threshold <= 1:
+            raise YawRuntimeError("INVALID_INPUT", "auto_merge_threshold must be in (0, 1]")
+        if not 0 < self.candidate_volume_ratio < float("inf"):
+            raise YawRuntimeError("INVALID_INPUT", "candidate_volume_ratio must be finite and positive")
         if self.queue_maxsize < 1:
             raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
         if self.chunk_size < 1:
@@ -423,7 +434,10 @@ class YawConfig:
             "reflection_input_tokens": self.reflection_input_tokens,
             "reflection_tokenizer_url": self.reflection_tokenizer_url,
             "max_context_chars": self.max_context_chars,
-            "synonymy_threshold": self.synonymy_threshold,
+            "candidate_dense_threshold": self.candidate_dense_threshold,
+            "candidate_lexical_threshold": self.candidate_lexical_threshold,
+            "auto_merge_threshold": self.auto_merge_threshold,
+            "candidate_volume_ratio": self.candidate_volume_ratio,
             "synonym_batch_size": self.synonym_batch_size,
             "damping": self.damping,
         }
@@ -482,8 +496,10 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "linking_top_k": "graph",
     "retrieval_top_k": "graph",
     "damping": "graph",
-    "synonymy_threshold": "graph",
-    "synonymy_top_k": "graph",
+    "candidate_dense_threshold": "graph",
+    "candidate_lexical_threshold": "graph",
+    "auto_merge_threshold": "graph",
+    "candidate_volume_ratio": "graph",
     "synonym_batch_size": "graph",
     "embed_batch_size": "graph",
     "embed_batch_chars": "graph",
@@ -566,6 +582,8 @@ def load_config(
         section = data.get(sec_name)
         if isinstance(section, dict):
             for k, v in section.items():
+                if sec_name == "graph" and k in {"synonymy_threshold", "synonymy_top_k"}:
+                    raise YawRuntimeError("INVALID_INPUT", f"Retired candidate setting: graph.{k}")
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":

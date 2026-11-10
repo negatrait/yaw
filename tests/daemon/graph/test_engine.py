@@ -1046,7 +1046,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             program=program,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
+            candidate_dense_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
         )
     )
     try:
@@ -1299,7 +1299,7 @@ using all 5 bound REPL tools."""
             program=program,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
         )
     )
     try:
@@ -1621,7 +1621,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
             program=program,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
         )
     )
     try:
@@ -2135,7 +2135,7 @@ minibatch q_stats lookup."""
             program=program,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
         )
     )
     try:
@@ -2947,7 +2947,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
             program=prog,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
             traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
         )
     )
@@ -3057,7 +3057,7 @@ def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
             program=prog,
             embedder=embedder,
             retrieval_top_k=2,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
         )
     )
     try:

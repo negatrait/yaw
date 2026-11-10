@@ -65,6 +65,27 @@ Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
 persistent configuration setting; `uv run typecheck` supplies it automatically.
 See the [coverage plan](docs/coverage-plan.md) for remaining verification work.
 
+Indexes created before source-vector retention require a rebuild from source
+before indexing with this version. The pipeline reports the missing schema
+explicitly. Restart long-running processes to load the implementation.
+
+Candidate discovery uses fixed `[graph]` `candidate_dense_threshold` and
+`candidate_lexical_threshold` cutoffs. `auto_merge_threshold` separately requires
+extreme cosine and difflib agreement on labels and definitions. The old
+`synonymy_threshold` and `synonymy_top_k` settings are rejected.
+
+To calibrate candidate volume for a corpus, use
+`uv run --locked python scripts/calibrate_candidates.py --db <yaw.db> --reference <reference.json>`.
+The reference contains `{"cases":[{"entity_ids":["..."],"candidate_count":33}]}`
+for complete fixed calibration pools. The command reads configured
+`graph.candidate_volume_ratio` (default `1.0`; optional `--volume-ratio` override),
+fits cutoffs within ±10% of target volume and prints the settings. Apply the
+printed cutoffs with `yaw config set graph.candidate_dense_threshold <value>`
+and `yaw config set graph.candidate_lexical_threshold <value>`. Calibration never
+changes the database or imposes runtime batch quotas. Current defaults target
+the optimizer corpus; new corpora need their own calibration. See the
+[candidate-search record](docs/reviews/synonym-candidate-search.md).
+
 Optimization uses the canonical `.yaw/optimize_yaw.db` sandbox and resumes by
 default so databases are never wiped accidentally (`--resume` and timestamped
 `*_optimize_<datestamp>*` sandboxes are retired). If `.yaw/optimize_yaw.db`
@@ -205,8 +226,8 @@ YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON 
   - `fact`: Directed assertion triples (`subj` $\to$ `obj`) enriched with contextual triple `skos:definition`. Predicates remain typed edge properties rather than graph concept hubs, preventing PPR super-node collapse.
   - `skos:related`: Symmetric associative links (weighted by $\beta$) traversed by sparse CSR Personalized PageRank.
   - `owl:differentFrom`: Symmetric contrastive non-identity links between distinct polysemous/homograph senses. These edges are strictly dominant over merging and are excluded from PPR random walks.
-- **Two-Channel Candidate Combiner & Provisional Sense-Split Gate:**
-  `find_entity_disambiguation_candidates` surfaces candidate pairs using dense vector kNN, lexical `difflib` similarity, and unadjudicated surface matches. When two mentions share identical surface labels but have divergent definitions ($\cos < 0.85$), YAW allocates a provisional `sense_id` instead of colliding or prematurely asserting `owl:differentFrom`.
+- **Two-Channel Candidate Discovery & Source-Sense Preservation:**
+  `find_entity_candidates` combines blocked cosine thresholds with sparse character-trigram similarity and exact source-label matches. Immutable `entity_candidate_vectors` preserve member evidence after merges; labels and definitions identify provisional senses independently of admission scores. A separate calibrated `auto_merge_threshold` requires extreme cosine and difflib agreement on labels and definitions. Remaining pairs enter the merge, hierarchy and relation/distinctness judges.
 - **Closed-World SHACL Validation (`lint_graph_shacl`):**
   Native SQLite checks enforce resource labels/definitions, SKOS label integrity, resource/literal endpoints, irreflexive statements, provenance, hierarchy/disjointness and confidence constraints. Validation runs during planning and before atomic publication; its cost must be measured against graph size.
 - **Autonomous DSPy RLM Self-Healing (`heal_shacl_violations`):**

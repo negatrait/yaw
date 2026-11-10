@@ -580,7 +580,6 @@ def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
         cand_meta,
         decisions,
         set(),
-        synonymy_threshold=0.8,
         rlm_stats=rlm_stats,
     )
     assert staged_merges == []
@@ -715,7 +714,17 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
     """Verify cased literal objects ('AWS TGW', 'Pricing addendum', 'KMS/region support matrix', 'Diego Morales')
     and consecutive chunks of the same document ('Priya Nair', 'Ethan Cole', 'Diego Morales') never split into
     duplicate entities or produce false owl:differentFrom edges."""
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_no_false_diff.db", synonym_callback=lambda _: [])
+
+    def judge_same_people(candidates):
+        return [
+            {"pair_id": pair["pair_id"], "relation": "skos:exactMatch", "definition": "A participant in the meeting."}
+            for pair in candidates
+            if pair["name_a"].casefold() == pair["name_b"].casefold()
+        ]
+
+    engine, conn = _make_engine(
+        synonym_token_counter, tmp_path, "test_no_false_diff.db", synonym_callback=judge_same_people
+    )
 
     doc_path = tmp_path / "meeting.md"
     doc_path.write_text(
@@ -913,7 +922,6 @@ def test_apply_synonym_adjudication_remaps_semantic_edges_after_later_merge() ->
             cand_meta,
             decisions,
             set(),
-            synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
         assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [("ent-c", "ent-b")]
@@ -979,7 +987,6 @@ def test_apply_synonym_adjudication_prevents_transitive_collapse_across_separate
             cand_meta,
             decisions,
             {("ent-p1", "ent-p2")},
-            synonymy_threshold=0.8,
             rlm_stats=rlm_stats,
         )
         assert [(merge.removed_id, merge.canonical_id) for merge in staged_merges] == [

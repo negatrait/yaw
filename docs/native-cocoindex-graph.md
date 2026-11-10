@@ -24,6 +24,41 @@ Non-goals: Source file discovery, `localfs.walk_dir` scheduling, and runtime wor
 
 Depends on decisions: [2026-11-06: two-stage NER resource vocabulary & literal object boundary](#decisions), [2026-11-06: Step 4 atomic units](#decisions), [2026-11-07: validity-ordered repair-preserving fact definitions & focus-isolated SHACL healing](#decisions), [2026-11-07: direct pre-hydrated `shacl_repair` dispatch](#decisions), [2026-11-07: remedy gaps 1–5 across indexing and graph specs](#decisions), [2026-11-08: W3C ontology simplification](#decisions), [2026-11-09: ManagedTableTarget.delete_row & input-only graph_input_fingerprints](#decisions), [native-cocoindex-indexing.md decisions](native-cocoindex-indexing.md#decisions).
 
+### 1.1 Pipeline order: extract local evidence before global adjudication
+
+The common production/optimization pipeline computes memoized `F(Source)` per
+chunk, then plans and publishes a cross-chunk graph for each micro-batch.
+
+| Order | Operation | Evidence and effect |
+| --- | --- | --- |
+| 1 | `_run_ner_stage` | Extract resource labels and contextual definitions from the passage. |
+| 2 | `extract_structured_triples` | Extract passage-local statements bounded by NER-owned resources; valid literal objects remain literals. Memoized `extract_text` retains the OpenIE record and traces. |
+| 3 | `prepare_synonym_candidates` | Search the affected cross-chunk neighborhood using immutable source vectors and lexical features; apply the separate extreme-agreement merge gate. |
+| 4 | `judge_synonyms` | Adjudicate admitted pairs through labels, hierarchy, then relation/distinctness, with short circuits. Requests contain at most four pairs, further bounded by the configured batch size and token budget. |
+| 5 | `bind_merged_evidence` | Bind occurrences and previously extracted assertions to canonical entity/fact IDs after merges, including affected prior chunks. Preserve raw source identity/evidence and retained member vectors. |
+| 6 | SHACL validation and healing | Run `auto_heal_deterministic_shacl`; dispatch remaining focus-bound violations through `heal_shacl_violations`, apply validated repairs and revalidate. |
+| 7 | Validated atomic publication | `plan_graph_publication` rejects remaining SHACL violations. `publish_graph` declares the graph targets; `validate_graph_state` validates the reconciled SQLite state before the shared `DatabaseSink` transaction commits relational, provenance, FTS and vector changes. |
+
+**Triples precede synonym adjudication because they are its evidence.** They
+describe what the author asserted in that passage, before canonical IDs are
+selected. Candidate dossiers include `direct_facts` and `shared_role_facts`.
+Under project rules W1/W2, direct facts bypass `JudgeLabels` and enter
+`JudgeHierarchy`. After hierarchy declines a pair, direct/shared-role facts can
+resolve it deterministically to `skos:related`, avoiding `JudgeRelated`.
+Extracting triples after judging would remove this relational context.
+
+The remaining cascade is `JudgeLabels` (equivalent/altLabel, hiddenLabel, or
+non-equivalent) -> `JudgeHierarchy` (broader/narrower) -> `JudgeRelated`
+(related/differentFrom). It feeds more than deduplication: dance-event `ball`
+and toy `ball` are useful disambiguation candidates. Accepted equivalences
+rebind existing statements rather than re-extracting them from rewritten text.
+Unselected pairs remain unjudged; a missing candidate is not an assertion of
+distinctness. Irreflexivity, provenance and closed-world shape violations must
+be resolved before publication; failed repair/validation aborts the publication.
+
+See [CS1](reviews/synonym-candidate-search.md) for the revised
+candidate algorithm, calibrated thresholds and fixed-evidence batch results.
+
 ## 2. Problem, with evidence
 
 Following the resolution of `50be17d` Gaps 1–5 (recorded in [incremental-publication-work.md](reviews/incremental-publication-work.md)), audit of pinned commit `28a1113` identified `2` `[observed: yaw/daemon/graph/storage/rows.py:333, yaw/daemon/graph/planner.py:853-856, 28a1113]` remaining graph-storage and planner defects (Anti-Pattern 6 and the planner half of Anti-Pattern 1; see [native-cocoindex-indexing.md §2](native-cocoindex-indexing.md#2-problem-with-evidence) for Anti-Patterns 1–5):
@@ -68,8 +103,34 @@ Historical `50be17d` Gaps 1–5 (resolved in Checkpoints `C1–C5`, `G4-VEC0`, `
   - Skipping or narrowing `lint_graph_shacl` validation without proving affected-closure equivalence.
 
 ### Goal B: Exact batch-independent canonical graph (`64 + 64` == `128`)
+
+Candidate-search revision (2026-11-10): the
+[speed-first candidate proposal](reviews/synonym-candidate-search.md) may replace
+the empirically chosen cosine/difflib heuristic. Old/new candidate lists, scores,
+ordering, prompt bytes and physical vector/index bytes need not match. Preserve
+canonical identities, source-supported facts, relations and evidence bindings
+between fixed-evidence 64+64 and 128 runs of the replacement. Similarity thresholds
+are discovery heuristics, not identity rules. Reuse the existing batch gate and
+one bounded speed/memory/candidate-volume comparison; no separate full retrieval
+campaign is required for this candidate-search unit. Implementation and evidence are tracked in CS1; final gates are recorded there.
+The volume-control hyperparameter is `candidate_volume_ratio` (default `1.0`):
+offline calibration must place unique eligible candidate count within ±10% of
+the baseline on each calibration input. Emit fixed dense/lexical cutoffs and
+check a separate small sample; no runtime batch quotas or adaptive cutoffs.
+Persist the calibrated policy in settings/program identity. Equal candidate
+counts alone do not establish useful deduplication or canonical graph equality.
+Evaluate this pool for the full merge -> hierarchy -> relation/differentFrom
+cascade, not merge yield alone. Identical labels with distinct supported senses
+must remain candidate pairs; shared lexical feature rows do not merge sense IDs.
+Only immutable source labels and vectors determine admission; canonical display
+and healed labels cannot create candidates. After automatic merges, complete
+surviving pair scores from all retained source members, including member pairs
+that individually fell below admission.
+The [review](reviews/synonym-candidate-search.md) records the dance/toy `ball`
+example and the existing same-name pre-consolidation path requiring verification.
+
 - **Measure**: Canonical entity count, fact count, counts by edge kind (`fact`, `skos:broader`, `skos:related`, `owl:differentFrom`), canonical sense ID sets, occurrence-to-entity bindings (`entity_mentions`), fact semantic keys and assertion bindings (`fact_assertions`), `entity_labels` (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`), `vec0` keys/bytes (`chunk_vec`, `entity_vec`, `fact_vec`), FTS5 rowids (`chunk_fts`, `fact_fts`), and aggregated epistemic confidences.
-- **Reference**: Canonical `15`-table `[target]` SQLite state produced by Reference arm $R$ (`canonical_graph(R(B, all128))`).
+- **Reference**: Canonical `16`-table `[target]` SQLite state, including source candidate vectors, produced by Reference arm $R$ (`canonical_graph(R(B, all128))`).
 - **Passes when**:
   - **Fixed-evidence harness (including entity count $> \text{top\_k}$ `[target]`)**: `canonical_graph(I(B, first64, last64)) == canonical_graph(R(B, all128))` with `0` `[target]` difference in entity, fact, and per-kind edge counts, `100%` `[target]` exact set equality on canonical IDs, bindings, labels, vectors, and FTS rows, and `<= 1e-6` `[target]` numeric difference on pooled confidence floats.
   - **Live stochastic model trials (`>= 5` `[target]` paired runs)**: Entity, fact, and per-kind edge count differences `<= 2%` `[target]` relative to `max(1, reference_count)`, set Jaccard `>= 0.98` `[target]` for canonical entities, facts, and edges individually, and `0` `[target]` missing required bridge facts or false homograph merges.
@@ -89,8 +150,25 @@ Thresholds are not loosened after seeing a run.
 
 - **Equality and batch-independent identity**:
   - **Resource sense identity & single-surface `skos:prefLabel`**: Keyed deterministically by `(text_processing(label), resolved_definition)`. `clean_surface_label(raw: str) -> str` (`yaw/core/types.py`, exported in `yaw/core/__init__.py`) strips leading/trailing clause punctuation (`:;,`), and `preferred_surface` ranks display forms by `(text_processing(value) == label_norm, value != value.lower(), -len(value), value)`. `canonicalize_entity_labels_edc`, `upsert_entity_labels`, and `upsert_entities` align `raw_label = winning_raw` across all `skos:prefLabel` rows of an entity so every `skos:Concept` has `1` `[target]` distinct `skos:prefLabel` lexical string in `entity_labels` and W3C Turtle output. An accepted equivalence class selects its minimum surviving member sense ID (`MIN(sense_id)`) as the canonical representative, never first-seen arrival order. When a smaller representative arrives in a later batch, `bind_merged_evidence` and `rekey_facts` rewrite affected `entity_mentions`, `fact_assertions`, `facts`, `fact_sources`, `edges`, `edge_sources`, `entity_vec`, and `fact_vec` atomically while preserving raw occurrence fields (`raw_entity_id`, `raw_sub_id`, `raw_obj_id`).
-  - **Same-norm pre-consolidation only (`W2`) & strict `JudgeLabels` equivalence (`W1`)**: `prepare_synonym_candidates` pre-consolidates $(A, B)$ before LLM adjudication if and only if $\text{text\_processing}(\text{name}_A) = \text{text\_processing}(\text{name}_B) \land d_{\text{sim}}(A, B) \ge \tau_{\text{syn}} \land \neg\text{is\_active\_fact\_pole}(A, B)$. Cross-label Python auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`) and post-hoc Python token overrides (`_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`) are retired from `planner.py`. Cross-label candidate pairs advance to `JudgeLabels` (`@coco.fn(memo=True, version=2)`, `gbnf_max_reasoning_chars = 360` `[target]`), which merges $(A, B)$ iff `equivalent: true` and routes all `equivalent: false` pairs to `JudgeHierarchy`.
-  - **Reverse top-$k$ candidate completeness**: Candidate discovery across `find_entity_disambiguation_candidates` and `find_entity_synonym_candidates` must produce the identical candidate pair set for `64 + 64` `[target]` and `128` `[target]` even when total entities exceed `top_k` (`> 10` `[target]` entities in a shared subspace), accounting for new Batch 2 entities entering an existing Batch 1 entity's top-$k$ neighborhood or invalidating a prior neighborhood boundary.
+  - **Extreme-agreement pre-consolidation (`W2`) & the complete judge cascade**:
+    A separate `auto_merge_threshold=0.98` requires cosine plus difflib ratios of
+    both normalized labels and nonempty definitions to pass. Recheck fact poles
+    and established semantic separation after resolving representatives. All
+    other selected pairs proceed through JudgeLabels -> JudgeHierarchy ->
+    JudgeRelated. Candidate thresholds (`candidate_dense_threshold`,
+    `candidate_lexical_threshold`) never authorize merging. See
+    [W3C invariant W2](w3c-improvements.md#invariant-w2-calibrated-extreme-agreement-pre-consolidation)
+    and [CS1](reviews/synonym-candidate-search.md).
+  - **Immutable candidate evidence**: `entity_candidate_vectors` is a typed
+    CocoIndex target in the same writer transaction, keyed by source sense ID.
+    Persist normalized source name/definition, canonical owner and original
+    embedding. Never replace member evidence with a merged canonical embedding
+    for candidate eligibility. Merge, withdrawal and SHACL deletion keep ownership
+    consistent with `entity_mentions`; publication rejects missing/orphan bindings.
+    Existing indexes without these source vectors require a source rebuild.
+
+
+  - **Batch-independent candidate discovery**: While top-$k$ selection remains active, account for reverse-neighbor changes even when total entities exceed `top_k`. Reverse top-$k$ is a requirement of that ranking policy, not a mandatory algorithm. The threshold-only replacement uses one canonical `find_entity_candidates` API with no compatibility aliases, refactors all consumers, and removes obsolete top-$k$ selection/settings. Fuzzy source labels survive canonical display-name changes. Pair eligibility must depend on the two resources' stable evidence rather than ingestion layout; final canonical graph equality remains required. See the [candidate-search proposal](reviews/synonym-candidate-search.md).
   - **Fact semantic key & universal statement irreflexivity (`W3`)**: Derived from `(canonical_sub_id, original_predicate, obj_kind, canonical_obj_id_or_literal_value, literal_datatype, literal_lang)`. Equal lexical strings with different datatypes or languages remain distinct facts. `is_irreflexive_statement` (`yaw/core/types.py`, exported in `yaw/core/__init__.py`) enforces statement irreflexivity across both `entity` and `literal` objects ($\text{text\_processing}(\text{subj}) = \text{text\_processing}(\text{obj})$ or $\text{obj\_kind} = \text{'literal'} \land \text{text\_processing}(\text{pred}) = \text{text\_processing}(\text{subj\_def})$) across `build_evidence`, `materialize_entities_and_facts`, `rekey_facts`, `validate_stage_invariants("triples")`, `StatementShape/irreflexive`, and `auto_heal_deterministic_shacl`. Collapsed or pseudo-reflexive entity and literal assertions retain their raw `fact_assertions` row with `fact_id = NULL`.
   - **Validity-ordered, repair-preserving `canonicalize_fact_definitions` with Tier 3 deterministic synthesis (`W4`)**: For each fact $f$ with subject definition `es.definition` and (when `obj_kind == 'entity'`) object definition `eo.definition`, a candidate definition $d$ satisfies `valid_spo_def(d, f)` iff `trim(d) != ''`, `lower(trim(d)) != lower(trim(es.definition))`, and (when `obj_kind == 'entity'`) `lower(trim(d)) != lower(trim(eo.definition))`. `canonicalize_fact_definitions(conn, prior_definitions=prior_fact_definitions)` propagates `prior_fact_definitions` across `merged.fact_bindings` and selects $d^*(f)$ by `3`-tier `[target]` precedence (resolving endpoint-duplicating or empty `spo_def` values with `0` `[target]` `heal_shacl_violations` LLM calls while keeping `fact_assertions.raw_json` immutable):
     1. **Tier 1 (Valid Source Assertion)**: Closed-world valid `fact_assertions` row with `MIN(assertion_id)`.

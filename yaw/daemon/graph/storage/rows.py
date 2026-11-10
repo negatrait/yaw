@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 
 from yaw.core import ChunkPointer
 
-from .evidence import EVIDENCE_INDEXES, EntityMention, FactAssertion
+from .evidence import EVIDENCE_INDEXES, CandidateVector, EntityMention, FactAssertion
 from .managed_sqlite import ManagedTableTarget, VecSpec, mount_table
 from .shacl import lint_graph_shacl
 
@@ -133,6 +133,7 @@ GRAPH_TABLES = (
     ("edge_sources", EdgeSourceRow, ("src_id", "dst_id", "kind", "chunk_id")),
     ("chunk_vec", ChunkVector, ("chunk_id",)),
     ("entity_vec", EntityVector, ("entity_id",)),
+    ("entity_candidate_vectors", CandidateVector, ("sense_id",)),
     ("fact_vec", FactVector, ("fact_id",)),
     ("entity_mentions", EntityMention, ("mention_id",)),
     ("fact_assertions", FactAssertion, ("assertion_id",)),
@@ -351,6 +352,17 @@ def validate_graph_state(conn: sqlite3.Connection) -> None:
         ).fetchone()
     ):
         raise ValueError("Noncanonical source mention binding")
+    if (
+        conn.execute(
+            "SELECT 1 FROM entity_mentions m LEFT JOIN entity_candidate_vectors v ON v.sense_id=m.sense_id "
+            "WHERE v.sense_id IS NULL OR v.entity_id!=m.entity_id LIMIT 1"
+        ).fetchone()
+        or conn.execute(
+            "SELECT 1 FROM entity_candidate_vectors v LEFT JOIN entity_mentions m ON m.sense_id=v.sense_id "
+            "WHERE m.sense_id IS NULL LIMIT 1"
+        ).fetchone()
+    ):
+        raise ValueError("Invalid source candidate-vector ownership")
     if conn.execute(
         "SELECT 1 FROM fact_assertions a LEFT JOIN entity_mentions s ON s.mention_id=a.subject_mention_id "
         "LEFT JOIN entity_mentions o ON o.mention_id=a.object_mention_id LEFT JOIN facts f ON f.fact_id=a.fact_id "

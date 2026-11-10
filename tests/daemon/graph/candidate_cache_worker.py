@@ -46,7 +46,7 @@ def main() -> None:
             workspace_root=args.root / "datasets",
             program=program,
             embedder=embedder,
-            synonymy_threshold=-1.0,
+            candidate_dense_threshold=-1.0,
         )
     )
     try:

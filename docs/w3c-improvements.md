@@ -41,8 +41,8 @@ Four concrete architectural defects cause this failure mode:
 
 ```mermaid
 flowchart TD
-    P["Candidate Pair (A, B)\nFlat Denormalized Evidence (v2)"] --> W0{"W3C Pre-Gates (SQLite/Python)\n• Same-norm sense consolidation [W2]?\n• Direct Fact (A --P--> B) [Rule W1]?"}
-    W0 -- "Same-norm d_sim >= threshold" --> MERGE["Union Concept Cluster (A, B)"]
+    P["Candidate Pair (A, B)\nFlat Denormalized Evidence (v2)"] --> W0{"W3C Pre-Gates (SQLite/Python)\n• Extreme label + definition agreement [W2]?\n• Direct Fact (A --P--> B) [Rule W1]?"}
+    W0 -- "Cosine AND both difflib ratios >= auto_merge_threshold" --> MERGE["Union Concept Cluster (A, B)"]
     W0 -- "Direct Fact [W1: Irreflexive]" --> S2
     W0 -- "Unresolved" --> S1["Stage 1: label_judge (JudgeLabels + GBNF Reasoning, max_reasoning_chars=360)\n{pair_id, reasoning, equivalent: true, definition, hidden_label: bool} | {pair_id, reasoning, equivalent: false}"]
     S1 -- "equivalent=true, hidden_label=false [W1/S13]" --> MERGE
@@ -277,7 +277,10 @@ def build_dspy_related_judge_grammar(
 4. **Full GEPA Visibility & Zero Old Judges/Trails**: `self.synonym_judge`, `JudgeSynonyms`, `synonym_fingerprint`, `_synonym_fp_cache`, `synonym_audit_trail`, and `synonym_judge_tokens` are completely removed and replaced with stage-explicit equivalents for `label_judge`, `hierarchy_judge`, and `related_judge`.
 
 ### Explicit Non-Goals (Anti-Invention Contract)
-- **Zero SQLite Schema Migrations**: Do not add new tables or columns to `yaw.db`.
+- **No general ontology schema migration**: CS1 adds only the typed
+  `entity_candidate_vectors` source-evidence target needed to retain immutable
+  member vectors through merges. Existing indexes require rebuilding source
+  evidence; do not infer missing member vectors from a canonical embedding.
 - **Zero Disjoint-Document `owl:differentFrom` Heuristics**: Never infer `owl:differentFrom` merely because two concepts reside in different documents; cross-document pairs that pass Stage 1 and Stage 2 without shared facts must be adjudicated by Stage 3 (`JudgeRelated`).
 - **Zero Legacy Compatibility Shims**: Do not keep `synonym_judge`, `JudgeSynonyms`, `build_dspy_synonym_judge_grammar`, `synonym_fingerprint`, `synonym_audit_trail`, or `synonym_judge_tokens` as fallback aliases.
 
@@ -570,10 +573,23 @@ Empirical audit of `.yaw/yaw_optimize_20261107_110501.db` (`703` published chunk
   - When `equivalent = false`: the JSON object closes immediately after `"equivalent": false`; `parse_label_decisions` sets `alt_label = False, hidden_label = False, relation = None`, `validate_stage_invariants("label_judge")` rejects any `equivalent: false` decision carrying `alt_label=True` or `hidden_label=True`, and $(A, B)$ **must** advance to Stage 2 (`JudgeHierarchy`).
 - **Reasoning budget & memoization**: `YawConfig.gbnf_max_reasoning_chars` defaults to `360` `[target]` and is forwarded through `YawGBNFAdapter.resolve_grammar` and `YawProgram._run_judge_stage` to `build_dspy_{label,hierarchy,related}_judge_grammar`. `judge_synonyms` in `yaw/daemon/graph/inference/components.py` is bumped to `version=2` `[target]`.
 
-### Invariant W2 (Same-Norm Pre-Consolidation Only & Canonical Gemma 4 Ontology SSOT)
-- Pre-LLM sense consolidation in `prepare_synonym_candidates` merges $(A, B)$ if and only if:
-  $$\text{text\_processing}(\text{name}_A) = \text{text\_processing}(\text{name}_B) \;\land\; d_{\text{sim}}(A, B) \ge \tau_{\text{syn}} \;\land\; \neg\text{is\_active\_fact\_pole}(A, B)$$
-- Cross-label candidate pairs ($\text{text\_processing}(\text{name}_A) \neq \text{text\_processing}(\text{name}_B)$) are **never** merged or re-typed by Python heuristics in `planner.py`. `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, `auto_merge_difflib_gate`, `_AUTO_MERGE_COSINE_GATE`, and `_AUTO_MERGE_DIFFLIB_GATE` are retired across `yaw/` (`0` `[target]` matches, superseding the former Guardrail 2).
+### Invariant W2 (Calibrated Extreme-Agreement Pre-Consolidation)
+- `prepare_synonym_candidates` uses a separately configurable `auto_merge_threshold`
+  (default `0.98`). Automatic merging requires cosine over label-and-definition
+  embeddings AND `SequenceMatcher(autojunk=False)` ratios for normalized labels
+  AND nonempty normalized definitions all to meet that threshold. Candidate
+  admission thresholds do not authorize merges. The small high-cosine shortlist
+  alone pays for difflib; broad candidate search uses sparse trigrams.
+- Resolve representatives before checking active fact poles and existing
+  `owl:differentFrom`, `skos:broader` and `skos:related` separation. A third node
+  must not collapse established separated endpoints transitively. All other
+  eligible pairs feed JudgeLabels -> JudgeHierarchy -> JudgeRelated; same-label
+  homographs remain separate senses pending adjudication.
+- This supersedes the former same-name plus general `0.8` cosine rule on
+  2026-11-10. Retired individual gates/aliases remain removed. The
+  [candidate-search record](reviews/synonym-candidate-search.md) contains the
+  bounded real-embedding calibration, including Cindy/Cinderella and both ball
+  senses. Empirical thresholds are not a universal semantic proof.
 - **Active W3C Semantic Guardrails**:
   1. **Homograph-Only `owl:differentFrom` (`apply_synonym_adjudication`)**: Emit `owl:differentFrom` when Stage 3 (`related_judge`) returns `related: false` **only** if `text_processing(name_a) == text_processing(name_b)` or `lexical_sim >= avg_alt_label_sim` on `stage_conn`; otherwise emit no edge.
   2. **Evidence-Based Identity Across Batches**: Canonical representatives (`MIN(sense_id)`) and surviving support are independent of batch/packet arrival order.
@@ -615,7 +631,7 @@ Empirical audit of `.yaw/yaw_optimize_20261107_110501.db` (`703` published chunk
 | Retired item | Location (`c98aebe`) | Replacement or "none" | Exit check |
 | --- | --- | --- | --- |
 | Python token/acronym overrides in planner: `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens` | `yaw/daemon/graph/planner.py:530-585, 643-647, 807-814` | `JudgeLabels` -> `JudgeHierarchy` -> `JudgeRelated` Gemma 4 cascade + topological `_is_active_fact_pole` guard | `git grep -n -e "_is_acronym" -e "is_modifier_head_specialization" -e "_has_disjoint_non_acronym_tokens" yaw/ tests/` has `0` `[target]` matches |
-| Cross-label Python auto-merge gates: `auto_merge_cosine_gate`, `auto_merge_difflib_gate`, `_AUTO_MERGE_COSINE_GATE`, `_AUTO_MERGE_DIFFLIB_GATE` | `yaw/core/config.py:183-184, 249-252, 440-441, 501-502`, `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/planner.py:98-99, 593-594, 655, 1182-1183`, `yaw/daemon/indexing.py`, `yaw/daemon/runtime.py` | Same-norm sense consolidation (`text_processing(name_a) == text_processing(name_b) and d_sim >= synonymy_threshold`) | `git grep -n -e "auto_merge_cosine_gate" -e "auto_merge_difflib_gate" -e "_AUTO_MERGE_COSINE_GATE" -e "_AUTO_MERGE_DIFFLIB_GATE" yaw/ tests/` has `0` `[target]` matches |
+| Cross-label Python auto-merge gates: `auto_merge_cosine_gate`, `auto_merge_difflib_gate`, `_AUTO_MERGE_COSINE_GATE`, `_AUTO_MERGE_DIFFLIB_GATE` | `yaw/core/config.py:183-184, 249-252, 440-441, 501-502`, `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/planner.py:98-99, 593-594, 655, 1182-1183`, `yaw/daemon/indexing.py`, `yaw/daemon/runtime.py` | The single calibrated `auto_merge_threshold` gate (W2) over cosine, label ratio and definition ratio | `git grep -n -e "auto_merge_cosine_gate" -e "auto_merge_difflib_gate" -e "_AUTO_MERGE_COSINE_GATE" -e "_AUTO_MERGE_DIFFLIB_GATE" yaw/ tests/` has `0` `[target]` matches |
 | Non-equivalent merge branches (`equivalent: false, alt_label: true` / `equivalent: false, hidden_label: true`) | `yaw/daemon/graph/inference/{prompts,grammars,parsers,invariants,program}.py` | `2`-branch `[target]` `equiv-branch` grammar (`true` -> `"definition"` + `"hidden_label"`; `false` -> closes immediately) | `CG-W3C-1` unit & grammar tests pass |
 | Multi-hop transitive `broader_tc` closure over non-transitive `skos:broader`: `query_broader_tc`, `broader_tc_pairs`, `"broader_tc"`, Rule W3 pre-gate, and `ConceptShape/broaderTransitiveCapExceeded` | `yaw/daemon/graph/storage/{synonyms,__init__,shacl}.py`, `yaw/daemon/graph/inference/program.py:1084-1115` | Direct `1`-hop `skos:broader` + `skos:related` S27 disjointness and fixed-point `ConceptShape/broaderCycle` healing | `git grep -n -e "query_broader_tc" -e "broader_tc" -e "broaderTransitiveCapExceeded" yaw/ tests/` has `0` `[target]` matches |
 | Invalid-assertion fallback (`min(assertions, ...)`) in `canonicalize_fact_definitions` | `yaw/daemon/graph/storage/evidence.py:254-255` | Tier `3` `[target]` deterministic synthesis `f"{subj_name} {pred} {obj_surface}."` | `CG-W3C-2` unit & replay tests pass |
@@ -681,3 +697,5 @@ in the current refactor.
 - 2026-11-06: "Should stay literals, NER is only allowed to capture skos:Concept and owl:NamedIndividual, triple extraction can point the rdf:Statement to rdf:object = rdfs:Literal but never rdf:subject = rdfs:Literal! This is why it's two stage. NER creates the allowed rdf:subject vocabulary, with predicates able to point towards literals but never the other way around - that's the W3C ontology rules and should be in our allowed SHACL shapes." (User). Enforced across GBNF grammars, extraction/repair parsers, Active EDC label canonicalization (§3.2), and closed-world SQLite SHACL shapes.
 - 2026-11-07: "Audit and review for root cause for batch indexing regressing back to exponential time behavior. Incremental indexing and graph publication was designed and tested to be near-constant time for 64 + 64 chunk batches vs 128 chunk batchless indexing." / "It’s a SHACL Violation CONSISTENCY_ERROR" / "you will need to /spec first." (User). Preserves SHACL-healed entity labels across incremental batches via `chunk_id = "__healed__"` (`cid.startswith("__")` -> `verbatim_in_source = 1`, `is_hidden = False`), marks scalar/non-resource labels `is_hidden = True` in `canonicalize_entity_labels_edc`, and scopes Active EDC to `touched_entity_ids` (§3.2).
 - 2026-11-08: "Option 1 (`skos:broader` is strictly 1-hop non-transitive; retire `query_broader_tc` and scope S27 to direct 1-hop collisions)" / W3C ontology simplification & deterministic statement canonicalization ([native-cocoindex-graph.md §4](native-cocoindex-graph.md#4-semantics-and-invariants), [epistemic-confidence-spec.md §§1.3, 2.4](epistemic-confidence-spec.md#13-empirical-bayes-1-hop-shacl-s27-resolution-zero-magic-thresholds-invariant-w5), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md)): (1) enforces Invariant `W1` in `JudgeLabels` (`merge(A, B) <=> equivalent(A, B) = true`, `2`-branch `equiv-branch` GBNF grammar, `gbnf_max_reasoning_chars = 360`, `judge_synonyms` `version=2`), superseding the `equivalent: false, alt_label/hidden_label: true` merge branches; (2) enforces Invariant `W2` in `planner.py` (same-norm pre-consolidation only, retiring `_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `auto_merge_cosine_gate`, and `auto_merge_difflib_gate`), superseding former Guardrail 2; (3) enforces Invariant `W3` (`is_irreflexive_statement` across entity and literal objects, preserving raw `fact_assertions` with `fact_id = NULL` while keeping `extract_chunk` at `version=2` and bumping `publish_graph` to `version=2`); (4) enforces Invariant `W4` (Tier 3 deterministic `f"{subj_name} {pred} {obj_surface}."` synthesis in `canonicalize_fact_definitions`), superseding the `2026-11-07` invalid-assertion fallback (`min(assertions, ...)`); (5) enforces single-surface `skos:prefLabel` and `clean_surface_label`; and (6) enforces Invariant `W5` (strictly non-transitive `1`-hop `skos:broader`, retiring `query_broader_tc`, `broader_tc`, Rule W3 pre-gate, and `ConceptShape/broaderTransitiveCapExceeded`, scoping `ConceptShape/S27-disjointBroaderRelated` to direct `1`-hop collisions, healing `ConceptShape/broaderCycle` via fixed-point iteration, and re-running `auto_heal_deterministic_shacl` after `apply_shacl_repairs` in `plan_graph_publication`).
+
+- 2026-11-10: "this should be a configurable hyperparameter which you calibrate now. Must take both the difflib and cosine into account" (User). Supersedes same-name/general-cosine W2 with the separate extreme-agreement threshold above; preserves full-cascade candidate selection and source-supported sense distinctions. Evidence: [CS1](reviews/synonym-candidate-search.md).

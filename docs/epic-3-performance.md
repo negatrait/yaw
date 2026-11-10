@@ -32,7 +32,46 @@ tracks this pilot; its scope, restart checklist and predefined gates are in the
 pending. This exception does not start the rest of Epic 3 or satisfy `E3-P6`,
 `E3-C3`, Epic 1 parity, or Epic 2 transport acceptance.
 
+Early Epic 1 candidate-search exception (2026-11-10): investigate and propose a
+minimal replacement for cosine/difflib candidate discovery under
+[native graph publication](native-cocoindex-graph.md).
+Prioritize speed, memory and one canonical API; old heuristic I/O parity is not
+required. Preserve fixed-evidence 64+64 versus 128 canonical graph equality.
+The [review proposal](reviews/synonym-candidate-search.md) records diagnostics and
+the lightweight acceptance scope. Implementation and gate evidence are recorded under CS1 in that review.
+
+Further candidate-search work is deferred to Epic 3: maintain a revision-safe
+read-only source projection and evaluate indexed lookup to avoid reconstructing
+vectors/lexical features per call. Retain the same source-evidence and batch
+contracts; do not substitute an insertion-order-sensitive approximate index
+without evidence. The present CS1 cutover takes the measured first order of
+magnitude improvement and introduces no maintained projection cache.
+
+Additional non-LLM adjudication/SHACL candidates (2026-11-10; proposals,
+not implemented or benchmarked by CS1):
+
+- Extend deterministic repair from authoritative evidence: for example, restore
+  a missing fact-source link when preserved assertions identify its support
+  unambiguously. Never invent provenance or rewrite a definition to satisfy a shape.
+- Propagate existing identity/separation and shape constraints through the three
+  judge stages. Skip a stage only when its admissible outcomes are already
+  determined; absence of a relation is not proof of distinctness. Measure saved
+  model calls before expanding the rule set.
+- Explore a small teacher-trained classifier over existing embeddings, lexical
+  scores and graph evidence. A float32 linear classifier could run in NumPy
+  without another dependency, but semantic accuracy and a conservative admission
+  margin require calibration on held-out judgments. This is an experiment,
+  especially for irreversible merges, not a certified replacement for the judge.
+
+Existing shortcuts are the separate extreme cosine/label/definition merge gate,
+direct/shared-role fact resolution to related after hierarchy, and deterministic
+SHACL handling of scalar orphans, irreflexive facts, hierarchy cycles and S27
+conflicts. Judgment and healing functions are already CocoIndex-memoized;
+adding another judgment cache would duplicate that mechanism. Prioritize the
+remaining violation/model-call distribution rather than reimplementing these paths.
+
 ### 1.1 How Epic 2 Ties Into Epic 3 (Architectural Decoupling)
+
 - **Locked External Boundary, Mutable Internal Engine:** In [Epic 2](epic-2-fastmcp-http.md), `yaw/daemon/mcp_server.py` imports only `yaw.daemon.runtime` and `yaw.core.*`, delegating retrieval and QA to `runtime.retrieve(query, top_k)` and `runtime.rag_qa(question)` while validating physical source freshness via `ChunkPointer.source_content_hash`.
 - Because MCP tool schemas, progress stages (`1/3` `[target]` `queued`, `2/3` `[target]` `started`, `3/3` `[target]` `ready`), and `Passage` citation envelopes are frozen at the `runtime.py` boundary in Epic 2, Epic 3 can freely swap internal W3C/OWL/SKOS/PROV-O pruning rules, CSR transition operators, `dspy.Flex` / query-cluster routing policies, and `msgspec` binary/JSON sidecar serializers without breaking a single MCP client or transport test.
 
@@ -42,9 +81,17 @@ At pinned commit `deddf36`, YAW already implements the following mechanisms from
 - **`1`-Hop `[target]` SKOS S27 Bayes-Factor Weighting & Cagle Reification:** [`pool_confidences`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/shacl.py#L20-L29) and `bayesian_noisy_or` (`yaw/core`) with `1`-hop `[target]` non-transitive `skos:broader` S27 disjointness in `yaw/daemon/graph/storage/shacl.py` (`deddf36`).
 - **Induced W3C Subgraph QA Grounding:** `format_subgraph_for_qa` in [`yaw/daemon/graph/storage/hydration.py`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/hydration.py) (`deddf36`), injecting structured entity definitions and reified `rdf:Statement` facts alongside hydrated disk passages.
 - **High-Throughput SQLite Connection PRAGMAs (`2026-11-08`):** `_configure_connection_pragmas` (`open_yaw_db`, `open_managed_yaw_db`, and `open_readonly_yaw_db` in `yaw/daemon/graph/storage/db.py`) configures `PRAGMA cache_size = -65536` (`64` `[target]` MiB page cache) and `PRAGMA mmap_size = 268435456` (`256` `[target]` MiB memory-mapped I/O) alongside `PRAGMA synchronous = NORMAL` and `PRAGMA temp_store = MEMORY`.
-- **Vectorized BLAS Entity Synonym & Neighborhood Seed Discovery, Upper-Bound Lexical Pruning, Zero-Copy Vector Deserialization & Fused Retrieval Fact Join (`2026-11-08`):**
-  - `find_entity_synonym_candidates` and Step `1d` of `load_affected_neighborhood` (`yaw/daemon/graph/storage/graph_ops.py`) compute contiguous `float32` BLAS matrix cosine distances (`mat[src_indices] @ mat.T`), deterministic `(distance ASC, entity_id ASC)` tie-breaking (`np.argsort(..., kind="stable")`), and reverse top-$k$ candidate discovery without per-entity `vec0` `MATCH` SQLite loops.
-  - `_lexical_similarity_cascade` and `find_entity_disambiguation_candidates` (`yaw/daemon/graph/storage/graph_ops.py`) precompute `_lexical_name_parts` once per entity, apply the exact length-ratio upper bound $2 \min(|a|, |b|) / (|a| + |b|) < \tau$ before touching `difflib.SequenceMatcher`, and cache `set_seq2(norm_a)` across inner-loop comparisons.
+- **Candidate search (`CS1`, 2026-11-10; supersedes the pinned baseline below):**
+  - One `find_entity_candidates` API serves staged adjudication and pre-staging
+    neighborhood discovery. Pair-local cosine thresholds in 16-row blocks and
+    sparse character-trigram Dice replace full stable sorting, reverse top-k
+    rescans and Python all-pairs difflib. Fuzzy source labels remain searchable
+    after display-name changes. `auto_merge_threshold` separately protects the
+    small extreme-agreement shortcut over labels AND definitions.
+  - `candidate_volume_ratio` calibrates fixed cutoffs offline against frozen
+    baseline volume (±10%); it is not a per-batch quota. See the
+    [implementation record](reviews/synonym-candidate-search.md) for scope,
+    measured latency/memory and exact fixed-evidence batch checks.
   - `deserialize_f32_vector` (`yaw/daemon/graph/storage/vectors.py`) returns a zero-copy `np.frombuffer(blob, dtype=np.float32)` view without redundant buffer `.copy()`.
   - `YawGraphEngine.retrieve_with_seeds` (`yaw/daemon/graph/engine.py`) fetches kept fact metadata and `fact_sources` chunk provenance in a single `FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id` query.
 

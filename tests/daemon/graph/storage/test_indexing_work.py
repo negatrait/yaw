@@ -6,10 +6,11 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import (
-    find_entity_disambiguation_candidates,
+    find_entity_candidates,
     iter_synonym_evidence,
     open_yaw_db,
     upsert_chunk_pointers,
@@ -74,10 +75,12 @@ def test_targeted_candidates_equal_full_lexical_search_without_duplicates(tmp_pa
             ],
         )
         upsert_semantic_edges(conn, [("a", "b", "owl:differentFrom", 1.0)])
-        full = find_entity_disambiguation_candidates(conn, dense_top_k=0)
+        seed_candidate_vectors(conn)
+        full = find_entity_candidates(conn, dense_threshold=2.0)
         assert full
         for targets in (["b"], ["a", "c", "g"], ["g", "g", "missing"], [], ["j"]):
-            actual = find_entity_disambiguation_candidates(conn, targets, dense_top_k=0)
+            seed_candidate_vectors(conn)
+            actual = find_entity_candidates(conn, targets, dense_threshold=2.0)
             assert actual == [p for p in full if p[0] in targets or p[1] in targets]
             assert len({(a, b) for a, b, _, _ in actual}) == len(actual)
 

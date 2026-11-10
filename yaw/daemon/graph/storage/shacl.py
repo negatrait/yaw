@@ -1093,6 +1093,9 @@ def apply_shacl_repairs(
     """Execute validated closed-world SHACL repair actions inside an atomic SQLite write transaction."""
     if not repairs:
         return 0
+    has_candidate_vectors = (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE name='entity_candidate_vectors'").fetchone() is not None
+    )
     applied = 0
     with write_tx(conn):
         has_evidence = (
@@ -1471,6 +1474,8 @@ def apply_shacl_repairs(
                     conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
+                    if has_candidate_vectors:
+                        conn.execute("DELETE FROM entity_candidate_vectors WHERE entity_id = ?", (focus,))
                     applied += 1
             elif action in ("delete_dangling", "delete_orphan", "delete_invalid_fact"):
                 if "->" in focus:
@@ -1518,6 +1523,8 @@ def apply_shacl_repairs(
                     conn.execute("DELETE FROM entity_labels WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entity_vec WHERE entity_id = ?", (focus,))
                     conn.execute("DELETE FROM entities WHERE entity_id = ?", (focus,))
+                    if has_candidate_vectors:
+                        conn.execute("DELETE FROM entity_candidate_vectors WHERE entity_id = ?", (focus,))
                     applied += 1
             else:
                 raise ValueError(f"Invalid SHACL repair action: {action!r}")

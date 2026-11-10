@@ -283,7 +283,8 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
         corpus_root=corpus_dir,
         program_identity="prog_v1",
         embedding_identity=adapter.profile.index_identity,
-        synonymy_top_k=0,
+        candidate_dense_threshold=2.0,
+        candidate_lexical_threshold=2.0,
     )
     try:
         for active_rows in ((chunk_a, chunk_b), (chunk_a,)):

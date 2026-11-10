@@ -11,6 +11,7 @@ import dspy
 import numpy as np
 import pytest
 
+from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram
@@ -19,8 +20,9 @@ from yaw.daemon.indexing import bind_native_indexing
 
 
 @pytest.fixture
-def indexing_provider():
+def indexing_provider(request):
     calls = []
+    empty_decisions = getattr(request, "param", False)
 
     class Handler(BaseHTTPRequestHandler):
         def send_json(self, payload):
@@ -91,7 +93,15 @@ def indexing_provider():
             elif "fact_before_filter" in prompt:
                 stage, result = "filter", {"fact": [["ada", "wrote", "notes"]]}
             elif "candidate_pairs" in prompt or "synonym-evidence" in prompt:
-                stage, result = "synonyms", {"decisions": []}
+                text = request["messages"][-1]["content"]
+                stage, result = (
+                    "synonyms",
+                    {
+                        "decisions": []
+                        if empty_decisions
+                        else complete_decisions(candidate_rows(text), [], stage_text=prompt)
+                    },
+                )
             elif "reasoning" in prompt.lower():
                 stage, result = "qa", {"reasoning": "The source states Ada wrote Notes.", "answer": "Answer: 'Ada'"}
             elif "missing_entities" in prompt:
@@ -226,10 +236,11 @@ def test_empty_engine_operations_do_not_call_inference_or_create_graph_rows(tmp_
         engine.close()
 
 
+@pytest.mark.parametrize("indexing_provider", [True], indirect=True)
 def test_unadjudicated_synonym_candidates_abort_graph_publication(tmp_path, indexing_provider):
     url, calls = indexing_provider
     engine = make_engine(tmp_path, url)
-    engine.synonymy_threshold = 0.1
+    engine.candidate_dense_threshold = 0.1
     try:
         with pytest.raises(ValueError, match="Missing synonym pairs|Empty decisions"):
             engine.index(["Ada wrote Notes."])

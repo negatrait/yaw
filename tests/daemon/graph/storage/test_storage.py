@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from yaw.core import ChunkPointer
+from yaw.core import ChunkPointer, text_processing
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     canonicalize_entity_labels_edc,
@@ -1139,6 +1139,15 @@ def test_shacl_repairs_maintains_validate_graph_state_across_actions(tmp_path: P
             ),
         )
         upsert_evidence(conn, mentions, assertions)
+        from struct import pack
+
+        conn.executemany(
+            "INSERT INTO entity_candidate_vectors VALUES (?,?,?,?,?)",
+            [
+                (m.sense_id, m.entity_id, str(text_processing(m.name)), m.resolved_definition, pack("<2f", 1.0, 0.0))
+                for m in mentions
+            ],
+        )
 
         # Execute all 4 repair actions:
         # 1) delete_invalid_fact on f_invalid

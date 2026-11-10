@@ -48,7 +48,7 @@ def native_environment(root, state_dir, url):
         corpus_root=root,
         program_identity=identity,
         embedding_identity=embedder.profile.index_identity,
-        synonymy_top_k=8,
+        candidate_lexical_threshold=0.55,
     )
     try:
         yield db, env, settings
@@ -133,7 +133,8 @@ def native_engine(root, state_dir, url, **settings):
     lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False, temperature=1.0, max_tokens=512)
     program = YawProgram(orchestrator_lm=lm, rlm_sub_lm=lm, enable_gbnf=False, max_output_tokens=512)
     return bind_native_indexing(
-        YawGraphEngine(state_dir / "yaw.db", root, program, adapter(url), synonymy_top_k=8, **settings), batch_size=2
+        YawGraphEngine(state_dir / "yaw.db", root, program, adapter(url), candidate_lexical_threshold=0.55, **settings),
+        batch_size=2,
     )
 
 
@@ -230,6 +231,7 @@ def test_native_evidence_replacement_withdrawal_and_late_representative(tmp_path
     url, state = provider
     state["delay"] = 0
     state["embedding_vector"] = fixed_vector
+    state["same_name_equivalence"] = True
     definitions = sorted(
         ("A telemetry service.", "A service collecting telemetry.", "An event telemetry service."),
         key=lambda definition: sense_id("Orion", definition),
@@ -503,6 +505,7 @@ def test_cross_batch_fact_definition_repair_persists_and_invalidates_on_endpoint
 
     url, state = provider
     state["delay"] = 0
+    state["same_name_equivalence"] = True
     state["embedding_vector"] = lambda text: (
         [1.0, 0.0, 0.0, 0.0] if text.casefold().startswith("text: # orion") else [0.0, 1.0, 0.0, 0.0]
     )
