@@ -1073,16 +1073,21 @@ This specification remediates the `6` CocoIndex `>= 1.1.0` (`uv.lock:330–331` 
     - Added `optimize_coco` cleanup to `_clean_optimization_artifacts` so `--fresh` purges optimization state directories alongside SQLite databases.
   - `yaw/daemon/graph/engine.py`:
     - In `_setup_optimization_splits`: added hydration fallback `if not self._opt_chunks_pool and self._opt_indexed_cids: self._hydrate_opt_chunks_pool_from_db()` to ensure bare resume reconstitutes chunk pool metadata.
+  - `yaw/daemon/graph/normalization.py`:
+    - In `normalize_openie_record`: classified scalar literals (`detect_scalar_literal` or `is_scalar_label`) as `is_literal_obj = True` with XSD datatype, preventing raw scalars (e.g. latency durations) from being materialized as `skos:Concept` nodes.
+  - `yaw/daemon/graph/planner.py`:
+    - In `materialize_entities_and_facts`: marked scalar literals as `is_literal_obj = True` to publish `owl:DatatypeProperty` statements with `obj_id = None` and prevent bogus entity generation.
+  - `yaw/daemon/graph/storage/shacl.py`:
+    - In `auto_heal_deterministic_shacl`: allowed `remove_scalar_entity` to literalize scalar fact objects without subject roles, preserving statements as datatype properties while pruning invalid entity nodes.
   - `tests/daemon/graph/test_indexing_overlap.py`:
     - Realigned substage progress assertion with `indexing: synonym adjudication (` emitted by planner.
 - **Gate results & evidence paths**:
   - `uv run ty check` (`All checks passed!`).
   - `uv run ruff check --fix` and `uv run ruff format` (`All checks passed!`, `187 files left unchanged`).
-  - `uv run pytest tests/daemon/test_runtime.py` (`7 passed`).
-  - `uv run pytest tests/daemon/graph/inference/test_parsers.py` (`11 passed`).
-  - `uv run pytest tests/daemon/graph/test_shacl_publication.py` (`9 passed`).
-  - `uv run pytest tests/daemon/graph/test_indexing_overlap.py` (`10 passed`).
-  - `uv run pytest tests/daemon/ingestion/test_source_targets.py` (`1 passed`).
+  - `uv run pytest --no-testmon tests/daemon/test_runtime.py` (`27 passed in 42.74s`).
+  - `uv run pytest --no-testmon tests/daemon/graph/test_shacl_publication.py` (`19 passed`).
+  - `uv run pytest --no-testmon tests/daemon/graph/test_normalization.py` (`4 passed`).
+  - `uv run pytest --no-testmon tests/daemon/graph/inference/test_parsers.py tests/daemon/graph/inference/test_parsers_shacl_literals.py` (`56 passed`).
   - `git diff --check` (`0` errors).
 - **Discoveries during implementation**:
   - `chunk_file_memo` in CocoIndex is keyed on `SourceSettings`. When `runtime._create_bound_engine` omitted `source_settings`, it defaulted to 1200 chars / 100 overlap, preventing user-configured `chunk_size = 1000` from taking effect.

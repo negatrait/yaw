@@ -1702,13 +1702,12 @@ def auto_heal_deterministic_shacl(conn: sqlite3.Connection) -> int:
     """
     repaired = 0
     with write_tx(conn):
-        # Resource roles need semantic label repair, not deletion of their statements.
+        # Resource roles (subjects) need semantic label repair; scalar objects without subject roles are literalized.
         scalar_eids = [
             str(r[0])
             for r in conn.execute(
                 "SELECT entity_id,name FROM entities e WHERE NOT EXISTS "
-                "(SELECT 1 FROM facts f WHERE f.subj_id=e.entity_id "
-                "OR (f.obj_kind='entity' AND f.obj_id=e.entity_id))"
+                "(SELECT 1 FROM facts f WHERE f.subj_id=e.entity_id)"
             )
             if detect_scalar_literal(str(r[1]))[0]
         ]

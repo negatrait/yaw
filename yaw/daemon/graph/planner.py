@@ -359,7 +359,7 @@ def materialize_entities_and_facts(
             resolved_in_chunk.add((s_norm_key, st.subj_def.strip().lower()))
             chunk_to_entities[cid].add(s_id)
 
-            is_literal_obj = st.obj_kind == "literal"
+            is_literal_obj = st.obj_kind == "literal" or is_scalar_label(st.obj) or detect_scalar_literal(st.obj)[0]
             if is_literal_obj:
                 if not is_irreflexive_statement(st.subj, st.pred, st.obj, st.subj_def, "", "literal"):
                     continue

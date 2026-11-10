@@ -127,8 +127,8 @@ def normalize_openie_record(rec: OpenIERecord) -> NormalizedRecord:
         o_raw_str = str(st.obj).strip()
         s_norm = str(text_processing(st.subj))
         p_norm = str(text_processing(st.pred))
-        _, detected_dt = detect_scalar_literal(str(st.obj))
-        is_literal_obj = getattr(st, "obj_kind", "entity") == "literal"
+        is_scalar, detected_dt = detect_scalar_literal(str(st.obj))
+        is_literal_obj = getattr(st, "obj_kind", "entity") == "literal" or is_scalar or is_scalar_label(str(st.obj))
         o_val = o_raw_str if is_literal_obj else str(text_processing(st.obj))
         if not s_norm or not p_norm or not o_val:
             continue
