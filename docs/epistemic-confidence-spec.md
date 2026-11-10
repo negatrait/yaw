@@ -205,8 +205,8 @@ No speculative scheme code or dependency remains for such an experiment.
 2. **Strict Literal Disjointness & Universal Irreflexivity Invariant (`W3`)**:
    Literals (`object_kind = 'literal'`) never create `entities`, `entity_labels`, or `edges` rows. They live strictly in `facts` with `object_kind = 'literal'` and `facts.confidence` (`prov:value`), and `is_irreflexive_statement` suppresses both entity self-loops and pseudo-reflexive literal triples (`text_processing(subj) == text_processing(obj)` or `text_processing(pred) == text_processing(subj_def)`), preserving raw `fact_assertions` with `fact_id = NULL`.
 3. **Closed-World Provenance & QA Payload Invariants**:
-   - Validated by `ProvenanceConfidenceShape` in `lint_graph_shacl(conn)` and queryable via `query_graph_provenance(conn)`.
-   - `format_subgraph_turtle` emits `prov:value "..."^^xsd:double` on `:ent_*` and `:fact_*` (entity and literal objects) directly into the QA prompt payload.
+   - Validated by `ProvenanceConfidenceShape` in `lint_graph_shacl(conn)`.
+   - `serialize_graph_turtle` emits `prov:value "..."^^xsd:double` for entities and facts, including literal-object facts. This export does not establish injection into QA prompts.
 
 ### 3.2 Failure & Fallback Matrix
 
@@ -246,7 +246,7 @@ No speculative scheme code or dependency remains for such an experiment.
 1. **[MODIFY] `yaw/core/types.py` & `yaw/core/config.py`**
    - Remove `datatype_property`, `parallel_aggregation`, and `parallel_cap` from `RelationTraversalPolicy` and `YawConfig`.
 2. **[MODIFY] `yaw/daemon/graph/inference/chat.py`**
-   - Add `extract_completion_logprob_confidence(response_or_history_entry, span_text) -> float | None`.
+   - No standalone completion-logprob parser: the unused parser was retired in the 2026-11-09 dead-code cleanup. Confidence consumers must use evidence available on the active inference path.
 3. **[MODIFY] `yaw/daemon/graph/storage/db.py`**
    - Add nullable `confidence REAL` to `entities` and `facts`, and `llm_prob REAL`, `vec_coherence REAL`, `atomic_confidence REAL` to `entity_chunks`, `fact_sources`, and `edge_sources`.
 4. **[MODIFY] `yaw/daemon/graph/storage/graph_ops.py`**
@@ -258,8 +258,8 @@ No speculative scheme code or dependency remains for such an experiment.
    - Replace hardcoded `1.0` and `max(0.5, sim)` weights with `pool_confidences(llm_prob, vec_coherence)`.
 6. **[MODIFY] `yaw/daemon/graph/storage/shacl.py`**
    - Remove `is_literal_node` entity rendering; preserve existing calibrated edge weights in `invert_broader` and `demote_sibling_to_related`; enforce `W3C_PREFIX_HEADER` (without `yaw:` or `dct:`).
-   - Add `ProvenanceConfidenceShape`, `query_graph_provenance(conn)`, and `auto_heal_deterministic_shacl(conn)` using empirical `stage_conn` averages and direct `1`-hop `w_broader` vs. `w_rel` Bayes Factor comparisons.
-   - Emit `prov:value` on `:ent_*` and `:fact_*` (entity and literal objects) in `serialize_graph_turtle` and `format_subgraph_turtle`.
+   - Retain `ProvenanceConfidenceShape` and `auto_heal_deterministic_shacl(conn)` using empirical `stage_conn` averages and direct `1`-hop `w_broader` vs. `w_rel` Bayes Factor comparisons. The unused provenance-summary API is retired.
+   - Emit `prov:value` on entities and facts (including literal objects) in `serialize_graph_turtle`. The test-only subgraph serializer is retired.
 7. **[MODIFY] `yaw/daemon/graph/ppr.py` & `yaw/daemon/graph/engine.py`**
    - Use `pool_confidences(w_edge, p_node)` in `build_transition_matrix` and `pool_confidences(query_sim, p_item)` in `retrieve_with_seeds`.
 
@@ -276,7 +276,7 @@ No speculative scheme code or dependency remains for such an experiment.
      3. $w_{\text{broader}}(A, C) \ge w_{\text{rel}}(A, C)$ prunes `skos:related(A, C)`.
      4. $w_{\text{rel}}(A, C) > w_{\text{broader}}(A, C)$ keeps `skos:related(A, C)` at $w_{\text{rel}}(A, C)$ and deletes the direct `1`-hop `skos:broader(A, C)` edge, while a `2`-hop `A skos:broader B skos:broader C` chain with `A skos:related C` is valid under non-transitive `skos:broader`.
    - **Canonical Gemma 4 Ontology SSOT Test (`W1` & `W2`)**: Verify `apply_synonym_adjudication` executes Stage 1–3 Gemma 4 decisions and topological `_is_active_fact_pole` guards without post-hoc Python token rewrites (`is_modifier_head_specialization` retired).
-   - **Markov Chain Divergence & QA Payload Provenance Test**: Prove `run_ppr` rankings diverge under calibrated + typed weights vs. uniform weights, and assert `format_subgraph_turtle` injects `prov:value "..."^^xsd:double` into the QA prompt payload with zero `yaw:` or `dct:` strings.
+   - **Markov Chain Divergence & Export Provenance Test**: Prove `run_ppr` rankings diverge under calibrated + typed weights vs. uniform weights, and assert `serialize_graph_turtle` exports `prov:value "..."^^xsd:double` with zero `yaw:` or `dct:` strings. QA injection requires separate evidence from the active QA path.
 2. **Mandatory Quality Gates**:
    ```bash
    uv run ty check

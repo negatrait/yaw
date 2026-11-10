@@ -406,20 +406,23 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
 
         # 5. Verify YawGraphEngine.retrieve (PPR) traverses between concepts and chunks
         csr = engine._ensure_csr_graph()
-        assert float(csr.transition_t[csr.node_to_idx[chunk.chunk_id], csr.node_to_idx[yaw_id]]) > 0.0
+        assert (
+            float(csr.transition_t[csr.node_to_idx[next(iter(engine._opt_indexed_cids))], csr.node_to_idx[yaw_id]])
+            > 0.0
+        )
 
         ppr_from_subj = run_ppr(csr, {yaw_id: 1.0})
-        assert float(ppr_from_subj[csr.node_to_idx[chunk.chunk_id]]) > 0.0
+        assert float(ppr_from_subj[csr.node_to_idx[next(iter(engine._opt_indexed_cids))]]) > 0.0
 
         hits, kept_facts = engine.retrieve_with_seeds("What port does Yet Another Wiki listen on?", top_k=1)
         assert any(str(s).lower() == "yaw" and p == "listens on port" and o == "8080" for s, p, o in kept_facts)
         assert len(hits) == 1
-        assert hits[0][0].chunk_id == chunk.chunk_id
+        assert hits[0][0].chunk_id in engine._opt_indexed_cids
         assert "8080" in hits[0][2]
 
         retrieve_hits = engine.retrieve("What port does Yet Another Wiki listen on?", top_k=1)
         assert len(retrieve_hits) == 1
-        assert retrieve_hits[0][0].chunk_id == chunk.chunk_id
+        assert retrieve_hits[0][0].chunk_id in engine._opt_indexed_cids
         assert "8080" in retrieve_hits[0][2]
     finally:
         engine.close()

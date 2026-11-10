@@ -244,22 +244,6 @@ def deserialize_openie_record(
     )
 
 
-def get_openie_checkpoints(
-    conn: sqlite3.Connection,
-    chunk_ids: Sequence[str],
-) -> dict[str, OpenIERecord]:
-    """Read source extraction artifacts from their native CocoIndex target."""
-    records = {}
-    for batch in batched(chunk_ids):
-        placeholders = ",".join("?" for _ in batch)
-        for chunk_id, raw in conn.execute(
-            f"SELECT chunk_id, extraction_json FROM chunk_inference WHERE chunk_id IN ({placeholders})",
-            tuple(batch),
-        ):
-            records[chunk_id] = deserialize_openie_record(raw, chunk_id=chunk_id)
-    return records
-
-
 def upsert_entities(
     conn: sqlite3.Connection,
     entities: Sequence[tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, float | None]],

@@ -281,16 +281,16 @@ def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None
     assert dt == "xsd:string"
 
 
-def test_relation_traversal_policy_datatype_property_and_aliases() -> None:
+def test_relation_traversal_policy_datatype_property() -> None:
     """Verify RelationTraversalPolicy exposes policy multipliers and aliases."""
     pol = RelationTraversalPolicy()
     assert pol.owl_different_from == pytest.approx(0.0)
     assert pol.passage == pytest.approx(1.0)
-    assert pol.fact_fwd == pytest.approx(1.0)
-    assert pol.fact_rev == pytest.approx(1.0)
+    assert pol.fact_forward == pytest.approx(1.0)
+    assert pol.fact_reverse == pytest.approx(1.0)
     assert pol.skos_related == pytest.approx(1.0)
-    assert pol.skos_broader == pytest.approx(1.0)
-    assert pol.skos_narrower == pytest.approx(0.5)
+    assert pol.skos_broader_up == pytest.approx(1.0)
+    assert pol.skos_broader_down == pytest.approx(0.5)
 
 
 def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:

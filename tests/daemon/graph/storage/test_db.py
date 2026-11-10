@@ -11,11 +11,11 @@ from yaw.core import ChunkPointer, OpenIERecord
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     deserialize_f32_vector,
+    deserialize_openie_record,
     find_entity_candidates,
     get_chunk_pointer,
     get_chunk_pointers,
     get_entity_vectors,
-    get_openie_checkpoints,
     initialize_schema,
     inspect_focus_node,
     lint_graph_shacl,
@@ -27,7 +27,6 @@ from yaw.daemon.graph.storage import (
     open_yaw_db,
     search_chunk_vectors_knn,
     search_chunks_fts,
-    search_entity_vectors_knn,
     search_fact_vectors_knn,
     search_facts_fts,
     serialize_f32_vector,
@@ -122,10 +121,6 @@ def test_vector_serialization_and_bounded_knn(tmp_path: Path) -> None:
         np.testing.assert_allclose(ent_vecs["e1"], vec1)
 
         # 5. Entity & Fact KNN
-        ent_hits = search_entity_vectors_knn(conn, vec2, top_k=1)
-        assert ent_hits[0][0] == "e2"
-        assert ent_hits[0][1] == pytest.approx(1.0, abs=1e-4)
-
         fact_hits = search_fact_vectors_knn(conn, vec1, top_k=1)
         assert fact_hits[0][0] == "f1"
         assert fact_hits[0][1] == pytest.approx(1.0, abs=1e-4)
@@ -230,7 +225,10 @@ def test_openie_checkpoints_cache(tmp_path: Path) -> None:
 
         publish_inference(tmp_path / "test_openie.db", [rec1, rec2])
 
-        loaded = get_openie_checkpoints(conn, ["c1", "c2", "missing"])
+        loaded = {
+            cid: deserialize_openie_record(raw)
+            for cid, raw in conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference")
+        }
         assert len(loaded) == 2
         assert loaded["c1"] == rec1
         assert loaded["c2"] == rec2
@@ -403,7 +401,7 @@ def test_high_load_batch_operations_exceeding_sqlite_variable_limits(tmp_path: P
         loaded_vecs = get_entity_vectors(conn, entity_ids)
         assert len(loaded_vecs) == n_items
 
-        loaded_ckpts = get_openie_checkpoints(conn, chunk_ids)
+        loaded_ckpts = dict(conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference"))
         assert len(loaded_ckpts) == n_items
 
     finally:

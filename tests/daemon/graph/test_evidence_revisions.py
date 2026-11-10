@@ -21,6 +21,7 @@ from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
 from yaw.daemon.graph.storage.rows import validate_graph_state
 from yaw.daemon.indexing import (
     ACTIVE_SOURCE_SETTINGS,
+    INDEXING_ERROR_SINK,
     CorpusIndexingLiveComponent,
     InferenceIdentity,
     bind_native_indexing,
@@ -117,6 +118,8 @@ def fixed_vector(text):
 
 
 def publish(env, app, chunks):
+    errors: list[BaseException] = []
+    env.context_provider.provide(INDEXING_ERROR_SINK, errors.append)
     included = tuple(ptr.rel_posix_path for ptr, _ in chunks)
     env.context_provider.provide(
         ACTIVE_SOURCE_SETTINGS,
@@ -124,6 +127,8 @@ def publish(env, app, chunks):
     )
     while True:
         app.update_blocking(live=False)
+        if errors:
+            raise errors[0]
         component = CorpusIndexingLiveComponent.last_instance
         if component is None or component.remaining_chunks == 0:
             break

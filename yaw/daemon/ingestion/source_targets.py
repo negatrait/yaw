@@ -27,9 +27,7 @@ class SharedCocoRuntime:
     ref_count: int = 0
 
 
-_SharedCocoRuntime = SharedCocoRuntime
 SHARED_COCO_RUNTIMES: dict[Path, SharedCocoRuntime] = {}
-_SHARED_COCO_RUNTIMES = SHARED_COCO_RUNTIMES
 _COCO_RUNTIME_LOCK = threading.Lock()
 
 

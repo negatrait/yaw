@@ -16,7 +16,6 @@ from yaw.daemon.graph.storage import (
     open_managed_yaw_db,
     open_yaw_db,
     search_chunk_vectors_knn,
-    search_entity_vectors_knn,
     search_fact_vectors_knn,
     serialize_f32_vector,
     upsert_chunk_vectors,
@@ -273,7 +272,6 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
                 assert conn.execute(f"SELECT COUNT(*) FROM {vec_table}").fetchone()[0] == 0
                 assert vec0_table_dimension(conn, vec_table) == 4
             assert search_chunk_vectors_knn(conn, v_c1, top_k=5) == []
-            assert search_entity_vectors_knn(conn, v_ea, top_k=5) == []
             assert search_fact_vectors_knn(conn, v_f1, top_k=5) == []
             changes_before = conn.total_changes
 
@@ -312,7 +310,6 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
 
         for prefix, search_fn in (
             ("c", search_chunk_vectors_knn),
-            ("e", search_entity_vectors_knn),
             ("f", search_fact_vectors_knn),
         ):
             hits = search_fn(knn_conn, query, top_k=5)
@@ -324,8 +321,8 @@ def test_vec0_managed_transaction_upsert_rollback_and_knn_parity(tmp_path: Path)
         tie_conn = open_yaw_db(tmp_path / "tie_knn.db")
         try:
             tie_vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-            upsert_entity_vectors(tie_conn, [("ent-c", tie_vec), ("ent-a", tie_vec), ("ent-b", tie_vec)])
-            tie_hits = search_entity_vectors_knn(tie_conn, tie_vec, top_k=3)
+            upsert_chunk_vectors(tie_conn, [("ent-c", tie_vec), ("ent-a", tie_vec), ("ent-b", tie_vec)])
+            tie_hits = search_chunk_vectors_knn(tie_conn, tie_vec, top_k=3)
             assert [h[0] for h in tie_hits] == ["ent-a", "ent-b", "ent-c"]
             for _, sim in tie_hits:
                 assert sim == pytest.approx(1.0, abs=1e-6)

@@ -172,15 +172,6 @@ def search_chunk_vectors_knn(
     return _search_knn(conn, "chunk", query_vec, top_k)
 
 
-def search_entity_vectors_knn(
-    conn: sqlite3.Connection,
-    query_vec: np.ndarray | Sequence[float],
-    top_k: int = 10,
-) -> list[tuple[str, float]]:
-    """Bounded SQL KNN top-k cosine search over entity_vec."""
-    return _search_knn(conn, "entity", query_vec, top_k)
-
-
 def search_fact_vectors_knn(
     conn: sqlite3.Connection,
     query_vec: np.ndarray | Sequence[float],

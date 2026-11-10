@@ -34,7 +34,7 @@ from yaw.daemon.graph.inference import (
     compute_task_quality_score,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.storage import get_openie_checkpoints, open_yaw_db
+from yaw.daemon.graph.storage import open_yaw_db
 from yaw.daemon.runtime import YawRuntime
 
 
@@ -749,7 +749,7 @@ re-extracting."""
         assert extracted_counts[first_chunk_id] == 1
         assert rt2.stats().chunks == 2
         assert rt2.engine is not None
-        saved_openie = get_openie_checkpoints(rt2.engine.conn, list(extracted_counts.keys()))
+        saved_openie = dict(rt2.engine.conn.execute("SELECT chunk_id,extraction_json FROM chunk_inference"))
         assert first_chunk_id in saved_openie
 
         hits = rt2.retrieve("Where did Alan Turing work?", top_k=2)

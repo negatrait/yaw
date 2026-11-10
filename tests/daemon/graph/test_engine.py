@@ -1351,6 +1351,7 @@ using all 5 bound REPL tools."""
         repl_tool_events.clear()
         program.telemetry.clear()
         program.label_judge_audit_trail.clear()
+        program.hierarchy_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
 
         assert (
@@ -1369,12 +1370,15 @@ using all 5 bound REPL tools."""
 
         # Verify exact non-double-counted token accounting:
         # Publication telemetry describes this update; it does not replay prior provider work.
-        assert len(program.label_judge_audit_trail) == 1
-        assert program.label_judge_audit_trail[0]["mode"] == "direct"
-        assert program.label_judge_audit_trail[0]["tokens_used"] == 30
-        assert engine._graph_rlm_stats["label_judge_tokens"] == 30
-        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
-        assert engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["hierarchy_judge_tokens"] == 60
+        assert len(program.label_judge_audit_trail) == 2
+        assert all(entry["mode"] == "direct" for entry in program.label_judge_audit_trail)
+        assert all(entry["tokens_used"] == 30 for entry in program.label_judge_audit_trail)
+        assert engine._graph_rlm_stats["label_judge_tokens"] == sum(
+            entry["tokens_used"] for entry in program.label_judge_audit_trail
+        )
+        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == sum(
+            entry["tokens_used"] for entry in program.hierarchy_judge_audit_trail
+        )
 
         # Step 7 (direct shacl_repair on pre-hydrated focus_context) = 2 focus nodes * 30 worker tokens = 60 tokens
         assert len(program.shacl_audit_trail) == 2

@@ -45,7 +45,6 @@ from yaw.daemon.graph.storage.hydration import (
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE, mount_table
 from yaw.daemon.graph.storage.rows import declare_tables, validate_graph_state
 from yaw.daemon.ingestion.source_targets import (
-    SHARED_COCO_RUNTIMES,
     SOURCE_DB,
     SOURCE_ROOT,
     SharedCocoRuntime,
@@ -57,9 +56,6 @@ from yaw.daemon.ingestion.source_targets import (
     declare_source_file,
     normalize_chunking_settings,
 )
-
-_SharedCocoRuntime = SharedCocoRuntime
-_SHARED_COCO_RUNTIMES = SHARED_COCO_RUNTIMES
 
 RELOAD_SIGNAL_ROOT = coco.ContextKey[Path]("yaw/reload_signal_root", detect_change=True)
 RELOAD_SIGNAL_HANDLER = coco.ContextKey[Callable[[str], None]]("yaw/reload_signal_handler")
@@ -279,10 +275,6 @@ class CorpusIndexingLiveComponent:
         self.last_changed: tuple[tuple[SourceMetadata, str], ...] = ()
         self.initial_retained: tuple[tuple[SourceMetadata, str], ...] = ()
         self.initial_changed: tuple[tuple[SourceMetadata, str], ...] = ()
-
-    @property
-    def active_files(self) -> dict[str, FileLike] | None:
-        return self._active_files
 
     def reset_active_files(self) -> None:
         self._active_files = None

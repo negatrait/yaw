@@ -25,6 +25,7 @@ from yaw.daemon.graph.storage import (
     upsert_semantic_edges,
 )
 from yaw.daemon.indexing import bind_native_indexing
+from yaw.daemon.ingestion.corpus import chunk_source_text
 
 
 class DeterministicMockLM(dspy.LM):
@@ -41,6 +42,7 @@ class DeterministicMockLM(dspy.LM):
         self._triples_json: str | None = None
         self._synonym_fn = synonym_fn
         self.observed_candidates: list[dict[str, Any]] = []
+        self.records: dict[str, tuple[str, str, str]] = {}
 
     def set_stage_responses(self, ner_json: str, triples_json: str) -> None:
         self._ner_json = ner_json
@@ -67,6 +69,16 @@ class DeterministicMockLM(dspy.LM):
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         full_text = self._extract_prompt_text(prompt, messages)
+        matched = sorted(
+            (
+                (max(full_text.rfind(text), full_text.rfind(json.dumps(text)[1:-1])), ner, triples)
+                for text, ner, triples in self.records.values()
+            ),
+            reverse=True,
+        )
+        ner_json, triples_json = (
+            matched[0][1:] if matched and matched[0][0] >= 0 else (self._ner_json, self._triples_json)
+        )
         if "repl_history" in full_text and "variables_info" in full_text:
             return [
                 json.dumps({"reasoning": "No semantic repair proposed by this fixture.", "code": "SUBMIT(repairs=[])"})
@@ -80,10 +92,10 @@ class DeterministicMockLM(dspy.LM):
                 stage_text=full_text,
             )
             return [json.dumps({"decisions": decisions})]
-        if "triples" in full_text and "named_entities" in full_text and self._triples_json is not None:
-            return [self._triples_json]
-        if "named_entities" in full_text and self._ner_json is not None:
-            return [self._ner_json]
+        if "triples" in full_text and "named_entities" in full_text and triples_json is not None:
+            return [triples_json]
+        if "named_entities" in full_text and ner_json is not None:
+            return [ner_json]
         out = self._responses[self._idx % len(self._responses)]
         self._idx += 1
         return [out]
@@ -132,7 +144,7 @@ def _index_chunk_with_record(
     chunk: ChunkPointer,
     text: str,
     record: OpenIERecord,
-) -> None:
+) -> ChunkPointer:
     ner_json = json.dumps(
         {
             "named_entities": [
@@ -164,9 +176,14 @@ def _index_chunk_with_record(
     mock_lm = engine.program.rlm_sub_lm
     assert isinstance(mock_lm, DeterministicMockLM)
     mock_lm.set_stage_responses(ner_json, triples_json)
-    snapshot = {ptr.chunk_id: (ptr, source) for ptr, source in engine._opt_chunks_pool}
-    snapshot[chunk.chunk_id] = (chunk, text)
-    engine.index_chunks(list(snapshot.values()))
+    mock_lm.records[chunk.chunk_id] = (text, ner_json, triples_json)
+    rel_path = str(Path(chunk.rel_posix_path).with_suffix(".json"))
+    rows = [{"text": source} for source, _, _ in mock_lm.records.values()]
+    content = json.dumps(rows, indent=2)
+    (engine.workspace_root / rel_path).write_text(content, encoding="utf8")
+    chunks = chunk_source_text(content, rel_path, min_chunk_size=1)
+    engine.index_chunks(chunks)
+    return next(ptr for ptr, source in chunks if source == text)
 
 
 def test_datatype_property_literal_objects_stored_with_weighted_edges_and_excluded_from_skos(
@@ -252,7 +269,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         ],
     )
 
-    _index_chunk_with_record(engine, chunk, "YAW Service listens on port 8080 and generated $1.2B.", record)
+    chunk = _index_chunk_with_record(engine, chunk, "YAW Service listens on port 8080 and generated $1.2B.", record)
 
     # Verify scalar and formatted literals NEVER enter entities
     all_entities = {
@@ -279,7 +296,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
     # Verify passage edges connect chunk-1 to subj_id only
     passage_edges = conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'passage'").fetchall()
     passage_pairs = {(r[0], r[1]) for r in passage_edges}
-    assert ("chunk-1", subj_id) in passage_pairs
+    assert (chunk.chunk_id, subj_id) in passage_pairs
 
     # Verify pure literals '8080' and '$1.2B' were excluded from SKOS candidate discovery
     assert len(called_candidates) == 0
@@ -683,7 +700,9 @@ def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter
         ],
     )
 
-    _index_chunk_with_record(engine, chunk, "C++ contrasts with C#. Python 3.10 interoperates with C++.", record)
+    chunk = _index_chunk_with_record(
+        engine, chunk, "C++ contrasts with C#. Python 3.10 interoperates with C++.", record
+    )
 
     rows = conn.execute("SELECT entity_id, name FROM entities ORDER BY name ASC").fetchall()
     names = {str(r[1]): str(r[0]) for r in rows}
@@ -698,7 +717,7 @@ def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter
     assert str(nocase_row[0]) == "Python 3.10"
 
     label_rows = conn.execute(
-        "SELECT label_norm, raw_label, label_kind FROM entity_labels WHERE chunk_id = 'chunk-tech-1'"
+        "SELECT label_norm, raw_label, label_kind FROM entity_labels WHERE chunk_id = ?", (chunk.chunk_id,)
     ).fetchall()
     labels_by_norm = {str(r[0]): (str(r[1]), str(r[2])) for r in label_rows}
     assert labels_by_norm["c++"] == ("C++", "skos:prefLabel")

@@ -1154,9 +1154,9 @@ def test_direct_use_mount_chunk_output_handoff_without_chunk_state_target(tmp_pa
 def test_shared_coco_environment_lifecycle_and_app_caching(tmp_path):
     import yaw.daemon.indexing as indexing_mod
     import yaw.daemon.runtime as runtime_mod
-    from yaw.daemon.indexing import (
-        _SHARED_COCO_RUNTIMES,
-        _SharedCocoRuntime,
+    from yaw.daemon.ingestion.source_targets import (
+        SHARED_COCO_RUNTIMES,
+        SharedCocoRuntime,
         acquire_coco_environment,
         close_coco_environment,
     )
@@ -1174,7 +1174,7 @@ def test_shared_coco_environment_lifecycle_and_app_caching(tmp_path):
     root_b = tmp_path / "env_b"
 
     shared_a1 = acquire_coco_environment(root_a)
-    assert isinstance(shared_a1, _SharedCocoRuntime)
+    assert isinstance(shared_a1, SharedCocoRuntime)
     assert shared_a1.ref_count == 1
     assert shared_a1.apps == {}
 
@@ -1210,8 +1210,8 @@ def test_shared_coco_environment_lifecycle_and_app_caching(tmp_path):
 
     from yaw.core import resolve_coco_state_root
 
-    assert resolve_coco_state_root(root_a).resolve() not in _SHARED_COCO_RUNTIMES
-    assert resolve_coco_state_root(root_b).resolve() not in _SHARED_COCO_RUNTIMES
+    assert resolve_coco_state_root(root_a).resolve() not in SHARED_COCO_RUNTIMES
+    assert resolve_coco_state_root(root_b).resolve() not in SHARED_COCO_RUNTIMES
 
 
 def test_corpus_feed_subscriber_incremental_active_files_event_handling():
@@ -1240,11 +1240,11 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     subscriber = _CorpusFeedSubscriber(cast(coco.LiveComponentOperator, op), comp)
 
     # When active_files is None, update and delete do not crash and still call update_full
-    assert comp.active_files is None
+    assert vars(comp)["_active_files"] is None
     handle = asyncio.run(subscriber.update("doc1.md", "file_obj_1"))
     assert asyncio.run(handle.ready()) is None
     assert op.update_full_calls == 1
-    assert comp.active_files is None
+    assert vars(comp)["_active_files"] is None
 
     handle = asyncio.run(subscriber.delete("doc1.md"))
     assert asyncio.run(handle.ready()) is None
@@ -1256,7 +1256,7 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     # update(key, value) updates in O(1)
     asyncio.run(subscriber.update("doc3.md", "file_obj_3"))
     assert op.update_full_calls == 3
-    assert comp.active_files == {
+    assert vars(comp)["_active_files"] == {
         "doc1.md": "file_obj_1",
         "doc2.md": "file_obj_2",
         "doc3.md": "file_obj_3",
@@ -1265,7 +1265,7 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     # delete(key) pops in O(1)
     asyncio.run(subscriber.delete("doc2.md"))
     assert op.update_full_calls == 4
-    assert comp.active_files == {
+    assert vars(comp)["_active_files"] == {
         "doc1.md": "file_obj_1",
         "doc3.md": "file_obj_3",
     }
@@ -1273,7 +1273,7 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     # delete of non-existent key is safe
     asyncio.run(subscriber.delete("non_existent.md"))
     assert op.update_full_calls == 5
-    assert comp.active_files == {
+    assert vars(comp)["_active_files"] == {
         "doc1.md": "file_obj_1",
         "doc3.md": "file_obj_3",
     }
@@ -1281,7 +1281,7 @@ def test_corpus_feed_subscriber_incremental_active_files_event_handling():
     # update_all() sets active_files to None
     asyncio.run(subscriber.update_all())
     assert op.update_full_calls == 6
-    assert comp.active_files is None
+    assert vars(comp)["_active_files"] is None
 
 
 def test_corpus_indexing_live_component_micro_batching_and_memo_hits(tmp_path, provider):

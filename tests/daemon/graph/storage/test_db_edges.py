@@ -17,7 +17,6 @@ from yaw.daemon.graph.storage import (
     open_readonly_yaw_db,
     open_yaw_db,
     search_chunks_fts,
-    search_entity_vectors_knn,
     search_facts_fts,
     set_meta,
     upsert_entities,
@@ -156,8 +155,6 @@ def test_open_readonly_yaw_db_enforces_ro_uri_and_busy_timeout(tmp_path):
         assert ro_conn.row_factory is sqlite3.Row
         assert ro_conn.execute("PRAGMA busy_timeout").fetchone()[0] == 2500
         assert ro_conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()["value"] == "1"
-        knn_hits = search_entity_vectors_knn(ro_conn, [1.0, 0.0], top_k=1)
-        assert knn_hits == [("entity-1", pytest.approx(1.0))]
         with pytest.raises(sqlite3.OperationalError):
             ro_conn.execute("INSERT INTO meta (key, value) VALUES ('x', 'y')")
 
