@@ -147,15 +147,36 @@ def build_dspy_triples_grammar(
     if not deduped_known:
         return root_line + list_line + _OPEN_TRIPLE_GBNF_RULES
 
-    pairs = [list(item[:2]) for item in known_entities or () if isinstance(item, (list, tuple)) and len(item) >= 2]
-    ambiguous = {name for name in deduped_known if len({pair[1] for pair in pairs if pair[0] == name}) > 1}
+    clean_pairs: list[list[str]] = []
+    def_lookup: dict[str, str] = {}
+    for item in known_entities or ():
+        if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[0], str):
+            clean_k = item[0].strip()
+            clean_v = clean_schema_definition(item[1]).strip()
+            if clean_k and clean_v:
+                norm_k = str(text_processing(clean_k))
+                def_lookup.setdefault(clean_k, clean_v)
+                if norm_k:
+                    def_lookup.setdefault(norm_k, clean_v)
+                pair = [clean_k, clean_v]
+                if pair not in clean_pairs:
+                    clean_pairs.append(pair)
+
+    ambiguous = {name for name in deduped_known if len({p[1] for p in clean_pairs if p[0] == name}) > 1}
     endpoints: list[Any] = [name for name in deduped_known if name not in ambiguous]
-    endpoints.extend(pair for pair in pairs if pair[0] in ambiguous and pair not in endpoints)
-    definition_of = {pair[0]: pair[1] for pair in pairs if pair[0] not in ambiguous}
+    endpoints.extend(p for p in clean_pairs if p[0] in ambiguous and p not in endpoints)
+    definition_of = {p[0]: p[1] for p in clean_pairs if p[0] not in ambiguous}
 
     def sense(endpoint: Any) -> tuple[str, str]:
-        label, definition = (endpoint, definition_of.get(endpoint, "")) if isinstance(endpoint, str) else endpoint
-        return text_processing(label), clean_schema_definition(definition).strip().casefold()
+        if isinstance(endpoint, (list, tuple)) and len(endpoint) >= 2:
+            label = str(endpoint[0]).strip()
+            definition = clean_schema_definition(endpoint[1]).strip()
+        else:
+            label = str(endpoint).strip()
+            definition = clean_schema_definition(definition_of.get(label, "")).strip()
+        norm_label = str(text_processing(label))
+        clean_def = definition or def_lookup.get(label, "") or def_lookup.get(norm_label, "")
+        return norm_label, clean_def.strip().casefold()
 
     # A statement never relates a resource sense to itself (native graph spec §5.3).
     senses = [sense(endpoint) for endpoint in endpoints]

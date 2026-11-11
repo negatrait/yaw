@@ -183,3 +183,29 @@ def test_ner_and_triples_grammars_bound_repetition_and_string_length() -> None:
     pinned_triples = _parse_gbnf_rules(build_dspy_triples_grammar(None, [["HubSpot", "CRM platform."]]))
     assert pinned_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
     assert pinned_triples["string"] == '"\\"" char{1,512} "\\""'
+
+
+def test_triples_grammar_normalizes_empty_definitions_to_prevent_reflexive_statements() -> None:
+    # Service Mesh has definition, service mesh does not; both normalize to the same sense
+    grammar = build_dspy_triples_grammar(
+        known_entities=[
+            ["Service Mesh", "Infrastructure layer for microservices."],
+            "service mesh",
+        ]
+    )
+    # Neither should have an objects rule linking to the other
+    assert "objects-0" not in grammar
+    assert "objects-1" not in grammar
+    assert 'subject-0 ::= endpoint-0 ", \\"pred\\": " literal-statement' in grammar
+    assert 'subject-1 ::= endpoint-1 ", \\"pred\\": " literal-statement' in grammar
+
+
+def test_triples_grammar_ignores_empty_definition_pairs_for_ambiguity() -> None:
+    grammar = build_dspy_triples_grammar(
+        known_entities=[
+            ["Service Mesh", "Infrastructure layer for microservices."],
+            ["Service Mesh", ""],
+        ]
+    )
+    assert 'endpoint-0 ::= "\\"Service Mesh\\""' in grammar
+    assert "endpoint-1" not in grammar
