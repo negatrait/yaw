@@ -893,8 +893,8 @@ def generate_graph_projection_svg(
 
     selected = largest_one_hop_neighborhood(all_edges)
     # Counts and colors describe only the connected neighborhood actually shown.
-    all_edges_tail = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected][-1000:]
-    if len(all_edges_tail) == 1000:
+    all_edges_tail = [(u, v, k) for u, v, k in all_edges if u in selected and v in selected][-500:]
+    if len(all_edges_tail) == 500:
         selected = {u for u, v, _ in all_edges_tail} | {v for u, v, _ in all_edges_tail}
     diff_nodes: set[str] = {u for u, v, k in all_edges_tail if k == "owl:differentFrom"} | {
         v for u, v, k in all_edges_tail if k == "owl:differentFrom"

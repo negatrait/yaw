@@ -10,8 +10,8 @@ status_path = ".yaw/status.json"
 compiled_program_path = ".yaw/compiled_program.json"
 
 [ingestion]
-included_patterns = ["*.md", "*.txt", "*.json"]
-excluded_patterns = [".*", "*/.*", "__pycache__/*"]
+# included_patterns = ["*.md", "*.txt", "*.json"]
+# excluded_patterns = [".*", "*/.*", "__pycache__/*"]
 chunk_size = 1000
 chunk_overlap = 150
 min_chunk_size = 100
@@ -44,9 +44,10 @@ retrieval_top_k = 10
 damping = 0.5
 
 candidate_dense_threshold = 0.85
-candidate_lexical_threshold = 0.65
+candidate_lexical_threshold = 0.675
 auto_merge_threshold = 0.98
 candidate_volume_ratio = 0.5
+semantic_adjudication_batch_size = 5
 embed_batch_size = 64
 # Aggregate formatted-input budget per embedding request; tune for the provider.
 embed_batch_chars = 3500

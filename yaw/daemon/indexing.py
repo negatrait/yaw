@@ -615,7 +615,7 @@ def bind_native_indexing(
             candidate_dense_threshold=engine.candidate_dense_threshold,
             candidate_lexical_threshold=engine.candidate_lexical_threshold,
             auto_merge_threshold=engine.auto_merge_threshold,
-            synonym_batch_size=engine.synonym_batch_size,
+            semantic_adjudication_batch_size=engine.semantic_adjudication_batch_size,
             ast_context_hops=engine.ast_context_hops,
             context_window_tokens=active_program.context_window_tokens,
             max_output_tokens=active_program.max_output_tokens,

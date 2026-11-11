@@ -107,16 +107,16 @@ class GraphPlanSettings:
     embedding_identity: str
     synonym_identity: str = ""
     shacl_identity: str = ""
-    candidate_dense_threshold: float = 0.8
-    candidate_lexical_threshold: float = 0.625
+    candidate_dense_threshold: float = 0.85
+    candidate_lexical_threshold: float = 0.675
     auto_merge_threshold: float = 0.98
-    synonym_batch_size: int = 4
+    semantic_adjudication_batch_size: int = 5
     ast_context_hops: int = 1
     context_window_tokens: int = 32768
     max_output_tokens: int = 4096
-    chunk_size: int = 1200
-    chunk_overlap: int = 100
-    min_chunk_size: int = 50
+    chunk_size: int = 1000
+    chunk_overlap: int = 150
+    min_chunk_size: int = 100
 
 
 type FactRow = tuple[str, str, str, str | None, str, str, str, str | None, str | None, str | None]
@@ -1097,12 +1097,12 @@ async def plan_graph_publication(
                 candidate_order = {str(c["pair_id"]): index for index, c in enumerate(candidates)}
                 # Cognitive Load Safeguard: clamp batch_limit to max 4 pairs. Smaller models (4B-8B)
                 # suffer attention dispersion and conservative rejection when evaluating too many pairs at once.
-                # Actual prompt context fit is strictly governed by fits=extraction.program.synonym_batch_fits
+                # Actual prompt context fit is strictly governed by fits=extraction.program.semantic_adjudication_fits
                 # via DSPy adapter token counting. max_dossier_chars serves purely as a generous in-memory backstop
                 # (context_window_tokens * 3) to prevent unbounded memory growth before tokenization, ensuring
                 # individual pairs with rich context/excerpts are never prematurely split or rejected by
                 # character heuristics.
-                batch_limit = max(1, min(settings.synonym_batch_size, 4))
+                batch_limit = max(1, min(settings.semantic_adjudication_batch_size, 4))
                 max_dossier_chars = max(40000, settings.context_window_tokens * 3)
                 evidence_batches = iter_synonym_evidence(
                     staging_conn,
@@ -1111,7 +1111,7 @@ async def plan_graph_publication(
                     ast_context_hops=settings.ast_context_hops,
                     batch_size=batch_limit,
                     max_chars=max_dossier_chars,
-                    fits=extraction.program.synonym_batch_fits,
+                    fits=extraction.program.semantic_adjudication_fits,
                 )
                 for batch_idx, ev in enumerate(evidence_batches, start=1):
                     original_count = len(ev.candidates)

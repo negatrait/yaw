@@ -104,10 +104,10 @@ class YawGraphEngine:
         passage_node_weight: float = 0.05,
         fts_weight: float = 0.2,
         damping: float = 0.5,
-        candidate_dense_threshold: float = 0.8,
-        candidate_lexical_threshold: float = 0.625,
+        candidate_dense_threshold: float = 0.85,
+        candidate_lexical_threshold: float = 0.675,
         auto_merge_threshold: float = 0.98,
-        synonym_batch_size: int = 4,
+        semantic_adjudication_batch_size: int = 5,
         retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
         activation: str = "scaled_tanh",
@@ -117,7 +117,7 @@ class YawGraphEngine:
         dual_weight: float | None = 0.5,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
-        ast_context_hops: int = 0,
+        ast_context_hops: int = 1,
         traversal_policy: RelationTraversalPolicy | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
@@ -157,7 +157,7 @@ class YawGraphEngine:
         self.candidate_dense_threshold = candidate_dense_threshold
         self.candidate_lexical_threshold = candidate_lexical_threshold
         self.auto_merge_threshold = auto_merge_threshold
-        self.synonym_batch_size = synonym_batch_size
+        self.semantic_adjudication_batch_size = semantic_adjudication_batch_size
         self.retrieval_top_k = retrieval_top_k
         self.embed_batch_size = embed_batch_size
         self.activation = activation

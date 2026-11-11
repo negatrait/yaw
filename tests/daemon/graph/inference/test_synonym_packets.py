@@ -203,7 +203,7 @@ def test_complete_native_request_and_original_id_decisions(tmp_path, packet_prov
     url, calls, rendered, _ = packet_provider
     program = make_program(url)
     batch = make_batch(tmp_path)
-    assert program.synonym_batch_fits(batch)
+    assert program.semantic_adjudication_fits(batch)
     decisions = program.judge_semantics(batch)
     assert [x["relation"] for x in decisions] == [
         "skos:altLabel",
@@ -256,7 +256,7 @@ def test_complete_request_budget_counts_demos_and_never_generates_over_budget(tm
     program = make_program(url, context=20000)
     batch = make_batch(tmp_path)
     program.label_judge.demos = [dspy.Example(candidate_pairs="unabridged demo " * 2000, decisions=[])]
-    assert not program.synonym_batch_fits(batch)
+    assert not program.semantic_adjudication_fits(batch)
     with pytest.raises(ValueError, match="exceeds context"):
         program.judge_semantics(batch)
     assert not calls

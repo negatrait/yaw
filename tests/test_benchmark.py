@@ -898,7 +898,7 @@ class PaperParityGateTests(unittest.TestCase):
                 def judge_semantics(self, candidates, *args, **kwargs):
                     return []
 
-                def synonym_batch_fits(self, batch):
+                def semantic_adjudication_fits(self, batch):
                     return True
 
                 def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):

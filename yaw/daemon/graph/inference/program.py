@@ -913,7 +913,7 @@ chunk."""
             )
         return self._synonym_budget
 
-    def synonym_batch_fits(self, batch: SynonymEvidenceBatch) -> bool:
+    def semantic_adjudication_fits(self, batch: SynonymEvidenceBatch) -> bool:
         """Check a whole pair packet including signature, demos, output budget and chat template."""
         lm = self.label_judge.lm or dspy.settings.lm
         return self.synonym_request_budget(lm).fits(batch, self.label_judge, lm)

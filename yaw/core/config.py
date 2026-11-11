@@ -226,16 +226,16 @@ class YawConfig:
     retrieval_top_k: int = 10
     damping: float = 0.5
 
-    candidate_dense_threshold: float = 0.8
-    candidate_lexical_threshold: float = 0.625
+    candidate_dense_threshold: float = 0.85
+    candidate_lexical_threshold: float = 0.675
     auto_merge_threshold: float = 0.98
-    candidate_volume_ratio: float = 1.0
-    synonym_batch_size: int = 4
+    candidate_volume_ratio: float = 0.5
+    semantic_adjudication_batch_size: int = 5
     embed_batch_size: int = 64
     embed_batch_chars: int = 3500
     max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
-    ast_context_hops: int = 0
+    ast_context_hops: int = 1
 
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
@@ -438,7 +438,7 @@ class YawConfig:
             "candidate_lexical_threshold": self.candidate_lexical_threshold,
             "auto_merge_threshold": self.auto_merge_threshold,
             "candidate_volume_ratio": self.candidate_volume_ratio,
-            "synonym_batch_size": self.synonym_batch_size,
+            "semantic_adjudication_batch_size": self.semantic_adjudication_batch_size,
             "damping": self.damping,
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -500,7 +500,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "candidate_lexical_threshold": "graph",
     "auto_merge_threshold": "graph",
     "candidate_volume_ratio": "graph",
-    "synonym_batch_size": "graph",
+    "semantic_adjudication_batch_size": "graph",
     "embed_batch_size": "graph",
     "embed_batch_chars": "graph",
     "max_context_chars": "graph",
