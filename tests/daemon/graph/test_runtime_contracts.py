@@ -24,7 +24,7 @@ def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
     program = YawProgram(enable_gbnf=False)
     assert type(program.qa) is dspy.ChainOfThought
     predictor = dict(program.named_predictors())["qa.predict"]
-    lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", cache=False)
+    lm = create_dspy_lm("gemma-4-e4b", cache=False)
     program.qa.set_lm(lm)
     assert predictor.lm is lm
     predictor.signature = predictor.signature.with_instructions("Use source names.")
@@ -51,7 +51,7 @@ def test_native_lm_capability_defaults_and_copy():
     assert bare._yaw_recipe is None
     assert bare._yaw_context_window_tokens is None
     assert bare._yaw_supports_gbnf is False
-    configured = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", context_window_tokens=65536)
+    configured = create_dspy_lm("gemma-4-e4b", context_window_tokens=65536)
     cloned = configured.copy(temperature=0.7)
     assert cloned._yaw_recipe == configured._yaw_recipe
     assert cloned._yaw_context_window_tokens == 65536

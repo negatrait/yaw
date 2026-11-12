@@ -83,10 +83,10 @@ class EmbeddingTests(unittest.TestCase):
 
     def test_dspy_embedder_and_adapter_preserve_prefixes_and_l2_normalization(self):
         # Verify Lemonade (openai/...) and Ollama (ollama/...) dspy.Embedder initialization
-        lemonade_emb = create_dspy_embedder(MODEL, base_url="http://localhost:13305/api/v1", provider="openai")
+        lemonade_emb = create_dspy_embedder(MODEL, base_url="http://127.0.0.1:8888/v1", provider="openai")
         self.assertEqual(lemonade_emb.model, f"openai/{MODEL}")
         self.assertEqual(lemonade_emb.default_kwargs.get("encoding_format"), "float")
-        self.assertEqual(lemonade_emb.default_kwargs.get("api_base"), "http://localhost:13305/api/v1")
+        self.assertEqual(lemonade_emb.default_kwargs.get("api_base"), "http://127.0.0.1:8888/v1")
 
         ollama_emb = create_dspy_embedder("nomic-embed-text", base_url="http://localhost:11434", provider="ollama")
         self.assertEqual(ollama_emb.model, "ollama/nomic-embed-text")

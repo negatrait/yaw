@@ -67,7 +67,7 @@ class DeterministicTestLM(dspy.LM):
         **kwargs: Any,
     ) -> list[str]:
         if self.fail_online:
-            raise ConnectionError("Inference server at http://localhost:13305/api/v1 is unreachable")
+            raise ConnectionError("Inference server at http://127.0.0.1:8888/v1 is unreachable")
         req_str = str(prompt or messages or kwargs)
         if dspy.settings.usage_tracker is not None:
             dspy.settings.usage_tracker.add_usage(
@@ -188,7 +188,7 @@ class DeterministicTestEmbedder:
 
 
 def _make_test_config(
-    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str = "http://localhost:13305/api/v1"
+    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str = "http://127.0.0.1:8888/v1"
 ) -> tuple[YawConfig, Path]:
     toml_path = tmp_path / "yaw.toml"
     toml_content = f"""
@@ -248,10 +248,10 @@ def test_load_config_and_fingerprint(tmp_path: Path) -> None:
     """Verify stdlib tomllib loader, relative path resolution, and deterministic config fingerprinting."""
     repo_cfg = load_config(Path(__file__).resolve().parents[2] / "yaw.toml")
     assert repo_cfg.queue_maxsize == 32
-    assert repo_cfg.embedding_model == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+    assert repo_cfg.embedding_model == "embeddinggemma-2"
     assert repo_cfg.context_window_tokens == 131072
-    assert repo_cfg.extraction_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-    assert repo_cfg.qa_model == "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    assert repo_cfg.extraction_model == "gemma-4-e4b"
+    assert repo_cfg.qa_model == "gemma-4-e4b"
     assert repo_cfg.config_fingerprint().startswith("yaw-cfg-v1:")
 
     cfg1, toml_path = _make_test_config(tmp_path)

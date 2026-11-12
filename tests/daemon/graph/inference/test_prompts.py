@@ -836,9 +836,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertFalse(getattr(orch_ref, "_yaw_supports_gbnf", True))
         self.assertTrue(getattr(worker_ref, "_yaw_supports_gbnf", False))
 
-        orch_gemma, worker_gemma = create_dspy_rlm_pair(
-            "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0", reflection=True
-        )
+        orch_gemma, worker_gemma = create_dspy_rlm_pair("gemma-4-e4b", "gemma-4-e4b", reflection=True)
         self.assertEqual(orch_gemma.kwargs["temperature"], 1.0)
         self.assertEqual(worker_gemma.kwargs["temperature"], 1.0)
 

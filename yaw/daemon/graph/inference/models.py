@@ -68,7 +68,7 @@ CHAT_MODELS = {
         expected_device="gpu",
         expected_context=16384,
     ),
-    "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0": ChatProfile(
+    "gemma-4-e4b": ChatProfile(
         checkpoint="unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M",
         recipe="llamacpp",
         role="both",
@@ -103,9 +103,9 @@ CHAT_MODELS = {
         qa_temperature=0.35,
     ),
 }
-DEFAULT_EXTRACTION_CHAT = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-DEFAULT_QA_CHAT = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-BASE_URL = "http://localhost:13305/api/v1"
+DEFAULT_EXTRACTION_CHAT = "gemma-4-e4b"
+DEFAULT_QA_CHAT = "gemma-4-e4b"
+BASE_URL = "http://127.0.0.1:8888/v1"
 
 
 def get_json(base_url, route):

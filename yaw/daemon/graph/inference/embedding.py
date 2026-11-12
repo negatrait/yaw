@@ -102,8 +102,8 @@ PROFILES = {
         QUERY_PREFIX,
         DOCUMENT_PREFIX,
     ),
-    "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0": EmbeddingProfile(
-        "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0",
+    "embeddinggemma-2": EmbeddingProfile(
+        "embeddinggemma-2",
         "ggml-org/embeddinggemma-300m-qat-q8_0-GGUF:Q8_0",
         768,
         2048,

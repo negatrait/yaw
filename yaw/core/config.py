@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from .types import YawRuntimeError
 
-DEFAULT_EMBEDDING_MODEL = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma-2"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
 DEFAULT_INCLUDED_PATTERNS: tuple[str, ...] = (
     "*.md",
@@ -201,13 +201,13 @@ class YawConfig:
     poll_interval_seconds: float = 10.0
 
     # Inference settings
-    base_url: str = "http://localhost:13305/api/v1"
+    base_url: str = "http://127.0.0.1:8888/v1"
     api_key: str = "lemonade"
     provider: str = "openai"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
-    extraction_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-    qa_model: str = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
+    extraction_model: str = "gemma-4-e4b"
+    qa_model: str = "gemma-4-e4b"
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     max_output_tokens: int | None = None
     rlm_max_iters: int = 20

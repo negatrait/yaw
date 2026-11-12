@@ -28,7 +28,7 @@ Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.A
 - **Runtime & Ingestion**:
   - One CocoIndex runtime (`yaw/daemon/runtime.py`), one declarative Cocoindex writer for `yaw.db`, zero imperative bypass writing is allowed. Event-driven live ingestion (`localfs.walk_dir(..., live=True)` in `yaw/daemon/ingestion/corpus.py`), and a thin adapter in `yaw/daemon/mcp_server.py`.
   - Stream ingestion and candidate indexing in dataset-agnostic micro-batches of `64` chunks per `app.update()` cycle; never encode train/val splits or benchmark presets in production code.
-  - Default LLM admission strictly to `parallel = 1` (`Semaphore(1)`) for local `llama.cpp` (`http://localhost:13305/api/v1`); batch embeddings (`max_batch_size = 64`). Keep sampling temp = 1 in development to prevent small-model looping.
+  - Default LLM admission strictly to `parallel = 1` (`Semaphore(1)`) for local `llama.cpp` (`http://127.0.0.1:8888/v1`); batch embeddings (`max_batch_size = 64`). Keep sampling temp = 1 in development to prevent small-model looping.
   - Point CocoIndex `coco.Settings(db_path=...)` at a persistent, content-addressed cache across runs—never tie memo state to transient timestamped DB filenames.
   - Remove ConceptSchemes, clustering, scheme inference/embeddings/storage and all scheme consumers under [native graph publication](docs/native-cocoindex-graph.md). For fixed evidence, 64+64 and 128 chunks must yield identical canonical entity/fact/edge state with comparable cumulative compute. Permit legitimate semantic islands; never manufacture isolation from batch boundaries or fabricate links to force connectivity. Future schemes require measured Recall@N, EM or F1 improvement and acceptable resource/quality costs.
 

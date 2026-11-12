@@ -84,7 +84,7 @@ def provider():
 def test_default_and_explicit_embedding_routes_are_independent(tmp_path, provider):
     url, requests = provider
     default = YawConfig(workspace_root=tmp_path, base_url=url)
-    assert default.embedding_model == MODEL == "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+    assert default.embedding_model == MODEL == "embeddinggemma-2"
     DSPyEmbeddingAdapter.from_config(default).batch_encode(["Aster"])
     assert requests[-1]["model"] == MODEL
     explicit = YawConfig(workspace_root=tmp_path, base_url=url, embedding_model="embeddinggemma-300m-GGUF")
@@ -188,7 +188,7 @@ def test_automatic_budgets_follow_context_and_explicit_overrides_remain_fixed(tm
 def test_gemma_profile_config_and_standalone_program_share_128k_defaults(tmp_path):
     config = YawConfig(workspace_root=tmp_path)
     program = YawProgram()
-    lm = create_dspy_lm("gemma-4-E4B-it-qat-q4_0-gguf-Q4_0")
+    lm = create_dspy_lm("gemma-4-e4b")
     proposer = RLMInstructionProposer(worker_lm=lm, orchestrator_lm=lm)
     assert CHAT_MODELS[config.qa_model].expected_context == config.context_window_tokens == 131072
     assert program.context_window_tokens == lm._yaw_context_window_tokens == 131072

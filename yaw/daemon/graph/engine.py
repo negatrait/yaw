@@ -118,6 +118,9 @@ class YawGraphEngine:
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
         ast_context_hops: int = 1,
+        chunk_size: int = 1200,
+        chunk_overlap: int = 120,
+        min_chunk_size: int = 100,
         traversal_policy: RelationTraversalPolicy | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
@@ -144,6 +147,9 @@ class YawGraphEngine:
         )
         self.max_ast_expansion_hops = max_ast_expansion_hops
         self.ast_context_hops = max(0, int(ast_context_hops))
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.min_chunk_size = min_chunk_size
         self.linking_top_k = linking_top_k
         self.fact_candidate_pool_k = fact_candidate_pool_k
         self.fact_fts_pool_k = fact_fts_pool_k
@@ -1036,7 +1042,13 @@ class YawGraphEngine:
             ).fetchall()
             for r in rows:
                 ptr = ChunkPointer(r[0], r[1], r[2], r[3], r[4], r[5], r[6])
-                c_text = resolve_chunk_text(ptr, self.workspace_root)
+                c_text = resolve_chunk_text(
+                    ptr,
+                    self.workspace_root,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    min_chunk_size=self.min_chunk_size,
+                )
                 pool.append((ptr, c_text))
         self._opt_chunks_pool = pool
 

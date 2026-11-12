@@ -886,7 +886,7 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
     # Probe local live inference server status & run verify_paper_parity_gate.py
     live_endpoint_reachable = False
     try:
-        with urllib.request.urlopen("http://localhost:13305/api/v1/models", timeout=2.0) as resp:
+        with urllib.request.urlopen("http://127.0.0.1:8888/v1/models", timeout=2.0) as resp:
             live_endpoint_reachable = resp.status == 200
     except OSError:
         live_endpoint_reachable = False
@@ -951,7 +951,7 @@ def test_g5_g6_paired_64_plus_64_vs_128_acceptance_report(tmp_path, provider):
         },
         "table_row_counts": {k: len(v) for k, v in trial_graphs["incremental"].items()},
         "live_silicon_parity_probe": {
-            "endpoint": "http://localhost:13305/api/v1/models",
+            "endpoint": "http://127.0.0.1:8888/v1/models",
             "live_endpoint_reachable": live_endpoint_reachable,
             "verify_paper_parity_gate_returncode": parity_proc.returncode,
             "verify_paper_parity_gate_summary": (parity_proc.stdout or parity_proc.stderr).strip()[:500],
