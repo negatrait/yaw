@@ -34,7 +34,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from yaw.core.config import write_text_atomic, write_via_temp_atomic  # noqa: E402
+from yaw.core.config import load_config, write_text_atomic, write_via_temp_atomic  # noqa: E402
 from yaw.core.logger import configure_logging, get_logger  # noqa: E402
 from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db  # noqa: E402
 from yaw.daemon.runtime import is_file_locked  # noqa: E402
@@ -243,22 +243,29 @@ class PoolTelemetry:
         return f"OPTIMIZER STOPPED • {self.openie_cnt} CHUNKS INDEXED", "#f59e0b"
 
 
-def get_lemonade_server_metrics() -> dict[str, Any]:
+_CONFIG_PATH = Path(__file__).resolve().parent.parent / "yaw.toml"
+_PROMETHEUS_TPS = "llamacpp:predicted_tokens_seconds"
+
+
+def _inference_endpoint() -> tuple[str, str]:
+    config = load_config(_CONFIG_PATH)
+    return config.base_url, config.api_key
+
+
+def get_llm_server_metrics(base_url: str, api_key: str) -> dict[str, Any]:
+    """Generation throughput from the llama.cpp ``--metrics`` route at the inference server root."""
+    root = base_url.rstrip("/").removesuffix("/v1")
     try:
-        req = urllib.request.Request("http://localhost:13305/metrics", headers={"Authorization": "Bearer lemonade"})
+        req = urllib.request.Request(f"{root}/metrics", headers={"Authorization": f"Bearer {api_key}"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
-            m = {
-                p[0]: float(p[1])
-                for line in resp.read().decode("utf-8", errors="ignore").splitlines()
-                if not line.startswith("#") and len(p := line.split()) == 2
-            }
-        tps = next(
-            (v for pref in ("Gemma", "Qwen3-4B", "") for k, v in m.items() if pref in k and "tokens_per_second" in k),
-            0.0,
-        )
-        return {"server_up": True, "llm_tps": round(tps, 1)}
-    except Exception:
+            text = resp.read().decode("utf-8", errors="ignore")
+    except OSError:
         return {"server_up": False}
+    gauges = {
+        p[0]: float(p[1]) for line in text.splitlines() if not line.startswith("#") and len(p := line.split()) == 2
+    }
+    tps = gauges.get(_PROMETHEUS_TPS)
+    return {"server_up": True, "llm_tps": None if tps is None else round(tps, 1)}
 
 
 def get_pipeline_resource_metrics() -> dict[str, Any]:
@@ -266,7 +273,7 @@ def get_pipeline_resource_metrics() -> dict[str, Any]:
     for p in psutil.process_iter(["pid", "name", "cmdline"]):
         with contextlib.suppress(psutil.Error, OSError):
             n, cmd = (p.info["name"] or "").lower(), " ".join(p.info["cmdline"] or []).lower()
-            if any(k in n or k in cmd for k in ("lemonade", "llama-server", "yaw")):
+            if any(k in n or k in cmd for k in ("unsloth", "llama-server", "yaw")):
                 rss += p.memory_info().rss
     gpu = _nvidia_smi("memory.used,memory.total")
     vram_used, vram_tot = gpu[:2] if len(gpu) >= 2 else (None, None)
@@ -418,7 +425,7 @@ def get_active_sandbox_info() -> dict[str, Any]:
         "mtime": datetime.fromtimestamp(latest_db.stat().st_mtime, tz=UTC).isoformat(),
         "start_time": start_dt.isoformat(),
         "elapsed_seconds": max(1.0, (datetime.now(UTC) - start_dt).total_seconds()),
-        "lemonade_metrics": get_lemonade_server_metrics(),
+        "llm_metrics": get_llm_server_metrics(*_inference_endpoint()),
         "pipeline_resources": get_pipeline_resource_metrics(),
         # Last good DB snapshot for THIS run only (never another run's numbers).
         **_CACHE.get(str(latest_db), {}),
@@ -662,7 +669,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any]) -> None:
     pt, kg, lem, samples = (
         PoolTelemetry.from_sandbox(sandbox),
         sandbox.get("kg_metrics", {}),
-        sandbox.get("lemonade_metrics", {}),
+        sandbox.get("llm_metrics", {}),
         sandbox.get("timeseries_samples", []),
     )
     ent, trip = int(kg.get("total_entities", 0)), int(kg.get("total_triples", 0))
@@ -684,7 +691,7 @@ def generate_kg_dashboard_svg(dest: Path, sandbox: dict[str, Any]) -> None:
         fontweight="bold",
     )
     rate = f"{pt.velocity:.2f}/m" if pt.velocity is not None else "n/a"
-    tps = f"{lem['llm_tps']:.0f} tok/s" if lem.get("server_up") else "LLM metrics n/a"
+    tps = f"{lem['llm_tps']:.0f} tok/s" if lem.get("llm_tps") is not None else "LLM metrics n/a"
     eta_str = pt.duration(pt.corpus_eta_min if pt.corpus_eta_min is not None else pt.val_eta_min)
     fig.text(
         0.04,
@@ -1664,7 +1671,7 @@ def generate_report_markdown(
     pt, kg, lem, res = (
         PoolTelemetry.from_sandbox(sandbox),
         sandbox.get("kg_metrics", {}),
-        sandbox.get("lemonade_metrics", {}),
+        sandbox.get("llm_metrics", {}),
         sandbox.get("pipeline_resources", {}),
     )
     counts = sandbox.get("counts", {})

@@ -52,6 +52,7 @@ def completions_server():
                     }
                 ],
                 "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+                "timings": {"predicted_n": 3, "predicted_ms": 20.0, "predicted_per_second": 150.0},
             }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -143,6 +144,9 @@ def test_typed_request_carries_the_grammar_in_config_extensions(completions_serv
     assert body["prompt"] == "<|turn>system\nBe terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
     assert response.text == TEXT
     assert response.usage.input_tokens == 11
+    assert response.provider_data == {
+        "timings": {"predicted_n": 3, "predicted_ms": 20.0, "predicted_per_second": 150.0}
+    }
 
 
 def test_auth_failure_is_the_canonical_lm15_error(completions_server):

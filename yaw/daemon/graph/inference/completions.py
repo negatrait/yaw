@@ -114,6 +114,7 @@ class GemmaCompletionsEngine:
                 total_tokens=usage["total_tokens"],
             ),
             logprobs=_logprobs(choice),
+            provider_data={"timings": payload["timings"]} if "timings" in payload else None,
         )
 
     def _body(self, model: str, prompt: str, **options: Any) -> dict[str, Any]:
