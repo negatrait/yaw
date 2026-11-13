@@ -83,11 +83,13 @@ def provider():
 
 def test_default_and_explicit_embedding_routes_are_independent(tmp_path, provider):
     url, requests = provider
-    default = YawConfig(workspace_root=tmp_path, base_url=url)
+    default = YawConfig(workspace_root=tmp_path, base_url=url, api_key="test-key")
     assert default.embedding_model == MODEL == "embeddinggemma-2"
     DSPyEmbeddingAdapter.from_config(default).batch_encode(["Aster"])
     assert requests[-1]["model"] == MODEL
-    explicit = YawConfig(workspace_root=tmp_path, base_url=url, embedding_model="embeddinggemma-300m-GGUF")
+    explicit = YawConfig(
+        workspace_root=tmp_path, base_url=url, api_key="test-key", embedding_model="embeddinggemma-300m-GGUF"
+    )
     DSPyEmbeddingAdapter.from_config(explicit).batch_encode(["Aster"])
     assert requests[-1]["model"] == explicit.embedding_model
     assert (

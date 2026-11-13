@@ -268,7 +268,7 @@ Thresholds are not loosened after seeing a run.
 
 | ID | Slice | Pipeline | Exit gate |
 | --- | --- | --- | --- |
-| B0 | Review record created; resolve the four Open items with the user and the capability probes | `research` → parent | Decisions recorded verbatim in §6.8 |
+| B0 (Route chosen: B) | Review record created; resolve the four Open items with the user and the capability probes | `research` → parent | Decisions recorded verbatim in §6.8 |
 | B1 | Client path: `create_dspy_lm`/`create_dspy_embedder` reduced to `dspy.LM("openai/...")` + `dspy.Embedder`; `api_key_env` | `simplifier` → `critic (flash)` | G1 greps for chat/embedding code; unit tests on a loopback server |
 | B2 | Retire `ServingTokenCounter` and registry evidence; usage-based accounting | `simplifier` → `critic (flash)` | removal-inventory greps; full suite |
 | B3 | Structured output and logprobs per §6.4 decisions | `ontologist` → `simplifier` → `critic (flash)` | G2/G3 loopback capture fixtures; parity tests green |
@@ -294,4 +294,4 @@ Quality gates: `uv run ty check`, `uv run ruff check --fix`, `uv run ruff format
 - 2026-11-12, user: "Would maybe be nice to have a solution that allows changing the inference [...] what if, at some stage, I want to use OpenAI paid API to run yaw? And production usually likes vLLM?"
 - 2026-11-12, user: inference backend is Unsloth at `http://127.0.0.1:8888/v1`, aliases `embeddinggemma-2` and `gemma-4-e4b` (implemented in commit `7fbec2b`).
 - 2026-11-13, user (pointing at the completions endpoint): "You get logprobs by calling the OpenAI-compatible **completions** endpoint with the `logprobs` parameter, then reading `response.choices[0].logprobs.content[0][\"top_logprobs\"]`."
-- Pending: the four Open items in §6.4.
+- 2026-11-13, user: Route B, minimal code change for now. The 150 tok/s average compared to 60 tok/s on lemonade is what I need right now, to be able to pass the epic 1 gates in reasonable time. Might be worth revisiting when epic 1 is officially closed. You'll also need to check the embeddinggemma-2 embedder. Also: The gemma-4 thinking contract requires the <|think|> token as the first token, see the model card.\n- Resolved by the 2026-11-13 decision: structured-output and logprob route is Route B (text completions). Implemented in inference/completions.py:GemmaCompletionsEngine (a dspy.LM(engine=...) that renders the Gemma 4 turn format and posts grammar + integer logprobs to /v1/completions); worker roles only, orchestrator roles keep the chat path. Revisit Route A after Epic 1 closes.\n- Still pending: reasoning mode for orchestrator roles on the chat route, pre-call sizing (ServingTokenCounter) and registry preflight (§6.4 Open items).

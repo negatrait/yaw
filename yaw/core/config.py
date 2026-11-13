@@ -202,7 +202,7 @@ class YawConfig:
 
     # Inference settings
     base_url: str = "http://127.0.0.1:8888/v1"
-    api_key: str = "lemonade"
+    api_key: str = field(default_factory=lambda: os.environ.get("UNSLOTH_STUDIO_AUTH_TOKEN", ""))
     provider: str = "openai"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"

@@ -11,6 +11,7 @@ import dspy
 
 from yaw.core.config import scale_context_budget
 
+from .completions import GemmaCompletionsEngine
 from .grammars import lm_supports_gbnf
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 
@@ -287,6 +288,7 @@ def create_dspy_lm(
 
     profile = CHAT_MODELS.get(clean_name)
     recipe = profile.recipe if profile is not None else None
+    supports_gbnf = recipe == "llamacpp" and role not in ("rlm", "reflection")
 
     if temperature is None:
         if role == "reflection":
@@ -346,21 +348,24 @@ def create_dspy_lm(
         )
     else:
         litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
+        connection: dict[str, Any] = (
+            {"engine": GemmaCompletionsEngine(base_url, api_key, timeout)}
+            if supports_gbnf
+            else {"api_base": base_url, "api_key": api_key, "timeout": timeout}
+        )
         lm = YawDSPyLM(
             model=litellm_model,
             model_type="chat",
             temperature=temperature,
             max_tokens=max_tokens,
             cache=cache,
-            api_base=base_url,
-            api_key=api_key,
-            timeout=timeout,
+            **connection,
             **lm_kwargs,
         )
 
     lm._yaw_recipe = recipe
     lm._yaw_context_window_tokens = context_tokens
-    lm._yaw_supports_gbnf = recipe == "llamacpp" and role not in ("rlm", "reflection")
+    lm._yaw_supports_gbnf = supports_gbnf
     return lm
 
 

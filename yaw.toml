@@ -19,7 +19,6 @@ poll_interval_seconds = 10.0
 
 [inference]
 base_url = "http://127.0.0.1:8888/v1"
-api_key = "lemonade"
 provider = "openai"
 embedding_model = "embeddinggemma-2"
 embedding_task_mode = "distinct-titled"
