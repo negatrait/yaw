@@ -150,15 +150,15 @@ def scale_context_budget(base_budget: int, context_tokens: int) -> int:
     return max(1, base_budget * context_tokens // 65536)
 
 
-def context_char_limit(base_chars: int, context_tokens: int, output_tokens: int) -> int:
+def context_char_limit(base_chars: int, context_tokens: int, output_tokens: int | None) -> int:
     """Scale conservative character safeguards by available input capacity.
 
-    Preserve the established 32K-context/4K-output limits. This is a character
+    An omitted output limit reserves no fixed token allowance. This is a character
     heuristic, not a tokenizer or a guarantee that an entire prompt will fit.
     """
-    if not 0 < output_tokens < context_tokens:
+    if context_tokens < 2 or (output_tokens is not None and not 0 < output_tokens < context_tokens):
         raise ValueError("Require 0 < output_tokens < context_tokens")
-    return max(1, base_chars * (context_tokens - output_tokens) // (32768 - 4096))
+    return max(1, base_chars * (context_tokens - (output_tokens or 0)) // (131072 - 8192))
 
 
 _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
@@ -213,15 +213,14 @@ class YawConfig:
     rlm_max_iters: int = 20
     rlm_max_llm_calls: int = 50
     rlm_max_output_chars: int | None = None
-    reflection_input_tokens: int | None = None
-    reflection_tokenizer_url: str = ""
+    reflection_input_chars: int = 65536
     enable_gbnf: bool = True
-    gbnf_max_entities: int | None = None
-    gbnf_max_triples: int | None = None
-    gbnf_max_facts: int = 4
-    gbnf_max_reasoning_chars: int | None = 360
+    gbnf_max_entities: int = 8
+    gbnf_max_triples: int = 8
+    gbnf_max_facts: int = 8
+    gbnf_max_reasoning_chars: int | None = None
 
-    # Graph & PPR settings
+    # Graph and HMM settings
     linking_top_k: int = 8
     retrieval_top_k: int = 10
     damping: float = 0.5
@@ -231,8 +230,8 @@ class YawConfig:
     auto_merge_threshold: float = 0.98
     candidate_volume_ratio: float = 0.5
     semantic_adjudication_batch_size: int = 5
-    embed_batch_size: int = 64
-    embed_batch_chars: int = 3500
+    embed_batch_size: int = 32
+    embed_batch_chars: int = 4096
     max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
     ast_context_hops: int = 1
@@ -240,14 +239,14 @@ class YawConfig:
     # Runtime & HTTP transport settings
     queue_maxsize: int = 32
     http_host: str = "127.0.0.1"
-    http_port: int = 13306
+    http_port: int = 8889
     http_path: str = "/mcp"
 
     # Prompt optimization settings ([optimization] in yaw.toml)
     optimize_datasets: tuple[str, ...] = ("2wikimultihopqa",)
     optimize_mode: Literal["miprov2", "gepa", "hybrid"] = "hybrid"
-    optimize_max_queries: int = 20
-    optimize_train_queries: int = 7
+    optimize_max_queries: int = 35
+    optimize_train_queries: int = 30
     optimize_query_offset: int = 0
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
     optimize_sleep_seconds: float = 0.0
@@ -277,31 +276,19 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
         if self.context_window_tokens < 2:
             raise YawRuntimeError("INVALID_INPUT", "context_window_tokens must be >= 2")
-        for name, base_budget in (
-            ("max_output_tokens", 4096),
-            ("rlm_max_output_chars", 10000),
-            ("reflection_input_tokens", 16384),
-        ):
-            if getattr(self, name) is None:
-                object.__setattr__(self, name, scale_context_budget(base_budget, self.context_window_tokens))
-        output_tokens = self.max_output_tokens
-        assert output_tokens is not None
-        if not 0 < output_tokens < self.context_window_tokens:
-            raise YawRuntimeError("INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens")
+        if self.max_output_tokens is not None and self.max_output_tokens < 1:
+            raise YawRuntimeError("INVALID_INPUT", "max_output_tokens must be positive")
         for name in (
             "rlm_max_iters",
             "rlm_max_llm_calls",
-            "rlm_max_output_chars",
-            "reflection_input_tokens",
+            "reflection_input_chars",
         ):
             value = getattr(self, name)
             if value is None or value < 1:
                 raise YawRuntimeError("INVALID_INPUT", f"{name} must be positive")
-        context_chars = self.max_context_chars
-        if context_chars is None:
-            context_chars = context_char_limit(24000, self.context_window_tokens, output_tokens)
-            object.__setattr__(self, "max_context_chars", context_chars)
-        if context_chars < 1:
+        if self.rlm_max_output_chars is not None and self.rlm_max_output_chars < 1:
+            raise YawRuntimeError("INVALID_INPUT", "rlm_max_output_chars must be positive")
+        if self.max_context_chars is not None and self.max_context_chars < 1:
             raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}")
@@ -347,6 +334,19 @@ class YawConfig:
                 j_attr,
                 j_tuple if j_attr == "json_keys_blacklist" else (j_tuple or j_default),
             )
+
+    def resolve_inference_budgets(self, context_tokens: int) -> YawConfig:
+        """Bind serving capacity and tool budgets; leave omitted generation limits to the endpoint."""
+        if context_tokens < 2:
+            raise YawRuntimeError("INVALID_INPUT", "context_window_tokens must be >= 2")
+        rlm_chars = (
+            self.rlm_max_output_chars
+            if self.rlm_max_output_chars is not None
+            else scale_context_budget(10000, context_tokens)
+        )
+        if self.max_output_tokens is not None and self.max_output_tokens >= context_tokens:
+            raise YawRuntimeError("INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens")
+        return replace(self, context_window_tokens=context_tokens, rlm_max_output_chars=rlm_chars)
 
     def for_optimization(
         self,
@@ -431,8 +431,7 @@ class YawConfig:
             "rlm_max_iters": self.rlm_max_iters,
             "rlm_max_llm_calls": self.rlm_max_llm_calls,
             "rlm_max_output_chars": self.rlm_max_output_chars,
-            "reflection_input_tokens": self.reflection_input_tokens,
-            "reflection_tokenizer_url": self.reflection_tokenizer_url,
+            "reflection_input_chars": self.reflection_input_chars,
             "max_context_chars": self.max_context_chars,
             "candidate_dense_threshold": self.candidate_dense_threshold,
             "candidate_lexical_threshold": self.candidate_lexical_threshold,
@@ -486,8 +485,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "rlm_max_iters": "inference",
     "rlm_max_llm_calls": "inference",
     "rlm_max_output_chars": "inference",
-    "reflection_input_tokens": "inference",
-    "reflection_tokenizer_url": "inference",
+    "reflection_input_chars": "inference",
     "enable_gbnf": "inference",
     "gbnf_max_entities": "inference",
     "gbnf_max_triples": "inference",

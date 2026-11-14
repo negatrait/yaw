@@ -7,9 +7,8 @@ import pytest
 from yaw.core import VALUE_BEARING_SHACL_ACTIONS
 from yaw.daemon.graph.inference.parsers import (
     compute_task_quality_score,
-    parse_hierarchy_decisions,
     parse_label_decisions,
-    parse_related_decisions,
+    parse_relation_decisions,
     parse_shacl_repairs,
     shacl_repair_actions,
 )
@@ -62,33 +61,31 @@ def test_label_judge_grammar_and_parser_forbid_non_equivalent_merges() -> None:
     from yaw.core.config import YawConfig
     from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
     from yaw.daemon.graph.inference.grammars import (
-        build_dspy_hierarchy_judge_grammar,
         build_dspy_label_judge_grammar,
-        build_dspy_related_judge_grammar,
+        build_dspy_relation_judge_grammar,
     )
     from yaw.daemon.graph.inference.invariants import validate_stage_invariants
     from yaw.daemon.graph.inference.program import YawProgram
-    from yaw.daemon.graph.inference.prompts import JudgeHierarchy, JudgeLabels, JudgeRelated
+    from yaw.daemon.graph.inference.prompts import JudgeLabels, JudgeRelations
 
     # 1. Grammar defaults to 360 reasoning chars and enforces 2-branch equiv-branch without alt_label
     grammar = build_dspy_label_judge_grammar(pair_ids=["e0|e1"])
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert 'reasoning-str ::= "\\"" char+ "\\""' in grammar
     assert (
         'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"'
         in grammar
     )
     assert "alt_label" not in grammar
     assert "alt-branch" not in grammar
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in build_dspy_hierarchy_judge_grammar()
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in build_dspy_related_judge_grammar()
+    assert 'reasoning-str ::= "\\"" char+ "\\""' in build_dspy_relation_judge_grammar()
 
     # 2. Config, Program, and Adapter default/forward max_reasoning_chars=360
     cfg = YawConfig()
-    assert cfg.gbnf_max_reasoning_chars == 360
+    assert cfg.gbnf_max_reasoning_chars is None
     prog = YawProgram()
-    assert prog.gbnf_max_reasoning_chars == 360
+    assert prog.gbnf_max_reasoning_chars is None
     adapter = YawGBNFAdapter(enable_gbnf=True, max_reasoning_chars=300)
-    for sig in (JudgeLabels, JudgeHierarchy, JudgeRelated):
+    for sig in (JudgeLabels, JudgeRelations):
         resolved = adapter.resolve_grammar(sig)
         assert resolved is not None
         assert "char{1,300}" in resolved
@@ -123,7 +120,7 @@ def test_label_judge_grammar_and_parser_forbid_non_equivalent_merges() -> None:
     assert parsed[3]["alt_label"] is False and parsed[3]["hidden_label"] is True
 
     # 4. Stage invariants reject alt_label/hidden_label when equivalent=False
-    inputs = {"candidate_pairs": json.dumps({"format": "synonym-evidence-v2", "pairs": [{"pair_id": "a|b"}]})}
+    inputs = {"candidate_pairs": json.dumps({"format": "synonym-evidence-v3", "pairs": [{"pair_id": "a|b"}]})}
     score_conflict, fb_conflict = validate_stage_invariants(
         "label_judge",
         inputs,
@@ -183,59 +180,17 @@ def test_parse_label_decisions_skips_invalid() -> None:
     assert decisions[0]["relation"] == "skos:hiddenLabel"
 
 
-def test_parse_hierarchy_decisions_truth_table() -> None:
-    raw = {
-        "decisions": [
-            {"pair_id": "a|b", "reasoning": "A is subtype of B", "broader": True, "narrower": False},
-            {"pair_id": "c|d", "reasoning": "D is subtype of C", "broader": False, "narrower": True},
-            {"pair_id": "e|f", "reasoning": "Bidirectional cycle", "broader": True, "narrower": True},
-            {"pair_id": "g|h", "reasoning": "No taxonomic link", "broader": False, "narrower": False},
-        ]
-    }
-    decisions = parse_hierarchy_decisions(raw)
-    assert len(decisions) == 4
-    # (True, False) -> broader, a_to_b
-    assert decisions[0]["relation"] == "skos:broader"
-    assert decisions[0]["source_direction"] == "a_to_b"
-
-    # (False, True) -> broader, b_to_a (SKOS S25 inverse)
-    assert decisions[1]["relation"] == "skos:broader"
-    assert decisions[1]["source_direction"] == "b_to_a"
-
-    # (True, True) -> related (SKOS S27 degrade)
-    assert decisions[2]["relation"] == "skos:related"
-    assert decisions[2]["source_direction"] is None
-
-    # (False, False) -> None (advances to Stage 3)
-    assert decisions[3]["relation"] is None
-    assert decisions[3]["source_direction"] is None
-
-
-def test_parse_related_decisions_truth_table() -> None:
-    raw = {
-        "decisions": [
-            {"pair_id": "a|b", "reasoning": "Domain interaction", "related": True},
-            {"pair_id": "c|d", "reasoning": "Completely disjoint", "related": False},
-        ]
-    }
-    decisions = parse_related_decisions(raw)
-    assert len(decisions) == 2
-    assert decisions[0]["relation"] == "skos:related"
-    assert decisions[1]["relation"] == "owl:differentFrom"
+def test_parse_relation_decisions_truth_table() -> None:
+    choices = ("skos:broader", "skos:narrower", "skos:related", "owl:differentFrom")
+    raw = [{"pair_id": f"a{i}|b{i}", "reasoning": "Evidence", "relation": value} for i, value in enumerate(choices)]
+    assert [item["relation"] for item in parse_relation_decisions(raw)] == list(choices)
+    assert not parse_relation_decisions([{"pair_id": "a|b", "reasoning": "Evidence", "relation": "invalid"}])
 
 
 def test_compute_task_quality_score_stage_tokens() -> None:
-    pred = compute_task_quality_score(
-        0.8,
-        tokens=150,
-        label_judge_tokens=42,
-        hierarchy_judge_tokens=30,
-        related_judge_tokens=15,
-    )
+    pred = compute_task_quality_score(0.8, tokens=150, label_judge_tokens=42, relation_judge_tokens=30)
     assert pred.label_judge_tokens == 42
-    assert pred.hierarchy_judge_tokens == 30
-    assert pred.related_judge_tokens == 15
-    assert not hasattr(pred, "semantic_judge_tokens")
+    assert pred.relation_judge_tokens == 30
 
 
 def test_stage_invariants_label_judge() -> None:
@@ -246,7 +201,7 @@ def test_stage_invariants_label_judge() -> None:
     inputs = {
         "candidate_pairs": json.dumps(
             {
-                "format": "synonym-evidence-v2",
+                "format": "synonym-evidence-v3",
                 "pairs": [{"pair_id": "a|b"}],
             }
         )
@@ -303,36 +258,16 @@ def test_stage_invariants_label_judge() -> None:
     assert "Conflicting alt_label=True and hidden_label=True" in feedback_bad3
 
 
-def test_stage_invariants_hierarchy_and_related_judges() -> None:
+def test_stage_invariants_relation_judge() -> None:
     import dspy
 
     from yaw.daemon.graph.inference.invariants import validate_stage_invariants
 
-    inputs_h = {
-        "candidate_pairs": json.dumps(
-            {
-                "format": "synonym-evidence-v2",
-                "pairs": [{"pair_id": "cat|feline"}],
-            }
-        )
-    }
-    pred_h = dspy.Prediction(
-        decisions=[{"pair_id": "cat|feline", "reasoning": "Cat is subtype", "broader": True, "narrower": False}]
+    inputs = {"candidate_pairs": json.dumps({"format": "synonym-evidence-v3", "pairs": [{"pair_id": "cat|feline"}]})}
+    prediction = dspy.Prediction(
+        decisions=[{"pair_id": "cat|feline", "reasoning": "Cat is subtype", "relation": "skos:broader"}]
     )
-    score, feedback = validate_stage_invariants("hierarchy_judge", inputs_h, pred_h)
-    assert score == 1.0
-
-    inputs_r = {
-        "candidate_pairs": json.dumps(
-            {
-                "format": "synonym-evidence-v2",
-                "pairs": [{"pair_id": "cat|dog"}],
-            }
-        )
-    }
-    pred_r = dspy.Prediction(decisions=[{"pair_id": "cat|dog", "reasoning": "Co-occurring pets", "related": True}])
-    score_r, feedback_r = validate_stage_invariants("related_judge", inputs_r, pred_r)
-    assert score_r == 1.0
+    assert validate_stage_invariants("relation_judge", inputs, prediction)[0] == 1.0
 
 
 def test_shacl_repair_actions_maps_scalar_and_resource_label_shapes() -> None:

@@ -12,8 +12,8 @@ from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import YawProgram
-from yaw.daemon.graph.inference.embedding import EmbeddingProfile
-from yaw.daemon.graph.ppr import run_ppr
+from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, EmbeddingProfile
+from yaw.daemon.graph.ppr import run_hmm
 from yaw.daemon.graph.storage import (
     lint_graph_shacl,
     open_yaw_db,
@@ -24,6 +24,10 @@ from yaw.daemon.indexing import bind_native_indexing
 
 class DummyEmbedder:
     """Deterministic unit-norm embedder that gives concepts high cosine similarity for candidate pairing."""
+
+    @property
+    def index_identity(self) -> str:
+        return self.profile.index_identity
 
     def __init__(self, dim: int = 16) -> None:
         self.dim = dim
@@ -67,7 +71,34 @@ class PipelineGateMockLM(dspy.LM):
     def _parse_candidate_pairs_from_text(self, text: str) -> list[dict[str, Any]]:
         return candidate_rows(text)
 
-    def __call__(
+    @property
+    def supported_params(self) -> set[str]:
+        return set()
+
+    @property
+    def supports_reasoning(self) -> bool:
+        return False
+
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        request = prompt
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        messages = [
+            {"role": message.role, "content": "".join(part.text for part in message.parts if hasattr(part, "text"))}
+            for message in request.messages
+        ]
+        if request.system:
+            messages.insert(0, {"role": "system", "content": str(request.system)})
+        result = self._fixture_answer(messages=messages, **kwargs)
+        return Response(
+            id="fixture",
+            model=self.model,
+            message=Message(role="assistant", parts=(TextPart(text=result[0]),)),
+            finish_reason="stop",
+            usage=Usage(input_tokens=32, output_tokens=16),
+        )
+
+    def _fixture_answer(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         full_text = self._extract_prompt_text(prompt, messages)
@@ -272,17 +303,14 @@ class PipelineGateMockLM(dspy.LM):
         ]
 
 
-def _make_engine(
-    synonym_token_counter, tmp_path: Path, *, mode: str = "gate"
-) -> tuple[YawGraphEngine, PipelineGateMockLM]:
+def _make_engine(tmp_path: Path, *, mode: str = "gate") -> tuple[YawGraphEngine, PipelineGateMockLM]:
     db_path = tmp_path / f"yaw_{mode}.db"
     open_yaw_db(db_path).close()
     mock_lm = PipelineGateMockLM(mode=mode)
     dspy.settings.configure(lm=mock_lm)
-    embedder = DummyEmbedder(dim=16)
-    prog = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
-    )
+    raw_embedder = DummyEmbedder(dim=16)
+    embedder = DSPyEmbeddingAdapter(profile=raw_embedder.profile, embedder=dspy.Embedder(raw_embedder, batch_size=64))
+    prog = YawProgram(enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm)
     engine = bind_native_indexing(
         YawGraphEngine(
             db_path=db_path,
@@ -294,9 +322,9 @@ def _make_engine(
     return engine, mock_lm
 
 
-def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) -> None:
+def test_build_time_shacl_gate_success(tmp_path: Path) -> None:
     """Run extraction, adjudication and strict SHACL publication without pre-seeded artifacts."""
-    engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="gate")
+    engine, mock_lm = _make_engine(tmp_path, mode="gate")
     try:
         text = (
             "Yet Another Wiki (YAW) was launched on 2026-10-25. It listens on port 8080.\n"
@@ -420,7 +448,7 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
             > 0.0
         )
 
-        ppr_from_subj = run_ppr(csr, {yaw_id: 1.0})
+        ppr_from_subj = run_hmm(csr, {yaw_id: 1.0})
         assert float(ppr_from_subj[csr.node_to_idx[next(iter(engine._opt_indexed_cids))]]) > 0.0
 
         hits, kept_facts = engine.retrieve_with_seeds("What port does Yet Another Wiki listen on?", top_k=1)
@@ -437,9 +465,9 @@ def test_build_time_shacl_gate_success(synonym_token_counter, tmp_path: Path) ->
         engine.close()
 
 
-def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(synonym_token_counter, tmp_path: Path) -> None:
+def test_pre_rlm_deterministic_auto_heal_skips_rlm_healer(tmp_path: Path) -> None:
     """Supported hierarchy facts require no model repair when structural validation passes."""
-    engine, mock_lm = _make_engine(synonym_token_counter, tmp_path, mode="pre_rlm_heal")
+    engine, mock_lm = _make_engine(tmp_path, mode="pre_rlm_heal")
     try:
         text = "Cryptanalysis applies discrete mathematics.\nDiscrete mathematics includes number theory.\n"
         (tmp_path / "math.md").write_text(text, encoding="utf-8")

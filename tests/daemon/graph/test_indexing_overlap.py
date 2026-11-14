@@ -99,7 +99,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider, title_awar
     embedder = DSPyEmbeddingAdapter(
         replace(adapter(url).profile, parse_document_title=title_aware), base_url=url + "/v1", batch_size=64
     )
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     endpoint = OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(1))
     context.provide(OPENIE_ENDPOINT, endpoint)
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
@@ -107,7 +107,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider, title_awar
         coco.AppConfig(name="file_pipeline", environment=env, max_inflight_components=4),
         indexing_app_main,
         SourceSettings(("**/*.md",), (), min_chunk_size=1),
-        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        InferenceIdentity("fixture-v1", embedder.index_identity),
     )
     try:
         app.update_blocking()
@@ -133,7 +133,7 @@ def test_native_file_pipeline_owns_inference_rows(tmp_path, provider, title_awar
             coco.AppConfig(name="file_pipeline", environment=env, max_inflight_components=4),
             indexing_app_main,
             SourceSettings(("**/*.md",), (), min_chunk_size=1),
-            InferenceIdentity("fixture-v2", embedder.profile.index_identity),
+            InferenceIdentity("fixture-v2", embedder.index_identity),
         )
         app.update_blocking()
         assert len(state["intervals"]) == calls + 2
@@ -184,12 +184,12 @@ program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
 context = coco.ContextProvider()
 context.provide(SOURCE_DB, db)
 context.provide(SOURCE_ROOT, root / 'documents')
-context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
+context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
 context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, 'fixture-v1', asyncio.Semaphore(1)))
 env = coco.Environment(settings=coco.Settings.from_env(root / 'state'), context_provider=context)
 app = coco.App(coco.AppConfig(name='restart', environment=env, max_inflight_components=4),
                indexing_app_main, SourceSettings(('**/*.md',), (), min_chunk_size=1),
-               InferenceIdentity('fixture-v1', profile.index_identity))
+               InferenceIdentity('fixture-v1', embedder.index_identity))
 app.update_blocking()
 with db.readonly() as conn:
     assert conn.execute('SELECT COUNT(*) FROM chunk_inference').fetchone()[0] == 1
@@ -224,7 +224,7 @@ def test_native_openie_overlaps_embedding_and_restores_traces(tmp_path, provider
     program = YawProgram(rlm_sub_lm=lm, max_output_tokens=512)
     embedder = adapter(url)
     context = coco.ContextProvider()
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(1)))
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
     app = coco.App(
@@ -261,7 +261,7 @@ def test_native_embedding_batches_and_reuses_persistent_results(tmp_path, provid
     calls = 0
     for _ in range(2):
         context = coco.ContextProvider()
-        context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(1)))
+        context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
         env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "native-state"), context_provider=context)
         app = coco.App(
             coco.AppConfig(name="embedding_fixture", environment=env, max_inflight_components=4),
@@ -354,7 +354,12 @@ def provider():
                     rows[0]["embedding"] = [1.0]
                 elif state["mode"] == "nan":
                     rows[0]["embedding"][0] = float("nan")
-                body = {"object": "list", "data": rows, "model": "overlap", "usage": {"total_tokens": 7}}
+                body: dict[str, Any] = {
+                    "object": "list",
+                    "data": rows,
+                    "model": "overlap",
+                    "usage": {"total_tokens": 7},
+                }
             else:
                 text = data["messages"][-1]["content"]
                 if "[[ ## fact_before_filter ## ]]" in text:
@@ -363,7 +368,10 @@ def provider():
                     packet = json.JSONDecoder().raw_decode(text[text.index('{"format":') :])[0]
                     state.setdefault("synonym_requests", []).append(
                         {
-                            "pairs": [(p["entity_a"]["name"], p["entity_b"]["name"]) for p in packet["pairs"]],
+                            "pairs": [
+                                (packet["entities"][p["entity_a"]]["name"], packet["entities"][p["entity_b"]]["name"])
+                                for p in packet["pairs"]
+                            ],
                             "logprobs": data.get("logprobs"),
                         }
                     )
@@ -376,13 +384,18 @@ def provider():
                                     "relation": "skos:exactMatch"
                                     if state.get("same_name_equivalence")
                                     and p["name_a"].casefold() == p["name_b"].casefold()
-                                    else state.get("relation", "skos:related"),
+                                    else (
+                                        "skos:related"
+                                        if state.get("relation") == "owl:differentFrom"
+                                        and (p.get("direct_facts") or p.get("shared_role_facts"))
+                                        else state.get("relation", "skos:related")
+                                    ),
                                     "canonical": p["pair_id"].split("|")[0],
                                     **(
                                         {
                                             "definition": max(
                                                 (
-                                                    pair[key]["definition"]
+                                                    packet["entities"][pair[key]]["definition"]
                                                     for pair in packet["pairs"]
                                                     if pair["pair_id"] == p["pair_id"]
                                                     for key in ("entity_a", "entity_b")
@@ -482,7 +495,7 @@ def provider():
                     output = {"named_entities": [["Ada", "A mathematician"], ["Algebra", "A mathematical discipline"]]}
                 if state["mode"] == "chat":
                     output = {"wrong": "invalid output"}
-                body = {
+                body: dict[str, Any] = {
                     "id": "overlap",
                     "object": "chat.completion",
                     "created": 0,
@@ -502,9 +515,18 @@ def provider():
                     probability = state.get("logprob_probability", 0.81)
                     if callable(probability):
                         probability = probability(output)
-                    body["choices"][0]["logprobs"] = response_logprobs(
-                        body["choices"][0]["message"]["content"], probability
-                    )
+                    choice: dict[str, Any] = body["choices"][0]
+                    choice["logprobs"] = {
+                        "content": [
+                            {
+                                "token": t.token,
+                                "bytes": list(t.bytes) if t.bytes is not None else None,
+                                "logprob": t.logprob,
+                                "top_logprobs": [],
+                            }
+                            for t in response_logprobs(choice["message"]["content"], probability)
+                        ]
+                    }
             with lock:
                 state["intervals"].append((kind, started, time.perf_counter()))
             self.send(body)
@@ -570,13 +592,13 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
     context.provide(SOURCE_ROOT, root)
     context.provide(RELOAD_SIGNAL_ROOT, signal_dir)
     context.provide(RELOAD_SIGNAL_HANDLER, on_reload_signal)
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
 
     graph_settings = GraphPlanSettings(
         corpus_root=root,
         program_identity="fixture-v1",
-        embedding_identity=embedder.profile.index_identity,
+        embedding_identity=embedder.index_identity,
         candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
@@ -584,7 +606,7 @@ def test_declarative_live_graph_publication_without_polling(tmp_path, provider):
         coco.AppConfig(name="live_graph_pipeline", environment=env, max_inflight_components=4),
         indexing_app_main,
         SourceSettings(("**/*.md",), (), min_chunk_size=1),
-        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        InferenceIdentity("fixture-v1", embedder.index_identity),
         graph_settings,
         True,
     )
@@ -660,14 +682,14 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
     context.provide(GRAPH_DB, db)
     context.provide(VALIDATE_SQLITE, validate_graph_state)
     context.provide(SOURCE_ROOT, root)
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
     context.provide(INDEXING_ERROR_SINK, recorded_errors.append)
 
     graph_settings = GraphPlanSettings(
         corpus_root=root,
         program_identity="fixture-v1",
-        embedding_identity=embedder.profile.index_identity,
+        embedding_identity=embedder.index_identity,
         candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
@@ -675,7 +697,7 @@ def test_invalid_resources_and_shacl_failure_preserve_prior_published_graph(tmp_
         coco.AppConfig(name="shacl_rollback_pipeline", environment=env, max_inflight_components=4),
         indexing_app_main,
         SourceSettings(("**/*.md",), (), min_chunk_size=1),
-        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        InferenceIdentity("fixture-v1", embedder.index_identity),
         graph_settings,
     )
     try:
@@ -1322,13 +1344,13 @@ def test_corpus_indexing_live_component_micro_batching_and_memo_hits(tmp_path, p
     context.provide(GRAPH_DB, db)
     context.provide(VALIDATE_SQLITE, validate_graph_state)
     context.provide(SOURCE_ROOT, root)
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "fixture-v1", asyncio.Semaphore(2)))
 
     graph_settings = GraphPlanSettings(
         corpus_root=root,
         program_identity="fixture-v1",
-        embedding_identity=embedder.profile.index_identity,
+        embedding_identity=embedder.index_identity,
         candidate_lexical_threshold=0.55,
     )
     env = coco.Environment(settings=coco.Settings.from_env(tmp_path / "state"), context_provider=context)
@@ -1336,7 +1358,7 @@ def test_corpus_indexing_live_component_micro_batching_and_memo_hits(tmp_path, p
         coco.AppConfig(name="batching_pipeline", environment=env, max_inflight_components=4),
         indexing_app_main,
         SourceSettings(("**/*.md",), (), min_chunk_size=1),
-        InferenceIdentity("fixture-v1", embedder.profile.index_identity),
+        InferenceIdentity("fixture-v1", embedder.index_identity),
         graph_settings,
         False,  # watch_reload_signal
         False,  # live
@@ -1410,11 +1432,11 @@ def test_active_context_keys_override_constructor_defaults(tmp_path, provider):
     embedder = adapter(url)
 
     active_src = SourceSettings(("**/*.md",), (), included_files=("doc.md",), min_chunk_size=1)
-    active_ident = InferenceIdentity("active-v1", embedder.profile.index_identity)
+    active_ident = InferenceIdentity("active-v1", embedder.index_identity)
     active_graph = GraphPlanSettings(
         corpus_root=root,
         program_identity="active-v1",
-        embedding_identity=embedder.profile.index_identity,
+        embedding_identity=embedder.index_identity,
         candidate_lexical_threshold=0.55,
     )
 
@@ -1423,7 +1445,7 @@ def test_active_context_keys_override_constructor_defaults(tmp_path, provider):
     context.provide(GRAPH_DB, db)
     context.provide(VALIDATE_SQLITE, validate_graph_state)
     context.provide(SOURCE_ROOT, root)
-    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder, asyncio.Semaphore(2)))
+    context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(embedder))
     context.provide(OPENIE_ENDPOINT, OpenIEEndpoint(program, lm, "active-v1", asyncio.Semaphore(2)))
     context.provide(ACTIVE_SOURCE_SETTINGS, active_src)
     context.provide(ACTIVE_INFERENCE_IDENTITY, active_ident)

@@ -18,7 +18,7 @@
 
 Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.Ahokas\Documents\yaw` on branch `dev`.
 
-- **Stack**: Single `sqlite-vec` DB (`yaw.db`) via declarative CocoIndex `>=1.1.0` targets (`TableSchema.from_class`), contentless FTS5, 1-indexed hydration, closed-world W3C concept/entity semantics without ConceptSchemes, sparse CSR + Forward-Push PPR, native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`), FastMCP over HTTP. Do not restore `rdflib`, OWL 2 RL, `pySHACL`, or spaCy without benchmark proof.
+- **Stack**: Single `sqlite-vec` DB (`yaw.db`) via declarative CocoIndex targets (`TableSchema.from_class`), contentless FTS5, 1-indexed hydration, closed-world W3C concept/entity semantics without ConceptSchemes, sparse CSR + Forward-Push PPR, native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`), FastMCP over HTTP. Do not restore `rdflib`, OWL 2 RL, `pySHACL`, or spaCy without benchmark proof.
 - **Resource Boundary & Invariants (§5.3)**:
   - NER alone captures `skos:Concept` and `owl:NamedIndividual`; resource labels require lexical content (letters). Pure numbers, codes, dates, and percentages remain literals (`rdfs:Literal`).
   - Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.

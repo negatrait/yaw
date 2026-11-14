@@ -24,18 +24,14 @@ embedding_model = "embeddinggemma-2"
 embedding_task_mode = "distinct-titled"
 extraction_model = "gemma-4-e4b"
 qa_model = "gemma-4-e4b"
-# Match the external server's configured serving window, not its advertised maximum.
-context_window_tokens = 131072
-# Omitted budgets follow context capacity: at 128K, output=8192 tokens,
-# reflection input=32768 tokens, and RLM output=20000 characters.
-# Set max_output_tokens, reflection_input_tokens or rlm_max_output_chars to pin a limit.
+# Runtime reads active model capacity from the configured endpoint.
+# Omitted max_output_tokens leaves generation capacity to the endpoint.
+# RLM tool output follows context capacity (20000 characters at 128K).
+# Reflection input is bounded independently in characters.
+# Set max_output_tokens, reflection_input_chars or rlm_max_output_chars to pin a limit.
 # Independent execution budgets; a larger context does not require more tool calls.
-rlm_max_iters = 10
-rlm_max_llm_calls = 20
-# Set only when Lemonade does not advertise the resident llama.cpp backend URL.
-reflection_tokenizer_url = ""
-enable_gbnf = true
-gbnf_max_facts = 4
+rlm_max_iters = 20
+rlm_max_llm_calls = 50
 
 [graph]
 linking_top_k = 10
@@ -47,9 +43,9 @@ candidate_lexical_threshold = 0.675
 auto_merge_threshold = 0.98
 candidate_volume_ratio = 0.5
 semantic_adjudication_batch_size = 5
-embed_batch_size = 64
+embed_batch_size = 32
 # Aggregate formatted-input budget per embedding request; tune for the provider.
-embed_batch_chars = 3500
+embed_batch_chars = 4096
 
 [runtime]
 queue_maxsize = 32

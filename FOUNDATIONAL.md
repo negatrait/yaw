@@ -68,7 +68,7 @@ YAW consists of five conceptual capabilities:
    - Persists source metadata, text, graph data, vectors, and lexical indexes in `yaw.db`.
    - Declares every SQLite table and `sqlite-vec` `vec0` index through typed CocoIndex targets (`TableSchema.from_class`), with one writer and no competing imperative `upsert_*` sinks.
 3. **Retrieval & Ontology**
-   - Produces lexical, vector, and graph-derived evidence using sparse CSR matrices and Forward-Push Personalized PageRank.
+   - Produces lexical, vector, and graph-derived evidence using sparse CSR entity-state HMM inference with separate passage emissions, as defined in [H1](docs/reviews/hmm-retrieval.md). The user approved this retrieval target on 2026-11-13; historical PPR measurements do not establish HMM quality.
    - Maintains closed-world W3C concept/entity semantics, source-supported facts and relations, and revisable canonical identities across documents and ingestion batches. Legitimate semantic islands are allowed; incomplete documents are not reported as semantically complete.
    - Removes `skos:ConceptScheme` and all scheme clustering, storage, inference, embeddings and retrieval/QA/telemetry consumers from the current implementation target. Reintroduction requires a separate experiment proving held-out Recall@N, EM or F1 improvement against the scheme-free baseline with acceptable compute, memory and other quality metrics.
 4. **Inference**
@@ -76,7 +76,7 @@ YAW consists of five conceptual capabilities:
    - Triple extraction selects existing NER resources as subjects/resource objects and discovers literal objects while expressing passage-supported `rdf:Statement` facts. Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.
    - Three-layer parity: GBNF grammar, extraction parsers, and SQLite SHACL shapes enforce identical resource and statement contracts. Every parser-accepted record must normalize, bind, and publish without dropped statements.
    - Uses native DSPy interfaces (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`) and treats model services as external dependencies.
-   - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`).
+   - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`). The configured Unsloth deployment admits two `embeddinggemma-2` requests through the single native DSPy embedding adapter and one `gemma-4-e4b` generation request; query and indexing embedding calls share the adapter limit.
    - Enforces sampling temperatures $\ge 0.3$ (defaulting to $0.35$ for extraction and QA, up to $0.7$–$0.8$ for reflection) on small local models to avoid looping; temperatures below $0.3$ are prohibited.
 5. **Runtime**
    - Coordinates ingestion, retrieval, inference, and source hydration in `yaw/daemon/runtime.py`.

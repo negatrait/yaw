@@ -2,7 +2,7 @@ import dataclasses
 import os
 
 import dspy
-from dspy.lm15 import Config, Message, Request
+from dspy.lm15 import Config, Message, Request, Response
 
 KEY = os.environ["UNSLOTH_STUDIO_AUTH_TOKEN"]
 lm = dspy.LM("openai/gemma-4-e4b", api_base="http://127.0.0.1:8888/v1", api_key=KEY, cache=False, max_tokens=1500)
@@ -12,6 +12,7 @@ print("Config fields:", [f.name for f in dataclasses.fields(Config)])
 print("Request fields:", [f.name for f in dataclasses.fields(Request)])
 try:
     resp = lm(Request(model=lm.model, messages=(Message.user("Say hi in one word."),), config=Config(max_tokens=1500)))
+    assert isinstance(resp, Response)
     print("response type:", type(resp).__name__)
     print("text:", repr(resp.text), "finish:", resp.finish_reason)
     print("usage:", resp.usage)

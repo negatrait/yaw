@@ -11,8 +11,8 @@ import pytest
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer, OpenIERecord, RelationTraversalPolicy, StructuredTriple
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import YawProgram, parse_hierarchy_decisions
-from yaw.daemon.graph.inference.embedding import EmbeddingProfile
+from yaw.daemon.graph.inference import YawProgram, parse_relation_decisions
+from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, EmbeddingProfile
 from yaw.daemon.graph.planner import apply_synonym_adjudication
 from yaw.daemon.graph.ppr import build_transition_matrix
 from yaw.daemon.graph.storage import (
@@ -65,7 +65,34 @@ class DeterministicMockLM(dspy.LM):
     def _parse_candidate_pairs_from_text(text: str) -> list[dict[str, Any]]:
         return candidate_rows(text)
 
-    def __call__(
+    @property
+    def supported_params(self) -> set[str]:
+        return set()
+
+    @property
+    def supports_reasoning(self) -> bool:
+        return False
+
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        request = prompt
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        messages = [
+            {"role": message.role, "content": "".join(part.text for part in message.parts if hasattr(part, "text"))}
+            for message in request.messages
+        ]
+        if request.system:
+            messages.insert(0, {"role": "system", "content": str(request.system)})
+        result = self._fixture_answer(messages=messages, **kwargs)
+        return Response(
+            id="fixture",
+            model=self.model,
+            message=Message(role="assistant", parts=(TextPart(text=result[0]),)),
+            finish_reason="stop",
+            usage=Usage(input_tokens=32, output_tokens=16),
+        )
+
+    def _fixture_answer(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         full_text = self._extract_prompt_text(prompt, messages)
@@ -102,6 +129,10 @@ class DeterministicMockLM(dspy.LM):
 
 
 class DeterministicMockEmbedder:
+    @property
+    def index_identity(self) -> str:
+        return self.profile.index_identity
+
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
         self.profile = EmbeddingProfile("deterministic", "fixture-v1", dim, 2048, "mean", "", "")
@@ -116,7 +147,6 @@ class DeterministicMockEmbedder:
 
 
 def _make_engine(
-    synonym_token_counter,
     tmp_path: Path,
     db_name: str,
     synonym_callback: Any = None,
@@ -124,10 +154,9 @@ def _make_engine(
     db_path = tmp_path / db_name
     mock_lm = DeterministicMockLM(synonym_fn=synonym_callback)
     dspy.settings.configure(lm=mock_lm)
-    program = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm
-    )
-    embedder: Any = DeterministicMockEmbedder(dim=64)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=mock_lm, rlm_sub_lm=mock_lm)
+    raw_embedder = DeterministicMockEmbedder(dim=64)
+    embedder = DSPyEmbeddingAdapter(profile=raw_embedder.profile, embedder=dspy.Embedder(raw_embedder, batch_size=64))
     engine = bind_native_indexing(
         YawGraphEngine(
             db_path=db_path,
@@ -187,7 +216,6 @@ def _index_chunk_with_record(
 
 
 def test_datatype_property_literal_objects_stored_with_weighted_edges_and_excluded_from_skos(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Literal objects belong to facts and never become entities or SKOS candidates."""
@@ -205,7 +233,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
         }
     )
     dspy.settings.configure(lm=DeterministicMockLM([lm_triple_json]))
-    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    prog = YawProgram(enable_gbnf=False)
     extracted_sts = prog.extract_structured_triples(
         "YAW Service listens on port 8080.",
         [
@@ -229,7 +257,7 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
             for c in candidates
         ]
 
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_lit_edges.db", synonym_callback=_judge)
+    engine, conn = _make_engine(tmp_path, "test_lit_edges.db", synonym_callback=_judge)
 
     chunk = ChunkPointer(
         chunk_id="chunk-1",
@@ -307,12 +335,11 @@ def test_datatype_property_literal_objects_stored_with_weighted_edges_and_exclud
 
 
 def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify a surface form used first as a literal and later as an ObjectProperty endpoint is promoted
     to a skos:Concept, and merge_entities preserves 0.5 weights on pure literal fact edges."""
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_dual_role.db")
+    engine, conn = _make_engine(tmp_path, "test_dual_role.db")
 
     c1 = ChunkPointer("c1", "doc1.md", 1, 5, "Rollout")
     r1 = OpenIERecord(
@@ -432,9 +459,9 @@ def test_dual_role_literal_promoted_to_concept_and_weight_preserved_across_merge
     assert lit_fact[4] is None
 
 
-def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: Path) -> None:
+def test_forward_fact_edges_strictly_directed(tmp_path: Path) -> None:
     """Resource facts retain measured forward weights; literal objects create no graph edge."""
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_directed_edges.db")
+    engine, conn = _make_engine(tmp_path, "test_directed_edges.db")
 
     chunk = ChunkPointer(
         chunk_id="chunk-2",
@@ -519,15 +546,13 @@ def test_forward_fact_edges_strictly_directed(synonym_token_counter, tmp_path: P
 
 
 def test_skos_broader_rejects_missing_canonical(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
-    """Verify that parse_hierarchy_decisions extracts skos:broader and direction cleanly."""
-    payload = json.dumps({"decisions": [{"pair_id": "a|b", "reasoning": "valid", "broader": True, "narrower": False}]})
-    parsed = parse_hierarchy_decisions(payload)
+    """Verify that parse_relation_decisions extracts skos:broader and direction cleanly."""
+    payload = json.dumps({"decisions": [{"pair_id": "a|b", "reasoning": "valid", "relation": "skos:broader"}]})
+    parsed = parse_relation_decisions(payload)
     assert len(parsed) == 1
     assert parsed[0]["relation"] == "skos:broader"
-    assert parsed[0]["source_direction"] == "a_to_b"
 
     def _judge_empty_canonical(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
         return [
@@ -539,9 +564,7 @@ def test_skos_broader_rejects_missing_canonical(
             for c in candidates
         ]
 
-    engine2, conn2 = _make_engine(
-        synonym_token_counter, tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical
-    )
+    engine2, conn2 = _make_engine(tmp_path, "test_missing_canon.db", synonym_callback=_judge_empty_canonical)
     record2 = OpenIERecord(
         chunk_id="chunk-3b",
         entities=[
@@ -563,7 +586,6 @@ def test_skos_broader_rejects_missing_canonical(
 
 
 def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify apply_synonym_adjudication executes only Gemma 4 decisions without acronym/homograph overrides,
@@ -623,7 +645,7 @@ def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
             for c in cands
         ]
 
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_fact_pole.db", synonym_callback=_judge_alt)
+    engine, conn = _make_engine(tmp_path, "test_fact_pole.db", synonym_callback=_judge_alt)
     chunk = ChunkPointer(
         chunk_id="chunk-5",
         rel_posix_path="doc5.md",
@@ -659,10 +681,10 @@ def test_canonical_gemma4_synonym_adjudication_and_fact_pole_self_loop_guard(
     assert len(conn.execute("SELECT src_id, dst_id FROM edges WHERE kind = 'skos:related'").fetchall()) == 2
 
 
-def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter, tmp_path: Path) -> None:
+def test_technical_punctuation_and_surface_forms_preserved(tmp_path: Path) -> None:
     """Verify C++, C#, and Python 3.10 remain distinct entities with preserved surface forms in entities.name
     and entity_labels.raw_label, normalized label_norms in entity_labels, and COLLATE NOCASE on entities.name."""
-    engine, conn = _make_engine(synonym_token_counter, tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
+    engine, conn = _make_engine(tmp_path, "test_tech_punct.db", synonym_callback=lambda _: [])
     chunk = ChunkPointer(
         chunk_id="chunk-tech-1",
         rel_posix_path="languages.md",
@@ -730,7 +752,6 @@ def test_technical_punctuation_and_surface_forms_preserved(synonym_token_counter
 
 
 def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_false_different_from(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify cased literal objects ('AWS TGW', 'Pricing addendum', 'KMS/region support matrix', 'Diego Morales')
@@ -744,9 +765,7 @@ def test_cased_literal_objects_and_same_doc_consecutive_chunks_never_produce_fal
             if pair["name_a"].casefold() == pair["name_b"].casefold()
         ]
 
-    engine, conn = _make_engine(
-        synonym_token_counter, tmp_path, "test_no_false_diff.db", synonym_callback=judge_same_people
-    )
+    engine, conn = _make_engine(tmp_path, "test_no_false_diff.db", synonym_callback=judge_same_people)
 
     doc_path = tmp_path / "meeting.md"
     doc_path.write_text(

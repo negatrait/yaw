@@ -164,6 +164,8 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     import json
     from dataclasses import asdict
 
+    import dspy
+
     from yaw.core import OpenIERecord, StructuredTriple
     from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_lm
     from yaw.daemon.graph.inference.components import (
@@ -198,7 +200,13 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             out[idx, (sum(ord(ch) for ch in text) % 768)] += 0.5
         return out
 
-    adapter = DSPyEmbeddingAdapter(embedder=fake_embed_fn)
+    class EmbeddingModel:
+        index_identity = "publication-fixture"
+
+        def __call__(self, texts: list[str]) -> np.ndarray:
+            return fake_embed_fn(texts)
+
+    adapter = DSPyEmbeddingAdapter(embedder=dspy.Embedder(EmbeddingModel(), caching=False))
 
     url, state = provider
     state["delay"] = 0.01
@@ -251,7 +259,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             chunk_id="chunk_a",
             source_hash=hashlib.sha256(text_a.encode()).hexdigest(),
             program_identity="prog_v1",
-            embedding_identity=adapter.profile.index_identity,
+            embedding_identity=adapter.index_identity,
             extraction_json=json.dumps(asdict(rec_a)),
             traces_json="[]",
         ),
@@ -264,7 +272,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             chunk_id="chunk_b",
             source_hash=hashlib.sha256(text_b.encode()).hexdigest(),
             program_identity="prog_v1",
-            embedding_identity=adapter.profile.index_identity,
+            embedding_identity=adapter.index_identity,
             extraction_json=json.dumps(asdict(rec_b)),
             traces_json="[]",
         ),
@@ -282,7 +290,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
     settings = GraphPlanSettings(
         corpus_root=corpus_dir,
         program_identity="prog_v1",
-        embedding_identity=adapter.profile.index_identity,
+        embedding_identity=adapter.index_identity,
         candidate_dense_threshold=2.0,
         candidate_lexical_threshold=2.0,
     )
@@ -291,7 +299,7 @@ def test_plan_graph_publication_keeps_yaw_db_outside_transaction_and_preserves_s
             context = coco.ContextProvider()
             context.provide(GRAPH_DB, db)
             context.provide(VALIDATE_SQLITE, validate_graph_state)
-            context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(adapter, asyncio.Semaphore(4)))
+            context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(adapter))
             context.provide(
                 OPENIE_ENDPOINT,
                 OpenIEEndpoint(program, lm, "prog_v1", asyncio.Semaphore(1)),

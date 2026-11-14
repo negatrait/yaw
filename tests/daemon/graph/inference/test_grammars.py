@@ -6,9 +6,8 @@ from yaw.daemon.graph.inference.grammars import (
     DSPY_NER_GBNF_GRAMMAR,
     DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
     DSPY_TRIPLES_GBNF_GRAMMAR,
-    build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
-    build_dspy_related_judge_grammar,
+    build_dspy_relation_judge_grammar,
     build_dspy_shacl_repair_grammar,
     build_dspy_triples_grammar,
 )
@@ -23,7 +22,7 @@ def test_label_judge_grammar_structure() -> None:
         'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"'
         in grammar
     )
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
+    assert 'reasoning-str ::= "\\"" char+ "\\""' in grammar
     assert 'boolean ::= "true" | "false"' in grammar
 
 
@@ -54,46 +53,14 @@ def test_label_judge_grammar_invalid_pair_ids() -> None:
         build_dspy_label_judge_grammar(pair_ids=["same|same"])
 
 
-def test_hierarchy_judge_grammar_structure() -> None:
-    grammar = build_dspy_hierarchy_judge_grammar()
-    assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
-    assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
-    assert ', \\"broader\\": " boolean' in grammar
-    assert ', \\"narrower\\": " boolean' in grammar
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
-    assert 'boolean ::= "true" | "false"' in grammar
-
-
-def test_hierarchy_judge_grammar_pair_ids() -> None:
-    pairs = ["car|vehicle"]
-    grammar = build_dspy_hierarchy_judge_grammar(pair_ids=pairs)
-    assert 'decision-0 ::= "{\\"pair_id\\": \\"car|vehicle\\", \\"reasoning\\": "' in grammar
-    assert ', \\"broader\\": " boolean' in grammar
-    assert ', \\"narrower\\": " boolean' in grammar
-
-
-def test_hierarchy_judge_grammar_invalid_pair_ids() -> None:
-    with pytest.raises(ValueError, match="nonempty, unique"):
-        build_dspy_hierarchy_judge_grammar(pair_ids=[])
-
-    with pytest.raises(ValueError, match="Invalid synonym pair ID"):
-        build_dspy_hierarchy_judge_grammar(pair_ids=["single"])
-
-
-def test_related_judge_grammar_structure() -> None:
-    grammar = build_dspy_related_judge_grammar()
-    assert 'root ::= "{\\"decisions\\": [" decision-list "]}"' in grammar
-    assert 'decision ::= "{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str' in grammar
-    assert ', \\"related\\": " boolean' in grammar
-    assert 'reasoning-str ::= "\\"" char{1,360} "\\""' in grammar
-    assert 'boolean ::= "true" | "false"' in grammar
-
-
-def test_related_judge_grammar_pair_ids() -> None:
-    pairs = ["doctor|hospital"]
-    grammar = build_dspy_related_judge_grammar(pair_ids=pairs)
-    assert 'decision-0 ::= "{\\"pair_id\\": \\"doctor|hospital\\", \\"reasoning\\": "' in grammar
-    assert ', \\"related\\": " boolean' in grammar
+def test_relation_judge_grammar_choices_and_pair_constraints() -> None:
+    grammar = build_dspy_relation_judge_grammar(pair_ids=["a|b", "c|d"], associated_pair_ids=["a|b"])
+    lines = [line for line in grammar.splitlines() if line.startswith("decision-")]
+    assert all(value in lines[0] for value in ("skos:broader", "skos:narrower", "skos:related"))
+    assert "owl:differentFrom" not in lines[0]
+    assert "owl:differentFrom" in lines[1]
+    with pytest.raises(ValueError):
+        build_dspy_relation_judge_grammar(pair_ids=["invalid"])
 
 
 def test_custom_reasoning_chars() -> None:
@@ -108,9 +75,8 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     from yaw.daemon.graph.inference.adapter import YawGBNFAdapter
     from yaw.daemon.graph.inference.prompts import (
         CompressInstructionSignature,
-        JudgeHierarchy,
         JudgeLabels,
-        JudgeRelated,
+        JudgeRelations,
         ProposeInstructionSignature,
     )
 
@@ -119,13 +85,9 @@ def test_adapter_resolves_3_stage_grammars() -> None:
     assert g_label is not None
     assert "hidden_label" in g_label
 
-    g_hier = adapter.resolve_grammar(JudgeHierarchy)
-    assert g_hier is not None
-    assert "broader" in g_hier
-
-    g_rel = adapter.resolve_grammar(JudgeRelated)
+    g_rel = adapter.resolve_grammar(JudgeRelations)
     assert g_rel is not None
-    assert "related" in g_rel
+    assert "skos:broader" in g_rel and "owl:differentFrom" in g_rel
 
     g_prop = adapter.resolve_grammar(ProposeInstructionSignature)
     assert g_prop is not None
@@ -167,22 +129,22 @@ def test_shacl_repair_grammar_lexical_label_branch_and_abstention() -> None:
     assert rules["non-letter"] == "[\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]"
 
 
-def test_ner_and_triples_grammars_bound_repetition_and_string_length() -> None:
+def test_ner_and_triples_grammars_leave_output_unbounded_by_default() -> None:
     ner_rules = _parse_gbnf_rules(DSPY_NER_GBNF_GRAMMAR)
-    assert ner_rules["entity-list"] == '"[]" | "[" entity-pair (", " entity-pair){0,39} "]"'
-    assert ner_rules["string"] == '"\\"" char{1,512} "\\""'
+    assert ner_rules["entity-list"] == '"[]" | "[" entity-pair (", " entity-pair)* "]"'
+    assert ner_rules["string"] == '"\\"" char+ "\\""'
     assert ner_rules["label"] == '"\\"" non-letter* letter char* "\\""'
 
     open_triples = _parse_gbnf_rules(DSPY_TRIPLES_GBNF_GRAMMAR)
-    assert open_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
+    assert open_triples["triple-list"] == '"[]" | "[" triple (", " triple)* "]"'
     assert open_triples["triple"] == '"{\\"sub\\": " resource-slot ", \\"pred\\": " pred-obj ", \\"def\\": " string "}"'
     assert open_triples["pred-obj"] == 'resource-pred ", \\"obj\\": " resource-slot | literal-statement'
     assert open_triples["resource-slot"] == 'string | "[" string ", " string "]"'
-    assert open_triples["string"] == '"\\"" char{1,512} "\\""'
+    assert open_triples["string"] == '"\\"" char+ "\\""'
 
     pinned_triples = _parse_gbnf_rules(build_dspy_triples_grammar(None, [["HubSpot", "CRM platform."]]))
-    assert pinned_triples["triple-list"] == '"[]" | "[" triple (", " triple){0,39} "]"'
-    assert pinned_triples["string"] == '"\\"" char{1,512} "\\""'
+    assert pinned_triples["triple-list"] == '"[]" | "[" triple (", " triple)* "]"'
+    assert pinned_triples["string"] == '"\\"" char+ "\\""'
 
 
 def test_triples_grammar_normalizes_empty_definitions_to_prevent_reflexive_statements() -> None:

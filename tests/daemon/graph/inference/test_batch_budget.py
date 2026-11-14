@@ -1,23 +1,25 @@
-"""Configured embedding request budgets operate independently of item counts."""
+"""Native embedding requests honor item limits without splitting whole inputs."""
 
-from pathlib import Path
+import dspy
+import numpy as np
 
-from yaw.core import YawConfig
 from yaw.daemon.graph.inference import DSPyEmbeddingAdapter
 
 
-def test_configured_batch_limits_reach_the_actual_request_partitioner(tmp_path: Path) -> None:
-    adapter = DSPyEmbeddingAdapter.from_config(
-        YawConfig(
-            workspace_root=tmp_path,
-            embed_batch_size=64,
-            embed_batch_chars=20000,
-        )
-    )
-    texts = ["A short input " * 8] * 64
-    assert len(adapter._prepare_pieces_and_batches(texts)[-1]) == 1
-    assert len(adapter._prepare_pieces_and_batches(texts, batch_size=16)[-1]) == 4
-    adapter.max_batch_chars = 3500
-    requests = adapter._prepare_pieces_and_batches(["x" * 1200] * 64)[-1]
-    assert len(requests) == 32
-    assert max(map(len, requests)) == 2
+def test_configured_batch_limits_reach_native_embedder() -> None:
+    class Model:
+        index_identity = "batch-budget-fixture"
+
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        def __call__(self, texts: list[str]) -> np.ndarray:
+            self.batches.append(texts)
+            return np.ones((len(texts), 768), dtype=np.float32)
+
+    model = Model()
+    adapter = DSPyEmbeddingAdapter(embedder=dspy.Embedder(model, batch_size=64, caching=False), max_batch_chars=100000)
+    texts = ["x" * 1200] * 64
+    adapter.batch_encode(texts, batch_size=16)
+    assert [len(batch) for batch in model.batches] == [16] * 4
+    assert all("x" * 1200 in text for batch in model.batches for text in batch)

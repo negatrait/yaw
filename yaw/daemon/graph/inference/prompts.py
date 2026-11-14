@@ -75,18 +75,10 @@ LabelDecision = EquivalentLabelDecision | DistinctLabelDecision
 
 
 @with_config(ConfigDict(extra="forbid"))
-class HierarchyDecision(TypedDict):
+class RelationDecision(TypedDict):
     pair_id: str
     reasoning: str
-    broader: bool
-    narrower: bool
-
-
-@with_config(ConfigDict(extra="forbid"))
-class RelatedDecision(TypedDict):
-    pair_id: str
-    reasoning: str
-    related: bool
+    relation: Literal["skos:broader", "skos:narrower", "skos:related", "owl:differentFrom"]
 
 
 SHACLRepairAction = Literal[
@@ -129,17 +121,26 @@ class DistillerSelection(TypedDict):
 
 
 class ExtractEntities(dspy.Signature):
-    """Extract ALL named individuals and ALL general domain concepts explicitly mentioned in `passage` prose.
-    An `owl:NamedIndividual` is a particular person, organization, place, system, product or artifact.
-    A `skos:Concept` is a general domain concept or category, such as a role, process or kind of thing.
-    Provide a deduplicated source-grounded noun-phrase label and contextual definition for each extracted
-    resource; each definition identifies what the resource is and its distinguishing role in this passage.
-    Do not extract relationships, statements or document/header metadata. Do not extract `rdfs:Literal`
-    data values such as numbers, dates, percentages, durations, booleans or descriptive strings as resources.
-    A resource label is also a JSON string: a named person, place or concept is not a literal merely because
-    its label is textual. Include every such resource, including less prominent subjects and objects.
-    The fact extractor discovers those literal values while establishing relationships. Never use a label
-    as its own definition."""
+    # fmt: off
+    (
+        '\n    **Extract ALL named individuals and ALL general domain concepts** '
+        'explicitly mentioned in `passage` prose.\n\n    - An '
+        '`owl:NamedIndividual` is a particular person, organization, place, '
+        'system, product or artifact.\n    - A `skos:Concept` is a general domain '
+        'concept or category, such as a role, process or kind of thing.\n    - '
+        'Provide a deduplicated source-grounded noun-phrase label and a concise '
+        'one sentence contextual definition for each extracted resource.\n    - '
+        'Never extract relationships, statements or document/header metadata.\n   '
+        ' - Never extract `rdfs:Literal` data values such as numbers, dates, '
+        'percentages, durations, booleans or descriptive strings as resources.\n  '
+        '  - A resource label is also a JSON string: a named person, place or '
+        'concept is not a literal merely because its label is textual.\n    - '
+        'Include every such resource, including less prominent subjects and '
+        'objects.\n    - The fact extractor discovers those literal values while '
+        'establishing relationships.\n    - Never use a label as its own '
+        'definition.\n    '
+    )
+    # fmt: on
 
     passage: str = dspy.InputField(desc="Source `passage` text")
     named_entities: list[EntitySensePair] = dspy.OutputField(
@@ -148,80 +149,70 @@ class ExtractEntities(dspy.Signature):
 
 
 class ExtractTriples(dspy.Signature):
-    """Establish all passage-supported rdf:Statement facts between supplied resources or literal values.
-    Each `pred` is a short relationship phrase. Each separate `def` is a factual sentence stating
-    how the subject relates to the object through that predicate. Mention both endpoint names
-    or the literal value, and preserve source qualifiers. Describe the relationship, not what
-    either endpoint is. Never copy or paraphrase a resource definition into `pred` or `def`.
-    NER alone discovers resources and their resource definitions. Do not introduce, rename or
-    redefine resources. Subjects and resource objects must use exact supplied labels. For a
-    homograph, select the exact supplied [label, definition] pair as that endpoint; copying
-    this pair does not supply the statement's separate `def`.
-    Tag each relationship predicate with owl:ObjectProperty when connecting two supplied resources,
-    or owl:DatatypeProperty when connecting a subject resource to a passage literal value with its
-    lexical string, datatype, and language tag.
-    Literal objects need not occur in named_entities. Subjects are resources, never literals.
-    Resolve pronouns to supplied labels; preserve predicate direction and literal meaning.
-    Never invent relationships to connect unrelated resources or use header metadata.
+    """
+    **Establish all passage-supported `rdf:Statement` facts** between supplied resources or literal values.
+    - Each `pred` is a short relationship phrase.
+    - Each separate `def` is a factual sentence stating how the subject relates to the object through that predicate.
+    - Mention both endpoint names or the subject literal value, preserve source qualifiers.
+    - Describe the relationship, endpoints have their definitions already.
+    - Never copy or paraphrase a resource definition into `pred` or `def`.
+    - NER alone discovers resources and their resource definitions. Do not introduce, rename or redefine resources.
+    - Subjects and resource objects must use exact supplied labels.
+    - For a homograph, select the exact supplied [label, definition] pair as that endpoint; copying this pair does not supply the statement's separate `def`.
+    - Tag each relationship predicate with `owl:ObjectProperty` when connecting two supplied resources, `owl:DatatypeProperty` when connecting a subject resource to a passage literal value with its lexical string, datatype, and language tag.
+    - Literal objects must not occur in named_entities. Subjects are resources, never literals.
+    - Resolve pronouns to supplied labels; preserve predicate direction and literal meaning.
+    - Never invent relationships to connect unrelated resources or use header metadata.
     """
 
-    passage: str = dspy.InputField(desc="Source passage text")
+    passage: str = dspy.InputField(desc="Source `passage` text to base `rdf:Statement` reifications.")
     named_entities: list[EntitySensePair] | list[str] = dspy.InputField(
-        desc="Extracted (resource label, contextual definition) pairs or resource labels from Stage 1"
+        desc="Pre-extracted (`skos:Concept` | `owl:NamedIndividual`, `skos:definition`) pairs from Stage 1"
     )
     triples: list[ReifiedStatement] = dspy.OutputField(
         desc=(
-            "Reified rdf:Statement facts coupling owl:ObjectProperty predicates with resource objects "
-            "and owl:DatatypeProperty predicates with literal objects"
+
+                'Your reified `rdf:Statement` facts coupling `owl:ObjectProperty` predi'
+                'cates with resource objects and `owl:DatatypeProperty` predicates with'
+                ' literal objects'
+
         )
     )
 
 
 class DefineMissingEntities(dspy.Signature):
-    """Synthesize concise, grounded genus-differentia contextual definitions for entities referenced in \
-`missing_entities` based on the passage text and extracted triples. These resources were already
-discovered by NER; never discover, add or rename resources during definition repair.
-Provide a contextual definition for every requested entity using the exact string from `missing_entities`; \
-never emit an empty definition or repeat the entity name tautologically."""
+    """
+    **Synthesize concise, grounded genus-differentia contextual definitions** for entities referenced in `missing_entities` based on the passage text and extracted triples.
+    - These resources were already discovered by NER; never discover, add or rename resources during definition repair.
+    - Provide a contextual definition for every requested entity using the exact string from `missing_entities`; never emit an empty definition or repeat the entity name tautologically.
+    """
 
     passage: str = dspy.InputField(desc="Source passage text")
     missing_entities: list[str] = dspy.InputField(desc="Entity names that require contextual definitions")
     triples: list[FactTriple | ReifiedStatement] = dspy.InputField(
-        desc="Extracted relation triples referencing the missing entities",
-        default=[],
+        desc="Extracted relation triples referencing the missing entities"
     )
     entity_definitions: list[EntitySensePair] = dspy.OutputField(
         desc="Contextual definitions paired with each requested entity name"
     )
 
 
-SEMANTIC_JUDGE_STAGE_NAMES: tuple[str, str, str] = (
-    "label_judge",
-    "hierarchy_judge",
-    "related_judge",
-)
+SEMANTIC_JUDGE_STAGE_NAMES: tuple[str, str] = ("label_judge", "relation_judge")
 
 
 class JudgeLabels(dspy.Signature):
-    """Evaluate candidate entity pairs in `candidate_pairs` for strict W3C SKOS identity equivalence \
-(`skos:altLabel` / `skos:hiddenLabel`).
-
+    """
+    **Evaluate candidate entity pairs in `candidate_pairs`** for strict W3C SKOS identity equivalence (`skos:altLabel` / `skos:hiddenLabel`).
+    
     CORE PRINCIPLE:
-    - Merging two nodes (`equivalent: true`) asserts they are the EXACT SAME underlying `skos:Concept` or \
-`owl:NamedIndividual` in this domain.
-    - If two nodes are distinct concepts or distinct individuals (`equivalent: false`), emit `"equivalent": false` \
-so the pair advances to Stage 2 (`JudgeHierarchy`).
-
+    - Merging two nodes (`equivalent: true`) asserts they are the EXACT SAME underlying `skos:Concept` or `owl:NamedIndividual` in this domain.
+    - If two nodes are distinct concepts or distinct individuals (`equivalent: false`), emit `"equivalent": false` so the pair advances to the relation judge (`JudgeRelations`).
+    
     MANDATORY FALSIFICATION RULES (state in 1 concise sentence in `reasoning` before `equivalent`):
-    1. Named Individuals & Identifiers: NEVER merge (`equivalent: false`) two people, teams, regions, tiers, stages, \
-versions, or percentiles that have different given names, surnames, numbers, or codes (e.g., 'Noah Patel' vs \
-'Ravi Patel', 'Priya Rao' vs 'Priya Shah', 'Tier 1' vs 'Tier 4', 'Fast tier' vs 'Standard tier', 'p95' vs 'p99').
-    2. Modifier-Head & Category Distinctions: NEVER merge (`equivalent: false`) a general system/tier/resource with \
-a specific component, metric, regression, or policy that modifies it (e.g., 'Fast tier' vs 'fast tier p99 regression', \
-'Tenant' vs 'Tenant-id', 'Latency' vs 'p99 TTFT regression', 'Redwood' vs 'Redwood Router').
-    3. True Equivalence (`equivalent: true`): Emit `equivalent: true` ONLY when both `a` and `b` denote the exact \
-same concept or individual, provide a unified `"definition"`, and set `"hidden_label": false` for a valid \
-synonym/acronym (`skos:altLabel`) or `"hidden_label": true` for a misspelling/typo (`skos:hiddenLabel`)."""
+    1. Named Individuals & Identifiers: NEVER merge (`equivalent: false`) two people, teams, regions, tiers, stages, versions, or percentiles that have different given names, surnames, numbers, or codes (e.g., 'Cinderella' vs 'Cindy Real', 'Michael Page' vs 'Michael Jackson', 'Tier 1' vs 'Tier 4', 'Free tier' vs 'Paid tier', 'p95' vs 'p99').
+    2. Modifier-Head & Category Distinctions: NEVER merge (`equivalent: false`) a general system/tier/resource with a specific component, metric, regression, or policy that modifies it (e.g., 'Fast tier' vs 'fast tier p99 regression', 'Tenant' vs 'Tenant-id', 'Latency' vs 'p99 TTFT regression', 'Redwood' vs 'Redwood Router').
+    3. True Equivalence (`equivalent: true`): Emit `equivalent: true` ONLY when both `a` and `b` denote the exact same concept or individual, provide a unified `"definition"`, and set `"hidden_label": false` for a valid synonym/acronym (`skos:altLabel`) or `"hidden_label": true` for a misspelling/typo (`skos:hiddenLabel`).
+    """
 
     candidate_pairs: str = dspy.InputField(
         desc=(
@@ -235,51 +226,27 @@ synonym/acronym (`skos:altLabel`) or `"hidden_label": true` for a misspelling/ty
             "and hidden_label flag only when equivalent"
         )
     )
+    # fmt: on
 
 
-class JudgeHierarchy(dspy.Signature):
-    """Evaluate Stage 2 W3C SKOS hierarchy (`skos:broader` and `skos:narrower`) for distinct concept pairs:
-    - Subsumption Axioms (W3C SKOS S19-S27): `broader=True` (`A skos:broader B`) holds only if every `A` is \
-necessarily a subtype/kind of `B` (`skos:broaderG`: 'Every A is a kind of B'), an individual instance of class/role \
-`B` (`skos:broaderI`: e.g. individual person under role/title, never role under person), \
-or an architectural component/part of whole system `B` (`skos:broaderP`).
-    - Cross-Category Disjointness: Never assert `skos:broader` across incompatible ontological categories (such as an \
-infrastructure cluster under a metric/event, role/class under person, or comparative/temporal metric states like \
-'Improved X' under 'Original X'). Cross-category pairs must emit `broader=False, narrower=False` to advance to \
-Stage 3 (`skos:related`)."""
+class JudgeRelations(dspy.Signature):
+    """
+    Decide the relation between distinct entities A and B from the evidence.
+    Give one concise, complete evidence-based reason and exactly one relation.
+    `skos:broader` means A is a kind, individual instance, or architectural part of B.
+    `skos:narrower` means B is a kind, individual instance, or architectural part of A.
+    Use `skos:related` for a non-hierarchical association, and `owl:differentFrom`
+    for unrelated distinct entities. Causation, mitigation, protocol use, or mere
+    co-occurrence alone does not establish hierarchy. Never place a role under a person.
+    """
 
-    candidate_pairs: str = dspy.InputField(
-        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
-    )
-    decisions: list[HierarchyDecision] = dspy.OutputField(
-        desc=(
-            "Hierarchical subsumption decisions for each candidate pair where broader=True indicates "
-            "A skos:broader B and narrower=True indicates A skos:narrower B"
-        )
-    )
-
-
-class JudgeRelated(dspy.Signature):
-    """Evaluate Stage 3 associative relation (`skos:related` vs `owl:differentFrom`) for non-hierarchical pairs.
-    - Associated Domain Concepts: If entity_a and entity_b are conceptually associated, interact in the same domain \
-workflow, or share semantic context without a taxonomic broader/narrower hierarchy, mark `related=True` \
-(`skos:related`).
-    - Disjoint / Unrelated Concepts: If entity_a and entity_b denote completely independent, disjoint, or \
-non-associated entities, mark `related=False` (`owl:differentFrom`)."""
-
-    candidate_pairs: str = dspy.InputField(
-        desc="JSON object (`synonym-evidence-v2`) with inline definitions, facts, and source excerpts."
-    )
-    decisions: list[RelatedDecision] = dspy.OutputField(
-        desc=(
-            "Associative relation decisions for each candidate pair where related=True asserts skos:related "
-            "and related=False asserts owl:differentFrom"
-        )
-    )
+    candidate_pairs: str = dspy.InputField(desc="JSON evidence packet with pairs, entities and sources")
+    decisions: list[RelationDecision] = dspy.OutputField(desc="One oriented relation and reasoning per pair")
 
 
 class ProposeSHACLRepairs(dspy.Signature):
-    """Repair only the reported graph defects using focus_context. Preserve source-supported
+    """
+    Repair only the reported graph defects using focus_context. Preserve source-supported
     entities and statements; do not invent facts.
     For a fact-* skos:definition defect, rewrite the rdf:Statement's definition as a factual
     sentence stating its subject-predicate-object relationship. Mention the supplied subject
@@ -312,13 +279,11 @@ class ProposeSHACLRepairs(dspy.Signature):
 
 
 class FilterTriples(dspy.Signature):
-    """Select the minimal closed-world subgraph of candidate `rdf:Statement` triples (`[rdf:subject, \
-rdf:predicate, rdf:object]`) from `fact_before_filter` into `fact` required to entail the answer to `question`.
-    - Prioritize triples that directly match the query's target `skos:Concept` anchors and sought relations, \
-as well as intermediate bridge triples (`?s ?p1 ?bridge . ?bridge ?p2 ?o`) that connect multi-hop reasoning \
-paths across passages.
-    - Select at most 4 verbatim `[subject, predicate, object]` triples from `fact_before_filter`, ordered by \
-evidentiary relevance; never fabricate or modify triple elements."""
+    """
+    Select the minimal closed-world subgraph of candidate `rdf:Statement` triples (`[rdf:subject, rdf:predicate, rdf:object]`) from `fact_before_filter` into `fact` required to entail the answer to `question`.
+    - Prioritize triples that directly match the query's target `skos:Concept` anchors and sought relations, as well as intermediate bridge triples (`?s ?p1 ?bridge . ?bridge ?p2 ?o`) that connect multi-hop reasoning paths across passages.
+    - Select at most 4 verbatim `[subject, predicate, object]` triples from `fact_before_filter`, ordered by evidentiary relevance; never fabricate or modify triple elements.
+    """
 
     question: str = dspy.InputField(desc="Query for retrieval")
     fact_before_filter: str = dspy.InputField(desc="Candidate triples to be filtered")
@@ -424,10 +389,8 @@ __all__ = [
     "FactTriple",
     "FilterTriples",
     "HealSHACLViolations",
-    "HierarchyDecision",
-    "JudgeHierarchy",
     "JudgeLabels",
-    "JudgeRelated",
+    "JudgeRelations",
     "LabelDecision",
     "LiteralObject",
     "ObjectPropertyPredicate",
@@ -436,7 +399,7 @@ __all__ = [
     "ProposeSHACLRepairs",
     "ReflectiveInnerDistillerSignature",
     "ReifiedStatement",
-    "RelatedDecision",
+    "RelationDecision",
     "SHACLRepair",
     "SHACLRepairAction",
     "SEMANTIC_JUDGE_STAGE_NAMES",

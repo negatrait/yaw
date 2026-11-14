@@ -394,7 +394,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 - **Implementation Details (`yaw/daemon/graph/ppr.py`, `yaw/daemon/graph/engine.py`):**
   - Added `GraphActivation` type (`"linear"`, `"scaled_tanh"`, `"hard_tanh"`, `"shifted_tanh"`, `"threshold_relu"`).
   - Added vectorized `apply_graph_activation` in NumPy.
-  - Parameterized `run_ppr(..., activation="linear", activation_param=None, renormalize=False)` with zero overhead on default `linear`.
+  - Parameterized `run_hmm(..., activation="linear", activation_param=None, renormalize=False)` with zero overhead on default `linear`.
   - Added CLI flags in `benchmark.py`: `--graph-activation`, `--graph-activation-param`, `--graph-activation-renormalize`.
   - Added comprehensive property and convergence tests in `tests/daemon/graph/test_ppr.py`.
 
@@ -434,7 +434,7 @@ Offline test suite: `uv run --locked python -m unittest discover -s tests -v` â€
 
 - **Implementation Details (`yaw/daemon/graph/ppr.py`, `yaw/daemon/graph/engine.py`, `benchmark.py`):**
   - Parameterized `build_transition_matrix(..., beta: float = 0.0)` with in-place vectorized row and column degree scaling.
-  - Parameterized `run_ppr(..., dual_weight: float | None = None)` to return the convex combination $(1 - \lambda) y_{norm} + \lambda z_{norm}$ when specified.
+  - Parameterized `run_hmm(..., dual_weight: float | None = None)` to return the convex combination $(1 - \lambda) y_{norm} + \lambda z_{norm}$ when specified.
   - Added `beta` and `dual_weight` parameters to `YawGraphEngine`.
   - Exposed CLI flags in `benchmark.py`: `--graph-beta` (default `0.0`) and `--graph-dual-weight` (default `None`).
   - Added comprehensive property and unit tests in `tests/daemon/graph/test_ppr.py`.

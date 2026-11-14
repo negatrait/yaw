@@ -3,10 +3,12 @@
 import json
 import re
 import sqlite3
+import stat
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from operator import attrgetter, itemgetter
 from pathlib import Path
 from threading import RLock
 
@@ -27,9 +29,14 @@ from .chunks import get_chunk_pointer
 
 _MAX_CHUNK_LINE_SPAN = 5000
 _DEFAULT_MAX_ISLAND_CHARS = 4000
-_DEFAULT_MAX_CONTEXT_CHARS = 32000
+_DEFAULT_MAX_CONTEXT_CHARS = 65536
 _AST_CROP_NOTICE = "\n[... AST section cropped due to context window limitations ...]"
 _HYDRATION_SPLITTER = RecursiveSplitter()
+_JSON_RAW_DECODE = json.JSONDecoder().raw_decode
+_WS_RE = re.compile(r"\s*")
+_GET_MAX_SCORE = attrgetter("max_score")
+_GET_ITEM1 = itemgetter(1)
+_EDGE_KIND_PRIO = {"owl:differentFrom": 0, "skos:broader": 1, "skos:related": 2}
 
 
 @dataclass(slots=True)
@@ -90,77 +97,109 @@ def coalesce_spans(spans: Sequence[MutableSpan]) -> list[CoalescedSpan]:
 
     by_file: dict[str, list[MutableSpan]] = {}
     for s in spans:
-        by_file.setdefault(s.rel_posix_path, []).append(s)
+        path = s.rel_posix_path
+        bucket = by_file.get(path)
+        if bucket is None:
+            by_file[path] = [s]
+        else:
+            bucket.append(s)
 
     coalesced: list[CoalescedSpan] = []
     for rel_path, file_spans in by_file.items():
+        if len(file_spans) == 1:
+            cur = file_spans[0]
+            cids = cur.hit_cids
+            coalesced.append(
+                CoalescedSpan(
+                    rel_path,
+                    cur.start_line,
+                    cur.end_line,
+                    cur.title,
+                    cur.score,
+                    tuple(dict.fromkeys(cids))
+                    if cids and len(cids) > 1
+                    else (tuple(cids) if cids else (cur.chunk_id,)),
+                )
+            )
+            continue
+
         is_json_file = _is_json_corpus_path(rel_path)
-        sorted_spans = sorted(file_spans, key=lambda s: (s.start_line, -s.end_line))
-        cur = sorted_spans[0]
-        cur_s, cur_e = cur.start_line, cur.end_line
+        file_spans.sort(key=lambda s: (s.start_line, -s.end_line))
+        it = iter(file_spans)
+        cur = next(it)
+        cur_s = cur.start_line
+        cur_e = cur.end_line
         cur_title = cur.title
-        cur_cids = list(cur.hit_cids or [cur.chunk_id])
+        cur_cids = list(cur.hit_cids or (cur.chunk_id,))
         cur_max_score = cur.score
         cur_ast_s = cur.ast_island_start
         cur_ast_e = cur.ast_island_end
 
-        for nxt in sorted_spans[1:]:
+        for nxt in it:
+            nxt_s = nxt.start_line
+            nxt_e = nxt.end_line
+            nxt_title = nxt.title
+            nxt_ast_s = nxt.ast_island_start
+            nxt_ast_e = nxt.ast_island_end
             if is_json_file:
-                should_merge = cur_s == nxt.start_line and cur_e == nxt.end_line
+                should_merge = cur_s == nxt_s and cur_e == nxt_e
             else:
-                same_title = not cur_title or not nxt.title or cur_title == nxt.title
-                same_ast_island = (
-                    cur_ast_s > 0 and cur_ast_s == nxt.ast_island_start and cur_ast_e == nxt.ast_island_end
+                should_merge = (not cur_title or not nxt_title or cur_title == nxt_title) and (
+                    (cur_ast_s > 0 and cur_ast_s == nxt_ast_s and cur_ast_e == nxt_ast_e)
+                    or (
+                        nxt_s <= cur_e + 1
+                        and (cur_ast_s == 0 or nxt_ast_s == 0 or cur_ast_s == nxt_ast_s)
+                        and (cur_ast_e == 0 or nxt_s <= cur_ast_e)
+                        and (nxt_ast_s == 0 or cur_e >= nxt_ast_s - 1)
+                    )
                 )
-                in_same_island = (
-                    (cur_ast_s == 0 or nxt.ast_island_start == 0 or cur_ast_s == nxt.ast_island_start)
-                    and (cur_ast_e == 0 or nxt.start_line <= cur_ast_e)
-                    and (nxt.ast_island_start == 0 or cur_e >= nxt.ast_island_start - 1)
-                )
-                is_contiguous = nxt.start_line <= cur_e + 1
-                should_merge = same_title and (same_ast_island or (in_same_island and is_contiguous))
             if should_merge:
-                cur_e = max(cur_e, nxt.end_line)
-                if not cur_title and nxt.title:
-                    cur_title = nxt.title
-                cur_cids.extend(nxt.hit_cids or [nxt.chunk_id])
-                cur_max_score = max(cur_max_score, nxt.score)
-                cur_ast_s = (
-                    min(cur_ast_s, nxt.ast_island_start)
-                    if cur_ast_s and nxt.ast_island_start
-                    else (cur_ast_s or nxt.ast_island_start)
-                )
-                cur_ast_e = max(cur_ast_e, nxt.ast_island_end)
+                if nxt_e > cur_e:
+                    cur_e = nxt_e
+                if not cur_title and nxt_title:
+                    cur_title = nxt_title
+                cur_cids.extend(nxt.hit_cids or (nxt.chunk_id,))
+                if (nxt_score := nxt.score) > cur_max_score:
+                    cur_max_score = nxt_score
+                if cur_ast_s and nxt_ast_s:
+                    if nxt_ast_s < cur_ast_s:
+                        cur_ast_s = nxt_ast_s
+                elif nxt_ast_s:
+                    cur_ast_s = nxt_ast_s
+                if nxt_ast_e > cur_ast_e:
+                    cur_ast_e = nxt_ast_e
             else:
                 coalesced.append(
                     CoalescedSpan(
-                        rel_posix_path=rel_path,
-                        start_line=cur_s,
-                        end_line=cur_e,
-                        title=cur_title,
-                        max_score=cur_max_score,
-                        hit_chunk_ids=tuple(dict.fromkeys(cur_cids)),
+                        rel_path,
+                        cur_s,
+                        cur_e,
+                        cur_title,
+                        cur_max_score,
+                        (cur_cids[0],) if len(cur_cids) == 1 else tuple(dict.fromkeys(cur_cids)),
                     )
                 )
-                cur_s, cur_e = nxt.start_line, nxt.end_line
-                cur_title = nxt.title
-                cur_cids = list(nxt.hit_cids or [nxt.chunk_id])
+                cur_s = nxt_s
+                cur_e = nxt_e
+                cur_title = nxt_title
+                cur_cids = list(nxt.hit_cids or (nxt.chunk_id,))
                 cur_max_score = nxt.score
-                cur_ast_s = nxt.ast_island_start
-                cur_ast_e = nxt.ast_island_end
+                cur_ast_s = nxt_ast_s
+                cur_ast_e = nxt_ast_e
 
         coalesced.append(
             CoalescedSpan(
-                rel_posix_path=rel_path,
-                start_line=cur_s,
-                end_line=cur_e,
-                title=cur_title,
-                max_score=cur_max_score,
-                hit_chunk_ids=tuple(dict.fromkeys(cur_cids)),
+                rel_path,
+                cur_s,
+                cur_e,
+                cur_title,
+                cur_max_score,
+                (cur_cids[0],) if len(cur_cids) == 1 else tuple(dict.fromkeys(cur_cids)),
             )
         )
 
-    coalesced.sort(key=lambda cs: cs.max_score, reverse=True)
+    if len(coalesced) > 1:
+        coalesced.sort(key=_GET_MAX_SCORE, reverse=True)
     return coalesced
 
 
@@ -171,36 +210,38 @@ def _decode_json_passage_fields(raw_text: str, default_title: str = "") -> tuple
     raw = raw_text.strip()
     if not raw:
         return "", ""
-    decoder = json.JSONDecoder()
-    data, end = decoder.raw_decode(raw)
-    remainder = raw[end:].lstrip()
-    if isinstance(data, str) and remainder.startswith(":"):
+    raw_decode = _JSON_RAW_DECODE
+
+    def skip_whitespace(position: int) -> int:
+        match = _WS_RE.match(raw, position)
+        assert match is not None  # The whitespace-star pattern always matches.
+        return match.end()
+
+    data, end = raw_decode(raw)
+    n = len(raw)
+    cursor = skip_whitespace(end)
+    if isinstance(data, str) and cursor < n and raw[cursor] == ":":
         fields = {}
         cursor = 0
-        while cursor < len(raw):
-            while cursor < len(raw) and raw[cursor].isspace():
-                cursor += 1
-            if cursor == len(raw):
+        while cursor < n:
+            cursor = skip_whitespace(cursor)
+            if cursor == n:
                 break
-            key, cursor = decoder.raw_decode(raw, cursor)
+            key, cursor = raw_decode(raw, cursor)
             if not isinstance(key, str):
                 raise ValueError("Projected JSON property key must be a string")
-            while cursor < len(raw) and raw[cursor].isspace():
-                cursor += 1
-            if cursor == len(raw) or raw[cursor] != ":":
+            cursor = skip_whitespace(cursor)
+            if cursor == n or raw[cursor] != ":":
                 raise ValueError("Projected JSON property requires a colon")
-            cursor += 1
-            while cursor < len(raw) and raw[cursor].isspace():
-                cursor += 1
-            fields[key], cursor = decoder.raw_decode(raw, cursor)
-            while cursor < len(raw) and raw[cursor].isspace():
-                cursor += 1
-            if cursor < len(raw):
+            cursor = skip_whitespace(cursor + 1)
+            fields[key], cursor = raw_decode(raw, cursor)
+            cursor = skip_whitespace(cursor)
+            if cursor < n:
                 if raw[cursor] != ",":
                     raise ValueError("Invalid projected JSON property separator")
                 cursor += 1
         data = fields
-    elif remainder not in ("", ","):
+    elif not (cursor == n or (cursor == n - 1 and raw[cursor] == ",")):
         raise ValueError("Unexpected content after JSON source value")
     return json_document_fields(data, default_title)
 
@@ -238,24 +279,26 @@ def dehydrate_passage_ast(
         return text
 
     notice = _AST_CROP_NOTICE
-    if max_chars <= len(notice) + 40:
-        return text[: max(1, max_chars - len(notice))].rstrip() + notice
+    notice_len = len(notice)
+    if max_chars <= notice_len + 40:
+        return text[: max(1, max_chars - notice_len)].rstrip() + notice
 
-    budget = max_chars - len(notice)
+    budget = max_chars - notice_len
     header_prefix = ""
     body_text = text
 
-    if "\n" in text:
-        first_line, rest = text.split("\n", 1)
+    nl = text.find("\n")
+    if nl >= 0 and nl + 1 < budget // 2:
+        first_line = text[:nl]
         fl_strip = first_line.strip()
         clean_title = title.strip()
         if (
             fl_strip.lower().startswith(("wikipedia title:", "title:"))
             or fl_strip.startswith("#")
             or (clean_title and fl_strip == clean_title)
-        ) and len(first_line) + 1 < budget // 2:
-            header_prefix = first_line + "\n"
-            body_text = rest
+        ):
+            header_prefix = text[: nl + 1]
+            body_text = text[nl + 1 :]
 
     body_budget = max(40, budget - len(header_prefix))
     lang = _detect_hydration_language(rel_posix_path)
@@ -274,28 +317,32 @@ def dehydrate_passage_ast(
         if not ast_chunks and body_text.strip():
             raise ValueError(f"{rel_posix_path}: splitter produced no chunks during hydration")
 
-        if ast_chunks:
-            last_valid_end_byte = 0
-            for ch in ast_chunks:
-                cand = body_bytes[: ch.end.byte_offset].decode("utf-8")
-                if len(cand) <= body_budget:
-                    last_valid_end_byte = ch.end.byte_offset
-                else:
-                    break
-            if last_valid_end_byte > 0:
-                best_body = body_bytes[:last_valid_end_byte].decode("utf-8").rstrip()
+        last_valid_end_byte = 0
+        last_valid_chars = 0
+        cum_chars = 0
+        for ch in ast_chunks:
+            end_b = ch.end.byte_offset
+            cum_chars += len(body_bytes[last_valid_end_byte:end_b].decode("utf-8"))
+            if cum_chars <= body_budget:
+                last_valid_end_byte = end_b
+                last_valid_chars = cum_chars
+            else:
                 break
+        if last_valid_chars > 0:
+            best_body = body_text[:last_valid_chars].rstrip()
+            break
 
     if not best_body:
         # Valid AST chunks may all exceed the budget (for example a long word).
         # Crop that valid text at a lexical boundary; parser failures propagate.
         window = body_text[:body_budget]
+        min_idx = body_budget // 3
         for sep in ("\n\n", "\n", ". ", "; ", " "):
             idx = window.rfind(sep)
-            if idx >= body_budget // 3:
-                best_body = window[: idx + (1 if sep == ". " else 0)].rstrip()
+            if idx >= min_idx:
+                best_body = window[: idx + (sep == ". ")].rstrip()
                 break
-        if not best_body:
+        else:
             best_body = window.rstrip()
 
     return f"{header_prefix}{best_body}{notice}"
@@ -312,19 +359,18 @@ def _source_revision(target_path: Path) -> tuple[int, int, int]:
     return st.st_mtime_ns, st.st_ctime_ns, st.st_size
 
 
-def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | None:
-    """Retrieve or construct a cached CocoIndex CodeSource, invalidating on file mtime changes."""
-    try:
-        revision = _source_revision(target_path)
-    except OSError:
-        return None
-    path_key = str(target_path.resolve())
+def _get_cached_code_source(
+    target_path: Path,
+    path_key: str,
+    revision: tuple[int, int, int],
+) -> tuple[CodeSource, list[str]] | None:
     with _HYDRATION_CACHE_LOCK:
         cached = _CODE_SOURCE_CACHE.get(path_key)
-        if cached is not None and cached[0] == revision:
-            _CODE_SOURCE_CACHE.move_to_end(path_key)
-            return cached[1], cached[2]
-        _CODE_SOURCE_CACHE.pop(path_key, None)
+        if cached is not None:
+            if cached[0] == revision:
+                _CODE_SOURCE_CACHE.move_to_end(path_key)
+                return cached[1], cached[2]
+            _CODE_SOURCE_CACHE.pop(path_key, None)
     try:
         text = target_path.read_text(encoding="utf-8")
     except OSError:
@@ -340,6 +386,15 @@ def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | 
     return src, lines
 
 
+def get_cached_code_source(target_path: Path) -> tuple[CodeSource, list[str]] | None:
+    """Retrieve or construct a cached CocoIndex CodeSource, invalidating on file mtime changes."""
+    try:
+        revision = _source_revision(target_path)
+    except OSError:
+        return None
+    return _get_cached_code_source(target_path, str(target_path.resolve()), revision)
+
+
 def read_corpus_lines(
     target_path: Path,
     start_line: int,
@@ -350,22 +405,25 @@ def read_corpus_lines(
     Validates mtime on each call, avoiding repeated open/close disk thrashing.
     Returns the newline-stripped content string, or None if the file is missing/unreadable or the slice is empty.
     """
-    if not target_path.is_file():
-        return None
     try:
-        cached = get_cached_code_source(target_path)
+        st = target_path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        cached = _get_cached_code_source(
+            target_path,
+            str(target_path.resolve()),
+            (st.st_mtime_ns, st.st_ctime_ns, st.st_size),
+        )
         if cached is None:
             return None
-        _, lines = cached
+        lines = cached[1]
         if start_line < 1 or start_line - 1 >= len(lines):
             return None
         raw_text = "".join(lines[start_line - 1 : end_line])
     except OSError:
         return None
 
-    if not raw_text:
-        return None
-    return raw_text.rstrip("\r\n")
+    return raw_text.rstrip("\r\n") if raw_text else None
 
 
 def hydrate_chunk_pointer(
@@ -376,35 +434,52 @@ def hydrate_chunk_pointer(
     max_chars: int = _DEFAULT_MAX_ISLAND_CHARS,
 ) -> HydratedPassage:
     """Hydrate a 1-indexed [start_line, end_line] AST island from disk, gracefully dehydrating if oversized."""
-    if pointer.start_line < 1 or pointer.end_line < pointer.start_line:
-        raise ValueError(f"Invalid line span [{pointer.start_line}, {pointer.end_line}] for chunk {pointer.chunk_id}")
-    line_count = pointer.end_line - pointer.start_line + 1
+    sl = pointer.start_line
+    el = pointer.end_line
+    if sl < 1 or el < sl:
+        raise ValueError(f"Invalid line span [{sl}, {el}] for chunk {pointer.chunk_id}")
+    line_count = el - sl + 1
     if line_count > _MAX_CHUNK_LINE_SPAN:
         raise ValueError(f"Line span {line_count} exceeds maximum {_MAX_CHUNK_LINE_SPAN} for chunk {pointer.chunk_id}")
 
-    target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
+    rel_path = pointer.rel_posix_path
+    title = pointer.title
+    target_path = resolve_corpus_path(corpus_root, rel_path)
     try:
-        revision = _source_revision(target_path)
+        st = target_path.stat()
     except OSError:
         return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
-    cache_key = (str(target_path.resolve()), revision, pointer.start_line, pointer.end_line, pointer.title, max_chars)
+    if not stat.S_ISREG(st.st_mode):
+        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
+
+    revision = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    path_key = str(target_path.resolve())
+    cache_key = (path_key, revision, sl, el, title, max_chars)
     with _HYDRATION_CACHE_LOCK:
         cached_text = _HYDRATED_TEXT_CACHE.get(cache_key)
         if cached_text is not None:
             _HYDRATED_TEXT_CACHE.move_to_end(cache_key)
             return HydratedPassage(pointer=pointer, text=cached_text, score=score, stale_on_disk=False)
-    text = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
-    if text is None:
-        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
 
-    if _is_json_corpus_path(pointer.rel_posix_path):
-        text = normalize_json_passage_text(text, default_title=pointer.title)
+    cached_src = _get_cached_code_source(target_path, path_key, revision)
+    if cached_src is None:
+        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
+    lines = cached_src[1]
+    if sl - 1 >= len(lines):
+        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
+    raw_text = "".join(lines[sl - 1 : el])
+    if not raw_text:
+        return HydratedPassage(pointer=pointer, text="", score=score, stale_on_disk=True)
+    text = raw_text.rstrip("\r\n")
+
+    if _is_json_corpus_path(rel_path):
+        text = normalize_json_passage_text(text, default_title=title)
     if max_chars > 0 and len(text) > max_chars:
         text = dehydrate_passage_ast(
             text,
             max_chars,
-            title=pointer.title,
-            rel_posix_path=pointer.rel_posix_path,
+            title=title,
+            rel_posix_path=rel_path,
         )
     # Cache only bounded rendered text, never pointers, scores or entire ASTs.
     # Re-check the revision to avoid storing content read during a source edit.
@@ -447,18 +522,19 @@ def resolve_chunk_text(
                 break
     if hydrated.stale_on_disk or not hydrated.text.strip():
         raise ValueError(f"Failed to hydrate source chunk {pointer.chunk_id} from {pointer.rel_posix_path}")
-    if _is_json_corpus_path(pointer.rel_posix_path):
+    rel_path = pointer.rel_posix_path
+    if _is_json_corpus_path(rel_path):
+        sl = pointer.start_line
+        el = pointer.end_line
+        cid = pointer.chunk_id
         full_unbounded = hydrate_chunk_pointer(pointer, corpus_root, max_chars=0)
-        if (
-            not full_unbounded.stale_on_disk
-            and compute_chunk_id(pointer.rel_posix_path, pointer.start_line, pointer.end_line, full_unbounded.text)
-            != pointer.chunk_id
-        ):
-            target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
-            raw_slice = read_corpus_lines(target_path, pointer.start_line, pointer.end_line)
+        if not full_unbounded.stale_on_disk and compute_chunk_id(rel_path, sl, el, full_unbounded.text) != cid:
+            target_path = resolve_corpus_path(corpus_root, rel_path)
+            raw_slice = read_corpus_lines(target_path, sl, el)
             if raw_slice is not None:
                 title, body = _decode_json_passage_fields(raw_slice, default_title=pointer.title)
-                if body.strip():
+                body_stripped_len = len(body.strip())
+                if body_stripped_len:
                     c_size = max(1, int(chunk_size))
                     c_overlap = max(0, min(int(chunk_overlap), c_size - 1))
                     m_size = max(1, min(int(min_chunk_size), c_size))
@@ -467,13 +543,10 @@ def resolve_chunk_text(
                         CodeSource(body, language="markdown"),
                         chunk_size=effective_size,
                         chunk_overlap=min(c_overlap, max(0, effective_size - 1)),
-                        min_chunk_size=min(m_size, max(1, len(body.strip()))),
+                        min_chunk_size=min(m_size, max(1, body_stripped_len)),
                     ):
                         cand_text = render_document_text(title, ch.text)
-                        if (
-                            compute_chunk_id(pointer.rel_posix_path, pointer.start_line, pointer.end_line, cand_text)
-                            == pointer.chunk_id
-                        ):
+                        if compute_chunk_id(rel_path, sl, el, cand_text) == cid:
                             return cand_text
     return hydrated.text
 
@@ -490,27 +563,28 @@ def hydrate_passages(
     used_chars = 0
     for ptr, score in pointers_with_scores:
         hp = hydrate_chunk_pointer(ptr, corpus_root, score, max_chars=max_island_chars)
-        if hp.stale_on_disk or not hp.text:
+        text = hp.text
+        if hp.stale_on_disk or not text:
             hydrated.append(hp)
             continue
         if max_total_chars > 0:
             remaining = max_total_chars - used_chars
             if remaining < 240:
                 break
-            if len(hp.text) > remaining:
-                dehydrated_text = dehydrate_passage_ast(
-                    hp.text,
+            if len(text) > remaining:
+                text = dehydrate_passage_ast(
+                    text,
                     remaining,
                     title=ptr.title,
                     rel_posix_path=ptr.rel_posix_path,
                 )
                 hp = HydratedPassage(
                     pointer=hp.pointer,
-                    text=dehydrated_text,
+                    text=text,
                     score=hp.score,
                     stale_on_disk=False,
                 )
-        used_chars += len(hp.text) + 2
+        used_chars += len(text) + 2
         hydrated.append(hp)
     return tuple(hydrated)
 
@@ -541,28 +615,44 @@ def resolve_one_hop_upward_ast_bounds(
         ast_s = max(1, pointer.ast_island_start if pointer.ast_island_start > 0 else pointer.start_line)
         ast_e = max(pointer.end_line, pointer.ast_island_end if pointer.ast_island_end > 0 else pointer.end_line)
         return min(ast_s, pointer.start_line), max(ast_e, pointer.end_line), pointer.title
-    curr_ptr = pointer
-    parent_s, parent_e, parent_title = pointer.start_line, pointer.end_line, pointer.title
+
+    curr_sl = pointer.start_line
+    curr_el = pointer.end_line
+    curr_title = pointer.title
+    curr_ast_s = pointer.ast_island_start
+    curr_ast_e = pointer.ast_island_end
+    parent_s, parent_e, parent_title = curr_sl, curr_el, curr_title
+
+    cached: tuple[CodeSource, list[str]] | None = None
+    cached_loaded = False
+    lang_src: CodeSource | None = None
+    lang_checked = False
+
     for _ in range(hops):
-        ast_s = max(1, curr_ptr.ast_island_start if curr_ptr.ast_island_start > 0 else curr_ptr.start_line)
-        ast_e = max(curr_ptr.end_line, curr_ptr.ast_island_end if curr_ptr.ast_island_end > 0 else curr_ptr.end_line)
-        if curr_ptr.start_line <= 1 and ast_s <= 1:
-            return 1, ast_e, curr_ptr.title
+        ast_s = curr_ast_s if curr_ast_s > 0 else curr_sl
+        if ast_s < 1:
+            ast_s = 1
+        ast_e = curr_ast_e if curr_ast_e > curr_el else curr_el
+        if curr_sl <= 1 and ast_s <= 1:
+            return 1, ast_e, curr_title
 
-        cached = get_cached_code_source(target_path) if target_path.is_file() else None
+        if not cached_loaded:
+            cached = get_cached_code_source(target_path) if target_path.is_file() else None
+            cached_loaded = True
         if cached is None:
-            parent_s = ast_s if curr_ptr.start_line > ast_s else 1
-            return parent_s, ast_e, curr_ptr.title
+            return (ast_s if curr_sl > ast_s else 1), ast_e, curr_title
 
-        _, lines = cached
+        src, lines = cached
         total_lines = len(lines)
-        ast_e = min(total_lines, max(ast_e, curr_ptr.end_line))
+        if ast_e > total_lines:
+            ast_e = total_lines
 
-        if curr_ptr.start_line > ast_s:
+        if curr_sl > ast_s:
             h_line = lines[ast_s - 1].strip() if 1 <= ast_s <= total_lines else ""
             m_h = _ATX_HEADING_LEVEL_RE.match(h_line)
-            p_title = (m_h.group(2) or "").strip() if m_h else (curr_ptr.title or h_line[:80])
-            parent_s, parent_e, parent_title = ast_s, ast_e, p_title
+            parent_s = ast_s
+            parent_e = ast_e
+            parent_title = (m_h.group(2) or "").strip() if m_h else (curr_title or h_line[:80])
         else:
             curr_line_text = lines[ast_s - 1].rstrip("\r\n") if 1 <= ast_s <= total_lines else ""
             m_curr = _ATX_HEADING_LEVEL_RE.match(curr_line_text)
@@ -572,21 +662,26 @@ def resolve_one_hop_upward_ast_bounds(
                 for idx in range(ast_s - 2, -1, -1):
                     m_prev = _ATX_HEADING_LEVEL_RE.match(lines[idx].rstrip("\r\n"))
                     if m_prev is not None and len(m_prev.group(1)) < curr_level:
-                        parent_s, parent_e, parent_title = idx + 1, ast_e, (m_prev.group(2) or "").strip()
+                        parent_s = idx + 1
+                        parent_e = ast_e
+                        parent_title = (m_prev.group(2) or "").strip()
                         resolved_step = True
                         break
                 if not resolved_step:
-                    parent_s, parent_e, parent_title = 1, ast_e, curr_ptr.title
+                    parent_s, parent_e, parent_title = 1, ast_e, curr_title
                     resolved_step = True
 
             if not resolved_step:
-                lang = detect_code_language(filename=curr_ptr.rel_posix_path)
-                if lang is not None:
-                    full_text = "".join(lines)
-                    lang_src = CodeSource(full_text, language=lang)
-                    byte_start = sum(len(line.encode("utf-8")) for line in lines[: ast_s - 1])
-                    char_start = sum(map(len, lines[: ast_s - 1]))
-                    anchor = lines[ast_s - 1].rstrip("\r\n")
+                if not lang_checked:
+                    lang = detect_code_language(filename=pointer.rel_posix_path)
+                    if lang is not None:
+                        lang_src = CodeSource(src.text, language=lang)
+                    lang_checked = True
+                if lang_src is not None:
+                    prefix = "".join(lines[: ast_s - 1])
+                    byte_start = len(prefix.encode("utf-8"))
+                    char_start = len(prefix)
+                    anchor = curr_line_text
                     anchor_match = CodeMatch(
                         kind="scope_anchor",
                         chunks=[
@@ -604,30 +699,28 @@ def resolve_one_hop_upward_ast_bounds(
                         captures={},
                     )
                     view = render_match(lang_src, anchor_match)
-                    enclosing_frames = [
-                        seg.start.line
-                        for seg in view.segments
-                        if seg.kind == "frame" and seg.summary is None and seg.start.line < ast_s
-                    ]
-                    if enclosing_frames:
-                        parent_line = max(enclosing_frames)
+                    parent_line = 0
+                    for seg in view.segments:
+                        if seg.kind == "frame" and seg.summary is None:
+                            sl = seg.start.line
+                            if parent_line < sl < ast_s:
+                                parent_line = sl
+                    if parent_line:
                         p_text = lines[parent_line - 1].strip().rstrip("{:").strip()
-                        parent_s, parent_e, parent_title = parent_line, ast_e, p_text or curr_ptr.title
+                        parent_s = parent_line
+                        parent_e = ast_e
+                        parent_title = p_text or curr_title
                         resolved_step = True
             if not resolved_step:
-                parent_s, parent_e, parent_title = 1, ast_e, curr_ptr.title
+                parent_s, parent_e, parent_title = 1, ast_e, curr_title
 
         if parent_s <= 1:
             break
-        curr_ptr = ChunkPointer(
-            chunk_id=curr_ptr.chunk_id,
-            rel_posix_path=curr_ptr.rel_posix_path,
-            start_line=parent_s,
-            end_line=parent_e,
-            title=parent_title,
-            ast_island_start=parent_s,
-            ast_island_end=parent_e,
-        )
+        curr_sl = parent_s
+        curr_el = parent_e
+        curr_title = parent_title
+        curr_ast_s = parent_s
+        curr_ast_e = parent_e
     return parent_s, parent_e, parent_title
 
 
@@ -647,15 +740,14 @@ def hydrate_ast_parent_context(
     target_path = resolve_corpus_path(corpus_root, pointer.rel_posix_path)
     if not target_path.is_file():
         return ""
-    parent_s, _parent_e, _parent_title = resolve_one_hop_upward_ast_bounds(target_path, pointer, hops=hops)
+    parent_s, _, _ = resolve_one_hop_upward_ast_bounds(target_path, pointer, hops=hops)
     preamble_end = pointer.start_line - 1
     if preamble_end < parent_s:
         return ""
 
     parts: list[str] = []
     if parent_s > 1:
-        root_end = min(parent_s - 1, 8)
-        root_head = read_corpus_lines(target_path, 1, root_end)
+        root_head = read_corpus_lines(target_path, 1, min(parent_s - 1, 8))
         if root_head and root_head.strip():
             parts.append(root_head.strip())
     parent_head = read_corpus_lines(target_path, parent_s, min(preamble_end, parent_s + 14))
@@ -666,7 +758,7 @@ def hydrate_ast_parent_context(
     if not combined:
         return ""
     if len(combined) > max_chars:
-        combined = combined[:max_chars].rstrip() + " ..."
+        return combined[:max_chars].rstrip() + " ..."
     return combined
 
 
@@ -714,12 +806,12 @@ def make_ast_island_hydrator(
         passage = hydrate_chunk_pointer(expanded_ptr, corpus_root, max_chars=max_chars)
         if passage.stale_on_disk:
             return f"Error: Chunk '{chunk_id}' file is missing or unreadable on disk."
-        header = (
+        return (
             f"# Document: {pointer.rel_posix_path} | AST Section: {expanded_ptr.title or '(root)'} "
             f"(Lines {expanded_ptr.start_line}–{expanded_ptr.end_line}, "
             f"Focus Chunk Lines {pointer.start_line}–{pointer.end_line})\n"
+            f"{passage.text}"
         )
-        return f"{header}{passage.text}"
 
     return hydrate_ast_island
 
@@ -730,27 +822,27 @@ def _hydrate_spans(
 ) -> list[HydratedPassage]:
     passages: list[HydratedPassage] = []
     for span in spans:
-        cid = (
-            span.hit_chunk_ids[0]
-            if span.hit_chunk_ids
-            else compute_chunk_id(span.rel_posix_path, span.start_line, span.end_line, span.title)
-        )
+        rel_path = span.rel_posix_path
+        sl = span.start_line
+        el = span.end_line
+        title = span.title
+        cid = span.hit_chunk_ids[0] if span.hit_chunk_ids else compute_chunk_id(rel_path, sl, el, title)
         ptr = ChunkPointer(
             chunk_id=cid,
-            rel_posix_path=span.rel_posix_path,
-            start_line=span.start_line,
-            end_line=span.end_line,
-            title=span.title,
-            ast_island_start=span.start_line,
-            ast_island_end=span.end_line,
+            rel_posix_path=rel_path,
+            start_line=sl,
+            end_line=el,
+            title=title,
+            ast_island_start=sl,
+            ast_island_end=el,
         )
-        target_path = resolve_corpus_path(corpus_root, span.rel_posix_path)
-        text = read_corpus_lines(target_path, span.start_line, span.end_line)
+        target_path = resolve_corpus_path(corpus_root, rel_path)
+        text = read_corpus_lines(target_path, sl, el)
         if text is None:
             passages.append(HydratedPassage(pointer=ptr, text="", score=span.max_score, stale_on_disk=True))
             continue
-        if _is_json_corpus_path(span.rel_posix_path):
-            text = normalize_json_passage_text(text, default_title=span.title)
+        if _is_json_corpus_path(rel_path):
+            text = normalize_json_passage_text(text, default_title=title)
         passages.append(HydratedPassage(pointer=ptr, text=text, score=span.max_score, stale_on_disk=False))
     return passages
 
@@ -759,7 +851,7 @@ def hydrate_budgeted_passages(
     pointers_with_scores: Sequence[tuple[ChunkPointer, float]],
     corpus_root: str | Path,
     *,
-    max_context_chars: int = 24000,
+    max_context_chars: int | None = None,
     max_expansion_hops: int = 1,
 ) -> list[HydratedPassage]:
     """Hydrate retrieved chunks via greedy priority AST-expansion:
@@ -774,54 +866,46 @@ if headroom permits.
         return []
 
     root_path = Path(corpus_root)
+    sorted_hits = sorted(pointers_with_scores, key=_GET_ITEM1, reverse=True)
 
-    # 1. Sort chunks by relevance descending
-    sorted_hits = sorted(pointers_with_scores, key=lambda x: x[1], reverse=True)
-
-    # Initialize active spans from raw hits (Inviolate Hit Invariant)
     active_spans: list[MutableSpan] = []
+    current_len = 0
     for ptr, score in sorted_hits:
-        ast_s = ptr.ast_island_start if ptr.ast_island_start > 0 else ptr.start_line
-        ast_e = ptr.ast_island_end if ptr.ast_island_end > 0 else ptr.end_line
+        sl = ptr.start_line
+        el = ptr.end_line
+        ast_s = ptr.ast_island_start if ptr.ast_island_start > 0 else sl
+        ast_e = ptr.ast_island_end if ptr.ast_island_end > 0 else el
+        cid = ptr.chunk_id
         active_spans.append(
             MutableSpan(
-                chunk_id=ptr.chunk_id,
-                rel_posix_path=ptr.rel_posix_path,
-                start_line=ptr.start_line,
-                end_line=ptr.end_line,
-                title=ptr.title,
-                score=score,
-                ast_island_start=min(ast_s, ptr.start_line),
-                ast_island_end=max(ast_e, ptr.end_line),
-                hit_cids=[ptr.chunk_id],
+                cid,
+                ptr.rel_posix_path,
+                sl,
+                el,
+                ptr.title,
+                score,
+                ast_s if ast_s < sl else sl,
+                ast_e if ast_e > el else el,
+                [cid],
             )
         )
-
-    # 2. Greedily expand most relevant candidates ONCE (non-recursive) while headroom permits
-    def estimate_total_chars(spans: list[MutableSpan]) -> int:
-        return sum((s.end_line - s.start_line + 1) * 80 for s in spans)
-
-    current_len = estimate_total_chars(active_spans)
+        current_len += (el - sl + 1) * 80
 
     if max_expansion_hops >= 1:
         for span in active_spans:
-            if current_len >= max_context_chars:
+            if max_context_chars is not None and current_len >= max_context_chars:
                 break
-            # Expand span ONCE outward to immediate neighbor lines (±10 lines) bounded by AST
-            new_start = max(span.ast_island_start, span.start_line - 10)
-            new_end = min(span.ast_island_end, span.end_line + 10)
-            added_lines = (span.start_line - new_start) + (new_end - span.end_line)
-            added_chars = added_lines * 80
-            if current_len + added_chars <= max_context_chars:
+            sl = span.start_line
+            el = span.end_line
+            new_start = max(span.ast_island_start, sl - 10)
+            new_end = min(span.ast_island_end, el + 10)
+            added_chars = ((sl - new_start) + (new_end - el)) * 80
+            if max_context_chars is None or current_len + added_chars <= max_context_chars:
                 span.start_line = new_start
                 span.end_line = new_end
                 current_len += added_chars
 
-    # 3. Deduplicate and coalesce overlapping / contiguous spans
-    final_spans = coalesce_spans(active_spans)
-
-    # 4. Hydrate exact line spans directly from disk
-    return _hydrate_spans(final_spans, root_path)
+    return _hydrate_spans(coalesce_spans(active_spans), root_path)
 
 
 def format_subgraph_for_qa(
@@ -829,7 +913,7 @@ def format_subgraph_for_qa(
     chunk_ids: Sequence[str],
     seed_facts: Sequence[tuple[str, str, str]] = (),
     *,
-    max_subgraph_chars: int = 6000,
+    max_subgraph_chars: int | None = None,
 ) -> str:
     """Format the closed-world SKOS/OWL/RDF subgraph induced by `chunk_ids` and `seed_facts` for QA grounding."""
     if not chunk_ids and not seed_facts:
@@ -837,6 +921,7 @@ def format_subgraph_for_qa(
 
     active_entity_ids: set[str] = set()
     seed_triples_set: set[tuple[str, str, str]] = set()
+    seed_endpoints: set[str] = set()
 
     for item in seed_facts:
         if len(item) >= 3:
@@ -844,55 +929,58 @@ def format_subgraph_for_qa(
             seed_triples_set.add((s, p, o))
             active_entity_ids.add(s)
             active_entity_ids.add(o)
+            seed_endpoints.add(s)
+            seed_endpoints.add(o)
 
     chunk_list = list(dict.fromkeys(chunk_ids))
-    chunk_facts: list[tuple[str, str, str, str, str]] = []
+    chunk_facts: list[tuple[str, str, str, str]] = []
     if chunk_list:
-        ph = ",".join("?" for _ in chunk_list)
-        fact_rows = conn.execute(
-            f"""
-            SELECT f.fact_id, f.subj_id, f.pred, f.obj_kind, f.obj_id, f.obj_literal_lex, COALESCE(f.definition, '')
-            FROM facts f
-            JOIN fact_sources fs ON f.fact_id = fs.fact_id
-            WHERE fs.chunk_id IN ({ph})
-            """,
+        ph = ("?," * len(chunk_list))[:-1]
+        for subj, pred, obj_kind, obj_id, obj_lex, definition in conn.execute(
+            f"SELECT f.subj_id,f.pred,f.obj_kind,f.obj_id,f.obj_literal_lex,COALESCE(f.definition,'') "
+            f"FROM facts f JOIN fact_sources fs ON f.fact_id=fs.fact_id WHERE fs.chunk_id IN({ph})",
             chunk_list,
-        ).fetchall()
-        for fid, subj, pred, obj_kind, obj_id, obj_lex, definition in fact_rows:
-            obj_val = str(obj_id) if obj_kind == "entity" and obj_id else str(obj_lex or "")
-            s_str, p_str, o_str = str(subj), str(pred), obj_val
-            chunk_facts.append((s_str, p_str, o_str, str(definition or "").strip(), str(fid)))
+        ):
+            is_ent = obj_kind == "entity" and obj_id
+            s_str = str(subj)
+            o_str = str(obj_id) if is_ent else str(obj_lex or "")
+            chunk_facts.append((s_str, str(pred), o_str, str(definition or "").strip()))
             active_entity_ids.add(s_str)
-            if obj_kind == "entity" and obj_id:
-                active_entity_ids.add(str(obj_id))
+            if is_ent:
+                active_entity_ids.add(o_str)
 
-        ent_rows = conn.execute(
-            f"SELECT DISTINCT entity_id FROM entity_labels WHERE chunk_id IN ({ph})",
+        for (eid,) in conn.execute(
+            f"SELECT DISTINCT entity_id FROM entity_labels WHERE chunk_id IN({ph})",
             chunk_list,
-        ).fetchall()
-        for (eid,) in ent_rows:
-            active_entity_ids.add(str(eid))
-
-    if active_entity_ids:
-        ph_ent = ",".join("?" for _ in active_entity_ids)
-        mapped_rows = conn.execute(
-            f"SELECT entity_id, name FROM entities WHERE entity_id IN ({ph_ent}) OR name IN ({ph_ent})",
-            list(active_entity_ids) * 2,
-        ).fetchall()
-        for eid, _ in mapped_rows:
+        ):
             active_entity_ids.add(str(eid))
 
     entity_names: dict[str, str] = {}
     entity_defs: dict[str, str] = {}
+    concept_entities: list[tuple] = []
+    act_list: list[str] = []
+    ph_act = ""
+
     if active_entity_ids:
-        ph_act = ",".join("?" for _ in active_entity_ids)
-        for eid, name, defn in conn.execute(
-            f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_act})",
-            list(active_entity_ids),
-        ).fetchall():
-            entity_names[str(eid)] = str(name).strip() or str(eid)
+        ent_list = list(active_entity_ids)
+        ph_ent = ("?," * len(ent_list))[:-1]
+        for (eid,) in conn.execute(
+            f"SELECT entity_id FROM entities WHERE entity_id IN({ph_ent}) OR name IN({ph_ent})",
+            ent_list * 2,
+        ):
+            active_entity_ids.add(str(eid))
+
+        act_list = list(active_entity_ids)
+        ph_act = ("?," * len(act_list))[:-1]
+        concept_entities = conn.execute(
+            f"SELECT entity_id,name,COALESCE(definition,'') FROM entities WHERE entity_id IN({ph_act})",
+            act_list,
+        ).fetchall()
+        for eid, name, defn in concept_entities:
+            eid_s = str(eid)
+            entity_names[eid_s] = str(name).strip() or eid_s
             if defn:
-                entity_defs[str(eid)] = str(defn).strip()
+                entity_defs[eid_s] = str(defn).strip()
 
     # SECTION 1: Knowledge Graph Statements (rdf:Statement)
     statement_lines: list[str] = []
@@ -900,133 +988,105 @@ def format_subgraph_for_qa(
 
     for s, p, o in seed_triples_set:
         fact_def_row = conn.execute(
-            """
-            SELECT definition FROM facts
-            WHERE subj_id = ? AND pred = ? AND (obj_id = ? OR obj_literal_lex = ?)
-            LIMIT 1
-            """,
+            "SELECT definition FROM facts WHERE subj_id=? AND pred=? AND (obj_id=? OR obj_literal_lex=?) LIMIT 1",
             (s, p, o, o),
         ).fetchone()
         f_def = str(fact_def_row[0] or "").strip() if fact_def_row is not None and fact_def_row[0] else ""
         seen_statements.add((s, p, o))
-        if f_def:
-            statement_lines.append(f"- [{s}, {p}, {o}]: {f_def}")
-        else:
-            statement_lines.append(f"- [{s}, {p}, {o}]")
+        statement_lines.append(f"- [{s}, {p}, {o}]: {f_def}" if f_def else f"- [{s}, {p}, {o}]")
 
-    for s, p, o, f_def, _ in chunk_facts:
+    for s, p, o, f_def in chunk_facts:
         f_subj = entity_names.get(s, s)
         f_obj = entity_names.get(o, o)
-        if (f_subj, p, f_obj) not in seen_statements:
-            seen_statements.add((f_subj, p, f_obj))
-            if f_def:
-                statement_lines.append(f"- [{f_subj}, {p}, {f_obj}]: {f_def}")
-            else:
-                statement_lines.append(f"- [{f_subj}, {p}, {f_obj}]")
+        key = (f_subj, p, f_obj)
+        if key not in seen_statements:
+            seen_statements.add(key)
+            statement_lines.append(f"- [{f_subj}, {p}, {f_obj}]: {f_def}" if f_def else f"- [{f_subj}, {p}, {f_obj}]")
 
     # SECTION 2: Taxonomy & Disambiguation Trace (SKOS / OWL)
-    trace_lines: list[str] = []
-    if active_entity_ids:
-        ph_act = ",".join("?" for _ in active_entity_ids)
-        edge_rows = conn.execute(
-            f"""
-            SELECT src_id, dst_id, kind, weight, COALESCE(reasoning, '')
-            FROM edges
-            WHERE kind IN ('owl:differentFrom', 'skos:broader', 'skos:related')
-              AND (src_id IN ({ph_act}) OR dst_id IN ({ph_act}))
-            """,
-            list(active_entity_ids) * 2,
-        ).fetchall()
-
-        # Resolve names and definitions for 1-hop counterpart entities from other chunks
-        edge_endpoint_ids = {str(r[0]) for r in edge_rows} | {str(r[1]) for r in edge_rows}
-        missing_endpoint_ids = edge_endpoint_ids - set(entity_names.keys())
-        if missing_endpoint_ids:
-            ph_miss = ",".join("?" for _ in missing_endpoint_ids)
-            for eid, name, defn in conn.execute(
-                f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_miss})",
-                list(missing_endpoint_ids),
-            ).fetchall():
-                entity_names[str(eid)] = str(name).strip() or str(eid)
-                if defn:
-                    entity_defs[str(eid)] = str(defn).strip()
-
-        kind_prio = {"owl:differentFrom": 0, "skos:broader": 1, "skos:related": 2}
-        seen_pairs: set[tuple[str, str, str]] = set()
-
-        sorted_edge_rows = sorted(
-            edge_rows,
-            key=lambda r: (
-                0 if (str(r[0]) in active_entity_ids and str(r[1]) in active_entity_ids) else 1,
-                kind_prio.get(str(r[2]), 9),
-            ),
-        )
-
-        for src, dst, kind, _, reasoning in sorted_edge_rows:
-            src_s, dst_s, kind_s, reas_s = str(src), str(dst), str(kind), str(reasoning or "").strip()
-            canon_pair = (
-                (min(src_s, dst_s), max(src_s, dst_s), kind_s) if kind_s != "skos:broader" else (src_s, dst_s, kind_s)
-            )
-            if canon_pair in seen_pairs:
-                continue
-            seen_pairs.add(canon_pair)
-
-            lbl_a = entity_names.get(src_s, src_s)
-            lbl_b = entity_names.get(dst_s, dst_s)
-
-            if kind_s == "owl:differentFrom":
-                def_a = entity_defs.get(src_s)
-                if not def_a:
-                    r = conn.execute("SELECT definition FROM entities WHERE entity_id = ?", (src_s,)).fetchone()
-                    def_a = str(r[0] or "").strip() if r is not None and r[0] else ""
-                def_b = entity_defs.get(dst_s)
-                if not def_b:
-                    r = conn.execute("SELECT definition FROM entities WHERE entity_id = ?", (dst_s,)).fetchone()
-                    def_b = str(r[0] or "").strip() if r is not None and r[0] else ""
-
-                pieces: list[str] = [f"- [DISJOINT] {lbl_a} owl:differentFrom {lbl_b}"]
-                if reas_s:
-                    pieces.append(f" — {reas_s}")
-                if def_a or def_b:
-                    pieces.append(f" ({lbl_a}: {def_a or 'N/A'} | {lbl_b}: {def_b or 'N/A'})")
-                trace_lines.append("".join(pieces))
-            elif kind_s == "skos:broader":
-                if reas_s:
-                    trace_lines.append(f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b} — {reas_s}")
-                else:
-                    trace_lines.append(f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b}")
-            elif kind_s == "skos:related":
-                if reas_s:
-                    trace_lines.append(f"- [RELATED] {lbl_a} skos:related {lbl_b} — {reas_s}")
-                else:
-                    trace_lines.append(f"- [RELATED] {lbl_a} skos:related {lbl_b}")
-
     # SECTION 3: Concept Definitions & Aliases (skos:Concept)
+    trace_lines: list[str] = []
     concept_lines: list[str] = []
-    if active_entity_ids:
-        ph_act = ",".join("?" for _ in active_entity_ids)
-        concept_entities = conn.execute(
-            f"SELECT entity_id, name, COALESCE(definition, '') FROM entities WHERE entity_id IN ({ph_act})",
-            list(active_entity_ids),
+    if act_list:
+        edge_rows = conn.execute(
+            f"SELECT src_id,dst_id,kind,COALESCE(reasoning,'') FROM edges "
+            f"WHERE kind IN('owl:differentFrom','skos:broader','skos:related') "
+            f"AND(src_id IN({ph_act}) OR dst_id IN({ph_act}))",
+            act_list * 2,
         ).fetchall()
+
+        if edge_rows:
+            missing_ids = list({eid for r in edge_rows for eid in (str(r[0]), str(r[1])) if eid not in entity_names})
+            if missing_ids:
+                ph_miss = ("?," * len(missing_ids))[:-1]
+                for eid, name, defn in conn.execute(
+                    f"SELECT entity_id,name,COALESCE(definition,'') FROM entities WHERE entity_id IN({ph_miss})",
+                    missing_ids,
+                ):
+                    eid_s = str(eid)
+                    entity_names[eid_s] = str(name).strip() or eid_s
+                    if defn:
+                        entity_defs[eid_s] = str(defn).strip()
+
+            edge_rows.sort(
+                key=lambda r: (
+                    0 if (str(r[0]) in active_entity_ids and str(r[1]) in active_entity_ids) else 1,
+                    _EDGE_KIND_PRIO.get(str(r[2]), 9),
+                )
+            )
+            seen_pairs: set[tuple[str, str, str]] = set()
+            for src, dst, kind, reasoning in edge_rows:
+                src_s = str(src)
+                dst_s = str(dst)
+                kind_s = str(kind)
+                canon_pair = (
+                    (src_s, dst_s, kind_s)
+                    if kind_s == "skos:broader"
+                    else ((src_s, dst_s, kind_s) if src_s <= dst_s else (dst_s, src_s, kind_s))
+                )
+                if canon_pair in seen_pairs:
+                    continue
+                seen_pairs.add(canon_pair)
+
+                reas_s = str(reasoning or "").strip()
+                lbl_a = entity_names.get(src_s, src_s)
+                lbl_b = entity_names.get(dst_s, dst_s)
+
+                if kind_s == "owl:differentFrom":
+                    def_a = entity_defs.get(src_s, "")
+                    def_b = entity_defs.get(dst_s, "")
+                    r_part = f" — {reas_s}" if reas_s else ""
+                    d_part = f" ({lbl_a}: {def_a or 'N/A'} | {lbl_b}: {def_b or 'N/A'})" if (def_a or def_b) else ""
+                    trace_lines.append(f"- [DISJOINT] {lbl_a} owl:differentFrom {lbl_b}{r_part}{d_part}")
+                elif kind_s == "skos:broader":
+                    trace_lines.append(
+                        f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b} — {reas_s}"
+                        if reas_s
+                        else f"- [HIERARCHY] {lbl_a} skos:broader {lbl_b}"
+                    )
+                else:
+                    trace_lines.append(
+                        f"- [RELATED] {lbl_a} skos:related {lbl_b} — {reas_s}"
+                        if reas_s
+                        else f"- [RELATED] {lbl_a} skos:related {lbl_b}"
+                    )
 
         labels_by_ent: dict[str, dict[str, list[str]]] = {}
         for eid, lbl, lkind in conn.execute(
-            f"SELECT entity_id, raw_label, label_kind FROM entity_labels WHERE entity_id IN ({ph_act})",
-            list(active_entity_ids),
-        ).fetchall():
+            f"SELECT entity_id,raw_label,label_kind FROM entity_labels WHERE entity_id IN({ph_act})",
+            act_list,
+        ):
             labels_by_ent.setdefault(str(eid), {}).setdefault(str(lkind), []).append(str(lbl))
 
-        sorted_concepts = sorted(
-            concept_entities,
+        concept_entities.sort(
             key=lambda c: (
-                0 if str(c[0]) in {s for s, _, _ in seed_triples_set} | {o for _, _, o in seed_triples_set} else 1,
+                0 if str(c[0]) in seed_endpoints else 1,
                 0 if str(c[2]).strip() else 1,
                 str(c[1]),
-            ),
+            )
         )
 
-        for eid, name, defn in sorted_concepts:
+        for eid, name, defn in concept_entities:
             eid_s = str(eid)
             pref_name = str(name).strip() or eid_s
             def_str = str(defn or "").strip()
@@ -1063,14 +1123,11 @@ def format_subgraph_for_qa(
                 + (len(title) + 2 if not kept_lines else 0)
                 + (2 if active_sections and not kept_lines else 0)
             )
-            if current_chars + needed > max_subgraph_chars:
+            if max_subgraph_chars is not None and current_chars + needed > max_subgraph_chars:
                 break
             kept_lines.append(line)
             current_chars += needed
         if kept_lines:
             active_sections.append(f"{title}\n" + "\n".join(kept_lines))
-
-    if not active_sections:
-        return ""
 
     return "\n\n".join(active_sections).rstrip()

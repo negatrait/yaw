@@ -8,7 +8,6 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,7 +23,6 @@ from yaw.core import (
     render_document_text,
     write_text_atomic,
 )
-from yaw.core.config import context_char_limit
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
     PASSAGE_INSTRUCTION,
@@ -51,8 +49,8 @@ from yaw.daemon.graph.ppr import (
     CSRGraph,
     build_transition_matrix,
     min_max_normalize,
-    rank_passages_by_ppr,
-    run_ppr,
+    rank_passages_by_hmm,
+    run_hmm,
 )
 from yaw.daemon.graph.storage import (
     ManagedConnection,
@@ -85,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 
 class YawGraphEngine:
-    """HippoRAG 2 engine backed by yaw.db, CSR Personalized PageRank, and lazy disk line hydration."""
+    """HippoRAG 2 engine backed by yaw.db, sparse entity-state HMM, and lazy disk line hydration."""
 
     def __init__(
         self,
@@ -110,11 +108,7 @@ class YawGraphEngine:
         semantic_adjudication_batch_size: int = 5,
         retrieval_top_k: int = 10,
         embed_batch_size: int = 64,
-        activation: str = "scaled_tanh",
-        activation_param: float | None = 5.0,
-        activation_renormalize: bool = False,
         beta: float = 0.5,
-        dual_weight: float | None = 0.5,
         max_context_chars: int | None = None,
         max_ast_expansion_hops: int = 1,
         ast_context_hops: int = 1,
@@ -140,11 +134,7 @@ class YawGraphEngine:
         self.indexing_runner: Callable[..., GraphPlanSummary] | None = None
         self._close_callbacks: list[Callable[[], None]] = []
 
-        self.max_context_chars = (
-            max_context_chars
-            if max_context_chars is not None
-            else context_char_limit(24000, program.context_window_tokens, program.max_output_tokens)
-        )
+        self.max_context_chars = max_context_chars
         self.max_ast_expansion_hops = max_ast_expansion_hops
         self.ast_context_hops = max(0, int(ast_context_hops))
         self.chunk_size = chunk_size
@@ -166,11 +156,7 @@ class YawGraphEngine:
         self.semantic_adjudication_batch_size = semantic_adjudication_batch_size
         self.retrieval_top_k = retrieval_top_k
         self.embed_batch_size = embed_batch_size
-        self.activation = activation
-        self.activation_param = activation_param
-        self.activation_renormalize = activation_renormalize
         self.beta = beta
-        self.dual_weight = dual_weight
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
 
         self._csr_graph: CSRGraph | None = None
@@ -199,19 +185,6 @@ class YawGraphEngine:
             tuple[str, tuple[str, ...], tuple[float, ...], tuple[str, ...]],
         ] = {}
         self.ensemble: dspy.Module = self.program
-        self._active_embed_instruction: str = ""
-        self._active_embed_stage: str | None = None
-
-        @lru_cache(maxsize=4096)
-        def _encode_cached_text(namespace: str, text: str) -> np.ndarray:
-            encoded = self.embedder.encode(
-                [text],
-                instruction=self._active_embed_instruction,
-                stage=self._active_embed_stage,
-            )
-            return np.asarray(encoded[0], dtype=np.float32)
-
-        self._encode_cached_text = _encode_cached_text
 
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
@@ -226,6 +199,7 @@ class YawGraphEngine:
         payload = {
             "config": self.config.config_fingerprint() if self.config is not None else None,
             "embed_fp": embed_fingerprint(profile or self.program, instruction),
+            "index_identity": self.embedder.index_identity,
             "instruction": instruction,
             "embedder": {
                 "class": type(self.embedder).__module__ + "." + type(self.embedder).__qualname__,
@@ -273,7 +247,7 @@ class YawGraphEngine:
                 "SELECT c.chunk_id FROM chunks c JOIN chunk_inference i ON c.chunk_id=i.chunk_id "
                 "JOIN chunk_vec v ON v.chunk_id=c.chunk_id "
                 "WHERE i.program_identity=? AND i.embedding_identity=?",
-                (curr_openie_fp, self.embedder.profile.index_identity),
+                (curr_openie_fp, self.embedder.index_identity),
             )
         }
         if ready_cids:
@@ -299,8 +273,7 @@ class YawGraphEngine:
                         "telemetry",
                         "embedding_audit_trail",
                         "label_judge_audit_trail",
-                        "hierarchy_judge_audit_trail",
-                        "related_judge_audit_trail",
+                        "relation_judge_audit_trail",
                         "shacl_audit_trail",
                         "entity_def_audit_trail",
                     ):
@@ -369,8 +342,7 @@ class YawGraphEngine:
             "shacl_repairs_applied": 0,
             "shacl_conforms": True,
             "label_judge_tokens": 0,
-            "hierarchy_judge_tokens": 0,
-            "related_judge_tokens": 0,
+            "relation_judge_tokens": 0,
             "shacl_healer_tokens": 0,
             "missing_entity_defs_count": 0,
             "missing_entity_defs_tokens": 0,
@@ -386,9 +358,19 @@ class YawGraphEngine:
         hydrator = make_ast_island_hydrator(self.conn, self.workspace_root)
         return hydrator(chunk_id)
 
+    def publish_indexing_embedding_telemetry(self, entries: Sequence[Mapping[str, Any]]) -> None:
+        """Record each indexing execution once on the engine owner boundary."""
+        with self._lock:
+            for entry in entries:
+                self._on_embedding_telemetry(entry)
+
     def _on_embedding_telemetry(self, entry: Mapping[str, Any]) -> None:
-        self._graph_rlm_stats["embedding_calls"] += 1
-        self._graph_rlm_stats["embedding_tokens"] += int(entry.get("tokens_used", 0))
+        self._graph_rlm_stats["embedding_calls"] += int(entry.get("num_batches", 1))
+        tokens = entry["tokens_used"]
+        current = self._graph_rlm_stats["embedding_tokens"]
+        self._graph_rlm_stats["embedding_tokens"] = (
+            current + tokens if current is not None and tokens is not None else None
+        )
         if hasattr(self.program, "record_embedding_telemetry"):
             self.program.record_embedding_telemetry(entry)
 
@@ -738,12 +720,7 @@ class YawGraphEngine:
     ) -> Any:
         if not texts:
             return []
-        if hasattr(self.embedder, "bind_telemetry_hook"):
-            namespace = self._embedding_cache_namespace(instruction)
-            self._active_embed_instruction = instruction
-            self._active_embed_stage = stage
-            return [self._encode_cached_text(namespace, str(t)) for t in texts]
-        return self.embedder.encode(texts, instruction=instruction)
+        return self.embedder.batch_encode(texts, instruction=instruction, stage=stage)
 
     @staticmethod
     def _format_hydrated_passage(p: ChunkPointer, text: str) -> str:
@@ -773,7 +750,7 @@ class YawGraphEngine:
         subgraph_header = ""
         passage_budget = budget
         if include_subgraph and self.conn is not None:
-            max_subgraph = min(6000, max(0, budget // 4))
+            max_subgraph = budget // 4 if budget is not None else None
             chunk_ids = [p.chunk_id for p, _, _ in hits]
             subgraph_header = format_subgraph_for_qa(
                 self.conn,
@@ -781,8 +758,8 @@ class YawGraphEngine:
                 seed_facts=seed_facts,
                 max_subgraph_chars=max_subgraph,
             )
-            if subgraph_header:
-                passage_budget = max(1000, budget - len(subgraph_header) - 2)
+            if subgraph_header and budget is not None:
+                passage_budget = max(0, budget - len(subgraph_header) - 2)
 
         ptrs_scores = [(p, s) for p, s, _ in hits]
         hydrated = hydrate_budgeted_passages(
@@ -888,8 +865,7 @@ class YawGraphEngine:
             if target_cids and any(cid in self._chunk_rlm_stats for cid in target_cids):
                 agg: dict[str, float] = {
                     "label_judge_tokens": 0.0,
-                    "hierarchy_judge_tokens": 0.0,
-                    "related_judge_tokens": 0.0,
+                    "relation_judge_tokens": 0.0,
                     "shacl_healer_tokens": 0.0,
                     "shacl_violations_initial": 0.0,
                     "shacl_violations_remaining": 0.0,
@@ -903,8 +879,7 @@ class YawGraphEngine:
                     if c_stats:
                         for k in (
                             "label_judge_tokens",
-                            "hierarchy_judge_tokens",
-                            "related_judge_tokens",
+                            "relation_judge_tokens",
                             "shacl_healer_tokens",
                             "shacl_violations_initial",
                             "shacl_violations_remaining",
@@ -1024,8 +999,7 @@ class YawGraphEngine:
             for name in (
                 "entity_def_audit_trail",
                 "label_judge_audit_trail",
-                "hierarchy_judge_audit_trail",
-                "related_judge_audit_trail",
+                "relation_judge_audit_trail",
                 "shacl_audit_trail",
             ):
                 getattr(active_program, name).extend(getattr(summary, name))
@@ -1143,14 +1117,6 @@ class YawGraphEngine:
                             )
                         )
 
-            if not kept_facts_with_scores and allow_intent_path:
-                return self.retrieve_with_seeds(
-                    intent_query,
-                    top_k=top_k,
-                    allow_intent_path=False,
-                    program=active_program,
-                )
-
             # 2. Hybrid Dense + Lexical Passage Seeding
             query_passage_vec = self._encode_texts(
                 [query], instruction=PASSAGE_INSTRUCTION, stage="query_passage_embed"
@@ -1169,96 +1135,86 @@ class YawGraphEngine:
                 for (cid, _), s in zip(fts_hits, fts_scores, strict=False):
                     passage_weights[cid] = passage_weights.get(cid, 0.0) + self.fts_weight * float(s)
 
-            # 3. PPR Execution or Dense Fallback
+            # 3. Infer entity relevance from both fact and passage seeds.
             pool_k = max(top_k * 4, 50)
-            ranked_chunks: list[tuple[str, float]] = []
+            kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
+            f_placeholders = ",".join("?" for _ in kept_fids)
+            fact_kind_by_fid: dict[str, str] = {}
+            fact_conf_by_fid: dict[str, float | None] = {}
+            endpoints_by_fid: dict[str, tuple[str, Any]] = {}
+            fact_sources_by_fid: dict[str, list[str]] = {}
+            for r in self.conn.execute(
+                f"SELECT f.fact_id, f.obj_kind, f.confidence, f.subj_id, f.obj_id, s.chunk_id "
+                f"FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id "
+                f"WHERE f.fact_id IN ({f_placeholders})",
+                kept_fids,
+            ):
+                fid = str(r[0])
+                if fid not in fact_kind_by_fid:
+                    fact_kind_by_fid[fid] = str(r[1])
+                    fact_conf_by_fid[fid] = float(r[2]) if r[2] is not None else None
+                    endpoints_by_fid[fid] = (str(r[3]), r[4])
+                if r[5] is not None:
+                    fact_sources_by_fid.setdefault(fid, []).append(str(r[5]))
 
-            if not kept_facts_with_scores:
-                sorted_passages = sorted(passage_weights.items(), key=lambda kv: kv[1], reverse=True)
-                ranked_chunks = sorted_passages[:pool_k]
-            else:
-                kept_fids = [fid for fid, _, _ in kept_facts_with_scores]
-                f_placeholders = ",".join("?" for _ in kept_fids)
-                fact_kind_by_fid: dict[str, str] = {}
-                fact_conf_by_fid: dict[str, float | None] = {}
-                endpoints_by_fid: dict[str, tuple[str, Any]] = {}
-                fact_sources_by_fid: dict[str, list[str]] = {}
-                for r in self.conn.execute(
-                    f"SELECT f.fact_id, f.obj_kind, f.confidence, f.subj_id, f.obj_id, s.chunk_id "
-                    f"FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id "
-                    f"WHERE f.fact_id IN ({f_placeholders})",
-                    kept_fids,
-                ):
-                    fid = str(r[0])
-                    if fid not in fact_kind_by_fid:
-                        fact_kind_by_fid[fid] = str(r[1])
-                        fact_conf_by_fid[fid] = float(r[2]) if r[2] is not None else None
-                        endpoints_by_fid[fid] = (str(r[3]), r[4])
-                    if r[5] is not None:
-                        fact_sources_by_fid.setdefault(fid, []).append(str(r[5]))
+            seed_entities: dict[str, list[float]] = {}
+            literal_chunk_seeds: dict[str, list[float]] = {}
+            for fid, _, score in kept_facts_with_scores:
+                f_prior = fact_conf_by_fid.get(fid)
+                pooled_score = pool_confidences(score, f_prior) or score
+                subject, obj = endpoints_by_fid[fid]
+                seed_entities.setdefault(subject, []).append(pooled_score)
+                if fact_kind_by_fid[fid] == "literal":
+                    src_cids = fact_sources_by_fid.get(fid, ())
+                    if src_cids:
+                        share = pooled_score / float(len(src_cids))
+                        for src_cid in src_cids:
+                            literal_chunk_seeds.setdefault(src_cid, []).append(share)
+                else:
+                    seed_entities.setdefault(str(obj), []).append(pooled_score)
 
-                seed_entities: dict[str, list[float]] = {}
-                literal_chunk_seeds: dict[str, list[float]] = {}
-                for fid, _, score in kept_facts_with_scores:
-                    f_prior = fact_conf_by_fid.get(fid)
-                    pooled_score = pool_confidences(score, f_prior) or score
-                    subject, obj = endpoints_by_fid[fid]
-                    seed_entities.setdefault(subject, []).append(pooled_score)
-                    if fact_kind_by_fid[fid] == "literal":
-                        src_cids = fact_sources_by_fid.get(fid, ())
-                        if src_cids:
-                            share = pooled_score / float(len(src_cids))
-                            for src_cid in src_cids:
-                                literal_chunk_seeds.setdefault(src_cid, []).append(share)
-                    else:
-                        seed_entities.setdefault(str(obj), []).append(pooled_score)
+            doc_freqs = get_entity_doc_frequencies(self.conn, list(seed_entities.keys()))
 
-                doc_freqs = get_entity_doc_frequencies(self.conn, list(seed_entities.keys()))
+            e_ids_list = list(seed_entities.keys())
+            ent_confs: dict[str, float | None] = {}
+            if e_ids_list:
+                e_ph = ",".join("?" for _ in e_ids_list)
+                ent_confs = {
+                    str(r[0]): (float(r[1]) if r[1] is not None else None)
+                    for r in self.conn.execute(
+                        f"SELECT entity_id, confidence FROM entities WHERE entity_id IN ({e_ph})",
+                        e_ids_list,
+                    ).fetchall()
+                }
 
-                e_ids_list = list(seed_entities.keys())
-                ent_confs: dict[str, float | None] = {}
-                if e_ids_list:
-                    e_ph = ",".join("?" for _ in e_ids_list)
-                    ent_confs = {
-                        str(r[0]): (float(r[1]) if r[1] is not None else None)
-                        for r in self.conn.execute(
-                            f"SELECT entity_id, confidence FROM entities WHERE entity_id IN ({e_ph})",
-                            e_ids_list,
-                        ).fetchall()
-                    }
+            entity_reset_weights: list[tuple[str, float]] = []
+            for eid, scores in seed_entities.items():
+                mean_score = sum(scores) / len(scores)
+                df = max(1, doc_freqs.get(eid, 0))
+                p_node = ent_confs.get(eid)
+                calibrated_score = pool_confidences(mean_score, p_node) or mean_score
+                w_entity = calibrated_score / float(df)
+                entity_reset_weights.append((eid, w_entity))
 
-                entity_reset_weights: list[tuple[str, float]] = []
-                for eid, scores in seed_entities.items():
-                    mean_score = sum(scores) / len(scores)
-                    df = max(1, doc_freqs.get(eid, 0))
-                    p_node = ent_confs.get(eid)
-                    calibrated_score = pool_confidences(mean_score, p_node) or mean_score
-                    w_entity = calibrated_score / float(df)
-                    entity_reset_weights.append((eid, w_entity))
+            entity_reset_weights.sort(key=lambda kv: kv[1], reverse=True)
+            top_entity_seeds = dict(entity_reset_weights[: self.linking_top_k])
 
-                entity_reset_weights.sort(key=lambda kv: kv[1], reverse=True)
-                top_entity_seeds = dict(entity_reset_weights[: self.linking_top_k])
+            reset_distribution: dict[str, float] = {}
+            for eid, w in top_entity_seeds.items():
+                reset_distribution[eid] = w
 
-                reset_distribution: dict[str, float] = {}
-                for eid, w in top_entity_seeds.items():
-                    reset_distribution[eid] = w
+            for cid, w in passage_weights.items():
+                reset_distribution[cid] = self.passage_node_weight * w
 
-                for cid, w in passage_weights.items():
-                    reset_distribution[cid] = self.passage_node_weight * w
+            for cid, l_scores in literal_chunk_seeds.items():
+                reset_distribution[cid] = reset_distribution.get(cid, 0.0) + (sum(l_scores) / len(l_scores))
 
-                for cid, l_scores in literal_chunk_seeds.items():
-                    reset_distribution[cid] = reset_distribution.get(cid, 0.0) + (sum(l_scores) / len(l_scores))
-
-                ppr_scores = run_ppr(
-                    graph,
-                    reset_distribution,
-                    damping=self.damping,
-                    activation=self.activation,
-                    activation_param=self.activation_param,
-                    renormalize=self.activation_renormalize,
-                    dual_weight=self.dual_weight,
-                )
-                ranked_chunks = rank_passages_by_ppr(graph, ppr_scores, top_k=pool_k)
+            hmm_scores = run_hmm(
+                graph,
+                reset_distribution,
+                damping=self.damping,
+            )
+            ranked_chunks = rank_passages_by_hmm(graph, hmm_scores, top_k=pool_k)
 
             kept_facts_triples = [t for _, t, _ in kept_facts_with_scores]
             for seed_t in kept_facts_triples:
@@ -1332,7 +1288,7 @@ class YawGraphEngine:
         *,
         program: YawProgram | None = None,
     ) -> list[tuple[ChunkPointer, float, str]]:
-        """Retrieve top-k chunks for query using hybrid PPR + 1-indexed line hydration."""
+        """Retrieve top-k chunks for query using hybrid HMM + 1-indexed line hydration."""
         hits, _ = self.retrieve_with_seeds(query, top_k=top_k, program=program)
         return hits
 
@@ -1515,7 +1471,7 @@ class YawGraphEngine:
                 for hp in hydrate_passages(
                     ptrs_scores,
                     self.workspace_root,
-                    max_island_chars=active_prog._context_char_limit(4000),
+                    max_island_chars=active_prog._context_char_limit(4096),
                     max_total_chars=0,
                 ):
                     if hp.text:
@@ -1576,11 +1532,7 @@ class YawGraphEngine:
                     "candidate_lexical_threshold",
                     "auto_merge_threshold",
                     "retrieval_top_k",
-                    "activation",
-                    "activation_param",
-                    "activation_renormalize",
                     "beta",
-                    "dual_weight",
                 )
             },
             bind_program_hooks=self._bind_program_hooks,
@@ -1606,7 +1558,6 @@ class YawGraphEngine:
         save_path: Path | str | None = None,
         reflection_lm: Any = None,
         reflection_worker_lm: Any = None,
-        reflection_token_counter: Any = None,
         auto: Literal["light", "medium", "heavy"] | None = "light",
         num_candidates: int | None = None,
         num_trials: int | None = None,
@@ -1628,7 +1579,6 @@ class YawGraphEngine:
                 save_path=save_path,
                 reflection_lm=reflection_lm,
                 reflection_worker_lm=reflection_worker_lm,
-                reflection_token_counter=reflection_token_counter,
                 auto=auto,
                 num_candidates=num_candidates,
                 num_trials=num_trials,

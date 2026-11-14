@@ -1857,15 +1857,20 @@ def _find_workload_processes(*, include_optimizer: bool = False) -> list[psutil.
         if "llama-server" in name:
             targets.append(p)
             seen_pids.add(p.pid)
-        elif include_optimizer and any(k in name for k in ("yaw", "python")):
-            if ("yaw" in cmd and "optimize" in cmd) and "watchdog" not in cmd:
-                targets.append(p)
-                seen_pids.add(p.pid)
-                with contextlib.suppress(psutil.Error, OSError):
-                    for child in p.children(recursive=True):
-                        if child.pid not in seen_pids and child.pid not in my_pids:
-                            targets.append(child)
-                            seen_pids.add(child.pid)
+        elif (
+            include_optimizer
+            and any(k in name for k in ("yaw", "python"))
+            and "yaw" in cmd
+            and "optimize" in cmd
+            and "watchdog" not in cmd
+        ):
+            targets.append(p)
+            seen_pids.add(p.pid)
+            with contextlib.suppress(psutil.Error, OSError):
+                for child in p.children(recursive=True):
+                    if child.pid not in seen_pids and child.pid not in my_pids:
+                        targets.append(child)
+                        seen_pids.add(child.pid)
 
     def _proc_depth(proc: psutil.Process) -> int:
         try:

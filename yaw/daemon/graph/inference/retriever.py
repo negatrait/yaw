@@ -29,7 +29,7 @@ class YawPassage(dspy.Prediction):
 
 
 class YawRM:
-    """First-class DSPy Retrieval Model (`dspy.RM`) backed by YAW's Forward-Push PPR & recognition memory hook."""
+    """DSPy retrieval model backed by the entity-state HMM and recognition memory."""
 
     def __init__(
         self,
@@ -111,7 +111,7 @@ class YawRM:
 
 
 class YawRetriever(dspy.Retrieve):
-    """First-class `dspy.Retrieve` module backed by `YawRM` and YAW's Forward-Push PPR + recognition memory."""
+    """First-class `dspy.Retrieve` module backed by `YawRM` and YAW's sparse entity-state HMM + recognition memory."""
 
     def __init__(
         self,

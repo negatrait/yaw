@@ -23,9 +23,8 @@ from yaw.daemon.graph.inference.prompts import (
     ExtractTriples,
     FilterTriples,
     HealSHACLViolations,
-    JudgeHierarchy,
     JudgeLabels,
-    JudgeRelated,
+    JudgeRelations,
     ProposeSHACLRepairs,
     ReflectiveInnerDistillerSignature,
 )
@@ -52,7 +51,7 @@ def provider():
                                 "content": json.dumps(
                                     {
                                         "named_entities": [["Widget", "An object described in the source."]],
-                                        "reasoning": "Supported by the source.",
+                                        "plan": "Supported by the source.",
                                         "answer": "Widget",
                                         "query_intent": "Widget is an object",
                                     }
@@ -241,8 +240,9 @@ def test_history_remains_explicit_conversation_input_not_diagnostic_storage():
 
     history = dspy.History(messages=[{"question": "Which object?", "answer": "Widget"}])
     messages = YawGBNFAdapter().format(Conversation, [], {"question": "What was its name?", "history": history})
-    assert [message["role"] for message in messages] == ["system", "user", "assistant", "user"]
-    assert "Widget" in messages[-2]["content"]
+    assert messages.system
+    assert [message.role for message in messages.messages] == ["user", "assistant", "user"]
+    assert "Widget" in str(messages.messages[-2].parts)
     assert len(history.messages) == 1
 
 
@@ -262,8 +262,7 @@ def test_typed_schema_contracts_exported_on_prompts_and_inference_facade():
         "EquivalentLabelDecision",
         "DistinctLabelDecision",
         "LabelDecision",
-        "HierarchyDecision",
-        "RelatedDecision",
+        "RelationDecision",
         "SHACLRepairAction",
         "SHACLRepair",
         "DistillerReference",
@@ -282,8 +281,7 @@ def test_predictor_signatures_emit_strict_json_schema_hints():
         ExtractTriples,
         DefineMissingEntities,
         JudgeLabels,
-        JudgeHierarchy,
-        JudgeRelated,
+        JudgeRelations,
         ProposeSHACLRepairs,
         HealSHACLViolations,
         FilterTriples,
@@ -301,8 +299,7 @@ def test_predictor_signatures_emit_strict_json_schema_hints():
     object_schema_signatures = (
         ExtractTriples,
         JudgeLabels,
-        JudgeHierarchy,
-        JudgeRelated,
+        JudgeRelations,
         ProposeSHACLRepairs,
         HealSHACLViolations,
         ReflectiveInnerDistillerSignature,
@@ -351,13 +348,9 @@ def test_predictor_signatures_emit_strict_json_schema_hints():
     ):
         assert token in label_schema, f"{token} missing from JudgeLabels schema: {label_schema}"
 
-    hierarchy_schema = adapter.format_field_structure(JudgeHierarchy).replace('\\"', '"')
-    for token in ("HierarchyDecision", '"pair_id"', '"reasoning"', '"broader"', '"narrower"'):
-        assert token in hierarchy_schema
-
-    related_schema = adapter.format_field_structure(JudgeRelated).replace('\\"', '"')
-    for token in ("RelatedDecision", '"pair_id"', '"reasoning"', '"related"'):
-        assert token in related_schema
+    relation_schema = adapter.format_field_structure(JudgeRelations).replace('\\"', '"')
+    for token in ("RelationDecision", '"pair_id"', '"reasoning"', '"relation"', "skos:broader", "owl:differentFrom"):
+        assert token in relation_schema
 
     for shacl_sig in (ProposeSHACLRepairs, HealSHACLViolations):
         shacl_schema = adapter.format_field_structure(shacl_sig).replace('\\"', '"')
@@ -421,18 +414,10 @@ def test_predictor_signatures_parse_valid_and_reject_invalid_payloads():
 
     assert (
         adapter.parse(
-            JudgeHierarchy,
-            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Subtype", "broader": true, "narrower": false}]}',
-        )["decisions"][0]["broader"]
-        is True
-    )
-
-    assert (
-        adapter.parse(
-            JudgeRelated,
-            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Related", "related": true}]}',
-        )["decisions"][0]["related"]
-        is True
+            JudgeRelations,
+            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Subtype", "relation": "skos:broader"}]}',
+        )["decisions"][0]["relation"]
+        == "skos:broader"
     )
 
     for shacl_sig in (ProposeSHACLRepairs, HealSHACLViolations):
@@ -492,11 +477,11 @@ def test_predictor_signatures_parse_valid_and_reject_invalid_payloads():
             JudgeLabels,
             '{"decisions": [{"pair_id": "a|b", "reasoning": "r", "equivalent": false, "hidden_label": false}]}',
         ),
-        (JudgeHierarchy, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing narrower", "broader": true}]}'),
-        (JudgeRelated, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing related"}]}'),
+        (JudgeRelations, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Missing relation"}]}'),
+        (JudgeRelations, '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Invalid", "relation": "invalid"}]}'),
         (
-            JudgeRelated,
-            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Extra field", "related": true, "extra": 1}]}',
+            JudgeRelations,
+            '{"decisions": [{"pair_id": "e0|e1", "reasoning": "Extra", "relation": "skos:related", "extra": 1}]}',
         ),
         (ProposeSHACLRepairs, '{"repairs": [{"focus_node": "ent-1", "action": "invent_action", "value": "x"}]}'),
         (HealSHACLViolations, '{"repairs": [{"focus_node": "ent-1", "action": "invent_action", "value": "x"}]}'),

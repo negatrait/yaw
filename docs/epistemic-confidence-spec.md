@@ -1,5 +1,7 @@
 # Technical Specification: Unified Logarithmic Opinion Pool & Bayesian Markov Graph Engine
 
+> **2026-11-13 P2 update:** Historical hierarchy/related model stages and their Boolean votes below are superseded by one oriented `JudgeRelations` enum decision. Pool only actually measured identity and relation votes; fact-derived constraints do not fabricate votes. [P2 review](reviews/prompt-context-integrity.md) records current evidence and gates.
+
 Status: active, 2026-11-08. Pinned code: `c98aebe`.
 
 - Controls: [types.py](../yaw/core/types.py), [__init__.py](../yaw/core/__init__.py), [config.py](../yaw/core/config.py), [planner.py](../yaw/daemon/graph/planner.py), [normalization.py](../yaw/daemon/graph/normalization.py), [engine.py](../yaw/daemon/graph/engine.py), [ppr.py](../yaw/daemon/graph/ppr.py), [prompts.py](../yaw/daemon/graph/inference/prompts.py), [grammars.py](../yaw/daemon/graph/inference/grammars.py), [adapter.py](../yaw/daemon/graph/inference/adapter.py), [parsers.py](../yaw/daemon/graph/inference/parsers.py), [program.py](../yaw/daemon/graph/inference/program.py), [invariants.py](../yaw/daemon/graph/inference/invariants.py), [components.py](../yaw/daemon/graph/inference/components.py), [evidence.py](../yaw/daemon/graph/storage/evidence.py), [graph_ops.py](../yaw/daemon/graph/storage/graph_ops.py), [shacl.py](../yaw/daemon/graph/storage/shacl.py), [rows.py](../yaw/daemon/graph/storage/rows.py), [synonyms.py](../yaw/daemon/graph/storage/synonyms.py), [__init__.py](../yaw/daemon/graph/storage/__init__.py), [indexing.py](../yaw/daemon/indexing.py), [runtime.py](../yaw/daemon/runtime.py) ([test_architecture.py](../tests/core/test_architecture.py))
@@ -11,7 +13,7 @@ Status: active, 2026-11-08. Pinned code: `c98aebe`.
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
 | Rules | [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
 | Owns code | `yaw/daemon/graph/storage/graph_ops.py:pool_confidences`, `yaw/daemon/graph/storage/graph_ops.py:bayesian_noisy_or`, `yaw/daemon/graph/storage/shacl.py:auto_heal_deterministic_shacl`, `yaw/daemon/graph/ppr.py:build_transition_matrix` |
-| Peers | [w3c-improvements.md](w3c-improvements.md): owns 3-stage `JudgeLabels` / `JudgeHierarchy` / `JudgeRelated` cascade (`W1`), same-norm pre-consolidation (`W2`), universal statement irreflexivity (`W3`), Tier 3 deterministic fact definition synthesis (`W4`), and non-transitive `1`-hop `skos:broader` (`W5`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns incremental graph publication and `DatabaseSink` atomicity; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture; [Epic 3](epic-3-performance.md): consumes `pool_confidences` and `bayesian_noisy_or` for post-Epic 2 functional-property distractor down-weighting and `prov:wasDerivedFrom` co-provenance reinforcement |
+| Peers | [w3c-improvements.md](w3c-improvements.md): owns two-stage `JudgeLabels` / `JudgeRelations` cascade (`W1`), same-norm pre-consolidation (`W2`), universal statement irreflexivity (`W3`), Tier 3 deterministic fact definition synthesis (`W4`), and non-transitive `1`-hop `skos:broader` (`W5`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns incremental graph publication and `DatabaseSink` atomicity; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture; [Epic 3](epic-3-performance.md): consumes `pool_confidences` and `bayesian_noisy_or` for post-Epic 2 functional-property distractor down-weighting and `prov:wasDerivedFrom` co-provenance reinforcement |
 | References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
 | Supersedes / superseded by | Supersedes heuristic `COUNT(*)` edge weights and `.5` modulo hacks; multi-hop `broader_tc` S27 closure (§1.1, §1.3) and `is_modifier_head_specialization` in `planner.py` (§2.4) are superseded on `2026-11-08` by Invariants `W1`–`W5` ([w3c-improvements.md §§12–13](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates)) |
 | Records | [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-inference.md](evaluation-inference.md) |
@@ -300,7 +302,7 @@ No speculative scheme code or dependency remains for such an experiment.
      3. $w_{\text{broader}}(A, C) \ge w_{\text{rel}}(A, C)$ prunes `skos:related(A, C)`.
      4. $w_{\text{rel}}(A, C) > w_{\text{broader}}(A, C)$ keeps `skos:related(A, C)` at $w_{\text{rel}}(A, C)$ and deletes the direct `1`-hop `skos:broader(A, C)` edge, while a `2`-hop `A skos:broader B skos:broader C` chain with `A skos:related C` is valid under non-transitive `skos:broader`.
    - **Canonical Gemma 4 Ontology SSOT Test (`W1` & `W2`)**: Verify `apply_synonym_adjudication` executes Stage 1–3 Gemma 4 decisions and topological `_is_active_fact_pole` guards without post-hoc Python token rewrites (`is_modifier_head_specialization` retired).
-   - **Markov Chain Divergence & Export Provenance Test**: Prove `run_ppr` rankings diverge under calibrated + typed weights vs. uniform weights, and assert `serialize_graph_turtle` exports `prov:value "..."^^xsd:double` with zero `yaw:` or `dct:` strings. QA injection requires separate evidence from the active QA path.
+   - **Markov Chain Divergence & Export Provenance Test**: Prove `run_hmm` rankings diverge under calibrated + typed weights vs. uniform weights, and assert `serialize_graph_turtle` exports `prov:value "..."^^xsd:double` with zero `yaw:` or `dct:` strings. QA injection requires separate evidence from the active QA path.
 2. **Mandatory Quality Gates**:
    ```bash
    uv run ty check
@@ -313,3 +315,17 @@ No speculative scheme code or dependency remains for such an experiment.
 ## Decisions
 
 - 2026-11-08: Supersedes multi-hop `broader_tc` S27 closure (§1.1, §1.3) and post-hoc Python token overrides (`is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `_is_acronym`, `auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` (§2.4) under Invariants `W1`–`W5` ([w3c-improvements.md §§12–13](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates), [native-cocoindex-graph.md §4](native-cocoindex-graph.md#4-semantics-and-invariants)): `skos:broader` is strictly `1`-hop non-transitive under W3C SKOS (`03-SEMANTIC-RELATIONS.md:45-59`), `ConceptShape/S27-disjointBroaderRelated` and `auto_heal_deterministic_shacl` operate strictly on direct `1`-hop `skos:broader` vs. `skos:related` collisions (`w_broader` vs. `w_rel`), and `planner.py` enforces same-norm pre-consolidation only (`W2`) while `JudgeLabels` enforces `merge(A, B) <=> equivalent(A, B) = true` (`W1`).
+
+## H1 retrieval contract (2026-11-13)
+
+The user-approved [decoupled graph-HMM contract](reviews/hmm-retrieval.md) supersedes
+the PPR propagation target. Entity confidence is a separate observation likelihood
+and must survive degree normalization; unknown confidence is neutral. Entity
+state relevance and passage emission relevance are separate layers, neither a
+calibration claim nor mixed-node probability-mass conservation. Distinctness
+remains outside positive and negative relevance scoring. Historical PPR experiments
+and their measurements remain historical, pending new HMM benchmark evidence.
+
+### P2 relation confidence (2026-11-13)
+
+One typed relation judgment replaces hierarchy and related judgments. Pool only actual identity and relation model votes; deterministic fact evidence contributes no fabricated vote. See P2 in the prompt-context review for acceptance evidence.

@@ -9,6 +9,7 @@ from typing import Any
 
 from yaw.core import (
     SHACLViolation,
+    compute_mdhash_id,
     detect_scalar_literal,
     is_irreflexive_statement,
     is_resource_label,
@@ -134,7 +135,7 @@ def inspect_entity_or_fact(
     ]
 
     raw_edges = conn.execute(
-        "SELECT src_id, dst_id, kind, weight FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?) "
+        "SELECT src_id, dst_id, kind, weight, reasoning FROM edges WHERE src_id IN (?, ?) OR dst_id IN (?, ?) "
         "ORDER BY src_id ASC, dst_id ASC, kind ASC",
         (focus_node, eid, focus_node, eid),
     ).fetchall()
@@ -166,6 +167,7 @@ def inspect_entity_or_fact(
                 "dst_id": d_id,
                 "kind": k_str,
                 "weight": w_val,
+                "reasoning": str(r[4]),
                 "neighbor_id": other_id,
                 "neighbor_name": other_name,
                 "neighbor_definition": other_def,
@@ -1571,15 +1573,17 @@ def serialize_graph_turtle(
         labels_by_eid.setdefault(eid, []).append((lkind, lbl, cid))
 
     sem_edges_by_eid: dict[str, list[tuple[str, str]]] = {}
+    semantic_assertions: list[tuple[str, str, str, float, str]] = []
     for row in conn.execute(
         """
-        SELECT src_id, kind, dst_id
+        SELECT src_id, kind, dst_id, weight, reasoning
         FROM edges
         WHERE kind IN ('skos:related', 'skos:broader', 'owl:differentFrom')
         ORDER BY src_id ASC, kind ASC, dst_id ASC
         """
     ):
         sem_edges_by_eid.setdefault(str(row[0]), []).append((str(row[1]), str(row[2])))
+        semantic_assertions.append((str(row[0]), str(row[1]), str(row[2]), float(row[3]), str(row[4])))
 
     for row in conn.execute("SELECT entity_id, name, definition, confidence FROM entities ORDER BY entity_id ASC"):
         eid, ename, edef, econf = str(row[0]), str(row[1]), str(row[2]), row[3]
@@ -1663,6 +1667,20 @@ def serialize_graph_turtle(
         if fconf is not None:
             stmt_parts.append(f'prov:value "{float(fconf):.6f}"^^xsd:double')
         lines.append(f":{fid} " + " ;\n    ".join(stmt_parts) + " .")
+        lines.append("")
+
+    for subject, predicate, obj, weight, reasoning in semantic_assertions:
+        assertion_id = compute_mdhash_id(json.dumps([subject, predicate, obj]), prefix="edge-")
+        parts = [
+            "a rdf:Statement",
+            f"rdf:subject :{subject}",
+            f"rdf:predicate {predicate}",
+            f"rdf:object :{obj}",
+            f'prov:value "{weight!r}"^^xsd:double',
+        ]
+        if reasoning.strip():
+            parts.append(f"skos:note {_escape_turtle_literal(reasoning)}")
+        lines.append(f":{assertion_id} " + " ;\n    ".join(parts) + " .")
         lines.append("")
 
     conforms_str = "true" if len(violations) == 0 else "false"

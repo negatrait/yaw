@@ -11,7 +11,7 @@ from daemon.graph.candidate_fixtures import seed_candidate_vectors
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.storage import (
     find_entity_candidates,
-    iter_synonym_evidence,
+    iter_semantic_evidence,
     open_yaw_db,
     upsert_chunk_pointers,
     upsert_edges_with_sources,
@@ -114,19 +114,19 @@ def test_dossiers_share_profiles_split_on_budget_and_keep_every_pair_evidence(tm
             }
             for i in range(1, 4)
         ]
-        batches = list(iter_synonym_evidence(conn, candidates, tmp_path))
+        batches = list(iter_semantic_evidence(conn, candidates, tmp_path))
         assert len(batches) == 1
         prompt = batches[0].payload
-        assert prompt.count("Unique definition 0") == 3
-        assert prompt.count("Grounded evidence for Concept 0.") == 3
-        assert prompt.count("Common evidence for all four entities.") == 6
+        assert prompt.count("Unique definition 0") == 1
+        assert prompt.count("Grounded evidence for Concept 0.") == 1
+        assert prompt.count("Common evidence for all four entities.") == 1
         for i in range(1, 4):
             assert f"Unique definition {i}" in prompt
             assert f"Grounded evidence for Concept {i}." in prompt
 
-        single_prompts = list(iter_synonym_evidence(conn, candidates, tmp_path, batch_size=1))
+        single_prompts = list(iter_semantic_evidence(conn, candidates, tmp_path, batch_size=1))
         limit = max(len(p.payload) for p in single_prompts)
-        split = list(iter_synonym_evidence(conn, candidates, tmp_path, max_chars=limit))
+        split = list(iter_semantic_evidence(conn, candidates, tmp_path, max_chars=limit))
         assert len(split) == 3
         assert [c for batch in split for c in batch.candidates] == candidates
         for batch in split:
@@ -134,12 +134,12 @@ def test_dossiers_share_profiles_split_on_budget_and_keep_every_pair_evidence(tm
             assert len(text) <= limit
             assert "Unique definition 0" in text
             assert batch.candidates[0]["def_b"] in text
-            assert text.count("Common evidence for all four entities.") == 2
+            assert text.count("Common evidence for all four entities.") == 1
             index = json.loads(text)["pairs"]
             a, b = index[0]["pair_id"].split("|")
             assert f"{batch.identifiers[a]}|{batch.identifiers[b]}" == batch.candidates[0]["pair_id"]
         with pytest.raises(ValueError, match="Complete disambiguation evidence"):
-            list(iter_synonym_evidence(conn, candidates, tmp_path, max_chars=100))
+            list(iter_semantic_evidence(conn, candidates, tmp_path, max_chars=100))
 
 
 def test_dossier_identity_changes_when_source_evidence_changes(tmp_path: Path) -> None:
@@ -151,14 +151,14 @@ def test_dossier_identity_changes_when_source_evidence_changes(tmp_path: Path) -
         upsert_chunk_pointers(conn, [(pointer, "Original passage.")])
         upsert_edges_with_sources(conn, [("c", "a", "passage", 1.0, "c")])
         candidates = [{"entity_a": "a", "entity_b": "b", "dense_sim": 0.8, "lexical_sim": 0.9}]
-        original = list(iter_synonym_evidence(conn, candidates, tmp_path))[0].payload
+        original = list(iter_semantic_evidence(conn, candidates, tmp_path))[0].payload
         source.write_text("Updated passage.\n", encoding="utf-8")
-        edited = list(iter_synonym_evidence(conn, candidates, tmp_path))[0].payload
+        edited = list(iter_semantic_evidence(conn, candidates, tmp_path))[0].payload
         assert "Updated passage." in edited
         assert "Original passage." not in edited
         assert edited != original
         upsert_entities(conn, [("a", "Alpha", "Changed definition")])
-        changed = list(iter_synonym_evidence(conn, candidates, tmp_path))[0].payload
+        changed = list(iter_semantic_evidence(conn, candidates, tmp_path))[0].payload
         assert edited != changed
         assert "Changed definition" in changed
 

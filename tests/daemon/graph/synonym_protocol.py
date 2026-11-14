@@ -5,24 +5,23 @@ import math
 import re
 from typing import Any
 
+from dspy.lm15 import TokenLogprob
 
-def response_logprobs(text: str, probability: float = 0.81) -> dict[str, Any]:
-    """OpenAI-shaped response metadata with measurable Boolean decision tokens."""
-    return {
-        "content": [
-            {
-                "token": token,
-                "bytes": list(token.encode()),
-                "logprob": math.log(probability) if token in ("true", "false") or token.startswith('"') else -0.001,
-                "top_logprobs": [],
-            }
-            for token in re.findall(r'"(?:[^"\\]|\\.)*"|true|false|.', text, re.DOTALL)
-        ]
-    }
+
+def response_logprobs(text: str, probability: float = 0.81) -> tuple[TokenLogprob, ...]:
+    """Native DSPy token metadata with measurable Boolean decision tokens."""
+    return tuple(
+        TokenLogprob(
+            token=token,
+            bytes=tuple(token.encode()),
+            logprob=math.log(probability) if token in ("true", "false") or token.startswith('"') else -0.001,
+        )
+        for token in re.findall(r'"(?:[^"\\]|\\.)*"|true|false|.', text, re.DOTALL)
+    )
 
 
 def candidate_rows(text: str) -> list[dict[str, Any]]:
-    m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', text)
+    m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v3"', text)
     if not m and '"pairs"' in text:
         m = re.search(r'\{\s*"pairs"\s*:', text)
     if not m:
@@ -76,28 +75,21 @@ def complete_decisions(
         or "hidden_label" in text_lower
         or "equivalent" in text_lower
     )
-    is_related_stage = not is_label_stage and (
-        "judgerelated" in text_lower
-        or "related_judge" in text_lower
+    is_relation_stage = not is_label_stage and (
+        "judgerelations" in text_lower
+        or "relationdecision" in text_lower
+        or "relation_judge" in text_lower
         or "differentfrom" in text_lower
-        or "different_from" in text_lower
+        or "skos:broader" in text_lower
     )
-    is_hierarchy_stage = (
-        not is_label_stage
-        and not is_related_stage
-        and ("judgehierarchy" in text_lower or "hierarchy_judge" in text_lower or "narrower" in text_lower)
-    )
-
-    if not (is_label_stage or is_hierarchy_stage or is_related_stage):
+    if not (is_label_stage or is_relation_stage):
         if any("equivalent" in d or "alt_label" in d or "hidden_label" in d for d in decisions):
             is_label_stage = True
-        elif any("broader" in d or "narrower" in d for d in decisions):
-            is_hierarchy_stage = True
-        elif any("related" in d and isinstance(d.get("related"), bool) for d in decisions):
-            is_related_stage = True
+        elif any("relation" in d for d in decisions):
+            is_relation_stage = True
 
     # If still not determined and stage_text is empty, fallback to legacy format
-    if not (is_label_stage or is_hierarchy_stage or is_related_stage):
+    if not (is_label_stage or is_relation_stage):
         result: list[dict[str, Any]] = []
         for pair in candidates:
             pid = pair["pair_id"]
@@ -152,73 +144,29 @@ def complete_decisions(
             res_list.append(item)
         return res_list
 
-    if is_hierarchy_stage:
-        res_list = []
+    if is_relation_stage:
+        result = []
         for pair in candidates:
             pid = pair["pair_id"]
-            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
-            d = chosen.get(pid, {})
-            if "broader" in d or "narrower" in d:
-                broader = bool(d.get("broader", False))
-                narrower = bool(d.get("narrower", False))
-                reason = str(d.get("reasoning", f"Hierarchy reasoning for {names}"))
-            else:
-                rel = str(d.get("relation", "")).strip()
-                if rel == "skos:broader":
-                    if "canonical" in d and not str(d.get("canonical", "")).strip():
-                        raise ValueError(f"invalid canonical: empty canonical in skos:broader decision for {pid}")
-                    canon = str(d.get("canonical", "")).strip().casefold()
-                    a_id = str(pair.get("entity_a", ""))
-                    b_id = str(pair.get("entity_b", ""))
-                    name_a = str(pair.get("name_a", "")).strip().casefold()
-                    name_b = str(pair.get("name_b", "")).strip().casefold()
-                    if canon in (b_id.casefold(), name_b, "b"):
-                        broader, narrower = True, False
-                    elif canon in (a_id.casefold(), name_a, "a"):
-                        broader, narrower = False, True
-                    else:
-                        broader, narrower = True, False
-                    reason = f"Broader hierarchy for {names}"
-                elif rel == "skos:narrower":
-                    broader, narrower = False, True
-                    reason = f"Narrower hierarchy for {names}"
-                else:
-                    broader, narrower = False, False
-                    reason = f"Not hierarchical for {names}"
-            res_list.append(
+            decision = chosen.get(pid, {})
+            relation = str(decision.get("relation", "skos:related"))
+            if relation == "skos:broader":
+                canonical = str(decision.get("canonical", "")).strip().casefold()
+                if "canonical" in decision and not canonical:
+                    raise ValueError(f"invalid canonical: empty canonical in skos:broader decision for {pid}")
+                if canonical in (str(pair.get("entity_a", "")).casefold(), str(pair.get("name_a", "")).casefold(), "a"):
+                    relation = "skos:narrower"
+            if relation in ("different", "different_from"):
+                relation = "owl:differentFrom"
+            if relation not in ("skos:broader", "skos:narrower", "skos:related", "owl:differentFrom"):
+                relation = "skos:related"
+            result.append(
                 {
                     "pair_id": pid,
-                    "reasoning": reason,
-                    "broader": broader,
-                    "narrower": narrower,
+                    "reasoning": str(decision.get("reasoning", "Evidence supports relation")),
+                    "relation": relation,
                 }
             )
-        return res_list
-
-    if is_related_stage:
-        res_list = []
-        for pair in candidates:
-            pid = pair["pair_id"]
-            names = " / ".join(sorted((str(pair.get("name_a", "")), str(pair.get("name_b", "")))))
-            d = chosen.get(pid, {})
-            if "related" in d and isinstance(d["related"], bool):
-                related = d["related"]
-                reason = str(d.get("reasoning", f"Related reasoning for {names}"))
-            else:
-                rel = str(d.get("relation", "")).strip()
-                if rel in ("owl:differentFrom", "different", "different_from"):
-                    related = False
-                    reason = f"Different concepts for {names}"
-                else:
-                    related = True
-                    reason = f"Related concepts for {names}"
-            res_list.append(
-                {
-                    "pair_id": pid,
-                    "reasoning": reason,
-                    "related": related,
-                }
-            )
-        return res_list
+        return result
 
     return []

@@ -1,4 +1,4 @@
-"""Real-substrate tests for YawProgram 3-stage W3C semantic cascade."""
+"""Real-substrate tests for YawProgram two-stage W3C semantic cascade."""
 
 import json
 from typing import Any
@@ -8,146 +8,60 @@ import dspy
 from yaw.core import SynonymEvidenceBatch
 from yaw.daemon.graph.inference.diagnostics import DiagnosticHistory
 from yaw.daemon.graph.inference.optimizer import (
-    hierarchy_judge_fingerprint,
     label_judge_fingerprint,
-    related_judge_fingerprint,
+    relation_judge_fingerprint,
 )
 from yaw.daemon.graph.inference.program import YawProgram
 
 
 class CascadeMockLM(dspy.LM):
-    """Deterministic mock LM for testing 3-stage semantic cascade execution."""
+    """Native DSPy request/response provider for semantic decision tests."""
 
     def __init__(self) -> None:
-        super().__init__(model="test-cascade-lm")
-        self.stage_calls: dict[str, int] = {
-            "label_judge": 0,
-            "hierarchy_judge": 0,
-            "related_judge": 0,
-        }
-        self.stage_payloads: dict[str, list[list[dict[str, Any]]]] = {
-            "label_judge": [],
-            "hierarchy_judge": [],
-            "related_judge": [],
-        }
+        super().__init__(model="test-cascade-lm", cache=False)
+        self.stage_calls = {"label_judge": 0, "relation_judge": 0}
+        self.stage_payloads: dict[str, list[list[dict[str, Any]]]] = {"label_judge": [], "relation_judge": []}
         self.label_responses: dict[str, tuple[bool, bool | str]] = {}
-        self.hierarchy_responses: dict[str, tuple[bool, bool]] = {}
-        self.related_responses: dict[str, bool] = {}
+        self.relation_responses: dict[str, str] = {}
 
-    def __call__(
-        self,
-        prompt: str | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> list[str]:
-        if getattr(dspy.settings, "usage_tracker", None) is not None:
-            dspy.settings.usage_tracker.add_usage(
-                self.model,
-                {"prompt_tokens": 32, "completion_tokens": 16, "total_tokens": 48},
-            )
-        req_str = str(prompt or messages or kwargs)
-        req_lower = req_str.lower()
-        pairs = self._extract_pairs(messages, req_str)
+    @property
+    def supported_params(self) -> set[str]:
+        return set()
 
-        is_related = "judgerelated" in req_lower or "differentfrom" in req_lower
-        is_related = is_related or (
-            "related" in req_lower
-            and "narrower" not in req_lower
-            and "alt_label" not in req_lower
-            and "hidden_label" not in req_lower
-            and "equivalent" not in req_lower
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        request = prompt
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        content = "\n".join(
+            part.text for message in request.messages for part in message.parts if hasattr(part, "text")
         )
-        if is_related:
-            self.stage_calls["related_judge"] += 1
-            self.stage_payloads["related_judge"].append(pairs)
-            decisions = []
-            for p in pairs:
-                pid = p["pair_id"]
-                related = self.related_responses.get(pid, False)
-                decisions.append(
-                    {
-                        "pair_id": pid,
-                        "reasoning": f"Stage 3 related reasoning for {pid}",
-                        "related": related,
-                    }
-                )
-            return [json.dumps({"decisions": decisions})]
-
-        if ("judgehierarchy" in req_lower and "hidden_label" not in req_lower and "equivalent" not in req_lower) or (
-            "narrower" in req_lower and "hidden_label" not in req_lower and "equivalent" not in req_lower
-        ):
-            self.stage_calls["hierarchy_judge"] += 1
-            self.stage_payloads["hierarchy_judge"].append(pairs)
-            decisions = []
-            for p in pairs:
-                pid = p["pair_id"]
-                broader, narrower = self.hierarchy_responses.get(pid, (False, False))
-                decisions.append(
-                    {
-                        "pair_id": pid,
-                        "reasoning": f"Stage 2 hierarchy reasoning for {pid}",
-                        "broader": broader,
-                        "narrower": narrower,
-                    }
-                )
-            return [json.dumps({"decisions": decisions})]
-
-        if "judgelabels" in req_lower or "hidden_label" in req_lower or "equivalent" in req_lower:
-            self.stage_calls["label_judge"] += 1
-            self.stage_payloads["label_judge"].append(pairs)
-            decisions = []
-            for p in pairs:
-                pid = p["pair_id"]
-                resp = self.label_responses.get(pid, (False, False))
-                if isinstance(resp[1], str):
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "reasoning": f"Stage 1 label reasoning for {pid}",
-                            "equivalent": True,
-                            "definition": resp[1],
-                            "hidden_label": False,
-                        }
-                    )
-                elif resp[0] or resp[1]:
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "reasoning": f"Stage 1 label reasoning for {pid}",
-                            "equivalent": True,
-                            "definition": f"Unified definition for {pid}",
-                            "hidden_label": bool(resp[1]),
-                        }
-                    )
-                else:
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "reasoning": f"Stage 1 label reasoning for {pid}",
-                            "equivalent": False,
-                        }
-                    )
-            return [json.dumps({"decisions": decisions})]
-
-        return ['{"decisions": []}']
-
-    def _extract_pairs(self, messages: list[dict[str, Any]] | None, req_str: str) -> list[dict[str, Any]]:
-        import re
-
-        if messages:
-            for msg in reversed(messages):
-                content = str(msg.get("content", ""))
-                m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', content)
-                if m:
-                    try:
-                        payload, _ = json.JSONDecoder().raw_decode(content[m.start() :])
-                        parsed_pairs = payload.get("pairs", [])
-                        if parsed_pairs:
-                            return parsed_pairs
-                    except Exception:
-                        pass
-        pids = list(dict.fromkeys(re.findall(r"e\d+\|e\d+", req_str)))
-        return [{"pair_id": pid} for pid in pids]
+        start = content.index('{"format":')
+        packet, _ = json.JSONDecoder().raw_decode(content[start:])
+        pairs = packet["pairs"]
+        is_label = "LabelDecision" in str(request.system)
+        stage = "label_judge" if is_label else "relation_judge"
+        self.stage_calls[stage] += 1
+        self.stage_payloads[stage].append(pairs)
+        decisions = []
+        for pair in pairs:
+            pid = pair["pair_id"]
+            item: dict[str, Any] = {"pair_id": pid, "reasoning": f"Grounded decision for {pid}"}
+            if is_label:
+                equivalent, hidden = self.label_responses.get(pid, (False, False))
+                item["equivalent"] = bool(equivalent or hidden)
+                if item["equivalent"]:
+                    item["definition"] = hidden if isinstance(hidden, str) else f"Unified definition for {pid}"
+                    item["hidden_label"] = hidden is True
+            else:
+                item["relation"] = self.relation_responses.get(pid, "skos:related")
+            decisions.append(item)
+        return Response(
+            id="test",
+            model="test-cascade-lm",
+            message=Message(role="assistant", parts=(TextPart(text=json.dumps({"decisions": decisions})),)),
+            finish_reason="stop",
+            usage=Usage(input_tokens=32, output_tokens=16),
+        )
 
 
 def _make_batch(pairs: list[dict[str, Any]]) -> SynonymEvidenceBatch:
@@ -170,8 +84,10 @@ def _make_batch(pairs: list[dict[str, Any]]) -> SynonymEvidenceBatch:
         )
     payload = json.dumps(
         {
-            "format": "synonym-evidence-v2",
+            "format": "synonym-evidence-v3",
             "pairs": pairs,
+            "entities": {k: {"sources": []} for k in identifiers},
+            "sources": {},
         }
     )
     return SynonymEvidenceBatch(
@@ -185,7 +101,6 @@ def _make_program(lm: dspy.LM) -> YawProgram:
     return YawProgram(
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        synonym_token_counter=lambda messages, **_kwargs: len(str(messages)) // 4,
         enable_gbnf=False,
     )
 
@@ -198,19 +113,16 @@ def test_program_named_predictors_and_audit_trails() -> None:
 
     named_predictors = dict(program.named_predictors())
     assert "label_judge" in named_predictors
-    assert "hierarchy_judge" in named_predictors
-    assert "related_judge" in named_predictors
+    assert "relation_judge" in named_predictors
     assert "semantic_judge" not in named_predictors
 
     assert isinstance(program.label_judge_audit_trail, DiagnosticHistory)
-    assert isinstance(program.hierarchy_judge_audit_trail, DiagnosticHistory)
-    assert isinstance(program.related_judge_audit_trail, DiagnosticHistory)
+    assert isinstance(program.relation_judge_audit_trail, DiagnosticHistory)
     assert not hasattr(program, "synonym_audit_trail")
 
     trails = program.dump_audit_trails()
     assert "label_judge_audit_trail" in trails
-    assert "hierarchy_judge_audit_trail" in trails
-    assert "related_judge_audit_trail" in trails
+    assert "relation_judge_audit_trail" in trails
     assert "synonym_audit_trail" not in trails
 
 
@@ -227,14 +139,13 @@ def test_cascade_rule_w1_direct_facts_skips_stage1_to_stage2() -> None:
             "shared_role_facts": [],
         },
     ]
-    lm.hierarchy_responses["e0|e1"] = (True, False)
+    lm.relation_responses["e0|e1"] = "skos:broader"
     batch = _make_batch(pairs)
 
     decisions = program.judge_semantics(batch)
     assert len(decisions) == 1
     assert lm.stage_calls["label_judge"] == 0
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 0
+    assert lm.stage_calls["relation_judge"] == 1
 
     assert decisions[0]["relation"] == "skos:broader"
     assert decisions[0]["source_id"] == "real_e0"
@@ -261,14 +172,13 @@ def test_cascade_stage1_truth_table_short_circuiting() -> None:
     lm.label_responses["e4|e5"] = (True, False)
     # e6|e7: equivalent=False -> distinct concepts, advances to Stage 2
     lm.label_responses["e6|e7"] = (False, False)
-    lm.hierarchy_responses["e6|e7"] = (True, False)
+    lm.relation_responses["e6|e7"] = "skos:broader"
 
     batch = _make_batch(pairs)
     decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 0
+    assert lm.stage_calls["relation_judge"] == 1
 
     d_equiv = next(d for d in decisions if d["pair_id"] == "real_e0|real_e1")
     assert d_equiv["relation"] == "skos:altLabel"
@@ -303,18 +213,17 @@ def test_cascade_stage2_hierarchy_truth_table() -> None:
         lm.label_responses[str(p["pair_id"])] = (False, False)
 
     # e0|e1: (True, False) -> A skos:broader B (source=e0, target=e1)
-    lm.hierarchy_responses["e0|e1"] = (True, False)
+    lm.relation_responses["e0|e1"] = "skos:broader"
     # e2|e3: (False, True) -> B skos:broader A (source=e3, target=e2)
-    lm.hierarchy_responses["e2|e3"] = (False, True)
+    lm.relation_responses["e2|e3"] = "skos:narrower"
     # e4|e5: (True, True) -> S27 degrade to skos:related
-    lm.hierarchy_responses["e4|e5"] = (True, True)
+    lm.relation_responses["e4|e5"] = "skos:related"
 
     batch = _make_batch(pairs)
     decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 0
+    assert lm.stage_calls["relation_judge"] == 1
 
     d0 = next(d for d in decisions if d["pair_id"] == "real_e0|real_e1")
     assert d0["relation"] == "skos:broader"
@@ -351,14 +260,13 @@ def test_cascade_rule_w1_w2_stage2_residuals_deterministic_related() -> None:
     # e0|e1 skips Stage 1 to Stage 2 due to direct_facts; e2|e3 goes to Stage 1
     lm.label_responses["e2|e3"] = (False, False)
     # Both are non-hierarchical in Stage 2
-    lm.hierarchy_responses["e0|e1"] = (False, False)
-    lm.hierarchy_responses["e2|e3"] = (False, False)
+    lm.relation_responses["e0|e1"] = "skos:related"
+    lm.relation_responses["e2|e3"] = "skos:related"
 
     batch = _make_batch(pairs)
     decisions = program.judge_semantics(batch)
 
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 0
+    assert lm.stage_calls["relation_judge"] == 1
 
     d0 = next(d for d in decisions if d["pair_id"] == "real_e0|real_e1")
     assert d0["relation"] == "skos:related"
@@ -379,17 +287,16 @@ def test_cascade_stage3_related_and_different_from() -> None:
     ]
     for p in pairs:
         lm.label_responses[str(p["pair_id"])] = (False, False)
-        lm.hierarchy_responses[str(p["pair_id"])] = (False, False)
+        lm.relation_responses[str(p["pair_id"])] = "skos:related"
 
-    lm.related_responses["e0|e1"] = True
-    lm.related_responses["e2|e3"] = False
+    lm.relation_responses["e0|e1"] = "skos:related"
+    lm.relation_responses["e2|e3"] = "owl:differentFrom"
 
     batch = _make_batch(pairs)
     decisions = program.judge_semantics(batch)
 
     assert lm.stage_calls["label_judge"] == 1
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 1
+    assert lm.stage_calls["relation_judge"] == 1
 
     d0 = next(d for d in decisions if d["pair_id"] == "real_e0|real_e1")
     assert d0["relation"] == "skos:related"
@@ -399,7 +306,7 @@ def test_cascade_stage3_related_and_different_from() -> None:
 
 
 def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
-    """Verify mutating only related_judge instruction isolates Stage 1 & 2 fingerprints without dead stage caches."""
+    """Verify mutating only relation_judge instruction isolates Stage 1 & 2 fingerprints without dead stage caches."""
     import inspect
 
     lm = CascadeMockLM()
@@ -413,27 +320,25 @@ def test_per_stage_fingerprint_isolation_on_signature_mutation() -> None:
         {"pair_id": "e0|e1", "direct_facts": [], "shared_role_facts": []},
     ]
     lm.label_responses["e0|e1"] = (False, False)
-    lm.hierarchy_responses["e0|e1"] = (False, False)
-    lm.related_responses["e0|e1"] = True
+    lm.relation_responses["e0|e1"] = "skos:related"
+    lm.relation_responses["e0|e1"] = "skos:related"
 
     batch = _make_batch(pairs)
 
     decisions1 = program.judge_semantics(batch)
     assert len(decisions1) == 1
     assert lm.stage_calls["label_judge"] == 1
-    assert lm.stage_calls["hierarchy_judge"] == 1
-    assert lm.stage_calls["related_judge"] == 1
+    assert lm.stage_calls["relation_judge"] == 1
 
-    # Mutate ONLY related_judge instructions
+    # Mutate ONLY relation_judge instructions
     cand_prog = program.deepcopy()
-    cand_prog.related_judge.signature = cand_prog.related_judge.signature.with_instructions(
+    cand_prog.relation_judge.signature = cand_prog.relation_judge.signature.with_instructions(
         "Mutated related judge instructions v2"
     )
 
     # Check fingerprints: label and hierarchy unchanged, related changed, and batch subset cache_identity preserved
     assert label_judge_fingerprint(cand_prog) == label_judge_fingerprint(program)
-    assert hierarchy_judge_fingerprint(cand_prog) == hierarchy_judge_fingerprint(program)
-    assert related_judge_fingerprint(cand_prog) != related_judge_fingerprint(program)
+    assert relation_judge_fingerprint(cand_prog) != relation_judge_fingerprint(program)
     assert batch.subset(["e0|e1"]).cache_identity == _make_batch(pairs).subset(["e0|e1"]).cache_identity
 
     cand_prog.set_lm(lm)

@@ -1,13 +1,9 @@
-"""Positional-safe DSPy RLM orchestrator, REPL code sanitizer, and stage delegation rules."""
+"""DSPy RLM orchestrator, REPL code sanitizer, and stage delegation rules."""
 
-import functools
-import inspect
 from collections.abc import Callable
 from typing import Any
 
 import dspy
-
-from .parsers import parse_shacl_repairs
 
 STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
     "shacl_repair": (
@@ -32,19 +28,6 @@ STAGE_RLM_DELEGATION_RULES: dict[str, str] = {
         "'references': [{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})"
     ),
 }
-
-
-def _normalize_rlm_field(name: str, val: Any, annotation: Any) -> Any:
-    if isinstance(val, dict):
-        if name in val:
-            val = val[name]
-        elif len(val) == 1:
-            val = next(iter(val.values()))
-    if name == "repairs":
-        return parse_shacl_repairs(val)
-    if annotation is str and isinstance(val, str):
-        return val.strip()
-    return val
 
 
 def sanitize_repl_code(code: str) -> str:
@@ -78,8 +61,7 @@ _RLM_Base: Any = getattr(dspy, "RLM", dspy.Module)
 
 
 class PositionalSafeRLM(_RLM_Base):
-    """RLM subclass that binds positional tool arguments, enforces 1-step LM delegation, and normalizes SUBMIT \
-payloads."""
+    """RLM subclass with stage instructions and sanitized REPL code."""
 
     def __init__(self, *args: Any, stage_rule: str = "", **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -108,8 +90,8 @@ payloads."""
         action = self.generate_action(
             signature=self._action_signature_for_current_factory(interpreter_factory, sub_agent_rules),
             variables_info=variables_info,
-            repl_history=history,
-            iteration=f"{iteration + 1}/{self.max_iters}",
+            history=history,
+            iteration=self._iteration_label(iteration),
         )
         self.last_reasoning = str(getattr(action, "reasoning", "") or "").strip()
         from dspy.predict.rlm import _strip_code_fences, format_error_for_lm
@@ -119,49 +101,9 @@ payloads."""
         except SyntaxError as e:
             code = action.code
             result = f"[Error] {format_error_for_lm(e)}"
-            return self._process_execution_result(action, code, result, history, output_field_names)
+            return self._process_execution_result(action, code, result, output_field_names)
         result = self._execute_code(repl, code, input_args)
-        return self._process_execution_result(action, code, result, history, output_field_names)
-
-    def _make_interpreter_tool(self, tool: dspy.Tool) -> Callable[..., Any]:
-        sig = inspect.signature(tool.func)
-        is_async = inspect.iscoroutinefunction(tool.func) or (
-            callable(tool.func) and inspect.iscoroutinefunction(tool.func.__call__)
-        )
-        if is_async:
-
-            async def invoke(*args: Any, **kwargs: Any) -> Any:
-                bound = sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-                return await tool.acall(**bound.arguments)
-        else:
-
-            def invoke(*args: Any, **kwargs: Any) -> Any:
-                bound = sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-                return tool(**bound.arguments)
-
-        functools.update_wrapper(invoke, tool.func)
-        # inspect.signature's documented callable protocol; retain coroutine
-        # identity rather than replacing the function with a callable object.
-        vars(invoke)["__signature__"] = sig
-        return invoke
-
-    def _process_final_output(
-        self,
-        result: Any,
-        output_field_names: list[str],
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        raw_output = getattr(result, "output", None)
-        if isinstance(raw_output, dict):
-            if len(output_field_names) == 1 and output_field_names[0] not in raw_output and len(raw_output) == 1:
-                raw_output[output_field_names[0]] = next(iter(raw_output.values()))
-            for name in output_field_names:
-                if name in raw_output:
-                    field = self.signature.output_fields[name]
-                    annotation = getattr(field, "annotation", str)
-                    raw_output[name] = _normalize_rlm_field(name, raw_output[name], annotation)
-        return super()._process_final_output(result, output_field_names)
+        return self._process_execution_result(action, code, result, output_field_names)
 
 
 __all__ = [

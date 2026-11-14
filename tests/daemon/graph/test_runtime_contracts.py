@@ -9,15 +9,23 @@ from contextlib import closing
 
 import dspy
 import pytest
+from embedding_fixture import IdentifiedEmbeddingCallable
 
 from daemon.graph.inference.test_reflection import proposer
 from daemon.graph.inference.test_reflection import provider as provider
 from yaw.core import ChunkPointer, YawRuntimeError
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import RLMInstructionProposer, YawProgram
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, RLMInstructionProposer, YawProgram
 from yaw.daemon.graph.inference.chat import YawDSPyLM, create_dspy_lm
 from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
 from yaw.daemon.indexing import bind_native_indexing
+
+
+def empty_embedder():
+    def embed(texts):
+        return []
+
+    return DSPyEmbeddingAdapter(embedder=dspy.Embedder(IdentifiedEmbeddingCallable(embed, "empty-fixture")))
 
 
 def test_native_qa_predictor_state_survives_json_restore_and_deepcopy(tmp_path):
@@ -80,9 +88,7 @@ def test_rlm_tool_preserves_signature_binding_and_coroutine_identity(asynchronou
 def test_bad_reflection_setup_preserves_existing_rows_before_indexing(tmp_path, have_lm):
     lm = create_dspy_lm("reflection-model", cache=False) if have_lm else None
     program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
-    engine = bind_native_indexing(
-        YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, dspy.Embedder(lambda texts: []))
-    )
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, empty_embedder()))
     try:
         from yaw.daemon.graph.storage import upsert_chunk_pointers
 
@@ -90,9 +96,13 @@ def test_bad_reflection_setup_preserves_existing_rows_before_indexing(tmp_path, 
         with engine.managed_conn.transaction() as conn:
             upsert_chunk_pointers(conn, [(ChunkPointer("existing", "source.md", 1, 1), "Preserve this source.")])
         gold = dspy.Example(question="Who?", item_docs=["A new passage."]).with_inputs("question")
-        with dspy.context(lm=None), pytest.raises(YawRuntimeError) as caught:
+        with dspy.context(lm=None), pytest.raises(ValueError if have_lm else YawRuntimeError) as caught:
             engine.evolve_prompts([gold])
-        assert caught.value.code == ("INVALID_INPUT" if have_lm else "MODEL_ERROR")
+        if have_lm:
+            assert "Trainset must have at least 2 examples" in str(caught.value)
+        else:
+            assert isinstance(caught.value, YawRuntimeError)
+            assert caught.value.code == "MODEL_ERROR"
         assert [row[0] for row in engine.conn.execute("SELECT chunk_id FROM chunks")] == ["existing"]
         assert engine._opt_chunks_pool == []
     finally:
@@ -124,7 +134,7 @@ def test_invalid_second_predictor_does_not_partially_restore_first():
 def learning(tmp_path, url, *, resume=False):
     prop = proposer(url, enable_simba=False)
     task = YawProgram(enable_gbnf=False, orchestrator_lm=prop.worker_lm, rlm_sub_lm=prop.worker_lm)
-    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, dspy.Embedder(lambda texts: [])))
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, task, empty_embedder()))
     train = [dspy.Example(question="Who?", context="Source.").with_inputs("question", "context")]
     try:
         configure_simba_task_learning(

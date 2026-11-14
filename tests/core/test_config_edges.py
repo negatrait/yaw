@@ -14,9 +14,9 @@ def test_character_budget_rejects_impossible_context_allowances(output):
         context_char_limit(100, 32, output)
 
 
-def test_invalid_completion_capacity_is_rejected_by_the_configuration():
+def test_invalid_completion_capacity_is_rejected_when_serving_capacity_is_bound():
     with pytest.raises(YawRuntimeError, match="max_output_tokens"):
-        YawConfig(context_window_tokens=4096, max_output_tokens=4096)
+        YawConfig(context_window_tokens=4096, max_output_tokens=4096).resolve_inference_budgets(4096)
 
 
 def test_loading_defaults_and_explicit_workspace_selection(tmp_path):

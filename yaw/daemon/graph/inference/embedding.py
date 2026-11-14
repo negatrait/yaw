@@ -1,17 +1,16 @@
-"""Native DSPy and OpenAI/Ollama embedding adapter with explicit model-specific retrieval contracts."""
+"""Native DSPy embedding adapter with model-specific retrieval contracts."""
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
-import os
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
+from threading import BoundedSemaphore
 from typing import Any, cast
-
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-os.environ.setdefault("LITELLM_TELEMETRY", "False")
 
 import dspy
 import numpy as np
@@ -27,6 +26,24 @@ PASSAGE_INSTRUCTION = "Given a question, retrieve relevant documents that best a
 TITLE_LINE_RE = re.compile(r"^(?:#{1,6}\s+|(?:wikipedia\s+)?title:\s*)(.+)$", re.IGNORECASE)
 
 
+def _hash_contract(prefix: str, contract: dict[str, Any], *, ensure_ascii: bool = True) -> str:
+    return (
+        prefix
+        + hashlib.sha256(json.dumps(contract, sort_keys=True, ensure_ascii=ensure_ascii).encode("utf-8")).hexdigest()
+    )
+
+
+def _extract_title_body(text: str) -> tuple[str, str] | None:
+    if "\n" in text:
+        first_line, body = text.split("\n", 1)
+        if match := TITLE_LINE_RE.match(first_line.strip()):
+            title = match.group(1).strip()
+            body = body.strip()
+            if title and body:
+                return title, body
+    return None
+
+
 @dataclass(frozen=True)
 class EmbeddingProfile:
     model: str
@@ -40,51 +57,58 @@ class EmbeddingProfile:
     parse_document_title: bool = False
 
     @property
-    def query_instruction_mode(self):
+    def query_instruction_mode(self) -> str:
         if self.fact_query_prefix and self.fact_query_prefix != self.query_prefix:
             return "distinct"
         return "shared"
 
     @property
-    def index_contract(self):
+    def index_contract(self) -> EmbeddingProfile:
         """Exclude query-only prefixes from document/entity/fact vector work."""
         return replace(self, query_prefix="", fact_query_prefix=None)
 
     @property
-    def index_identity(self):
-        payload = asdict(self.index_contract)
-        payload.pop("fact_query_prefix")
-        payload.pop("query_prefix")
-        if not self.parse_document_title:
-            payload.pop("parse_document_title", None)
-        contract = {"adapter": "retrieval-prompts-v4", "normalization": "l2", **payload}
-        return "yaw-embedding-v2:" + hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
+    def index_identity(self) -> str:
+        contract: dict[str, Any] = {
+            "adapter": "retrieval-prompts-v5-unsplit",
+            "checkpoint": self.checkpoint,
+            "context_tokens": self.context_tokens,
+            "dimensions": self.dimensions,
+            "document_prefix": self.document_prefix,
+            "model": self.model,
+            "normalization": "l2",
+            "pooling": self.pooling,
+        }
+        if self.parse_document_title:
+            contract["parse_document_title"] = True
+        return _hash_contract("yaw-embedding-v2:", contract)
 
-    def format(self, text, *, query, instruction=None, title: str | None = None):
+    def format(self, text: str, *, query: bool, instruction: str | None = None, title: str | None = None) -> str:
         if not isinstance(text, str):
             raise TypeError("Embedding inputs must all be strings.")
-        prefixes = tuple(p for p in (self.query_prefix, self.fact_query_prefix, self.document_prefix) if p)
-        if text.startswith(prefixes) or (
-            (self.document_prefix or self.parse_document_title) and text.startswith("title: ") and " | text: " in text
+        qp = self.query_prefix
+        fqp = self.fact_query_prefix
+        dp = self.document_prefix
+        if (
+            (qp and text.startswith(qp))
+            or (fqp and text.startswith(fqp))
+            or (dp and text.startswith(dp))
+            or ((dp or self.parse_document_title) and text.startswith("title: ") and " | text: " in text)
         ):
             raise ValueError("Pass raw text, not an already prefixed embedding input.")
         if not query:
             if self.parse_document_title:
-                if "\n" in text:
-                    first_line, body = text.split("\n", 1)
-                    match = TITLE_LINE_RE.match(first_line.strip())
-                    if match and match.group(1).strip() and body.strip():
-                        return f"title: {match.group(1).strip()} | text: {body.strip()}"
-                if title and title.strip():
-                    clean_title = title.strip()
+                if (parsed := _extract_title_body(text)) is not None:
+                    return f"title: {parsed[0]} | text: {parsed[1]}"
+                if title and (clean_title := title.strip()):
                     body = text[len(clean_title) + 1 :].strip() if text.startswith(f"{clean_title}\n") else text.strip()
                     if body:
                         return f"title: {clean_title} | text: {body}"
-            return self.document_prefix + text
-        if instruction == FACT_INSTRUCTION and self.fact_query_prefix:
-            return self.fact_query_prefix + text
+            return dp + text
+        if instruction == FACT_INSTRUCTION and fqp:
+            return fqp + text
         # Preserve the model's instruction separator, including Qwen's newline.
-        return self.query_prefix + text
+        return qp + text
 
 
 QUERY_PREFIX = "task: search result | query: "
@@ -92,6 +116,17 @@ QA_QUERY_PREFIX = "task: question answering | query: "
 FACT_CHECK_PREFIX = "task: fact checking | query: "
 DOCUMENT_PREFIX = "title: none | text: "
 GEMMA_TASK_MODES = ("search", "qa", "fact", "distinct", "titled", "distinct-titled")
+_GEMMA_TASK_OVERRIDES: dict[str, dict[str, Any]] = {
+    "qa": {"query_prefix": QA_QUERY_PREFIX},
+    "fact": {"query_prefix": FACT_CHECK_PREFIX},
+    "distinct": {"query_prefix": QA_QUERY_PREFIX, "fact_query_prefix": FACT_CHECK_PREFIX},
+    "titled": {"parse_document_title": True},
+    "distinct-titled": {
+        "query_prefix": QA_QUERY_PREFIX,
+        "fact_query_prefix": FACT_CHECK_PREFIX,
+        "parse_document_title": True,
+    },
+}
 PROFILES = {
     "embeddinggemma-300m-GGUF": EmbeddingProfile(
         "embeddinggemma-300m-GGUF",
@@ -124,200 +159,40 @@ PROFILES = {
 MODEL = DEFAULT_EMBEDDING_MODEL
 
 
-def resolve_embedding_profile(model=MODEL, task_mode="search"):
+def resolve_embedding_profile(model: str = MODEL, task_mode: str = "search") -> EmbeddingProfile:
     profile = PROFILES[model]
     if task_mode == "search":
         return profile
     if not model.startswith("embeddinggemma"):
         raise ValueError(f"Task mode {task_mode!r} is only supported for EmbeddingGemma profiles.")
-    if task_mode == "qa":
-        return replace(profile, query_prefix=QA_QUERY_PREFIX)
-    if task_mode == "fact":
-        return replace(profile, query_prefix=FACT_CHECK_PREFIX)
-    if task_mode == "distinct":
-        return replace(profile, query_prefix=QA_QUERY_PREFIX, fact_query_prefix=FACT_CHECK_PREFIX)
-    if task_mode == "titled":
-        return replace(profile, parse_document_title=True)
-    if task_mode == "distinct-titled":
-        return replace(
-            profile,
-            query_prefix=QA_QUERY_PREFIX,
-            fact_query_prefix=FACT_CHECK_PREFIX,
-            parse_document_title=True,
-        )
-    raise ValueError(f"Unsupported embedding task mode: {task_mode!r}")
+    overrides = _GEMMA_TASK_OVERRIDES.get(task_mode)
+    if overrides is None:
+        raise ValueError(f"Unsupported embedding task mode: {task_mode!r}")
+    return replace(profile, **overrides)
 
 
 def create_dspy_embedder(
     model_or_profile: EmbeddingProfile | str | Callable = MODEL,
     *,
     base_url: str = BASE_URL,
-    api_key: str = "lemonade",
+    api_key: str = "local",
     provider: str = "openai",
     batch_size: int = 32,
-    caching: bool = False,
-    **kwargs: Any,
+    caching: bool = True,
 ) -> dspy.Embedder:
-    """Create a native dspy.Embedder for Lemonade (openai/...) or Ollama (ollama/...)."""
+    """Construct DSPy's native OpenAI-compatible or callable embedder."""
     if callable(model_or_profile):
-        return dspy.Embedder(model_or_profile, batch_size=batch_size, caching=caching, **kwargs)
-
-    model_name = model_or_profile.model if isinstance(model_or_profile, EmbeddingProfile) else str(model_or_profile)
-    embedder_cls: Any = dspy.Embedder
-    if provider == "ollama" or model_name.startswith("ollama/"):
-        litellm_model = model_name if model_name.startswith("ollama/") else f"ollama/{model_name}"
-        return embedder_cls(
-            litellm_model,
-            batch_size=batch_size,
-            caching=caching,
-            api_base=base_url,
-            **kwargs,
-        )
-
-    litellm_model = model_name if "/" in model_name else f"openai/{model_name}"
-    return embedder_cls(
-        litellm_model,
+        return dspy.Embedder(model_or_profile, batch_size=batch_size, caching=caching)
+    if provider != "openai":
+        raise ValueError("Embedding requires an OpenAI-compatible provider")
+    name = model_or_profile.model if isinstance(model_or_profile, EmbeddingProfile) else model_or_profile
+    return dspy.Embedder(
+        f"openai/{name.removeprefix('openai/')}",
         batch_size=batch_size,
         caching=caching,
-        api_base=base_url,
-        api_key=api_key,
-        encoding_format="float",
-        **kwargs,
+        base_url=cast(Any, base_url),
+        api_key=cast(Any, api_key),
     )
-
-
-def is_batch_overflow_error(exc: Exception) -> bool:
-    """Detect embedding server token limit or physical batch size rejection."""
-    msg = str(exc).lower()
-    return (
-        "too large to process" in msg
-        or "physical batch size" in msg
-        or "context size" in msg
-        or "maximum context length" in msg
-        or "token limit" in msg
-        or "context window" in msg
-        or "too many tokens" in msg
-        or ("exceeds" in msg and "tokens" in msg)
-    )
-
-
-def split_text_gracefully(
-    text: str,
-    max_chars: int = 3000,
-    overlap_chars: int = 100,
-) -> list[str]:
-    """Gracefully divide a long text into sub-chunks without truncation.
-
-    Snaps split boundaries to paragraph (\\n\\n), newline (\\n), sentence (. ! ?),
-    or word boundaries (space), ensuring 100% of the original text is covered.
-    """
-    if not text:
-        return [""]
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks: list[str] = []
-    start = 0
-    total_len = len(text)
-
-    while start < total_len:
-        if total_len - start <= max_chars:
-            chunks.append(text[start:])
-            break
-
-        target_end = min(start + max_chars, total_len)
-        min_split = start + max(1, max_chars // 3)
-        window = text[min_split:target_end]
-        split_pos = -1
-
-        # Priority 1: Paragraph break \n\n
-        idx = window.rfind("\n\n")
-        if idx != -1:
-            split_pos = min_split + idx + 2
-        else:
-            # Priority 2: Line break \n
-            idx = window.rfind("\n")
-            if idx != -1:
-                split_pos = min_split + idx + 1
-            else:
-                # Priority 3: Sentence boundary (. ! ?)
-                sentence_match = list(re.finditer(r"[.!?]\s+", window))
-                if sentence_match:
-                    split_pos = min_split + sentence_match[-1].end()
-                else:
-                    # Priority 4: Clause or phrase boundary (; ,)
-                    clause_match = list(re.finditer(r"[,;:]\s+", window))
-                    if clause_match:
-                        split_pos = min_split + clause_match[-1].end()
-                    else:
-                        # Priority 5: Word boundary
-                        idx = window.rfind(" ")
-                        split_pos = min_split + idx + 1 if idx != -1 else target_end
-
-        chunk = text[start:split_pos]
-        if chunk.strip():
-            chunks.append(chunk)
-
-        advance = max(1, split_pos - overlap_chars) if overlap_chars > 0 and split_pos < total_len else split_pos
-        start = max(start + 1, advance)
-
-    return chunks if chunks else [text]
-
-
-def pool_subchunk_embeddings(
-    vectors: np.ndarray,
-    weights: Sequence[int] | np.ndarray,
-    *,
-    norm: bool = True,
-) -> np.ndarray:
-    """Combine sub-chunk embedding vectors into a single document vector via length-weighted pooling.
-
-    Args:
-        vectors: Array of shape (K, dim) containing sub-chunk embeddings.
-        weights: Sequence of positive weights (typically character counts of sub-chunks).
-        norm: Whether to apply L2 normalization to the pooled vector.
-
-    Returns:
-        1D array of shape (dim,) representing the whole document.
-    """
-    if len(vectors) == 1:
-        vec = np.asarray(vectors[0], dtype=np.float32)
-    else:
-        w = np.asarray(weights, dtype=np.float32)
-        total_w = float(w.sum())
-        w = w / total_w if total_w > 0 else np.full_like(w, 1.0 / len(w))
-        vec = np.sum(vectors * w[:, None], axis=0)
-
-    if norm:
-        v_norm = float(np.linalg.norm(vec))
-        vec = vec / max(v_norm, 1e-12)
-    return vec
-
-
-def batch_texts_by_budget(
-    texts: Sequence[str],
-    *,
-    max_batch_chars: int = 3500,
-    max_batch_size: int = 16,
-) -> list[list[int]]:
-    """Partition flat texts into index micro-batches bounded by character budget and count."""
-    micro_batches: list[list[int]] = []
-    current_batch: list[int] = []
-    current_chars = 0
-
-    for idx, t in enumerate(texts):
-        t_len = len(t)
-        if current_batch and (current_chars + t_len > max_batch_chars or len(current_batch) >= max_batch_size):
-            micro_batches.append(current_batch)
-            current_batch = [idx]
-            current_chars = t_len
-        else:
-            current_batch.append(idx)
-            current_chars += t_len
-
-    if current_batch:
-        micro_batches.append(current_batch)
-    return micro_batches
 
 
 @dataclass(frozen=True)
@@ -327,6 +202,7 @@ class EmbeddingRequest:
     task_mode: str
     batch_size: int
     max_batch_chars: int
+    index_identity: str
     instruction: str = ""
     stage: str = "chunk_embed"
 
@@ -337,30 +213,29 @@ class EmbeddingResult:
     telemetry: dict[str, Any]
 
 
-class DSPyEmbeddingAdapter(dspy.Embedder):
-    """Profile-aware retrieval embedding adapter subclassing native `dspy.Embedder`."""
+class DSPyEmbeddingAdapter:
+    """Profile-aware retrieval adapter using one native DSPy embedder."""
 
     def __init__(
         self,
         profile: EmbeddingProfile | None = None,
-        embedder: dspy.Embedder | Any = None,
+        embedder: dspy.Embedder | None = None,
         *,
         task_mode: str = "distinct-titled",
         base_url: str = BASE_URL,
-        api_key: str = "lemonade",
+        api_key: str = "local",
         provider: str = "openai",
         batch_size: int = 32,
-        caching: bool = False,
+        caching: bool = True,
         max_batch_chars: int = 3500,
     ) -> None:
         if batch_size < 1 or max_batch_chars < 1:
             raise ValueError("Embedding batch size and character budget must be positive.")
         self.max_batch_chars = max_batch_chars
         self.task_mode = task_mode
-        self.base_url = base_url
         self.provider = provider
         self.profile = profile or resolve_embedding_profile(MODEL, task_mode)
-        base_embedder = embedder or create_dspy_embedder(
+        self.embedder = embedder or create_dspy_embedder(
             self.profile,
             base_url=base_url,
             api_key=api_key,
@@ -368,23 +243,37 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             batch_size=batch_size,
             caching=caching,
         )
-        if isinstance(base_embedder, dspy.Embedder):
-            super().__init__(
-                base_embedder.model,
-                batch_size=base_embedder.batch_size,
-                caching=base_embedder.caching,
-                **getattr(base_embedder, "default_kwargs", {}),
-            )
-            self.embedder: Any = base_embedder
+        if not isinstance(self.embedder, dspy.Embedder):
+            raise TypeError("embedder must be a native dspy.Embedder")
+        if callable(self.embedder.model):
+            identity = getattr(self.embedder.model, "index_identity", None)
+            if not identity:
+                raise ValueError("Callable embedding models must declare index_identity")
+            self.base_url = str(identity)
         else:
-            super().__init__(
-                base_embedder,
-                batch_size=batch_size,
-                caching=caching,
-            )
-            self.embedder = base_embedder
+            name = self.profile.model
+            expected_model = f"openai/{name.removeprefix('openai/')}"
+            if self.embedder.model != expected_model:
+                raise ValueError("Embedding model does not match the configured profile")
+            self.base_url = str(self.embedder.default_kwargs.get("base_url", base_url)).rstrip("/")
+        self.batch_size = self.embedder.batch_size
+        self._admission = BoundedSemaphore(2)
         self.telemetry: list[dict[str, Any]] = DiagnosticHistory()
         self._telemetry_hook: Callable[[dict[str, Any]], None] | None = None
+
+    @property
+    def index_identity(self) -> str:
+        """Identify the configured document-vector contract, without claiming remote weight verification."""
+        return _hash_contract(
+            "yaw-embedding-deployment-v1:",
+            {
+                "profile": self.profile.index_identity,
+                "provider": self.provider,
+                "base_url": self.base_url.rstrip("/"),
+                "max_batch_chars": self.max_batch_chars,
+            },
+            ensure_ascii=False,
+        )
 
     def bind_telemetry_hook(self, hook: Callable[[dict[str, Any]], None] | None) -> None:
         """Bind a callback invoked with each structured embedding telemetry entry."""
@@ -393,7 +282,13 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
     def prepare_request(self, texts: Sequence[str], *, batch_size: int, stage: str) -> EmbeddingRequest:
         """Capture an immutable embedding contract on the engine owner thread."""
         return EmbeddingRequest(
-            tuple(texts), self.profile.index_contract, self.task_mode, batch_size, self.max_batch_chars, stage=stage
+            tuple(texts),
+            self.profile.index_contract,
+            self.task_mode,
+            batch_size,
+            self.max_batch_chars,
+            self.index_identity,
+            stage=stage,
         )
 
     def publish_result(self, result: EmbeddingResult) -> np.ndarray:
@@ -406,47 +301,31 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
 
     async def aexecute_request(self, request: EmbeddingRequest) -> EmbeddingResult:
         """Execute on the native async provider without publishing shared state."""
-        if (self.profile.index_identity, self.task_mode, self.max_batch_chars) != (
-            request.profile.index_identity,
+        if (self.index_identity, self.task_mode, self.max_batch_chars) != (
+            request.index_identity,
             request.task_mode,
             request.max_batch_chars,
         ):
             raise RuntimeError("Embedding settings changed during an indexing batch")
         started = time.perf_counter()
-        texts, query, mapping, pieces, weights, batches = self._prepare_pieces_and_batches(
-            list(request.texts), instruction=request.instruction, batch_size=request.batch_size
-        )
-        flat: list[np.ndarray | None] = [None] * len(pieces)
-        for batch in batches:
-            vectors = await self._aencode_prepared([pieces[i] for i in batch], {"batch_size": len(batch)})
-            if vectors.shape != (len(batch), request.profile.dimensions) or not np.isfinite(vectors).all():
-                raise ValueError("Embedding provider returned an invalid vector count, dimensions or values")
-            for i, vector in zip(batch, vectors, strict=True):
-                flat[i] = vector
+        batches = self._prepare_batches(request.texts, instruction=request.instruction, batch_size=request.batch_size)
+        vectors = [await self._aencode_prepared(batch, {"batch_size": len(batch)}) for batch in batches]
         result = self._build_embedding_result(
-            texts,
-            mapping,
-            pieces,
-            weights,
-            batches,
-            flat,
-            is_query=query,
-            instruction=request.instruction,
-            norm=True,
-            stage=request.stage,
+            batches, vectors, instruction=request.instruction, norm=True, stage=request.stage
         )
-        result.telemetry["duration_seconds"] = time.perf_counter() - started
-        result.telemetry["started_at"] = started
-        result.telemetry["completed_at"] = time.perf_counter()
-        result.telemetry["batch_sizes"] = [len(batch) for batch in batches]
+        completed = time.perf_counter()
+        telemetry = result.telemetry
+        telemetry["duration_seconds"] = completed - started
+        telemetry["started_at"] = started
+        telemetry["completed_at"] = completed
+        telemetry["batch_sizes"] = [len(batch) for batch in batches]
         return result
 
     @classmethod
     def from_config(cls, config: YawConfig) -> DSPyEmbeddingAdapter:
         """Construct a profile-aware DSPyEmbeddingAdapter from a YawConfig."""
-        profile = resolve_embedding_profile(config.embedding_model, config.embedding_task_mode)
         return cls(
-            profile=profile,
+            profile=resolve_embedding_profile(config.embedding_model, config.embedding_task_mode),
             task_mode=config.embedding_task_mode,
             base_url=config.base_url,
             api_key=config.api_key,
@@ -455,386 +334,122 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
             max_batch_chars=config.embed_batch_chars,
         )
 
-    def _encode_prepared(
-        self,
-        prepared: list[str],
-        call_kwargs: dict[str, Any],
-    ) -> np.ndarray:
+    def _encode_prepared(self, prepared: list[str], call_kwargs: dict[str, Any]) -> np.ndarray:
+        with self._admission:
+            return np.asarray(self.embedder(prepared, **call_kwargs), dtype=np.float32)
+
+    async def _aencode_prepared(self, prepared: list[str], call_kwargs: dict[str, Any]) -> np.ndarray:
+        acquire = asyncio.create_task(asyncio.to_thread(self._admission.acquire))
         try:
-            if isinstance(self.embedder, dspy.Embedder):
-                raw = dspy.Embedder.__call__(self, prepared, **call_kwargs)
-            else:
-                raw = self.embedder(prepared, **call_kwargs)
-            vectors = np.asarray(raw, dtype=np.float32)
-            if vectors.ndim == 1:
-                vectors = vectors.reshape(1, -1)
-            from .chat import get_yaw_sleep_seconds
-
-            sleep_sec = get_yaw_sleep_seconds()
-            if sleep_sec > 0:
-                import time
-
-                time.sleep(sleep_sec)
-            return vectors
-        except Exception as exc:
-            if not is_batch_overflow_error(exc):
-                raise
-            if len(prepared) > 1:
-                mid = len(prepared) // 2
-                left = self._encode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
-                right = self._encode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
-                return np.concatenate([left, right], axis=0)
-
-            # Single item overflow: divide gracefully into 2+ sub-chunks and pool without truncation
-            single = prepared[0]
-            sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
-            if len(sub_chunks) <= 1:
-                raise
-            sub_vecs = self._encode_prepared(sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)})
-            weights = [max(1, len(s)) for s in sub_chunks]
-            pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
-            return pooled.reshape(1, -1)
-
-    async def _aencode_prepared(
-        self,
-        prepared: list[str],
-        call_kwargs: dict[str, Any],
-    ) -> np.ndarray:
+            await asyncio.shield(acquire)
+        except asyncio.CancelledError:
+            # A worker waiting for a permit cannot be cancelled. Return it as
+            # soon as the worker acquires it, even if this task has exited.
+            acquire.add_done_callback(lambda _: self._admission.release())
+            raise
         try:
-            if isinstance(self.embedder, dspy.Embedder) and isinstance(self.model, str):
-                raw = await dspy.Embedder.acall(self, prepared, **call_kwargs)
-            else:
-                target_fn = (
-                    (lambda items, **kw: dspy.Embedder.__call__(self, items, **kw))
-                    if isinstance(self.embedder, dspy.Embedder)
-                    else self.embedder
-                )
-                async_fn = cast(
-                    Callable[..., Awaitable[Any]],
-                    dspy.asyncify(cast(Any, target_fn)),
-                )
-                raw = await async_fn(prepared, **call_kwargs)
-            vectors = np.asarray(raw, dtype=np.float32)
-            if vectors.ndim == 1:
-                vectors = vectors.reshape(1, -1)
-            from .chat import get_yaw_sleep_seconds
+            return np.asarray(await self.embedder.acall(prepared, **call_kwargs), dtype=np.float32)
+        finally:
+            self._admission.release()
 
-            sleep_sec = get_yaw_sleep_seconds()
-            if sleep_sec > 0:
-                await asyncio.sleep(sleep_sec)
-            return vectors
-        except Exception as exc:
-            if not is_batch_overflow_error(exc):
-                raise
-            if len(prepared) > 1:
-                mid = len(prepared) // 2
-                left = await self._aencode_prepared(prepared[:mid], {**call_kwargs, "batch_size": mid})
-                right = await self._aencode_prepared(prepared[mid:], {**call_kwargs, "batch_size": len(prepared) - mid})
-                return np.concatenate([left, right], axis=0)
-
-            single = prepared[0]
-            sub_chunks = split_text_gracefully(single, max_chars=max(256, len(single) // 2))
-            if len(sub_chunks) <= 1:
-                raise
-            sub_vecs = await self._aencode_prepared(sub_chunks, {**call_kwargs, "batch_size": len(sub_chunks)})
-            weights = [max(1, len(s)) for s in sub_chunks]
-            pooled = pool_subchunk_embeddings(sub_vecs, weights, norm=True)
-            return pooled.reshape(1, -1)
-
-    def _prepare_pieces_and_batches(
+    def _prepare_batches(
         self,
-        texts: list[str] | str,
+        texts: list[str] | str | Sequence[str],
         *,
         instruction: str | None = None,
         batch_size: int | None = None,
-    ) -> tuple[list[str], bool, list[list[int]], list[str], list[int], list[list[int]]]:
-        if instruction not in (None, "") and instruction not in (FACT_INSTRUCTION, PASSAGE_INSTRUCTION):
+    ) -> list[list[str]]:
+        if instruction not in (None, "", FACT_INSTRUCTION, PASSAGE_INSTRUCTION):
             raise ValueError(f"Unsupported retrieval instruction: {instruction!r}")
         if isinstance(texts, str):
             texts = [texts]
+        elif not isinstance(texts, list):
+            texts = list(texts)
         if not texts:
             raise ValueError("Embedding input cannot be empty.")
 
-        max_chunk_chars = 3000
-        max_batch_chars = self.max_batch_chars
-        effective_max_batch_size = batch_size if (isinstance(batch_size, int) and batch_size >= 1) else self.batch_size
-
-        text_piece_map: list[list[int]] = []
-        flat_pieces: list[str] = []
-        piece_weights: list[int] = []
-
+        requested_batch_size = batch_size if batch_size is not None else self.batch_size
+        if requested_batch_size < 1:
+            raise ValueError("Embedding batch size must be positive")
+        effective_max_batch_size = min(requested_batch_size, 64)
         is_query = bool(instruction)
-        for t in texts:
-            if len(t) <= max_chunk_chars:
-                formatted = self.profile.format(t, query=is_query, instruction=instruction)
-                text_piece_map.append([len(flat_pieces)])
-                flat_pieces.append(formatted)
-                piece_weights.append(max(1, len(t)))
-            else:
-                title = ""
-                body = t
-                if not is_query and self.profile.parse_document_title and "\n" in t:
-                    first_line, rest = t.split("\n", 1)
-                    match = TITLE_LINE_RE.match(first_line.strip())
-                    if match and match.group(1).strip() and rest.strip():
-                        title = match.group(1).strip()
-                        body = rest.strip()
-
-                sub_chunks = split_text_gracefully(body, max_chars=max_chunk_chars)
-                indices: list[int] = []
-                for sc in sub_chunks:
-                    indices.append(len(flat_pieces))
-                    if is_query:
-                        formatted = self.profile.format(sc, query=True, instruction=instruction)
-                    elif title:
-                        formatted = f"title: {title} | text: {sc}"
-                    else:
-                        formatted = self.profile.format(sc, query=False)
-                    flat_pieces.append(formatted)
-                    piece_weights.append(max(1, len(sc)))
-                text_piece_map.append(indices)
-
-        micro_batches = batch_texts_by_budget(
-            flat_pieces,
-            max_batch_chars=max_batch_chars,
-            max_batch_size=effective_max_batch_size,
-        )
-        return texts, is_query, text_piece_map, flat_pieces, piece_weights, micro_batches
+        formatted = [self.profile.format(t, query=is_query, instruction=instruction) for t in texts]
+        batches: list[list[str]] = []
+        current: list[str] = []
+        chars = 0
+        for text in formatted:
+            if current and (len(current) >= effective_max_batch_size or chars + len(text) > self.max_batch_chars):
+                batches.append(current)
+                current, chars = [], 0
+            current.append(text)
+            chars += len(text)
+        if current:
+            batches.append(current)
+        return batches
 
     def _build_embedding_result(
         self,
-        texts: list[str],
-        text_piece_map: list[list[int]],
-        flat_pieces: list[str],
-        piece_weights: list[int],
-        micro_batches: list[list[int]],
-        flat_vectors: list[np.ndarray | None],
+        batches: list[list[str]],
+        outputs: list[np.ndarray],
         *,
-        is_query: bool,
         instruction: str | None,
         norm: bool,
         stage: str | None,
     ) -> EmbeddingResult:
-        doc_vectors: list[np.ndarray] = []
-        for indices in text_piece_map:
-            sub_vecs = np.asarray(
-                [flat_vectors[i] for i in indices if flat_vectors[i] is not None],
-                dtype=np.float32,
-            )
-            weights = [piece_weights[i] for i in indices]
-            doc_vec = pool_subchunk_embeddings(sub_vecs, weights, norm=norm)
-            doc_vectors.append(doc_vec)
-
-        vectors = np.stack(doc_vectors)
+        dims = self.profile.dimensions
+        for batch, output in zip(batches, outputs, strict=True):
+            if output.shape != (len(batch), dims) or not np.isfinite(output).all():
+                raise ValueError("Embedding provider returned an invalid vector count, dimensions or values")
+        vectors = np.concatenate(outputs, axis=0)
+        formatted_inputs = [text for batch in batches for text in batch]
+        is_query = bool(instruction)
+        profile = self.profile
+        dims = profile.dimensions
+        num_inputs = len(formatted_inputs)
         if (
-            vectors.shape != (len(texts), self.profile.dimensions)
+            vectors.shape != (num_inputs, dims)
             or not np.isfinite(vectors).all()
-            or np.any(np.linalg.norm(vectors, axis=1) == 0)
+            or np.any((norms := np.linalg.norm(vectors.astype(np.float64), axis=1)) == 0)
         ):
-            raise ValueError(f"Expected finite, nonzero {self.profile.dimensions}-dimensional vectors.")
+            raise ValueError(f"Expected finite, nonzero {dims}-dimensional vectors.")
+        if norm:
+            vectors = (vectors / norms[:, None]).astype(np.float32)
 
         if is_query:
+            is_fact = instruction == FACT_INSTRUCTION
             active_prefix = (
-                self.profile.fact_query_prefix
-                if (instruction == FACT_INSTRUCTION and self.profile.fact_query_prefix)
-                else self.profile.query_prefix
+                profile.fact_query_prefix if (is_fact and profile.fact_query_prefix) else profile.query_prefix
             )
-            resolved_stage = stage or ("query_fact_embed" if instruction == FACT_INSTRUCTION else "query_passage_embed")
+            resolved_stage = stage or ("query_fact_embed" if is_fact else "query_passage_embed")
         else:
-            active_prefix = self.profile.document_prefix
+            active_prefix = profile.document_prefix
             resolved_stage = stage or "document_embed"
 
-        total_chars = sum(len(p) for p in flat_pieces)
-        approx_tokens = max(1, (total_chars + 3) // 4)
+        total_chars = sum(map(len, formatted_inputs))
+        model_name = profile.model
         entry: dict[str, Any] = {
             "stage": resolved_stage,
             "predictor": "embedder",
-            "model": self.profile.model,
+            "model": model_name,
             "mode": "embed",
             "task_mode": self.task_mode,
             "query": is_query,
             "instruction": instruction or "",
             "active_prefix": active_prefix,
-            "parse_document_title": bool(self.profile.parse_document_title),
-            "num_inputs": len(texts),
-            "num_pieces": len(flat_pieces),
-            "num_batches": len(micro_batches),
+            "parse_document_title": bool(profile.parse_document_title),
+            "num_inputs": num_inputs,
+            "num_batches": len(batches),
             "total_chars": total_chars,
-            "tokens_used": approx_tokens,
-            "usage": {
-                self.profile.model: {
-                    "prompt_tokens": approx_tokens,
-                    "completion_tokens": 0,
-                    "total_tokens": approx_tokens,
-                }
-            },
+            # Native Embedder returns vectors, without provider token usage.
+            "tokens_used": None,
+            "usage": {},
             "inputs_summary": (
-                f"num_inputs={len(texts)}, num_pieces={len(flat_pieces)}, "
-                f"prefix={active_prefix!r}, sample={flat_pieces[0][:120]!r}"
+                f"num_inputs={num_inputs}, prefix={active_prefix!r}, sample={formatted_inputs[0][:120]!r}"
             ),
         }
         return EmbeddingResult(vectors, entry)
 
     def batch_encode(
-        self,
-        texts: list[str] | str,
-        *,
-        instruction: str | None = None,
-        norm: bool = True,
-        batch_size: int | None = None,
-        stage: str | None = None,
-    ) -> np.ndarray:
-        (
-            resolved_texts,
-            is_query,
-            text_piece_map,
-            flat_pieces,
-            piece_weights,
-            micro_batches,
-        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
-
-        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
-        for mb in micro_batches:
-            mb_texts = [flat_pieces[i] for i in mb]
-            call_kwargs = {"batch_size": len(mb_texts)}
-            vecs = self._encode_prepared(mb_texts, call_kwargs)
-            for local_idx, global_idx in enumerate(mb):
-                flat_vectors[global_idx] = vecs[local_idx]
-
-        return self.publish_result(
-            self._build_embedding_result(
-                resolved_texts,
-                text_piece_map,
-                flat_pieces,
-                piece_weights,
-                micro_batches,
-                flat_vectors,
-                is_query=is_query,
-                instruction=instruction,
-                norm=norm,
-                stage=stage,
-            )
-        )
-
-    async def abatch_encode(
-        self,
-        texts: list[str] | str,
-        *,
-        instruction: str | None = None,
-        norm: bool = True,
-        batch_size: int | None = None,
-        stage: str | None = None,
-    ) -> np.ndarray:
-        """Asynchronously encode micro-batches concurrently using anyio task groups and dspy.asyncify."""
-        import anyio
-
-        (
-            resolved_texts,
-            is_query,
-            text_piece_map,
-            flat_pieces,
-            piece_weights,
-            micro_batches,
-        ) = self._prepare_pieces_and_batches(texts, instruction=instruction, batch_size=batch_size)
-
-        flat_vectors: list[np.ndarray | None] = [None] * len(flat_pieces)
-
-        async def _run_micro_batch(mb: list[int]) -> None:
-            mb_texts = [flat_pieces[i] for i in mb]
-            call_kwargs = {"batch_size": len(mb_texts)}
-            vecs = await self._aencode_prepared(mb_texts, call_kwargs)
-            for local_idx, global_idx in enumerate(mb):
-                flat_vectors[global_idx] = vecs[local_idx]
-
-        if len(micro_batches) == 1:
-            await _run_micro_batch(micro_batches[0])
-        else:
-            async with anyio.create_task_group() as tg:
-                for mb in micro_batches:
-                    tg.start_soon(_run_micro_batch, mb)
-
-        return self.publish_result(
-            self._build_embedding_result(
-                resolved_texts,
-                text_piece_map,
-                flat_pieces,
-                piece_weights,
-                micro_batches,
-                flat_vectors,
-                is_query=is_query,
-                instruction=instruction,
-                norm=norm,
-                stage=stage,
-            )
-        )
-
-    def __call__(
-        self,
-        inputs: str | list[str],
-        batch_size: int | None = None,
-        caching: bool | None = None,
-        **kwargs: Any,
-    ) -> np.ndarray:
-        """DSPy Embedder entrypoint delegating to profile-aware batch_encode."""
-        _ = caching
-        instruction = kwargs.pop("instruction", None)
-        norm = bool(kwargs.pop("norm", True))
-        stage = kwargs.pop("stage", None)
-        return self.batch_encode(
-            inputs,
-            instruction=instruction if isinstance(instruction, str) else None,
-            norm=norm,
-            batch_size=batch_size,
-            stage=stage if isinstance(stage, str) else None,
-        )
-
-    async def acall(
-        self,
-        inputs: str | list[str],
-        batch_size: int | None = None,
-        caching: bool | None = None,
-        *,
-        instruction: str | None = None,
-        norm: bool = True,
-        stage: str | None = None,
-        **kwargs: Any,
-    ) -> np.ndarray:
-        """Async DSPy Embedder entrypoint delegating to profile-aware abatch_encode."""
-        _ = (caching, kwargs)
-        return await self.abatch_encode(
-            inputs,
-            instruction=instruction,
-            norm=norm,
-            batch_size=batch_size,
-            stage=stage,
-        )
-
-    def forward(
-        self,
-        texts: list[str] | str,
-        *,
-        instruction: str | None = None,
-        norm: bool = True,
-        batch_size: int | None = None,
-        stage: str | None = None,
-    ) -> np.ndarray:
-        """Forward pass delegating to batch_encode."""
-        return self.batch_encode(
-            texts,
-            instruction=instruction,
-            norm=norm,
-            batch_size=batch_size,
-            stage=stage,
-        )
-
-    def as_async(self) -> Callable[..., Awaitable[np.ndarray]]:
-        """Return a thread-context-preserving async callable via dspy.asyncify(self)."""
-        return cast(
-            Callable[..., Awaitable[np.ndarray]],
-            dspy.asyncify(cast(Any, self)),
-        )
-
-    def encode(
         self,
         texts: list[str] | str | Sequence[str],
         *,
@@ -843,16 +458,29 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         batch_size: int | None = None,
         stage: str | None = None,
     ) -> np.ndarray:
-        """Alias for batch_encode matching sentence-transformers and DSPy embedder interfaces."""
-        if not isinstance(texts, (str, list)):
-            texts = list(texts)
-        return self.batch_encode(
-            texts,
-            instruction=instruction,
-            norm=norm,
-            batch_size=batch_size,
-            stage=stage,
+        batches = self._prepare_batches(texts, instruction=instruction, batch_size=batch_size)
+        outputs = [self._encode_prepared(batch, {"batch_size": len(batch)}) for batch in batches]
+        return self.publish_result(
+            self._build_embedding_result(batches, outputs, instruction=instruction, norm=norm, stage=stage)
         )
+
+    async def abatch_encode(
+        self,
+        texts: list[str] | str | Sequence[str],
+        *,
+        instruction: str | None = None,
+        norm: bool = True,
+        batch_size: int | None = None,
+        stage: str | None = None,
+    ) -> np.ndarray:
+        batches = self._prepare_batches(texts, instruction=instruction, batch_size=batch_size)
+        outputs = [await self._aencode_prepared(batch, {"batch_size": len(batch)}) for batch in batches]
+        return self.publish_result(
+            self._build_embedding_result(batches, outputs, instruction=instruction, norm=norm, stage=stage)
+        )
+
+    __call__ = batch_encode
+    acall = abatch_encode
 
     def update_prefixes(
         self,
@@ -875,10 +503,11 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
     def format_chunk_for_embedding(self, ptr: ChunkPointer, text: str) -> str:
         """Ensure AST-resolved ChunkPointer.title is passed as a Title: line for title-aware embedders."""
         parse_title = bool(getattr(getattr(self, "profile", None), "parse_document_title", False))
-        if not parse_title or not ptr.title or not ptr.title.strip():
+        clean_title = ptr.title.strip() if ptr.title else ""
+        if not parse_title or not clean_title:
             return text
-        clean_title = ptr.title.strip()
-        first_line = text.split("\n", 1)[0].strip() if "\n" in text else text.strip()
+        nl = text.find("\n")
+        first_line = (text[:nl] if nl != -1 else text).strip()
         if first_line.startswith("#") or first_line.lower().startswith(("title:", "wikipedia title:")):
             return text
         if text.startswith(f"{clean_title}\n"):
@@ -890,9 +519,7 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
     def format_entity_for_embedding(name: str, definition: str) -> str:
         """Format an entity name and contextual definition for embedding."""
         clean_def = definition.strip()
-        if clean_def:
-            return f"# {name}\n{clean_def}"
-        return name
+        return f"# {name}\n{clean_def}" if clean_def else name
 
     @staticmethod
     def format_fact_for_embedding(
@@ -904,11 +531,11 @@ class DSPyEmbeddingAdapter(dspy.Embedder):
         obj_def: str = "",
     ) -> str:
         """Format a subject-predicate-object fact and contextual statement definition for embedding."""
-        _ = (subj_def, obj_def)
+        base = f"{subj} {pred} {obj}"
         s_d = definition.strip()
-        if s_d and s_d.lower().rstrip(".") != f"{subj} {pred} {obj}".lower().rstrip("."):
-            return f"{subj} {pred} {obj}. {s_d}"
-        return f"{subj} {pred} {obj}"
+        if s_d and s_d.lower().rstrip(".") != base.lower().rstrip("."):
+            return f"{base}. {s_d}"
+        return base
 
 
 __all__ = [
@@ -921,8 +548,4 @@ __all__ = [
     "resolve_embedding_profile",
     "create_dspy_embedder",
     "DSPyEmbeddingAdapter",
-    "is_batch_overflow_error",
-    "split_text_gracefully",
-    "pool_subchunk_embeddings",
-    "batch_texts_by_budget",
 ]

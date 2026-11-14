@@ -7,6 +7,8 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from typing import Any
 
+from dspy.lm15 import TokenLogprob
+
 _JUDGE_JSON = re.compile(rb'"(?:[^"\\]|\\.)*"|true|false|[{}:]')
 _VOTE_FIELDS = {"equivalent", "hidden_label", "broader", "narrower", "related"}
 _JSON_TOKENS = re.compile(rb'"(?:[^"\\]|\\.)*"|true|false|null|[{}\[\]:,]|-?\d+(?:\.\d+)?')
@@ -15,13 +17,13 @@ _JSON_TOKENS = re.compile(rb'"(?:[^"\\]|\\.)*"|true|false|null|[{}\[\]:,]|-?\d+(
 class LogprobMeasurement:
     """Reconstruct one response once; missing measurements stay unknown."""
 
-    def __init__(self, logprobs: Any) -> None:
-        self.content = logprobs["content"] if logprobs is not None else None
+    def __init__(self, logprobs: Sequence[TokenLogprob] | None) -> None:
+        self.content = logprobs
         self.text: bytes | None = None
         self.ends: list[int] = []
-        if not self.content or any(token["bytes"] is None for token in self.content):
+        if not self.content or any(token.bytes is None for token in self.content):
             return
-        parts = [bytes(token["bytes"]) for token in self.content]
+        parts = [bytes(token.bytes) for token in self.content if token.bytes is not None]
         offset = 0
         for part in parts:
             offset += len(part)
@@ -36,9 +38,7 @@ class LogprobMeasurement:
             first, last = bisect_right(self.ends, start), bisect_left(self.ends, end)
             value_total = 0.0
             for index in range(first, last + 1):
-                value = self.content[index]["logprob"]
-                if value is None:
-                    return None
+                value = self.content[index].logprob
                 if not math.isfinite(value) or value > 0:
                     raise ValueError("Invalid decision token logprob")
                 value_total += value
@@ -46,15 +46,15 @@ class LogprobMeasurement:
         return math.exp(total / len(fields))
 
 
-def judge_logprob_votes(logprobs: Any, decisions: list[dict[str, Any]]) -> None:
-    """Attach measured Boolean-value confidence, or None; never score reasoning/syntax."""
+def judge_logprob_votes(logprobs: Sequence[TokenLogprob] | None, decisions: list[dict[str, Any]]) -> None:
+    """Measure decision values, never reasoning or structural syntax."""
     for decision in decisions:
         decision["llm_prob"] = None
     measurement = LogprobMeasurement(logprobs)
     if measurement.text is None:
         return
     stack: list[dict[str, Any]] = []
-    spans: dict[str, tuple[list[tuple[int, int]], dict[str, bool]]] = {}
+    spans: dict[str, tuple[list[tuple[int, int]], dict[str, Any]]] = {}
     key = ""
     last_string = b'""'
     for match in _JUDGE_JSON.finditer(measurement.text):
@@ -75,6 +75,11 @@ def judge_logprob_votes(logprobs: Any, decisions: list[dict[str, Any]]) -> None:
                 if stack[-1]["pair_id"] is not None:
                     raise ValueError("Duplicate pair identifier in judge logprobs")
                 stack[-1]["pair_id"] = json.loads(value)
+            elif key == "relation":
+                if key in stack[-1]["values"]:
+                    raise ValueError("Duplicate decision field in judge logprobs")
+                stack[-1]["spans"].append((match.start() + 1, match.end() - 1))
+                stack[-1]["values"][key] = json.loads(value)
             last_string = value
             key = ""
         else:
@@ -89,12 +94,14 @@ def judge_logprob_votes(logprobs: Any, decisions: list[dict[str, Any]]) -> None:
     for decision in decisions:
         fields, values = spans[decision["pair_id"]]
         expected = {key: decision[key] for key in _VOTE_FIELDS if key in decision}
+        if not expected and "relation" in decision:
+            expected["relation"] = decision["relation"]
         if decision.get("equivalent") is False:
             expected.pop("hidden_label", None)
         if values != expected:
             raise ValueError("Judge logprobs do not match the parsed decision values")
         if not fields:
-            raise ValueError("Judge logprobs contain no Boolean decision values")
+            raise ValueError("Judge logprobs contain no decision values")
         decision["llm_prob"] = measurement.probability(fields)
 
 
@@ -107,7 +114,9 @@ def _unique_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def extraction_logprob_votes(logprobs: Any, field: str, records: Sequence[Any]) -> tuple[float | None, ...]:
+def extraction_logprob_votes(
+    logprobs: Sequence[TokenLogprob] | None, field: str, records: Sequence[Any]
+) -> tuple[float | None, ...]:
     """Measure each source record's value strings, validating the exact decoded records."""
     measurement = LogprobMeasurement(logprobs)
     if measurement.text is None:

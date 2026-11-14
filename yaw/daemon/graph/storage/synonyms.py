@@ -4,7 +4,7 @@ import copy
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from itertools import chain
 from pathlib import Path
@@ -155,7 +155,9 @@ class _Packet:
         self.aliases: dict[tuple[str, str], str] = {}
         self.infos: dict[str, dict[str, Any]] = {}
         self.pairs: list[dict[str, Any]] = []
-        self.source_texts: dict[str, str] = {}
+        self.entities: dict[str, dict[str, Any]] = {}
+        self.sources: dict[str, dict[str, Any]] = {}
+        self.source_aliases: dict[tuple[str, int, int, str], str] = {}
         self.shared_role_facts_map = shared_role_facts_map
 
     def fork(self) -> _Packet:
@@ -163,7 +165,9 @@ class _Packet:
         other.identifiers = dict(self.identifiers)
         other.aliases = dict(self.aliases)
         other.infos = dict(self.infos)
-        other.source_texts = dict(self.source_texts)
+        other.entities = dict(self.entities)
+        other.sources = dict(self.sources)
+        other.source_aliases = dict(self.source_aliases)
         other.candidates = list(self.candidates)
         other.pairs = list(self.pairs)
         return other
@@ -184,51 +188,55 @@ class _Packet:
         if ent is None:
             raise ValueError(f"Missing synonym candidate entity {eid}")
 
-        pref_labels = sorted({str(x["raw_label"]) for x in info["labels"] if x["label_kind"] == "skos:prefLabel"})[:4]
+        missing_chunks = set(info["chunk_ids"]) - {cm["chunk_id"] for cm in info["chunks_meta"]}
+        if missing_chunks:
+            raise ValueError(f"Missing source pointers for {eid}: {sorted(missing_chunks)}")
+
+        pref_labels = sorted({str(x["raw_label"]) for x in info["labels"] if x["label_kind"] == "skos:prefLabel"})
         if not pref_labels:
             pref_labels = [str(ent["name"])]
-        alt_labels = sorted({str(x["raw_label"]) for x in info["labels"] if x["label_kind"] == "skos:altLabel"})[:8]
-
-        facts = [list(f["raw_triple"]) for f in info["facts"][:6]]
-
-        sources = []
-        for cm in info["chunks_meta"][:2]:
+        alt_labels = sorted({str(x["raw_label"]) for x in info["labels"] if x["label_kind"] == "skos:altLabel"})
+        hidden_labels = sorted({str(x["raw_label"]) for x in info["labels"] if x["label_kind"] == "skos:hiddenLabel"})
+        facts = [{"triple": list(f["raw_triple"]), "definition": str(f["definition"])} for f in info["facts"]]
+        source_refs = []
+        for cm in info["chunks_meta"]:
             cid = cm["chunk_id"]
-            if cid not in self.source_texts:
-                ptr_map = get_chunk_pointers(self.conn, [cid])
-                pointer = ptr_map.get(cid)
-                if pointer is not None:
-                    hp = hydrate_chunk_pointer(pointer, self.root, max_chars=900)
-                    body = "\n".join(hp.text.strip().splitlines()[:14]) if not hp.stale_on_disk else ""
-                else:
-                    body = ""
-                self.source_texts[cid] = body
-            sources.append(
-                {
-                    "path": cm["rel_posix_path"],
-                    "title": cm["title"],
-                    "text": self.source_texts[cid],
+            pointer = get_chunk_pointers(self.conn, [cid]).get(cid)
+            if pointer is None:
+                raise ValueError(f"Missing source pointer {cid}")
+            key = (pointer.rel_posix_path, pointer.start_line, pointer.end_line, pointer.title)
+            hp = hydrate_chunk_pointer(pointer, self.root, max_chars=0)
+            if hp.stale_on_disk:
+                raise ValueError(f"Stale source pointer {cid}")
+            if key not in self.source_aliases:
+                ref = f"s{len(self.source_aliases)}"
+                self.source_aliases[key] = ref
+                self.sources[ref] = {
+                    "path": pointer.rel_posix_path,
+                    "title": pointer.title,
+                    "start_line": pointer.start_line,
+                    "end_line": pointer.end_line,
+                    "text": hp.text,
                 }
-            )
-
+            ref = self.source_aliases[key]
+            if ref not in source_refs:
+                source_refs.append(ref)
         return {
             "name": str(ent["name"]),
             "definition": str(ent["definition"]),
-            "type": "skos:Concept",
-            "labels": {
-                "skos:prefLabel": pref_labels,
-                "skos:altLabel": alt_labels,
-            },
+            "labels": {"skos:prefLabel": pref_labels, "skos:altLabel": alt_labels, "skos:hiddenLabel": hidden_labels},
             "facts": facts,
-            "sources": sources,
+            "sources": source_refs,
         }
 
     def add(self, candidate: dict[str, Any]) -> None:
         ea, eb = str(candidate["entity_a"]), str(candidate["entity_b"])
         a = self.ref("e", ea)
         b = self.ref("e", eb)
-        ent_a = self.build_entity_dict(ea)
-        ent_b = self.build_entity_dict(eb)
+        if a not in self.entities:
+            self.entities[a] = self.build_entity_dict(ea)
+        if b not in self.entities:
+            self.entities[b] = self.build_entity_dict(eb)
         ia, ib = self.infos[ea], self.infos[eb]
 
         def docs(info: dict[str, Any]) -> set[str]:
@@ -244,8 +252,8 @@ class _Packet:
                 for cm in info["chunks_meta"]
             }
 
-        shared_docs = sorted(docs(ia) & docs(ib))[:2]
-        shared_islands = [list(x) for x in sorted(islands(ia) & islands(ib))[:2]]
+        shared_docs = sorted(docs(ia) & docs(ib))
+        shared_islands = [list(x) for x in sorted(islands(ia) & islands(ib))]
 
         direct_facts: list[list[str]] = []
         seen_direct: set[tuple[str, str, str]] = set()
@@ -255,8 +263,6 @@ class _Packet:
                 if triple not in seen_direct:
                     seen_direct.add(triple)
                     direct_facts.append(list(triple))
-                    if len(direct_facts) >= 2:
-                        break
 
         if self.shared_role_facts_map is None:
             self.shared_role_facts_map = query_shared_role_facts(self.conn, [(ea, eb)])
@@ -272,8 +278,8 @@ class _Packet:
                 "shared_islands": shared_islands,
                 "direct_facts": direct_facts,
                 "shared_role_facts": shared_role,
-                "entity_a": ent_a,
-                "entity_b": ent_b,
+                "entity_a": a,
+                "entity_b": b,
             }
         )
         self.candidates.append(candidate)
@@ -281,8 +287,10 @@ class _Packet:
     def to_json(self) -> str:
         return json.dumps(
             {
-                "format": "synonym-evidence-v2",
+                "format": "synonym-evidence-v3",
                 "pairs": self.pairs,
+                "entities": self.entities,
+                "sources": self.sources,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -292,7 +300,7 @@ class _Packet:
         return SynonymEvidenceBatch(tuple(self.candidates), self.to_json(), dict(self.identifiers), elapsed)
 
 
-def iter_synonym_evidence(
+def iter_semantic_evidence(
     conn: sqlite3.Connection,
     candidates: Sequence[dict[str, Any]],
     corpus_root: Path,
@@ -300,7 +308,6 @@ def iter_synonym_evidence(
     ast_context_hops: int = 0,
     batch_size: int = 6,
     max_chars: int = 40000,
-    fits: Callable[[SynonymEvidenceBatch], bool] | None = None,
 ) -> Iterator[SynonymEvidenceBatch]:
     """Yield complete evidence packets, splitting whole pairs without dropping evidence."""
     if batch_size < 1 or max_chars < 1:
@@ -316,39 +323,11 @@ def iter_synonym_evidence(
     )
     started = time.perf_counter()
 
-    def emit(current: _Packet, elapsed: float) -> Iterator[SynonymEvidenceBatch]:
-        batch = current.batch(elapsed)
-        if fits is None or fits(batch):
-            yield batch
-        elif len(current.candidates) == 1:
-            raise ValueError(f"Complete synonym evidence exceeds context budget for {current.candidates[0]['pair_id']}")
-        else:
-            middle = len(current.candidates) // 2
-            for part in (current.candidates[:middle], current.candidates[middle:]):
-                child_started = time.perf_counter()
-                child = _Packet(
-                    conn,
-                    corpus_root,
-                    ast_context_hops,
-                    shared_role_facts_map=shared_role_facts_map,
-                )
-                child.infos = {
-                    eid: info
-                    for eid, info in current.infos.items()
-                    if any(eid in (c["entity_a"], c["entity_b"]) for c in part)
-                }
-                child.source_texts = dict(current.source_texts)
-                for candidate in part:
-                    child.add(candidate)
-                yield from emit(
-                    child, elapsed * len(part) / len(current.candidates) + time.perf_counter() - child_started
-                )
-
     for candidate in candidates:
         trial = packet.fork()
         trial.add(candidate)
         if packet.candidates and (len(trial.candidates) > batch_size or len(trial.batch(0).payload) > max_chars):
-            yield from emit(packet, time.perf_counter() - started)
+            yield packet.batch(time.perf_counter() - started)
             packet = _Packet(
                 conn,
                 corpus_root,
@@ -356,7 +335,6 @@ def iter_synonym_evidence(
                 shared_role_facts_map=shared_role_facts_map,
             )
             packet.infos = {eid: trial.infos[eid] for eid in (candidate["entity_a"], candidate["entity_b"])}
-            packet.source_texts = dict(trial.source_texts)
             started = time.perf_counter()
             packet.add(candidate)
         else:
@@ -367,4 +345,4 @@ def iter_synonym_evidence(
                 f"exceeds {max_chars} characters"
             )
     if packet.candidates:
-        yield from emit(packet, time.perf_counter() - started)
+        yield packet.batch(time.perf_counter() - started)

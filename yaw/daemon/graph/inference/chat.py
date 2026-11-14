@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import re
@@ -8,17 +9,14 @@ from pathlib import Path
 from typing import Any
 
 import dspy
+from dspy.lm15 import Response
 
-from yaw.core.config import scale_context_budget
-
-from .completions import GemmaCompletionsEngine
+from .completions import AsyncGemmaCompletionsEngine, GemmaCompletionsEngine
 from .grammars import lm_supports_gbnf
 from .models import BASE_URL, CHAT_MODELS, DEFAULT_EXTRACTION_CHAT, DEFAULT_QA_CHAT
 
 for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy", "litellm", "httpx"):
     logging.getLogger(_logger_name).setLevel(logging.WARNING)
-if hasattr(dspy, "disable_litellm_logging"):
-    dspy.disable_litellm_logging()
 
 _YAW_SLEEP_SECONDS: ContextVar[float] = ContextVar("yaw_sleep_seconds", default=0.0)
 
@@ -56,6 +54,10 @@ class _UsageAccountingCache:
 
     @staticmethod
     def _is_truncated(record: Any) -> bool:
+        if isinstance(record, Response):
+            return record.finish_reason == "length"
+        if isinstance(record, Mapping) and "responses" in record:
+            return any(response.get("finish_reason") == "length" for response in record["responses"])
         choices = record.get("choices") if isinstance(record, Mapping) else getattr(record, "choices", None)
         if not isinstance(choices, Sequence) or not choices:
             return False
@@ -189,9 +191,31 @@ class YawDSPyLM(dspy.LM):
     _yaw_recipe: str | None = None
     _yaw_context_window_tokens: int | None = None
     _yaw_supports_gbnf: bool = False
+    _yaw_deployment_identity: str | None = None
 
-    def __call__(self, prompt: Any = None, *, messages: Any = None, **kwargs: Any) -> Any:
-        res = super().__call__(prompt=prompt, messages=messages, **kwargs)
+    def _scope_rollout(self, kwargs: dict[str, Any]) -> None:
+        if self._yaw_deployment_identity is not None:
+            rollout = kwargs.get("rollout_id", self.kwargs.get("rollout_id"))
+            value = f"{self._yaw_deployment_identity}:{rollout!r}".encode()
+            kwargs["rollout_id"] = int.from_bytes(hashlib.sha256(value).digest()[:8], "big")
+
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        self._scope_rollout(kwargs)
+        if isinstance(prompt, str):
+            from dspy.clients.execution import execute, finalize, prepare
+
+            cache = kwargs.pop("cache", None)
+            rollout_id = kwargs.pop("rollout_id", None)
+            call = prepare(self, prompt, kwargs, cache=cache, rollout_id=rollout_id)
+            result = execute(self, call)
+            for response in result.responses:
+                if response.finish_reason == "length":
+                    raise ValueError(f"Incomplete generation from {response.model}: finish_reason='length'")
+            res = finalize(self, call, result)
+        else:
+            res = super().__call__(prompt, **kwargs)
+        if isinstance(res, Response) and res.finish_reason == "length":
+            raise ValueError(f"Incomplete generation from {res.model}: finish_reason='length'")
         if isinstance(res, list):
             res = [strip_thinking_channel(item) if isinstance(item, str) else item for item in res]
         elif isinstance(res, str):
@@ -201,10 +225,30 @@ class YawDSPyLM(dspy.LM):
             time.sleep(sleep_sec)
         return res
 
+    async def acall(self, prompt: Any = None, **kwargs: Any) -> Any:
+        self._scope_rollout(kwargs)
+        if isinstance(prompt, str):
+            from dspy.clients.execution import aexecute, finalize, prepare
+
+            cache = kwargs.pop("cache", None)
+            rollout_id = kwargs.pop("rollout_id", None)
+            call = prepare(self, prompt, kwargs, cache=cache, rollout_id=rollout_id, asynchronous=True)
+            result = await aexecute(self, call)
+            for response in result.responses:
+                if response.finish_reason == "length":
+                    raise ValueError(f"Incomplete generation from {response.model}: finish_reason='length'")
+            res = finalize(self, call, result)
+        else:
+            res = await super().acall(prompt, **kwargs)
+        if isinstance(res, Response) and res.finish_reason == "length":
+            raise ValueError(f"Incomplete generation from {res.model}: finish_reason='length'")
+        return res
+
     def copy(self, **kwargs: Any) -> YawDSPyLM:
         copied = super().copy(**kwargs)
         if not isinstance(copied, YawDSPyLM):
             raise TypeError("DSPy returned an incompatible LM copy")
+        copied._yaw_deployment_identity = self._yaw_deployment_identity
         copied._yaw_context_window_tokens = getattr(self, "_yaw_context_window_tokens", None)
         copied._yaw_recipe = getattr(self, "_yaw_recipe", None)
         copied._yaw_supports_gbnf = getattr(self, "_yaw_supports_gbnf", False)
@@ -266,6 +310,7 @@ def create_dspy_lm(
     context_window_tokens: int | None = None,
     cache: bool = True,
     timeout: float = 240.0,
+    diagnostic_dir: Path | None = None,
     **kwargs: Any,
 ) -> YawDSPyLM:
     """Create a native dspy.LM configured for Lemonade (openai/...) or Ollama (ollama_chat/...).
@@ -310,13 +355,7 @@ def create_dspy_lm(
     context_tokens = (
         context_window_tokens if context_window_tokens is not None else profile.expected_context if profile else None
     )
-    if max_tokens is None:
-        max_tokens = (
-            scale_context_budget(4096, context_tokens)
-            if context_tokens is not None and (context_window_tokens is not None or context_tokens >= 65536)
-            else 4096
-        )
-    if context_tokens is not None and not 0 < max_tokens < context_tokens:
+    if max_tokens is not None and (max_tokens < 1 or (context_tokens is not None and max_tokens >= context_tokens)):
         raise ValueError("Require 0 < max_tokens < context_window_tokens")
 
     lm_kwargs: dict[str, Any] = dict(kwargs)
@@ -324,13 +363,6 @@ def create_dspy_lm(
         lm_kwargs.setdefault("top_p", top_p)
     if top_k is not None:
         lm_kwargs.setdefault("top_k", top_k)
-        extra = dict(lm_kwargs.get("extra_body") or {})
-        extra.setdefault("top_k", top_k)
-        lm_kwargs["extra_body"] = extra
-    if recipe == "flm":
-        extra = dict(lm_kwargs.get("extra_body") or {})
-        extra.setdefault("think", False)
-        lm_kwargs["extra_body"] = extra
 
     if provider == "ollama" or model_name.startswith(("ollama_chat/", "ollama/")):
         litellm_model = (
@@ -348,10 +380,16 @@ def create_dspy_lm(
         )
     else:
         litellm_model = model_name if "/" in model_name else f"openai/{clean_name}"
+        if supports_gbnf and clean_name == "gemma-4-e4b":
+            # DSPy keys custom-engine legacy calls from kwargs, not engine state.
+            lm_kwargs["yaw_completion_identity"] = f"gemma4-completions-v1:{base_url.rstrip('/')}"
         connection: dict[str, Any] = (
-            {"engine": GemmaCompletionsEngine(base_url, api_key, timeout)}
-            if supports_gbnf
-            else {"api_base": base_url, "api_key": api_key, "timeout": timeout}
+            {
+                "engine": GemmaCompletionsEngine(base_url, api_key, timeout, diagnostic_dir=diagnostic_dir),
+                "async_engine": AsyncGemmaCompletionsEngine(base_url, api_key, timeout, diagnostic_dir=diagnostic_dir),
+            }
+            if supports_gbnf and clean_name == "gemma-4-e4b"
+            else {"engine": "lm15", "api_base": base_url, "api_key": api_key, "timeout": timeout}
         )
         lm = YawDSPyLM(
             model=litellm_model,
@@ -387,7 +425,7 @@ def create_dspy_rlm_pair(
       generation without GBNF (`_yaw_supports_gbnf=False`).
     - `sub_lm` (`role="extraction"` or `"reflection_worker"`): runs inner `llm_query`,
       `synthesize_instruction`, and GBNF-constrained `llm_*` worker calls (`_yaw_supports_gbnf=True`).
-    - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"` (`temp=0.8`, `max_tokens=4096`)
+    - When `reflection=True`, configures `orchestrator_lm` with `role="reflection"`
       and `sub_lm` with `role="reflection_worker"`; sampling follows each model profile.
     """
     orchestrator_lm = create_dspy_lm(

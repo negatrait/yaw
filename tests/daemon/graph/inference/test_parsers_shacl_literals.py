@@ -21,9 +21,8 @@ from yaw.daemon.graph.inference.parsers import (
 )
 from yaw.daemon.graph.inference.prompts import (
     ExtractTriples,
-    JudgeHierarchy,
     JudgeLabels,
-    JudgeRelated,
+    JudgeRelations,
     ProposeSHACLRepairs,
 )
 
@@ -284,7 +283,7 @@ def test_detect_scalar_literal_rejects_normal_concepts(concept_str: str) -> None
 def test_relation_traversal_policy_datatype_property() -> None:
     """Verify RelationTraversalPolicy exposes policy multipliers and aliases."""
     pol = RelationTraversalPolicy()
-    assert pol.owl_different_from == pytest.approx(0.0)
+    assert not hasattr(pol, "owl_different_from")
     assert pol.passage == pytest.approx(1.0)
     assert pol.fact_forward == pytest.approx(1.0)
     assert pol.fact_reverse == pytest.approx(1.0)
@@ -294,14 +293,14 @@ def test_relation_traversal_policy_datatype_property() -> None:
 
 
 def test_gbnf_and_prompts_typed_predicate_and_shacl_actions() -> None:
-    """Verify ExtractTriples, JudgeLabels, JudgeHierarchy, JudgeRelated, ProposeSHACLRepairs,
+    """Verify ExtractTriples, JudgeLabels, JudgeRelations, ProposeSHACLRepairs,
     GBNF grammars, and VALID_SHACL_ACTIONS contracts."""
     assert "owl:ObjectProperty" in ExtractTriples.instructions
     assert "owl:DatatypeProperty" in ExtractTriples.instructions
     assert "skos:altLabel" in JudgeLabels.instructions
     assert "skos:hiddenLabel" in JudgeLabels.instructions
-    assert "skos:broader" in JudgeHierarchy.instructions
-    assert "skos:related" in JudgeRelated.instructions
+    assert "skos:broader" in JudgeRelations.instructions
+    assert "skos:related" in JudgeRelations.instructions
     assert "pred-obj ::=" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:ObjectProperty" in DSPY_TRIPLES_GBNF_GRAMMAR
     assert "owl:DatatypeProperty" in DSPY_TRIPLES_GBNF_GRAMMAR

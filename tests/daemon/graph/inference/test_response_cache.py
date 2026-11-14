@@ -21,15 +21,16 @@ import json, os, sys
 from pathlib import Path
 import dspy
 from dspy.utils.usage_tracker import track_usage
+from dspy.lm15 import Config, Message, Request
 from yaw.daemon.graph.inference import configure_yaw_dspy_cache, create_dspy_lm
 
 root, url, case = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 configure_yaw_dspy_cache(root / "responses", enable_disk_cache=True,
     enable_memory_cache=False, restrict_pickle=True, account_cached_usage=True)
-lm = create_dspy_lm("cache-other" if case == "model" else "cache-test",
+model = "gemma-4-e4b" if case in ("grammar", "grammar_base") else ("cache-other" if case == "model" else "cache-test")
+lm = create_dspy_lm(model,
     base_url=url, api_key="test", temperature=0.4 if case == "temperature" else 0.2,
-    max_tokens=200, cache=case != "bypass",
-    **({"engine": "litellm"} if case == "legacy" else {}))
+    max_tokens=200, cache=case != "bypass")
 dspy.configure(lm=lm, track_usage=True, adapter=dspy.JSONAdapter())
 if case == "gepa":
     student = dspy.Predict("question -> answer")
@@ -47,11 +48,13 @@ if case == "gepa":
 else:
     messages = [{"role": "user", "content": "A changed request" if case == "prompt"
                  else "Return the cached result."}]
-    options = {"extra_body": {"grammar": 'root ::= "cached"'}} if case == "grammar" else {}
+    options = {"grammar": 'root ::= "cached"'} if case == "grammar" else {}
     logical, physical, outputs = [], [], []
     for _ in range(2):
         with track_usage() as tracker:
-            outputs.append(lm(messages=messages, **options))
+            outputs.append(lm(Request(model=lm.model, messages=(Message.user(messages[0]["content"]),),
+                config=Config(temperature=0.4 if case == "temperature" else 0.2,
+                              max_tokens=200, extensions=options or None))).text)
         logical.append(sum(v.get("total_tokens", 0) for v in tracker.get_total_tokens().values()))
         physical.append(lm.history[-1]["usage"].get("total_tokens", 0))
     report = {"logical": logical, "physical": physical, "outputs": outputs}
@@ -71,7 +74,7 @@ def inference_server():
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(request)
             content = (
-                '{"answer":"cached","reasoning":"Grounded in the supplied passage."}'
+                json.dumps({"answer": "cached", "plan": "Grounded.", "reasoning": "Grounded."})
                 if request["model"] == "retention-test"
                 else '{"answer":"cached"}'
             )
@@ -89,6 +92,8 @@ def inference_server():
                 ],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
             }
+            if self.path.endswith("/completions") and not self.path.endswith("/chat/completions"):
+                response["choices"][0] = {"index": 0, "text": content, "finish_reason": "stop"}
             body = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -195,11 +200,16 @@ def test_response_disk_cache_across_processes_and_request_invalidation(
     assert second["physical"] == [0, 0]
     assert second["hits"] == 2 and second["cached_tokens"] == 60
     assert second["disk"] and not second["memory"]
-    for case in ("prompt", "model", "temperature", "grammar"):
+    for case in ("prompt", "model", "temperature"):
         before = len(requests)
         changed = _run_worker(tmp_path, url, case)
         assert len(requests) == before + 1
         assert changed["logical"] == [30, 30]
+    _run_worker(tmp_path, url, "grammar_base")
+    before = len(requests)
+    changed = _run_worker(tmp_path, url, "grammar")
+    assert len(requests) == before + 1
+    assert changed["logical"] == [30, 30]
     before = len(requests)
     bypass = _run_worker(tmp_path, url, "bypass")
     assert len(requests) == before + 2
@@ -221,13 +231,13 @@ def test_native_gepa_scores_match_after_request_cache_restart(
     assert second["hits"] == 1
 
 
-def test_legacy_sdk_response_cache_preserves_logical_usage(
+def test_native_sdk_response_cache_preserves_logical_usage(
     tmp_path: Path,
     inference_server,
 ) -> None:
     url, requests = inference_server
-    first = _run_worker(tmp_path, url, "legacy")
-    second = _run_worker(tmp_path, url, "legacy")
+    first = _run_worker(tmp_path, url)
+    second = _run_worker(tmp_path, url)
     assert len(requests) == 1
     assert first["logical"] == second["logical"] == [30, 30]
     assert second["physical"] == [0, 0]
@@ -257,7 +267,7 @@ def test_response_cache_passthrough_and_unreported_usage(tmp_path: Path) -> None
         dspy.cache.put(unrelated, {"answer": "unchanged"})
         assert dspy.cache.get(unrelated) == {"answer": "unchanged"}
         assert dspy.cache.cache_hits == 0
-        request = {"_fn_identifier": "dspy.clients.lm.litellm_completion", "model": "test"}
+        request = {"_fn_identifier": "dspy.clients.lm15.completion", "model": "test"}
         record = {
             "_dspy_format": "counter-test",
             "usage": {
@@ -315,7 +325,7 @@ def test_response_cache_rejects_length_truncated_lm_completions(tmp_path: Path) 
         account_cached_usage=True,
     )
     try:
-        request = {"_fn_identifier": "dspy.clients.lm.litellm_completion", "model": "test"}
+        request = {"_fn_identifier": "dspy.clients.lm15.completion", "model": "test"}
         truncated = {
             "_dspy_format": "truncated-test",
             "choices": [{"index": 0, "finish_reason": "length", "message": {"content": '{"triples": ['}}],

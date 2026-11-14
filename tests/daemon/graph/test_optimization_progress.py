@@ -180,6 +180,7 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
                     retrieved_chunk_ids=["chunk-short", "chunk-cropped"],
                     retrieved_passages=[short_false_positive, cropped_chunk],
                 )
+                pred.set_lm_usage({"evaluation": {"total_tokens": 5}})
                 self.metric(ex, pred)
             return student
 
@@ -201,7 +202,7 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
         hydrate_top_chunks=lambda cids, p: {
             cid: (short_false_positive if cid == "chunk-short" else cropped_chunk) for cid in cids
         },
-        query_rlm_stats=lambda docs: {},
+        query_rlm_stats=lambda docs: {"openie_tokens": 100},
         graph_rlm_stats=lambda: {},
         last_hook_program=lambda: prog,
         persist_trails=lambda p: None,
@@ -218,7 +219,6 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
         save_path=save_path,
         reflection_lm=dummy_lm,
         reflection_worker_lm=dummy_lm,
-        reflection_token_counter=lambda text: len(text.split()),
     )
     audit_path = tmp_path / "compiled_audit.json"
     assert audit_path.exists()
@@ -232,3 +232,6 @@ def test_evaluate_program_uses_canonical_recall_and_gold_matching(tmp_path, monk
     assert rec["r5"] == 1.0
     assert rec["em"] == 1.0
     assert rec["f1"] == 1.0
+    assert rec["tokens"] == 5
+    assert rec["indexing_lm_usage_available"] is False
+    assert rec["reported_openie_tokens"] == 100

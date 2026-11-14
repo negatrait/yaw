@@ -65,15 +65,10 @@ STAGE_SCHEMA_CONTRACTS: dict[str, tuple[str, tuple[str, ...], str]] = {
             "and `hidden_label` flag only when equivalent."
         ),
     ),
-    "hierarchy_judge": (
+    "relation_judge": (
         "decisions",
         ("decisions",),
-        "Populate `decisions` with hierarchical subsumption decisions (`broader` and `narrower`).",
-    ),
-    "related_judge": (
-        "decisions",
-        ("decisions",),
-        "Populate `decisions` with associative relation decisions (`related`).",
+        "Populate decisions with one oriented relation per pair.",
     ),
     "shacl_repair": (
         "repairs",
@@ -256,7 +251,7 @@ def validate_stage_invariants(
             f"[entity_definer] ConceptShape/definition missing or tautological for: {unrepaired}",
         )
 
-    if stage in ("label_judge", "hierarchy_judge", "related_judge"):
+    if stage in ("label_judge", "relation_judge"):
         raw_decisions = getattr(prediction, "decisions", None)
         items = list(raw_decisions) if isinstance(raw_decisions, (list, tuple)) else []
         if not items:
@@ -271,15 +266,10 @@ def validate_stage_invariants(
         expected = (
             {pair["pair_id"] for pair in packet["pairs"]}
             if isinstance(packet, dict)
-            and packet.get("format") == "synonym-evidence-v2"
+            and packet.get("format") == "synonym-evidence-v3"
             and isinstance(packet.get("pairs"), list)
             else None
         )
-        bool_keys = {
-            "label_judge": (),
-            "hierarchy_judge": ("broader", "narrower"),
-            "related_judge": ("related",),
-        }[stage]
 
         for d in items:
             if not isinstance(d, Mapping):
@@ -319,12 +309,17 @@ def validate_stage_invariants(
                         issues.append(f"Non-boolean value {d['hidden_label']!r} for 'hidden_label' in {pair_id!r}")
                     elif d.get("alt_label") is True or d.get("hidden_label") is True:
                         issues.append(f"Conflicting alt_label/hidden_label with equivalent=False in {pair_id!r}")
-            else:
-                for bk in bool_keys:
-                    if bk not in d:
-                        issues.append(f"Missing boolean field {bk!r} for {pair_id!r}")
-                    elif not isinstance(d[bk], bool):
-                        issues.append(f"Non-boolean value {d[bk]!r} for {bk!r} in {pair_id!r}")
+            elif d.get("relation") not in {"skos:broader", "skos:narrower", "skos:related", "owl:differentFrom"}:
+                issues.append(f"Invalid relation for {pair_id!r}")
+            elif (
+                d["relation"] == "owl:differentFrom"
+                and isinstance(packet, dict)
+                and any(
+                    pair.get("pair_id") == pair_id and (pair.get("direct_facts") or pair.get("shared_role_facts"))
+                    for pair in packet.get("pairs", [])
+                )
+            ):
+                issues.append(f"Fact-associated pair cannot be differentFrom: {pair_id!r}")
             if pair_id in seen_pairs:
                 issues.append(f"Duplicate pair_id={pair_id!r}")
             seen_pairs.add(pair_id)

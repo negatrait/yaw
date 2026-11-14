@@ -202,17 +202,16 @@ def build_internal_import_graph() -> dict[str, set[str]]:
                         alias_full = f"{full}.{alias.name}" if full else alias.name
                         if alias_full in module_map and alias_full != mod:
                             graph[mod].add(alias_full)
-                elif node.module:
-                    if node.module.startswith("yaw.") or node.module == "yaw":
-                        cand = node.module
-                        while cand and cand not in module_map:
-                            cand = cand.rsplit(".", 1)[0] if "." in cand else None
-                        if cand and cand != mod:
-                            graph[mod].add(cand)
-                        for alias in node.names:
-                            alias_full = f"{node.module}.{alias.name}"
-                            if alias_full in module_map and alias_full != mod:
-                                graph[mod].add(alias_full)
+                elif node.module and (node.module.startswith("yaw.") or node.module == "yaw"):
+                    cand = node.module
+                    while cand and cand not in module_map:
+                        cand = cand.rsplit(".", 1)[0] if "." in cand else None
+                    if cand and cand != mod:
+                        graph[mod].add(cand)
+                    for alias in node.names:
+                        alias_full = f"{node.module}.{alias.name}"
+                        if alias_full in module_map and alias_full != mod:
+                            graph[mod].add(alias_full)
 
     return graph
 

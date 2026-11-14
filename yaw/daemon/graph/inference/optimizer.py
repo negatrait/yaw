@@ -21,14 +21,15 @@ from cocoindex.connectorkits.fingerprint import fingerprint_object
 from gepa.core.callbacks import CompositeCallback
 
 from yaw.core import ChunkPointer, YawRuntimeError, compute_mdhash_id, write_text_atomic
+from yaw.core.constants import HMM_RETRIEVAL_VERSION
 
+from .adapter import sum_usage_tokens
 from .chat import configure_yaw_dspy_cache, set_yaw_sleep_seconds
 from .diagnostics import (
     extract_named_trace_entries,
-    hierarchy_judge_fingerprint,
     judge_stage_fingerprint,
     label_judge_fingerprint,
-    related_judge_fingerprint,
+    relation_judge_fingerprint,
     serialize_predictor_surface,
 )
 from .embedding import FACT_INSTRUCTION
@@ -43,16 +44,28 @@ from .program import YawProgram
 from .proposer import RLMInstructionProposer
 from .reflection import (
     ActiveReflectionCheckpoint,
-    ServingTokenCounter,
     checkpoint_object,
     validate_active_checkpoint,
     validate_request_checkpoint,
     validate_simba_state,
 )
 
-# Extraction/validation contract version (native graph spec §5.3). Bump whenever a grammar, parser
+# Extraction/validation contract version (native graph spec Â§5.3). Bump whenever a grammar, parser
 # or SHACL rule changes so memoized artifacts produced under the old contract are not reused.
-SCHEMA_VERSION = "skos-shacl-v7-source-logprobs"
+SCHEMA_VERSION = "skos-shacl-v8-lossless-native-two-stage"
+
+
+def _prediction_lm_usage(prediction: Any) -> tuple[int, bool]:
+    """Use only usage captured by DSPy for this prediction, never shared diagnostics."""
+    get_usage = getattr(prediction, "get_lm_usage", None)
+    usage = get_usage() if callable(get_usage) else None
+    if usage is None:
+        return 0, False
+    if isinstance(usage, (int, float)):
+        return int(usage), True
+    if not isinstance(usage, Mapping):
+        raise TypeError("Prediction LM usage must be a model usage mapping")
+    return sum_usage_tokens(usage), True
 
 
 def _optimization_history_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -280,6 +293,7 @@ def shacl_fingerprint(program: YawProgram) -> str:
         name: getattr(healer, name, None) for name in ("max_iters", "max_llm_calls", "max_output_chars")
     }
     payload["context_budget"] = [program.context_window_tokens, program.max_output_tokens]
+    payload["serving_identity"] = getattr(program, "_yaw_serving_identity", None)
     payload["schema_version"] = SCHEMA_VERSION
     return fingerprint_object(payload).hex()
 
@@ -294,6 +308,7 @@ def openie_fingerprint(program: YawProgram) -> str:
         "gbnf_max_entities": getattr(program, "gbnf_max_entities", None),
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "serving_identity": getattr(program, "_yaw_serving_identity", None),
         "schema_version": SCHEMA_VERSION,
     }
     return fingerprint_object(payload).hex()
@@ -307,8 +322,7 @@ def extraction_fingerprint(program: YawProgram) -> str:
         "triples",
         "entity_definer",
         "label_judge",
-        "hierarchy_judge",
-        "related_judge",
+        "relation_judge",
         "shacl_repair",
         "shacl_healer_rlm.generate_action",
         "shacl_healer_rlm.extract",
@@ -319,6 +333,7 @@ def extraction_fingerprint(program: YawProgram) -> str:
         "gbnf_max_triples": getattr(program, "gbnf_max_triples", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "serving_identity": getattr(program, "_yaw_serving_identity", None),
         "schema_version": SCHEMA_VERSION,
     }
     return fingerprint_object(payload).hex()
@@ -328,11 +343,13 @@ def candidate_fingerprint(program: YawProgram) -> str:
     """Identify an optimizer candidate by hashing every predictor surface and embedding prefix."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
+        "retrieval_version": HMM_RETRIEVAL_VERSION,
         "stages": {k: serialize_predictor_surface(v) for k, v in sorted(named.items())},
         "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "embedding_document_prefix": getattr(program, "embedding_document_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "serving_identity": getattr(program, "_yaw_serving_identity", None),
         "schema_version": SCHEMA_VERSION,
     }
     return fingerprint_object(payload).hex()[:16]
@@ -342,10 +359,12 @@ def query_retrieval_fingerprint(program: YawProgram) -> str:
     """Compute SHA-256 fingerprint for query-time retrieval predictor surfaces (`query_intent`, `triple_filter`)."""
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     payload = {
+        "retrieval_version": HMM_RETRIEVAL_VERSION,
         "stages": {k: serialize_predictor_surface(named[k]) for k in ("query_intent", "triple_filter") if k in named},
         "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "serving_identity": getattr(program, "_yaw_serving_identity", None),
     }
     return fingerprint_object(payload).hex()[:16]
 
@@ -355,10 +374,12 @@ def _query_qa_fingerprint(program: YawProgram) -> str:
     named = dict(program.named_predictors()) if hasattr(program, "named_predictors") else {}
     qa_keys = ("query_intent", "triple_filter", "qa", "qa.predict")
     payload = {
+        "retrieval_version": HMM_RETRIEVAL_VERSION,
         "stages": {k: serialize_predictor_surface(named[k]) for k in qa_keys if k in named},
         "embedding_query_prefix": getattr(program, "embedding_query_prefix", None),
         "embedding_fact_prefix": getattr(program, "embedding_fact_prefix", None),
         "context_budget": [program.context_window_tokens, program.max_output_tokens],
+        "serving_identity": getattr(program, "_yaw_serving_identity", None),
     }
     return fingerprint_object(payload).hex()[:16]
 
@@ -500,7 +521,7 @@ def rrf_fuse_passage_lists(
     top_k: int = 20,
     rrf_k: float = 60.0,
 ) -> list[tuple[Any, float, str]]:
-    """Fuse ranked `(chunk_id_or_pointer, score, text)` lists via RRF (`1 / (60 + r)`) + normalized PPR scores."""
+    """Fuse ranked `(chunk_id_or_pointer, score, text)` lists via RRF (`1 / (60 + r)`) + normalized retrieval scores."""
     if not ranked_lists or top_k <= 0:
         return []
 
@@ -769,8 +790,7 @@ def configure_simba_task_learning(
             proposer.enable_gbnf,
             proposer.worker_temperature,
             proposer.reflection_temperature,
-            proposer.reflection_input_tokens,
-            getattr(proposer.token_counter, "identity", None),
+            proposer.reflection_input_chars,
         ],
     }
     context = hashlib.sha256(
@@ -981,7 +1001,6 @@ def evolve_program_prompts(
     save_path: Path | str | None = None,
     reflection_lm: Any = None,
     reflection_worker_lm: Any = None,
-    reflection_token_counter: Any = None,
     auto: Literal["light", "medium", "heavy"] | None = "light",
     num_candidates: int | None = None,
     num_trials: int | None = None,
@@ -1012,27 +1031,15 @@ def evolve_program_prompts(
     resolved_worker_lm = reflection_worker_lm or program.rlm_sub_lm or program.orchestrator_lm or resolved_ref_lm
     if resolved_worker_lm is None:
         raise YawRuntimeError("MODEL_ERROR", "Optimization requires a reflection LM")
-    if reflection_token_counter is None:
-        if hooks.config is None:
-            raise YawRuntimeError(
-                "INVALID_INPUT",
-                "Optimization requires inference configuration or an explicit verified tokenizer",
-            )
-        reflection_token_counter = ServingTokenCounter(
-            hooks.config.base_url,
-            resolved_worker_lm.model,
-            hooks.config.reflection_tokenizer_url,
-        )
     proposer = RLMInstructionProposer(
         orchestrator_lm=resolved_ref_lm,
         worker_lm=resolved_worker_lm,
         enable_gbnf=True,
-        rlm_max_iters=getattr(hooks.config, "rlm_max_iters", 10),
-        rlm_max_llm_calls=getattr(hooks.config, "rlm_max_llm_calls", 20),
+        rlm_max_iters=getattr(hooks.config, "rlm_max_iters", 20),
+        rlm_max_llm_calls=getattr(hooks.config, "rlm_max_llm_calls", 50),
         rlm_max_output_chars=getattr(hooks.config, "rlm_max_output_chars", None),
         max_field_chars=program._context_char_limit(600),
-        reflection_input_tokens=getattr(hooks.config, "reflection_input_tokens", None),
-        token_counter=reflection_token_counter,
+        reflection_input_chars=getattr(hooks.config, "reflection_input_chars", None),
     )
 
     proposer.preflight()
@@ -1219,33 +1226,13 @@ def evolve_program_prompts(
             if em_score < 1.0:
                 missed.append(f"Predicted={pred_answer!r} != Expected={gold_answers!r}")
 
-        usage_tokens = 0
-        if hasattr(pred, "get_lm_usage") and callable(pred.get_lm_usage):
-            usage_map = pred.get_lm_usage() or {}
-            if isinstance(usage_map, (int, float)):
-                usage_tokens = int(usage_map)
-            elif isinstance(usage_map, dict):
-                for model_usage in usage_map.values():
-                    if isinstance(model_usage, dict):
-                        usage_tokens += int(
-                            model_usage.get("completion_tokens")
-                            or model_usage.get("output_tokens")
-                            or model_usage.get("total_tokens")
-                            or 0
-                        )
-                    elif isinstance(model_usage, (int, float)):
-                        usage_tokens += int(model_usage)
-        if usage_tokens <= 0 and hasattr(cand_prog, "telemetry") and cand_prog.telemetry:
-            usage_tokens = sum(
-                int(entry.get("tokens_used", 0)) for entry in cand_prog.telemetry[-20:] if isinstance(entry, dict)
-            )
+        usage_tokens, lm_usage_available = _prediction_lm_usage(pred)
         apm_hit: bool | None = None
         if gold_answers is not None and len(gold_answers) > 0:
             apm_hit = compute_answer_passage_match(gold_answers, context_str)
 
         gold_item_docs = getattr(gold, "item_docs", None) or getattr(gold, "gold_docs", None)
         q_stats = hooks.query_rlm_stats(gold_item_docs)
-        usage_tokens += int(q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens", 0)))
         score_pred = compute_task_quality_score(
             recalls_by_k[5] if has_retrieval_labels else None,
             recall_at_1=recalls_by_k[1] if has_retrieval_labels else None,
@@ -1256,8 +1243,7 @@ def evolve_program_prompts(
             f1=f1_score,
             tokens=usage_tokens,
             label_judge_tokens=int(q_stats.get("label_judge_tokens", 0)),
-            hierarchy_judge_tokens=int(q_stats.get("hierarchy_judge_tokens", 0)),
-            related_judge_tokens=int(q_stats.get("related_judge_tokens", 0)),
+            relation_judge_tokens=int(q_stats.get("relation_judge_tokens", 0)),
             shacl_healer_tokens=int(q_stats.get("shacl_healer_tokens", 0)),
             shacl_violations_initial=int(
                 q_stats.get(
@@ -1276,6 +1262,13 @@ def evolve_program_prompts(
             pred_name=str(pred_name) if pred_name else None,
             missed_items=missed,
         )
+        score_pred.reported_openie_tokens = q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens"))
+        score_pred.lm_usage_available = lm_usage_available
+        score_pred.embedding_usage_available = False
+        score_pred.indexing_lm_usage_available = False
+        score_pred.feedback = f"{score_pred.feedback} | Candidate indexing LM usage unavailable"
+        if not lm_usage_available:
+            score_pred.feedback = f"{score_pred.feedback} | LM usage unavailable"
         if apm_hit is not None:
             score_pred.answer_passage_match = 1.0 if apm_hit else 0.0
             score_pred.feedback = f"{score_pred.feedback} | AnswerPassageMatch={1 if apm_hit else 0}"
@@ -1310,6 +1303,10 @@ def evolve_program_prompts(
                 "em": round(em_val, 4),
                 "f1": round(f1_val, 4),
                 "tokens": int(usage_tokens),
+                "lm_usage_available": lm_usage_available,
+                "embedding_usage_available": False,
+                "indexing_lm_usage_available": False,
+                "reported_openie_tokens": q_stats.get("openie_tokens", q_stats.get("cached_openie_tokens")),
                 "s_per_it": round(dt_eval, 2),
                 "ts": round(now_ts, 2),
             }
@@ -1682,7 +1679,7 @@ __all__ = [
     "evolve_program_prompts",
     "extract_named_trace_entries",
     "extraction_fingerprint",
-    "hierarchy_judge_fingerprint",
+    "relation_judge_fingerprint",
     "judge_stage_fingerprint",
     "label_judge_fingerprint",
     "openie_fingerprint",
@@ -1690,7 +1687,6 @@ __all__ = [
     "prune_mismatching_demos",
     "query_retrieval_fingerprint",
     "reduce_pareto_predictions",
-    "related_judge_fingerprint",
     "rrf_fuse_passage_lists",
     "select_pareto_frontier_programs",
     "serialize_predictor_surface",

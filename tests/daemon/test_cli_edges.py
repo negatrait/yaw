@@ -10,6 +10,7 @@ from contextlib import closing
 import psutil
 import pytest
 from filelock import FileLock
+from test_benchmark import benchmark_inference_server as benchmark_inference_server
 
 from daemon.native_inference import publish_inference
 from yaw.core import OpenIERecord, YawConfig, YawRuntimeError, load_config
@@ -207,11 +208,14 @@ def test_daemon_status_normalizes_bad_counters_against_sqlite(tmp_path, bad_coun
     assert result["status"]["active_op"] == "indexing: 2 openie passages processed"
 
 
-def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(tmp_path, capsys):
+def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
+    tmp_path, capsys, benchmark_inference_server
+):
+    url, requests = benchmark_inference_server
     config_file = tmp_path / "yaw.toml"
     config_file.write_text(
         f"[workspace]\nworkspace_root={json.dumps(tmp_path.as_posix())}\n"
-        '[inference]\nbase_url="http://127.0.0.1:9/v1"\nenable_gbnf=false\n'
+        f'[inference]\nbase_url="{url}"\napi_key="benchmark-key"\nenable_gbnf=false\n'
         '[ingestion]\nincluded_patterns=["*.txt"]\npoll_interval_seconds=0.1\n',
         encoding="utf-8",
     )
@@ -236,6 +240,7 @@ def test_detached_empty_daemon_starts_and_stops_without_leaking_process_handles(
                 time.sleep(0.05)
             else:
                 pytest.fail("Owned empty daemon did not reach readiness")
+            assert ("/v1/models", "Bearer benchmark-key", None) in requests
             assert handle_daemon_stop(config) == 0
             assert json.loads(capsys.readouterr().out)["stopped"] is True
             assert inspect_status(config)["status"]["lifecycle"] == "stopped"

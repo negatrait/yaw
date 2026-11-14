@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from embedding_fixture import IdentifiedEmbeddingCallable
 
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.daemon.graph.engine import YawGraphEngine
@@ -45,7 +46,7 @@ def test_query_embedding_lru_cache_and_absence_of_retired_cache_tables(tmp_path:
             dimensions=8,
             fact_query_prefix="task: fact search | query: ",
         ),
-        create_dspy_embedder(embed, caching=False),
+        create_dspy_embedder(IdentifiedEmbeddingCallable(embed, "candidate-cache-sha256-v1"), caching=False),
     )
     engine = bind_native_indexing(
         YawGraphEngine(
@@ -58,22 +59,20 @@ def test_query_embedding_lru_cache_and_absence_of_retired_cache_tables(tmp_path:
     try:
         tables = {row[0] for row in engine.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {t for t in tables if "cache" in t} == set()
-        assert engine._encode_cached_text.cache_info().maxsize == 4096
 
         v1 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
         v2 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
         np.testing.assert_array_equal(v1, v2)
-        assert len(calls) == 1
-        assert engine._encode_cached_text.cache_info().hits == 1
+        assert len(calls) == 2
 
         fact_vec = engine._encode_texts(["Where did Turing work?"], instruction=FACT_INSTRUCTION)[0]
-        assert len(calls) == 2
+        assert len(calls) == 3
         assert not np.array_equal(v1, fact_vec)
 
         program.embedding_query_prefix = "task: custom query | query: "
         engine._apply_program_embedding_prefixes(program)
         v3 = engine._encode_texts(["Where did Turing work?"], instruction=PASSAGE_INSTRUCTION)[0]
-        assert len(calls) == 3
+        assert len(calls) == 4
         assert not np.array_equal(v1, v3)
     finally:
         engine.close()
@@ -127,12 +126,6 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
 
         def do_POST(self) -> None:
             data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if self.path == "/apply-template":
-                self._send_json({"prompt": json.dumps(data, ensure_ascii=False)})
-                return
-            if self.path == "/tokenize":
-                self._send_json({"tokens": list(range(len(data["content"].encode("utf-8")) // 3))})
-                return
             if self.path.endswith("/embeddings"):
                 requests.append("embedding")
                 texts = data["input"] if isinstance(data["input"], list) else [data["input"]]
@@ -286,7 +279,7 @@ def test_candidate_stages_make_zero_requests_after_process_restart(tmp_path: Pat
                 )
             )
             run_worker(url, "query")
-            assert requests[before:] == ["embedding", "embedding"]
+            assert requests[before:] == ["embedding", "embedding", "embedding"]
             before = len(requests)
             run_worker(url, "prompt")
             assert "ner" in requests[before:]

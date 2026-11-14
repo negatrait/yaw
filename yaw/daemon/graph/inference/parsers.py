@@ -702,64 +702,18 @@ def parse_label_decisions(raw_output: Any) -> list[dict[str, Any]]:
     return decisions
 
 
-def parse_hierarchy_decisions(raw_output: Any) -> list[dict[str, Any]]:
-    """Parse and validate Stage 2 taxonomic hierarchy decisions from JudgeHierarchy."""
+def parse_relation_decisions(raw_output: Any) -> list[dict[str, Any]]:
+    """Validate the four oriented relation choices."""
     decisions: list[dict[str, Any]] = []
     for item in _extract_decision_items(raw_output):
         if not isinstance(item, Mapping):
             continue
         validated = _extract_pair_id_and_reasoning(item)
-        if validated is None:
+        relation = item.get("relation")
+        if validated is None or relation not in {"skos:broader", "skos:narrower", "skos:related", "owl:differentFrom"}:
             continue
         pair_id, reasoning = validated
-        broader = _parse_bool(item.get("broader"))
-        narrower = _parse_bool(item.get("narrower"))
-        source_direction: str | None = None
-        if broader and not narrower:
-            relation: str | None = "skos:broader"
-            source_direction = "a_to_b"
-        elif not broader and narrower:
-            relation = "skos:broader"
-            source_direction = "b_to_a"
-        elif broader and narrower:
-            relation = "skos:related"
-            source_direction = None
-        else:
-            relation = None
-            source_direction = None
-        decisions.append(
-            {
-                "pair_id": pair_id,
-                "reasoning": reasoning,
-                "broader": broader,
-                "narrower": narrower,
-                "relation": relation,
-                "source_direction": source_direction,
-            }
-        )
-    return decisions
-
-
-def parse_related_decisions(raw_output: Any) -> list[dict[str, Any]]:
-    """Parse and validate Stage 3 associative relation decisions from JudgeRelated."""
-    decisions: list[dict[str, Any]] = []
-    for item in _extract_decision_items(raw_output):
-        if not isinstance(item, Mapping):
-            continue
-        validated = _extract_pair_id_and_reasoning(item)
-        if validated is None:
-            continue
-        pair_id, reasoning = validated
-        related = _parse_bool(item.get("related"))
-        relation = "skos:related" if related else "owl:differentFrom"
-        decisions.append(
-            {
-                "pair_id": pair_id,
-                "reasoning": reasoning,
-                "related": related,
-                "relation": relation,
-            }
-        )
+        decisions.append({"pair_id": pair_id, "reasoning": reasoning, "relation": relation})
     return decisions
 
 
@@ -1238,8 +1192,7 @@ def compute_task_quality_score(
     shacl_violations_initial: int = 0,
     shacl_violations_remaining: int = 0,
     label_judge_tokens: int = 0,
-    hierarchy_judge_tokens: int = 0,
-    related_judge_tokens: int = 0,
+    relation_judge_tokens: int = 0,
     shacl_healer_tokens: int = 0,
     missing_entity_defs_count: int = 0,
     missing_entity_defs_tokens: int = 0,
@@ -1308,8 +1261,7 @@ def compute_task_quality_score(
         f1=obj_scores.get("f1"),
         tokens=safe_tokens,
         label_judge_tokens=max(0, int(label_judge_tokens)),
-        hierarchy_judge_tokens=max(0, int(hierarchy_judge_tokens)),
-        related_judge_tokens=max(0, int(related_judge_tokens)),
+        relation_judge_tokens=max(0, int(relation_judge_tokens)),
         shacl_healer_tokens=max(0, int(shacl_healer_tokens)),
         shacl_violations_initial=eff_v_init,
         shacl_violations_remaining=eff_v_rem,
@@ -1327,7 +1279,7 @@ def check_benchmark_integrity(
     qa_errors: Sequence[str] = (),
     include_qa: bool = True,
 ) -> list[str]:
-    """Fail-fast system integrity checks on indexing, chat completions, and PPR activation."""
+    """Fail-fast system integrity checks on indexing, chat completions, and HMM relevance inference."""
     errors: list[str] = []
     if extraction_errors:
         errors.extend(f"extraction_llm: {err}" for err in extraction_errors)
@@ -1349,7 +1301,7 @@ def check_benchmark_integrity(
             ):
                 errors.append(f"Question {idx + 1}: empty StandardRAG (DPR) answer")
     if len(records) > 1 and not any(record.get("graph_seeds") for record in records):
-        errors.append("All queries had empty graph_seeds (recognition memory / PPR never activated)")
+        errors.append("All queries had empty graph_seeds (recognition memory / HMM received no seeds)")
     return errors
 
 
@@ -1370,9 +1322,8 @@ __all__ = [
     "extract_entity_definitions",
     "extract_structured_triples",
     "match_facts_to_candidate_indices",
-    "parse_hierarchy_decisions",
     "parse_label_decisions",
-    "parse_related_decisions",
+    "parse_relation_decisions",
     "parse_shacl_repairs",
     "text_processing",
 ]

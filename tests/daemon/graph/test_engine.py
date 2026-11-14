@@ -20,33 +20,9 @@ from yaw.daemon.graph.inference import (
     YawProgram,
     extraction_fingerprint,
 )
-from yaw.daemon.graph.inference.embedding import EmbeddingProfile
+from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, EmbeddingProfile
 from yaw.daemon.graph.storage import apply_shacl_repairs
 from yaw.daemon.indexing import bind_native_indexing
-
-
-class ProtocolTokenCounter:
-    """Exact loopback tokenizer with an independent synthetic task LM identity."""
-
-    def __init__(self, url):
-        from yaw.daemon.graph.inference import ServingTokenCounter
-
-        self.serving = ServingTokenCounter(url, "reflection-model")
-        self.identity = self.serving.identity
-        self.context_tokens = self.serving.context_tokens
-
-    def __call__(self, messages, **kwargs):
-        return self.serving(messages, **kwargs)
-
-
-def protocol_token_counter(url):
-    return ProtocolTokenCounter(url)
-
-
-@pytest.fixture
-def reflection_token_counter(provider):
-    url, _calls = provider
-    return protocol_token_counter(url)
 
 
 def _extract_mock_pair_ids(
@@ -57,7 +33,7 @@ def _extract_mock_pair_ids(
     if messages:
         for msg in reversed(messages):
             content = str(msg.get("content", ""))
-            m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', content)
+            m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v3"', content)
             if m:
                 try:
                     payload, _ = json.JSONDecoder().raw_decode(content[m.start() :])
@@ -68,7 +44,7 @@ def _extract_mock_pair_ids(
                 except Exception:
                     pass
     if prompt:
-        m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v2"', prompt)
+        m = re.search(r'\{\s*"format"\s*:\s*"synonym-evidence-v3"', prompt)
         if m:
             try:
                 payload, _ = json.JSONDecoder().raw_decode(prompt[m.start() :])
@@ -88,13 +64,64 @@ def _extract_mock_pair_ids(
     return pids
 
 
-class DeterministicMockLM(dspy.LM):
+class NativeFixtureLM(dspy.LM):
+    """Native request/response boundary for deterministic graph test providers."""
+
+    @property
+    def supported_params(self) -> set[str]:
+        return set()
+
+    @property
+    def supports_reasoning(self) -> bool:
+        return False
+
+    @property
+    def supports_function_calling(self) -> bool:
+        return False
+
+    @property
+    def supports_response_schema(self) -> bool:
+        return False
+
+    @property
+    def supported_tool_result_media(self) -> set[str]:
+        return set()
+
+    def _fixture_answer(
+        self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> list[str]:
+        raise NotImplementedError
+
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        request = prompt
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        messages = [
+            {"role": message.role, "content": "".join(part.text for part in message.parts if hasattr(part, "text"))}
+            for message in request.messages
+        ]
+        if request.system:
+            messages.insert(0, {"role": "system", "content": str(request.system)})
+        result = self._fixture_answer(messages=messages, **kwargs)
+        input_tokens, output_tokens = (
+            (20, 10) if self.model == "qwen-worker" else (25, 15) if self.model == "qwen-rlm-orchestrator" else (32, 16)
+        )
+        return Response(
+            id="fixture",
+            model=self.model,
+            message=Message(role="assistant", parts=(TextPart(text=result[0]),)),
+            finish_reason="stop",
+            usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+
+class DeterministicMockLM(NativeFixtureLM):
     """Deterministic offline LM for testing YawProgram and YawGraphEngine."""
 
     def __init__(self) -> None:
         super().__init__(model="mock-lm")
 
-    def __call__(
+    def _fixture_answer(
         self, prompt: str | None = None, messages: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> list[str]:
         if getattr(dspy.settings, "usage_tracker", None) is not None:
@@ -124,7 +151,7 @@ class DeterministicMockLM(dspy.LM):
                 )
             ]
         req_lower = req_str.lower()
-        if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+        if "relationdecision" in req_lower:
             return [
                 json.dumps(
                     {
@@ -132,14 +159,14 @@ class DeterministicMockLM(dspy.LM):
                             {
                                 "pair_id": pid,
                                 "reasoning": f"Deterministic related decision for {pid}",
-                                "related": True,
+                                "relation": "skos:related",
                             }
                             for pid in pids
                         ]
                     }
                 )
             ]
-        if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+        if "narrower" in req_lower or "judgerelations" in req_lower or "broader" in req_lower:
             return [
                 json.dumps(
                     {
@@ -147,8 +174,7 @@ class DeterministicMockLM(dspy.LM):
                             {
                                 "pair_id": pid,
                                 "reasoning": f"Deterministic hierarchy decision for {pid}",
-                                "broader": False,
-                                "narrower": False,
+                                "relation": "skos:related",
                             }
                             for pid in pids
                         ]
@@ -201,11 +227,11 @@ class DeterministicMockLM(dspy.LM):
         # QA stage
         if "AnswerQuestion" in req_str or "Retrieved evidence passages" in req_str or "context" in req_str:
             if "Turing" in req_str:
-                return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
+                return ['{"plan": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
             if "Lovelace" in req_str:
-                return ['{"reasoning": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}']
-            return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
-        return ['{"reasoning": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
+                return ['{"plan": "Ada Lovelace worked on the Analytical Engine.", "answer": "Ada Lovelace"}']
+            return ['{"plan": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
+        return ['{"plan": "Alan Turing founded computer science.", "answer": "Alan Turing"}']
 
 
 class DeterministicMockEmbedder:
@@ -256,13 +282,23 @@ class DeterministicMockEmbedder:
         return results
 
 
+def _native_embedding(raw: Any) -> DSPyEmbeddingAdapter:
+    class Model:
+        index_identity = f"fixture:{raw.profile.model}:{raw.profile.checkpoint}:{raw.profile.dimensions}"
+
+        def __call__(self, texts: list[str]) -> list[list[float]]:
+            return [np.asarray(vector).tolist() for vector in raw.encode(texts)]
+
+    return DSPyEmbeddingAdapter(profile=raw.profile, embedder=dspy.Embedder(Model(), batch_size=64))
+
+
 @pytest.fixture
-def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngine]:
+def test_engine(tmp_path: Path) -> Iterator[YawGraphEngine]:
     db_path = tmp_path / "yaw.db"
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
 
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -270,7 +306,7 @@ def test_engine(synonym_token_counter, tmp_path: Path) -> Iterator[YawGraphEngin
             db_path=db_path,
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -326,7 +362,9 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     doc = "Alan Turing was an English mathematician and computer scientist."
     database = tmp_path / "resume.db"
     first = YawProgram(enable_gbnf=False)
-    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, first, DeterministicMockEmbedder()))
+    engine = bind_native_indexing(
+        YawGraphEngine(database, tmp_path, first, _native_embedding(DeterministicMockEmbedder()))
+    )
     try:
         assert engine.index([doc]) == 1
         ids = [str(row[0]) for row in engine.conn.execute("SELECT chunk_id FROM chunks")]
@@ -338,7 +376,9 @@ def test_openie_resume_reuses_matching_prompts_and_invalidates_mutations(tmp_pat
     finally:
         engine.close()
     second = YawProgram(enable_gbnf=False)
-    engine = bind_native_indexing(YawGraphEngine(database, tmp_path, second, DeterministicMockEmbedder()))
+    engine = bind_native_indexing(
+        YawGraphEngine(database, tmp_path, second, _native_embedding(DeterministicMockEmbedder()))
+    )
     try:
         engine.index_chunks(chunks)
         assert (
@@ -373,7 +413,7 @@ def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
     # Ranking needs meaningful geometry; hash-random vectors cannot assert relevance.
     embedder = TopicEmbedder()
     embedder.profile = EmbeddingProfile("deterministic", "topic-fixture-v1", 64, 2048, "mean", "", "")
-    test_engine.embedder = embedder
+    test_engine.embedder = _native_embedding(embedder)
     docs = [
         "Alan Turing was an English mathematician and computer scientist.\nHe formulated the Turing machine.",
         "Ada Lovelace was a mathematician recognized for work on the Analytical Engine.",
@@ -382,7 +422,7 @@ def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
 
     # Retrieval
     hits = test_engine.retrieve("Who formulated the Turing machine?", top_k=2)
-    assert len(hits) == 2
+    assert len(hits) == 1
     top_ptr, top_score, top_text = hits[0]
     assert isinstance(top_ptr, ChunkPointer)
     assert isinstance(top_score, float)
@@ -397,7 +437,7 @@ def test_engine_retrieve_and_rag_qa(test_engine: YawGraphEngine) -> None:
     res = qa_results[0]
     assert res["question"] == "Who formulated the Turing machine?"
     assert res["answer"] == "Alan Turing"
-    assert len(res["retrieved_chunk_ids"]) == 2
+    assert len(res["retrieved_chunk_ids"]) == 1
     assert "Alan Turing" in res["context"]
 
 
@@ -442,7 +482,7 @@ def test_engine_snapshot_withdrawal_invalidates_csr(test_engine: YawGraphEngine)
     assert c1_id not in graph2.chunk_ids
 
 
-def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token_counter, tmp_path: Path) -> None:
+def test_engine_multi_batch_indexing_and_bounded_embedding_batches(tmp_path: Path) -> None:
     batch_sizes_seen: list[int] = []
 
     class TrackingEmbedder(DeterministicMockEmbedder):
@@ -458,7 +498,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
 
     mock_lm = DeterministicMockLM()
     dspy.settings.configure(lm=mock_lm)
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = TrackingEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -466,7 +506,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
             db_path=tmp_path / "yaw_batches.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             embed_batch_size=2,
         )
     )
@@ -505,7 +545,7 @@ def test_engine_multi_batch_indexing_and_bounded_embedding_batches(synonym_token
         engine.close()
 
 
-def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_counter, tmp_path: Path) -> None:
+def test_engine_fact_score_weighting_and_thread_safe_retrieval(tmp_path: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     class ControlledFactEmbedder:
@@ -525,7 +565,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
             return vecs
 
     class KeepAllFactsLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -537,10 +577,10 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
                     '{"fact": [["alan turing", "father of", "computer science"], '
                     '["ada lovelace", "worked on", "analytical engine"]]}'
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=KeepAllFactsLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = ControlledFactEmbedder()
 
     engine = bind_native_indexing(
@@ -548,7 +588,7 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
             db_path=tmp_path / "yaw_scores.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             passage_node_weight=0.0,  # Isolate entity seed PPR contribution
         )
     )
@@ -587,7 +627,6 @@ def test_engine_fact_score_weighting_and_thread_safe_retrieval(synonym_token_cou
 
 
 def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
-    reflection_token_counter,
     test_engine: YawGraphEngine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -666,12 +705,12 @@ def test_engine_evolve_prompts_miprov2_and_gepa_metric_contracts(
     monkeypatch.setattr(dspy, "MIPROv2", FakeMIPROv2, raising=False)
     monkeypatch.setattr(dspy, "GEPA", FakeGEPA, raising=False)
 
-    test_engine.evolve_prompts(trainset, mode="hybrid", reflection_token_counter=reflection_token_counter)
+    test_engine.evolve_prompts(trainset, mode="hybrid")
     assert len(mipro_scores) == 1
     assert len(gepa_scores) == 1
 
 
-def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path: Path) -> None:
+def test_engine_hybrid_fact_candidate_retrieval(tmp_path: Path) -> None:
     class HybridFactEmbedder:
         """Deterministic embedder: query is close to Turing in dense space."""
 
@@ -691,7 +730,7 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
             return vecs
 
     class InspectFilterLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -703,10 +742,10 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
                     '{"fact": [["ada lovelace", "worked on", "analytical engine"], '
                     '["alan turing", "father of", "computer science"]]}'
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=InspectFilterLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = HybridFactEmbedder()
 
     engine = bind_native_indexing(
@@ -714,7 +753,7 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
             db_path=tmp_path / "yaw_hybrid.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             fact_candidate_pool_k=10,
             fact_fts_pool_k=10,
             fact_rrf_k=60,
@@ -747,12 +786,12 @@ def test_engine_hybrid_fact_candidate_retrieval(synonym_token_counter, tmp_path:
         engine.close()
 
 
-def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_token_counter, tmp_path: Path) -> None:
+def test_engine_query_intent_expands_candidates_once(tmp_path: Path) -> None:
     intent_calls: list[str] = []
     filter_calls: list[str] = []
 
     class IntentEscalationLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -766,14 +805,14 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
                 return ['{"query_intent": "Ada Lovelace worked on Analytical Engine"}']
             if "FilterTriples" in req_str or "fact_before_filter" in req_str:
                 filter_calls.append(req_str)
-                # Only keep facts when the rewritten intent includes 'Ada Lovelace'
-                if "Ada Lovelace worked on Analytical Engine" in req_str:
+                # Judge the discovered candidate against the original question.
+                if "Who built the early engine?" in req_str:
                     return ['{"fact": [["ada lovelace", "worked on", "analytical engine"]]}']
                 return ['{"fact": []}']
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=IntentEscalationLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -781,7 +820,7 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
             db_path=tmp_path / "yaw_intent.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -793,32 +832,32 @@ def test_engine_query_intent_escalation_once_without_infinite_recursion(synonym_
             ]
         )
 
-        # 1. Happy path: initial query keeps 0 facts -> escalates once -> succeeds on intent
+        # Intent expands candidate discovery while relevance uses the original query.
         hits, kept_facts = engine.retrieve_with_seeds("Who built the early engine?", top_k=2)
         assert len(intent_calls) == 1
-        assert len(filter_calls) == 2
+        assert len(filter_calls) == 1
         assert len(kept_facts) == 1
         assert kept_facts[0][0].lower() == "ada lovelace"
-        assert len(hits) == 2
+        assert hits
 
-        # 2. Boundary envelope: when intent also keeps 0 facts, stop trying to reword (no infinite loop)
+        # A failed fact filter does not trigger a second relevance judgment.
         intent_calls.clear()
         filter_calls.clear()
         hits_fallback, kept_empty = engine.retrieve_with_seeds("never_matches query", top_k=2)
         assert len(intent_calls) == 1
-        assert len(filter_calls) == 2
+        assert len(filter_calls) == 1
         assert kept_empty == []
-        assert len(hits_fallback) == 2
+        assert hits_fallback
     finally:
         engine.close()
 
 
-def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, tmp_path: Path) -> None:
+def test_engine_homograph_gate_edc_and_shacl_conformance(tmp_path: Path) -> None:
     """Verify Same-Label Homograph Gate splits conflicting senses via JudgeLabels and passes SHACL linting."""
     import json
 
     class HomographGateLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -831,7 +870,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                 )
             req_str = str(prompt or messages or kwargs)
             req_lower = req_str.lower()
-            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+            if "relationdecision" in req_lower:
                 pair_ids = _extract_mock_pair_ids(prompt, messages, req_str)
                 return [
                     json.dumps(
@@ -840,7 +879,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                                 {
                                     "pair_id": pid,
                                     "reasoning": f"Conflicting homograph senses for {pid}",
-                                    "related": False,
+                                    "relation": "owl:differentFrom",
                                 }
                                 for pid in pair_ids
                             ]
@@ -903,10 +942,10 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
                             }
                         )
                     ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=HomographGateLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -914,7 +953,7 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
             db_path=tmp_path / "yaw_homograph.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -952,7 +991,6 @@ def test_engine_homograph_gate_edc_and_shacl_conformance(synonym_token_counter, 
 
 
 def test_engine_same_label_provisional_split_merged_by_judge_semantics_and_stage1_standalone_ner(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Hazard 2 (same-label cos < 0.85 merged back when JudgeLabels returns skos:altLabel) and Hazard 3 \
@@ -960,7 +998,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
     import json
 
     class SynonymMergeAndStandaloneNerLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1045,10 +1083,10 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
                             }
                         )
                     ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=SynonymMergeAndStandaloneNerLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1056,7 +1094,7 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
             db_path=tmp_path / "yaw_hazard2_3.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=0.99,  # Ensure only same-label candidate pair is surfaced
         )
@@ -1093,13 +1131,9 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
         assert passage_edges_for_standalone == 1
 
         # Verify 0 SHACL violations (including ConceptShape/S13-disjointLabels across both chunks)
-        assert (
-            engine._graph_rlm_stats["label_judge_tokens"]
-            + engine._graph_rlm_stats["hierarchy_judge_tokens"]
-            + engine._graph_rlm_stats["related_judge_tokens"]
-        ) == 48
+        assert (engine._graph_rlm_stats["label_judge_tokens"] + engine._graph_rlm_stats["relation_judge_tokens"]) == 48
         assert engine._graph_rlm_stats["embedding_calls"] > 0
-        assert engine._graph_rlm_stats["embedding_tokens"] > 0
+        assert engine._graph_rlm_stats["embedding_tokens"] is None
         assert len(program.embedding_audit_trail) > 0
         report = engine.lint_graph()
         assert report["conforms"] is True
@@ -1109,7 +1143,6 @@ Option A (standalone Stage 1 NER entities preserved with definitions)."""
 
 
 def test_engine_step7_heal_shacl_violations_rlm_repl_tools_and_token_stats(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Step 6 direct GBNF label_judge_tokens and Step 7 heal_shacl_violations via shacl_healer_rlm \
@@ -1117,8 +1150,9 @@ using all 5 bound REPL tools."""
     import json
 
     repl_tool_events: list[str] = []
+    label_worker_packets: list[tuple[str, ...]] = []
 
-    class RLMOrchestratorLM(dspy.LM):
+    class RLMOrchestratorLM(NativeFixtureLM):
         """RLM orchestrator LM (40 tokens per call, ChatAdapter, no GBNF)."""
 
         def __init__(self) -> None:
@@ -1126,7 +1160,7 @@ using all 5 bound REPL tools."""
             self._yaw_recipe = "llamacpp"
             self._yaw_supports_gbnf = False
 
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1150,13 +1184,10 @@ using all 5 bound REPL tools."""
                     "repairs = propose_repairs()\n"
                     "SUBMIT(repairs=repairs)"
                 )
-                return [
-                    f"[[ ## reasoning ## ]]\nInspect focus node, hydrate chunk, and propose repairs.\n\n"
-                    f"[[ ## code ## ]]\n```python\n{code}\n```\n\n[[ ## completed ## ]]"
-                ]
+                return [json.dumps({"plan": "Inspect focus node, hydrate chunk, and propose repairs.", "code": code})]
             return ['{"repairs": []}']
 
-    class QwenWorkerLM(dspy.LM):
+    class QwenWorkerLM(NativeFixtureLM):
         """GBNF-constrained GPU worker LM (30 tokens per call, JSONAdapter)."""
 
         def __init__(self) -> None:
@@ -1164,7 +1195,7 @@ using all 5 bound REPL tools."""
             self._yaw_recipe = "llamacpp"
             self._yaw_supports_gbnf = True
 
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1200,6 +1231,7 @@ using all 5 bound REPL tools."""
                 ]
             pids = _extract_mock_pair_ids(prompt, messages, req_str)
             if "alt_label" in req_str or "hidden_label" in req_str or "JudgeLabels" in req_str:
+                label_worker_packets.append(tuple(pids))
                 decisions = [
                     {
                         "pair_id": pid,
@@ -1210,7 +1242,7 @@ using all 5 bound REPL tools."""
                 ]
                 return [json.dumps({"decisions": decisions})]
             req_lower = req_str.lower()
-            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+            if "relationdecision" in req_lower:
                 return [
                     json.dumps(
                         {
@@ -1218,14 +1250,14 @@ using all 5 bound REPL tools."""
                                 {
                                     "pair_id": pid,
                                     "reasoning": "Associative related match",
-                                    "related": True,
+                                    "relation": "skos:related",
                                 }
                                 for pid in pids
                             ]
                         }
                     )
                 ]
-            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+            if "narrower" in req_lower or "judgerelations" in req_lower or "broader" in req_lower:
                 return [
                     json.dumps(
                         {
@@ -1233,8 +1265,7 @@ using all 5 bound REPL tools."""
                                 {
                                     "pair_id": pid,
                                     "reasoning": "Not hierarchical",
-                                    "broader": False,
-                                    "narrower": False,
+                                    "relation": "skos:related",
                                 }
                                 for pid in pids
                             ]
@@ -1296,7 +1327,6 @@ using all 5 bound REPL tools."""
     orch_lm = RLMOrchestratorLM()
     worker_lm = QwenWorkerLM()
     program = YawProgram(
-        synonym_token_counter=synonym_token_counter,
         enable_gbnf=True,
         orchestrator_lm=orch_lm,
         rlm_sub_lm=worker_lm,
@@ -1309,15 +1339,16 @@ using all 5 bound REPL tools."""
             db_path=tmp_path / "yaw_step7_rlm.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=-1.0,
+            semantic_adjudication_batch_size=2,
         )
     )
     try:
         # 1. Index first document so "alan turing" and "turing machine" are materialized and linked to chunk 1 on disk
         assert engine.index(["Alan Turing formulated the Turing machine in 1936."]) == 1
-        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == 30
+        assert engine._graph_rlm_stats["relation_judge_tokens"] == 30
         assert engine._graph_rlm_stats["label_judge_tokens"] == 0
 
         # Verify apply_shacl_repairs ignores nonexistent focus nodes without inserting orphan labels
@@ -1358,12 +1389,13 @@ using all 5 bound REPL tools."""
         assert sum(1 for ev in repl_tool_events if ev.startswith("propose_repairs:")) == 2
 
         # 2. Index second document:
-        #    - Step 6 runs direct GBNF label_judge on candidate pairs (30 tokens)
+        #    - Step 6 runs bounded direct GBNF label packets (30 tokens per call)
         #    - Step 7 runs direct GBNF shacl_repair on pre-hydrated focus_context (2 * 30 = 60 tokens)
         repl_tool_events.clear()
         program.telemetry.clear()
         program.label_judge_audit_trail.clear()
-        program.hierarchy_judge_audit_trail.clear()
+        label_worker_packets.clear()
+        program.relation_judge_audit_trail.clear()
         program.shacl_audit_trail.clear()
 
         assert (
@@ -1382,14 +1414,17 @@ using all 5 bound REPL tools."""
 
         # Verify exact non-double-counted token accounting:
         # Publication telemetry describes this update; it does not replay prior provider work.
-        assert len(program.label_judge_audit_trail) == 2
+        assert label_worker_packets
+        assert [
+            tuple(decision["pair_id"] for decision in entry["decisions"]) for entry in program.label_judge_audit_trail
+        ] == label_worker_packets
         assert all(entry["mode"] == "direct" for entry in program.label_judge_audit_trail)
         assert all(entry["tokens_used"] == 30 for entry in program.label_judge_audit_trail)
         assert engine._graph_rlm_stats["label_judge_tokens"] == sum(
             entry["tokens_used"] for entry in program.label_judge_audit_trail
         )
-        assert engine._graph_rlm_stats["hierarchy_judge_tokens"] == sum(
-            entry["tokens_used"] for entry in program.hierarchy_judge_audit_trail
+        assert engine._graph_rlm_stats["relation_judge_tokens"] == sum(
+            entry["tokens_used"] for entry in program.relation_judge_audit_trail
         )
 
         # Step 7 (direct shacl_repair on pre-hydrated focus_context) = 2 focus nodes * 30 worker tokens = 60 tokens
@@ -1423,7 +1458,6 @@ using all 5 bound REPL tools."""
 
 
 def test_engine_define_missing_entities_telemetry_and_no_heuristic_fallbacks(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify index_chunks repairs missing entity definitions via DefineMissingEntities, tracks stats, and never \
@@ -1431,7 +1465,7 @@ uses heuristic fallbacks."""
     import json
 
     class MissingEntityRepairLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1484,10 +1518,10 @@ uses heuristic fallbacks."""
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     dspy.settings.configure(lm=MissingEntityRepairLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1495,7 +1529,7 @@ uses heuristic fallbacks."""
             db_path=tmp_path / "yaw_missing_defs.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -1528,8 +1562,6 @@ uses heuristic fallbacks."""
 
 
 def test_engine_evolve_prompts_reindexes_on_extraction_mutation_and_captures_all_stage_traces(
-    synonym_token_counter,
-    reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1540,7 +1572,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
     ner_calls: list[str] = []
 
     class CandidateSensitiveExtractionLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1621,13 +1653,11 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = CandidateSensitiveExtractionLM()
     dspy.settings.configure(lm=lm)
-    program = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-    )
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1635,7 +1665,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
             db_path=tmp_path / "yaw_evo_extract.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=-1.0,
         )
@@ -1730,7 +1760,7 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
                 return cand_ner
 
         monkeypatch.setattr(dspy, "GEPA", InspectingGEPA, raising=False)
-        compiled = engine.evolve_prompts(trainset, mode="gepa", reflection_token_counter=reflection_token_counter)
+        compiled = engine.evolve_prompts(trainset, mode="gepa")
         assert "MUTATED_NER_MARKER" in compiled.ner.signature.instructions
         assert len(observed_traces) >= 3
         assert "[ner]" in feedback_by_stage["ner"]
@@ -1743,7 +1773,6 @@ traces into dspy.settings.trace, and emits per-predictor feedback."""
 
 
 def test_sprint3_engine_as_rm_and_as_retriever_and_dspy_retrieve_compatibility(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify YawGraphEngine.as_rm, as_retriever, workspace DSPy cache isolation, and stock dspy.Retrieve(k=...) \
@@ -1751,7 +1780,7 @@ compatibility."""
     from yaw.daemon.graph.inference import YawPassage, YawRetriever, YawRM
 
     dspy.settings.configure(lm=DeterministicMockLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1759,7 +1788,7 @@ compatibility."""
             db_path=tmp_path / "yaw_rm_sprint3.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -1776,15 +1805,15 @@ compatibility."""
         assert dspy.settings.rm is rm
 
         rm_hits = rm("Who designed the Automatic Computing Engine?", k=2)
-        assert len(rm_hits) == 2
+        assert len(rm_hits) == 1
         assert all(isinstance(h, YawPassage) for h in rm_hits)
         assert any("Alan Turing" in h.long_text for h in rm_hits)
         assert all(h.pid.startswith("chunk-") for h in rm_hits)
-        assert [h.rank for h in rm_hits] == [1, 2]
+        assert [h.rank for h in rm_hits] == [1]
 
         stock_retrieve = dspy.Retrieve(k=2)
         stock_pred = stock_retrieve("Who designed the Automatic Computing Engine?")
-        assert len(stock_pred.passages) == 2
+        assert len(stock_pred.passages) == 1
         assert any("Alan Turing" in p for p in stock_pred.passages)
 
         retriever = engine.as_retriever(k=2, configure_dspy=True)
@@ -1800,7 +1829,6 @@ compatibility."""
 
 
 def test_sprint3_engine_search_graph_for_react_and_react_v2_fallback_integration(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify _search_graph_for_react queries real SQLite yaw.db facts and passages and powers dspy.ReActV2 \
@@ -1808,7 +1836,7 @@ multi-hop fallback."""
     import json
 
     class ReActEngineMockLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1860,17 +1888,16 @@ multi-hop fallback."""
                 return [
                     json.dumps(
                         {
-                            "reasoning": "Alan Turing received the Presidential Medal of Freedom in 1969.",
+                            "plan": "Alan Turing received the Presidential Medal of Freedom in 1969.",
                             "answer": "1969",
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = ReActEngineMockLM()
     dspy.settings.configure(lm=lm)
     program = YawProgram(
-        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -1882,7 +1909,7 @@ multi-hop fallback."""
             db_path=tmp_path / "yaw_react_sprint3.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -1904,9 +1931,7 @@ multi-hop fallback."""
 
 
 def test_sprint3_engine_evaluate_and_pareto_frontier_export(
-    synonym_token_counter,
     tmp_path: Path,
-    reflection_token_counter,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify YawGraphEngine.evaluate (dspy.Evaluate + answer_passage_match) and compiled candidate persistence."""
@@ -1914,9 +1939,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
-    program = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-    )
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -1924,7 +1947,7 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
             db_path=tmp_path / "yaw_eval_sprint3.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -1980,7 +2003,6 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
             valset=devset,
             mode="gepa",
             save_path=save_path,
-            reflection_token_counter=reflection_token_counter,
         )
         assert len(observed_feedbacks) == 1
         assert "AnswerPassageMatch=1" in observed_feedbacks[0]
@@ -1989,7 +2011,6 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
         assert (tmp_path / "compiled_sprint3_eval.json").exists()
 
         reloaded = YawProgram(
-            synonym_token_counter=synonym_token_counter,
             enable_gbnf=False,
             compiled_path=save_path,
             orchestrator_lm=lm,
@@ -2004,14 +2025,13 @@ def test_sprint3_engine_evaluate_and_pareto_frontier_export(
 
 
 def test_canonical_retrieval_hook_and_rag_qa_forward_unification(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify _canonical_retrieval_hook unifies YawRM, YawRetriever, YawProgram.forward, and rag_qa with \
 GEPA trace replay and Pareto support."""
 
     class UnifiedHookMockLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2022,12 +2042,11 @@ GEPA trace replay and Pareto support."""
                     self.model,
                     {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
                 )
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = UnifiedHookMockLM()
     dspy.settings.configure(lm=lm)
     program = YawProgram(
-        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -2039,7 +2058,7 @@ GEPA trace replay and Pareto support."""
             db_path=tmp_path / "yaw_unified_hook.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -2089,8 +2108,6 @@ GEPA trace replay and Pareto support."""
 
 
 def test_hybrid_e2e_per_query_isolation_stage_caching_and_reflective_stats(
-    synonym_token_counter,
-    reflection_token_counter,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2102,7 +2119,7 @@ minibatch q_stats lookup."""
     stage_call_counts = {"ner": 0, "label_judge": 0}
 
     class StageCountingMockLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2135,13 +2152,11 @@ minibatch q_stats lookup."""
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = StageCountingMockLM()
     dspy.settings.configure(lm=lm)
-    program = YawProgram(
-        synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-    )
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -2149,7 +2164,7 @@ minibatch q_stats lookup."""
             db_path=tmp_path / "yaw_hybrid_e2e.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=-1.0,
         )
@@ -2247,13 +2262,12 @@ minibatch q_stats lookup."""
                 return cand_syn
 
         monkeypatch.setattr(dspy, "GEPA", VerifyingGEPA, raising=False)
-        _ = engine.evolve_prompts([ex1, ex2], mode="gepa", reflection_token_counter=reflection_token_counter)
+        _ = engine.evolve_prompts([ex1, ex2], mode="gepa")
     finally:
         engine.close()
 
 
 def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
-    synonym_token_counter,
     tmp_path: Path,
     provider,
 ) -> None:
@@ -2261,11 +2275,10 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
     import json
 
     tokenizer_url, _tokenizer_calls = provider
-    counter = protocol_token_counter(tokenizer_url)
     max_observed_prompt_chars = 0
 
     class ContextGuardedRealOptLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2281,16 +2294,15 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             max_observed_prompt_chars = max(max_observed_prompt_chars, len(req_str))
             if len(req_str) > 32000:
                 raise RuntimeError(f"Request ({len(req_str)} chars) exceeds available context size (32000 chars)")
-            if "variables_info" in req_str and "repl_history" in req_str:
+            if "selection" in req_str and "examples_with_feedback" in req_str and "code" in req_str:
                 return [
-                    "[[ ## reasoning ## ]]\n"
-                    "Select original evidence by reference.\n\n"
-                    "[[ ## code ## ]]\n"
-                    "```python\n"
-                    "SUBMIT(selection={'diagnosis': 'Use original evidence', 'references': "
-                    "[{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})\n"
-                    "```\n"
-                    "[[ ## completed ## ]]"
+                    json.dumps(
+                        {
+                            "plan": "Select original evidence by reference.",
+                            "code": "SUBMIT(selection={'diagnosis': 'Use original evidence', 'references': "
+                            "[{'example_id': examples_with_feedback[0]['evidence_id'], 'path': []}]})",
+                        }
+                    )
                 ]
             if "new_instruction" in req_str and ("examples_with_feedback" in req_str or "length_limit" in req_str):
                 return [
@@ -2317,7 +2329,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
                     return [
                         json.dumps(
                             {
-                                "reasoning": "Initial incomplete guess.",
+                                "plan": "Initial incomplete guess.",
                                 "answer": "Babbage",
                             }
                         )
@@ -2325,17 +2337,16 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
                 return [
                     json.dumps(
                         {
-                            "reasoning": "Alan Turing designed the Automatic Computing Engine.",
+                            "plan": "Alan Turing designed the Automatic Computing Engine.",
                             "answer": "Alan Turing",
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = ContextGuardedRealOptLM()
     dspy.settings.configure(lm=lm)
     program = YawProgram(
-        synonym_token_counter=synonym_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -2347,7 +2358,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
             db_path=tmp_path / "yaw_real_unmocked_opt.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -2379,7 +2390,6 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         save_path = tmp_path / "real_compiled.json"
         compiled = engine.evolve_prompts(
             trainset,
-            reflection_token_counter=counter,
             valset=valset,
             mode="hybrid",
             num_candidates=2,
@@ -2394,9 +2404,7 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
         assert getattr(compiled, "detailed_results", None) is not None
         # Zero-shot optimization must remove seeded task demos, including SHACL's.
         # Verify the saved artifact preserves that contract as well.
-        restored = YawProgram(
-            synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm
-        )
+        restored = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
         restored.load(str(save_path))
         for task_program in (compiled, restored):
             for name, predictor in task_program.named_predictors():
@@ -2411,7 +2419,6 @@ def test_evolve_prompts_real_unmocked_gepa_and_miprov2_with_context_limit_guard(
 
 
 def test_engine_homographs_paronyms_and_same_label_triple_permutations(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify paronyms ('Cindy Real' vs 'Cinderella'), typos ('Cindarella'), and homograph permutations ('a \
@@ -2421,7 +2428,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
     from yaw.daemon.graph.storage import load_graph_topology
 
     class HomographAndParonymLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2458,7 +2465,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                 return [json.dumps({"decisions": complete_decisions(candidates, decisions, stage_text=req_str)})]
 
             req_lower = req_str.lower()
-            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
+            if "relationdecision" in req_lower:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2471,7 +2478,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                             {
                                 "pair_id": pid,
                                 "reasoning": "Homograph senses related",
-                                "related": True,
+                                "relation": "skos:related",
                             }
                         )
                     else:
@@ -2479,12 +2486,12 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                             {
                                 "pair_id": pid,
                                 "reasoning": "Distinct concepts",
-                                "related": False,
+                                "relation": "owl:differentFrom",
                             }
                         )
                 return [json.dumps({"decisions": decisions})]
 
-            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+            if "narrower" in req_lower or "judgerelations" in req_lower or "broader" in req_lower:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2494,8 +2501,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
                         {
                             "pair_id": pid,
                             "reasoning": "Not hierarchical",
-                            "broader": False,
-                            "narrower": False,
+                            "relation": "skos:related",
                         }
                     )
                 return [json.dumps({"decisions": decisions})]
@@ -2581,7 +2587,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             ]
 
     dspy.settings.configure(lm=HomographAndParonymLM())
-    program = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False)
+    program = YawProgram(enable_gbnf=False)
     embedder: Any = DeterministicMockEmbedder(dim=64)
 
     engine = bind_native_indexing(
@@ -2589,7 +2595,7 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
             db_path=tmp_path / "yaw_homograph_permutations.db",
             workspace_root=tmp_path,
             program=program,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=5,
         )
     )
@@ -2703,7 +2709,6 @@ ball' skos:related + owl:differentFrom 'a ball', and 'a ball, was handled, in a 
 
 
 def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Pareto dspy.Ensemble runs read-only against yaw.db and memoizes identical query retrievals."""
@@ -2711,7 +2716,7 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
     ner_calls: list[str] = []
 
     class TrackingEnsembleLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2720,18 +2725,18 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
             req_str = str(prompt or messages or kwargs)
             if "ExtractEntities" in req_str or ("named_entities" in req_str and "triples" not in req_str):
                 ner_calls.append(req_str)
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = TrackingEnsembleLM()
     dspy.settings.configure(lm=lm)
-    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = bind_native_indexing(
         YawGraphEngine(
             db_path=tmp_path / "yaw_step10_ens.db",
             workspace_root=tmp_path,
             program=prog,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
         )
     )
@@ -2800,7 +2805,6 @@ def test_step10_engine_pareto_ensemble_readonly_graph_and_memoization(
 
 
 def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
-    synonym_token_counter,
     tmp_path: Path,
 ) -> None:
     """Verify Step 11 (H1-H4) end-to-end: literal-object triples, SHACL, PPR seeding, and skos:broader."""
@@ -2809,7 +2813,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
     from yaw.core import RelationTraversalPolicy
 
     class Step11MockLM(DeterministicMockLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -2832,22 +2836,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                 return [json.dumps({"decisions": decisions})]
 
             req_lower = req_str.lower()
-            if "differentfrom" in req_lower or "judgerelated" in req_lower or "related_judge" in req_lower:
-                decisions = []
-                packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
-                candidates = candidate_rows(packet_text)
-                for p in candidates:
-                    pid = str(p.get("pair_id", ""))
-                    decisions.append(
-                        {
-                            "pair_id": pid,
-                            "reasoning": "Associative relation",
-                            "related": True,
-                        }
-                    )
-                return [json.dumps({"decisions": decisions})]
-
-            if "narrower" in req_lower or "judgehierarchy" in req_lower or "broader" in req_lower:
+            if "relationdecision" in req_lower:
                 decisions = []
                 packet_text = "\n".join(str(m.get("content", "")) for m in messages or [])
                 candidates = candidate_rows(packet_text)
@@ -2860,8 +2849,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                             {
                                 "pair_id": pid,
                                 "reasoning": "Cryptanalysis is narrower branch of broader mathematics",
-                                "broader": na == "cryptanalysis",
-                                "narrower": na == "mathematics",
+                                "relation": "skos:broader" if na == "cryptanalysis" else "skos:narrower",
                             }
                         )
                     else:
@@ -2869,8 +2857,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                             {
                                 "pair_id": pid,
                                 "reasoning": "Not hierarchical",
-                                "broader": False,
-                                "narrower": False,
+                                "relation": "skos:related",
                             }
                         )
                 return [json.dumps({"decisions": decisions})]
@@ -2950,18 +2937,18 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
                         }
                     )
                 ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     lm = Step11MockLM()
     dspy.settings.configure(lm=lm)
-    prog = YawProgram(synonym_token_counter=synonym_token_counter, enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    prog = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
     embedder: Any = DeterministicMockEmbedder(dim=64)
     engine = bind_native_indexing(
         YawGraphEngine(
             db_path=tmp_path / "yaw_step11_e2e.db",
             workspace_root=tmp_path,
             program=prog,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=-1.0,
             traversal_policy=RelationTraversalPolicy(skos_broader_up=1.0, skos_broader_down=0.25),
@@ -3047,7 +3034,7 @@ def test_step11_engine_literal_objects_skos_broader_and_ppr_seeding(
 
 
 def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reflection_token_counter: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Verify CSRGraph is cached across unchanged queries and invalidated on graph commits (P3-P4)."""
     import sqlite3
@@ -3059,7 +3046,6 @@ def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
     lm = DeterministicMockLM()
     dspy.settings.configure(lm=lm)
     prog = YawProgram(
-        synonym_token_counter=reflection_token_counter,
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
@@ -3071,7 +3057,7 @@ def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
             db_path=db_path,
             workspace_root=tmp_path,
             program=prog,
-            embedder=embedder,
+            embedder=_native_embedding(embedder),
             retrieval_top_k=2,
             candidate_dense_threshold=-1.0,
         )
@@ -3139,3 +3125,46 @@ def test_csr_graph_cached_across_queries_and_invalidated_on_graph_commit(
         assert engine._query_retrieval_memo == {}
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize("intent", ["", "unrelated", "Alan"])
+def test_passage_only_query_traverses_real_entity_graph(test_engine, monkeypatch, intent):
+    """A passage seed can reach a distinct passage without reranked facts."""
+    from yaw.daemon.graph.inference.embedding import PASSAGE_INSTRUCTION
+    from yaw.daemon.graph.storage.graph_ops import upsert_semantic_edges
+    from yaw.daemon.graph.storage.vectors import search_chunk_vectors_knn
+
+    class TopicEmbedder(DeterministicMockEmbedder):
+        def encode(self, texts, instruction="", *, stage=None):
+            vectors = super().encode(texts, instruction, stage=stage)
+            for text, vector in zip(texts, vectors, strict=True):
+                vector.fill(0)
+                vector[0 if "turing" in text.lower() else 1] = 1
+            return vectors
+
+    embedder = TopicEmbedder()
+    embedder.profile = EmbeddingProfile("deterministic", "topic-fixture-hmm-v1", 64, 2048, "mean", "", "")
+    test_engine.embedder = _native_embedding(embedder)
+    test_engine.index(
+        [
+            "Alan Turing was an English mathematician and computer scientist.",
+            "Ada Lovelace was a mathematician recognized for work on the Analytical Engine.",
+        ]
+    )
+    entities = dict(test_engine.conn.execute("SELECT name, entity_id FROM entities"))
+    turing = next(identifier for name, identifier in entities.items() if "turing" in name.lower())
+    lovelace = next(identifier for name, identifier in entities.items() if "lovelace" in name.lower())
+    upsert_semantic_edges(test_engine.conn, [(turing, lovelace, "skos:related", 1.0)])
+    test_engine._csr_graph = None
+    test_engine._csr_cache_key = None
+    monkeypatch.setattr(test_engine.program, "filter_triples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(test_engine.program, "extract_query_intent", lambda query: intent)
+    query = "Alan Turing"
+    query_vector = test_engine._encode_texts([query], instruction=PASSAGE_INSTRUCTION)[0]
+    dense = search_chunk_vectors_knn(test_engine.conn, query_vector, top_k=2)
+    assert len(dense) == 2 and dense[0][1] > dense[1][1]
+    hits, facts = test_engine.retrieve_with_seeds(query, top_k=2, allow_intent_path=True)
+    assert facts == []
+    assert len(hits) == 2
+    assert "Turing" in hits[0][2] and "Lovelace" in hits[1][2]
+    assert hits[1][1] > 0

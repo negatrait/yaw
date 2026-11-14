@@ -42,7 +42,11 @@ class LMRequestAudit(BaseCallback):
         self.calls: list[tuple[Any, dict[str, Any]]] = []
 
     def on_lm_start(self, call_id: str, instance: Any, inputs: dict[str, Any]):
-        self.calls.append((instance, {**instance.kwargs, **inputs.get("kwargs", {})}))
+        from dspy.lm15 import Request
+
+        request = inputs["prompt"]
+        assert isinstance(request, Request)
+        self.calls.append((instance, {**(request.config.extensions or {}), "temperature": request.config.temperature}))
 
 
 class RecallInputs(TypedDict):
@@ -244,7 +248,7 @@ class PromptsAndParsersParityTests(unittest.TestCase):
                     ]
                 },
                 {
-                    "reasoning": "Neville Stanton works at the University of Southampton, founded in 1862.",
+                    "plan": "Neville Stanton works at the University of Southampton, founded in 1862.",
                     "answer": "1862",
                 },
             ],
@@ -325,15 +329,15 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         orch_lm = CapabilityDummyLM(
             [
                 {
-                    "reasoning": "Delegate the actual bound report to the structured GBNF repair worker.",
+                    "plan": "Delegate the actual bound report to the structured GBNF repair worker.",
                     "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
                 },
                 {
-                    "reasoning": "Delegate once with pre-hydrated focus_context.",
+                    "plan": "Delegate once with pre-hydrated focus_context.",
                     "code": ("reps = propose_repairs()\nSUBMIT(repairs=reps)"),
                 },
             ],
-            adapter=dspy.ChatAdapter(),
+            adapter=dspy.XMLAdapter(),
         )
         orch_lm._yaw_recipe = "llamacpp"
         orch_lm._yaw_supports_gbnf = False
@@ -404,11 +408,11 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         )
         self.assertEqual(inspector_calls, ["ent-1"])
         self.assertEqual(len(orch_lm.request_audit.calls), 1)
-        self.assertIsNone(orch_lm.request_audit.calls[0][1].get("extra_body"))
+        self.assertIsNone(orch_lm.request_audit.calls[0][1].get("grammar"))
         self.assertEqual(len(sub_lm.request_audit.calls), 1)
         self.assertEqual(
-            sub_lm.request_audit.calls[0][1].get("extra_body"),
-            {"grammar": build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report))},
+            sub_lm.request_audit.calls[0][1].get("grammar"),
+            build_dspy_shacl_repair_grammar(allowed_actions=shacl_repair_actions(report)),
         )
 
         # Explicit mode="rlm" with non-empty focus_context reuses bound focus_context (0 node_inspector calls)
@@ -504,7 +508,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
                     ]
                 },
                 {"fact": [["alan turing", "born in", "london"]]},
-                {"reasoning": "Born in London.", "answer": "London"},
+                {"plan": "Born in London.", "answer": "London"},
             ],
             adapter=dspy.JSONAdapter(),
         )
@@ -514,12 +518,12 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertNotIn("[[ ##", DSPY_TRIPLES_GBNF_GRAMMAR)
         self.assertNotIn("[[ ##", DSPY_QA_GBNF_GRAMMAR)
         self.assertEqual(
-            lm.request_audit.calls[0][1].get("extra_body"),
-            {"grammar": DSPY_NER_GBNF_GRAMMAR},
+            lm.request_audit.calls[0][1].get("grammar"),
+            DSPY_NER_GBNF_GRAMMAR,
         )
         self.assertEqual(
-            lm.request_audit.calls[1][1].get("extra_body"),
-            {"grammar": build_dspy_triples_grammar(None, stage1_pairs)},
+            lm.request_audit.calls[1][1].get("grammar"),
+            build_dspy_triples_grammar(None, stage1_pairs),
         )
 
         candidates = [
@@ -532,14 +536,14 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertNotIn("[[ ##", expected_rerank_grammar)
         self.assertIn('"[\\"alan turing\\", \\"born in\\", \\"london\\"]"', expected_rerank_grammar)
         self.assertEqual(
-            lm.request_audit.calls[2][1].get("extra_body"),
-            {"grammar": expected_rerank_grammar},
+            lm.request_audit.calls[2][1].get("grammar"),
+            expected_rerank_grammar,
         )
 
         program.answer_question("Alan Turing was born in London.", "Where?", lm=lm, use_gbnf=True)
         self.assertEqual(
-            lm.request_audit.calls[3][1].get("extra_body"),
-            {"grammar": build_dspy_qa_grammar(program.gbnf_max_reasoning_chars)},
+            lm.request_audit.calls[3][1].get("grammar"),
+            build_dspy_qa_grammar(program.gbnf_max_reasoning_chars),
         )
 
     def test_sizecoding_gbnf_caps_and_gepa_pareto_metric(self):
@@ -579,18 +583,18 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
                         }
                     ]
                 },
-                {"reasoning": "Born in London.", "answer": "London"},
+                {"plan": "Born in London.", "answer": "London"},
             ],
             adapter=dspy.JSONAdapter(),
         )
         program.extract_openie("c-1", "Alan Turing was born in London.", lm=lm)
         self.assertEqual(
-            lm.request_audit.calls[0][1].get("extra_body"),
-            {"grammar": build_dspy_ner_grammar(3)},
+            lm.request_audit.calls[0][1].get("grammar"),
+            build_dspy_ner_grammar(3),
         )
         self.assertEqual(
-            lm.request_audit.calls[1][1].get("extra_body"),
-            {"grammar": build_dspy_triples_grammar(2, stage1_pairs)},
+            lm.request_audit.calls[1][1].get("grammar"),
+            build_dspy_triples_grammar(2, stage1_pairs),
         )
 
         # Calling program(...) (GEPA's forward pass) automatically attaches the capped QA GBNF grammar
@@ -599,8 +603,8 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertEqual(pred.answer, "London")
         self.assertIn("char{1,180}", build_dspy_qa_grammar(180))
         self.assertEqual(
-            lm.request_audit.calls[2][1].get("extra_body"),
-            {"grammar": build_dspy_qa_grammar(180)},
+            lm.request_audit.calls[2][1].get("grammar"),
+            build_dspy_qa_grammar(180),
         )
 
         # 1. Task quality has no reference gate or cost denominator.
@@ -694,8 +698,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             "triples",
             "entity_definer",
             "label_judge",
-            "hierarchy_judge",
-            "related_judge",
+            "relation_judge",
             "shacl_repair",
             "triple_filter",
             "query_intent",
@@ -709,12 +712,17 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         self.assertEqual(hooked_names, expected_canonical_predictors)
 
     @staticmethod
-    def _probe_live_lemonade_models(base_url: str) -> set[str]:
+    def _probe_live_models(base_url: str, api_key: str) -> set[str]:
         import urllib.request
 
-        with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=10) as resp:
+        if not api_key:
+            raise RuntimeError("Live inference requires UNSLOTH_STUDIO_AUTH_TOKEN or inference.api_key")
+        request = urllib.request.Request(
+            base_url.rstrip("/") + "/models", headers={"Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(request, timeout=10) as resp:
             payload = json.load(resp)
-        return {item["model_name"] for item in payload["all_models_loaded"] if item.get("loaded")}
+        return {item["id"] for item in payload["data"]}
 
     @pytest.mark.live
     def test_live_silicon_direct_gemma_gbnf(self):
@@ -725,7 +733,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         from yaw.daemon.graph.inference.program import YawProgram
 
         config = load_config(Path(__file__).resolve().parents[4] / "yaw.toml")
-        loaded = self._probe_live_lemonade_models(config.base_url)
+        loaded = self._probe_live_models(config.base_url, config.api_key)
         self.assertIn(config.extraction_model, loaded, "Configured extraction model must already be resident")
         passage = (
             "Radio City is India's first private FM radio station and was started on "
@@ -759,7 +767,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         requests = [request for lm, request in audit.calls if lm is direct_lm]
         self.assertIn(len(requests), (4, 5))
         for request in requests:
-            self.assertIn("grammar", request.get("extra_body") or {})
+            self.assertIn("grammar", request)
         self.assertEqual(direct_lm.history, [])
 
     def test_leaf_modularization_and_inference_facade_integrity(self):
@@ -820,11 +828,11 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
         llm_orch_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection")
         llm_ref = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="reflection_worker")
         self.assertEqual(llm_orch_ref.kwargs["temperature"], 0.8)
-        self.assertEqual(llm_orch_ref.kwargs["max_tokens"], 4096)
+        self.assertIsNone(llm_orch_ref.kwargs["max_tokens"])
         self.assertFalse(getattr(llm_orch_ref, "_yaw_supports_gbnf", True))
 
         self.assertEqual(llm_ref.kwargs["temperature"], 0.7)
-        self.assertEqual(llm_ref.kwargs["max_tokens"], 4096)
+        self.assertIsNone(llm_ref.kwargs["max_tokens"])
         self.assertNotIn("frequency_penalty", llm_ref.kwargs)
         self.assertTrue(getattr(llm_ref, "_yaw_supports_gbnf", False))
 
@@ -842,29 +850,27 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
 
     def test_rlm_instruction_proposer_contract_and_boundary_envelope(self):
         from yaw.daemon.graph.inference import RLMInstructionProposer
-        from yaw.daemon.graph.inference.reflection import ReflectionBudgetError
 
         with self.assertRaises(ValueError):
             RLMInstructionProposer(max_instruction_chars=0)
         proposer = RLMInstructionProposer()
         self.assertEqual(proposer({}, {}, []), {})
-        with self.assertRaises(ReflectionBudgetError):
+        with self.assertRaisesRegex(ValueError, "requires an LM"):
             proposer(component_name="qa.predict", current_instruction="Use evidence.")
 
     @pytest.mark.live
     def test_live_silicon_rlm_instruction_proposer(self):
-        """Run un-mocked single-level RLMInstructionProposer against live Lemonade Server."""
+        """Run un-mocked single-level RLMInstructionProposer against the configured inference server."""
         import dspy
 
         config = load_config(Path(__file__).resolve().parents[4] / "yaw.toml")
-        loaded = self._probe_live_lemonade_models(config.base_url)
+        loaded = self._probe_live_models(config.base_url, config.api_key)
         self.assertTrue(
             {config.qa_model, config.extraction_model}.issubset(loaded), "Reflection models must be resident"
         )
 
         from yaw.daemon.graph.inference import (
             RLMInstructionProposer,
-            ServingTokenCounter,
             build_dspy_instruction_proposal_grammar,
             create_dspy_rlm_pair,
         )
@@ -885,7 +891,6 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
             enable_gbnf=True,
             max_instruction_chars=800,
             rlm_max_iters=3,
-            token_counter=ServingTokenCounter(config.base_url, worker_lm.model),
         )
         candidate = {"qa": "Read the retrieved Wikipedia passages and answer the multi-hop question."}
         reflective_dataset = {
@@ -900,7 +905,7 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
                         "question": "What county is Erik Hort's birthplace a part of?",
                     },
                     "Generated Outputs": {
-                        "reasoning": "Erik Hort was born in Montebello, which is in Rockland County, New York.",
+                        "plan": "Erik Hort was born in Montebello, which is in Rockland County, New York.",
                         "answer": "Erik Hort's birthplace is part of Rockland County in New York.",
                     },
                     "Feedback": "[qa] PASS Tier 1 floor (1.0000 >= 0.0000). EM=0.0000, F1=0.3636. Missed gold items: "
@@ -920,13 +925,13 @@ tools, and mode=None routes pre-hydrated focus_context directly to shacl_repair.
 
         orchestrator_calls = [request for lm, request in audit.calls if lm is orch_lm]
         self.assertGreaterEqual(len(orchestrator_calls), 1)
-        self.assertNotIn("grammar", orchestrator_calls[0].get("extra_body") or {})
-        self.assertEqual(orchestrator_calls[0].get("temperature"), 0.8)
+        self.assertNotIn("grammar", orchestrator_calls[0])
+        self.assertEqual(orchestrator_calls[0].get("temperature"), 1.0)
         worker_calls = [request for lm, request in audit.calls if lm is worker_lm]
         self.assertGreaterEqual(len(worker_calls), 1)
-        gbnf_calls = [request for request in worker_calls if (request.get("extra_body") or {}).get("grammar")]
+        gbnf_calls = [request for request in worker_calls if request.get("grammar")]
         self.assertGreaterEqual(len(gbnf_calls), 1)
-        self.assertEqual(gbnf_calls[0]["extra_body"]["grammar"], build_dspy_instruction_proposal_grammar(max_chars=800))
+        self.assertEqual(gbnf_calls[0]["grammar"], build_dspy_instruction_proposal_grammar(max_chars=800))
         self.assertEqual(len(proposer.telemetry), 1)
         self.assertEqual(orch_lm.history, [])
         self.assertEqual(worker_lm.history, [])
@@ -947,6 +952,7 @@ no frequency penalty."""
         llm_lm = CapabilityDummyLM([{"query_intent": "Erik Hort birthplace village town county"}])
         llm_lm._yaw_recipe = "llamacpp"
         llm_lm._yaw_supports_gbnf = True
+        llm_lm.kwargs["temperature"] = 1.0
 
         prog = YawProgram(
             enable_gbnf=True,
@@ -959,7 +965,7 @@ no frequency penalty."""
         self.assertAlmostEqual(call_kwargs["temperature"], 1.0)
         self.assertNotIn("frequency_penalty", call_kwargs)
         self.assertEqual(
-            (call_kwargs.get("extra_body") or {}).get("grammar"),
+            call_kwargs.get("grammar"),
             DSPY_QUERY_INTENT_GBNF_GRAMMAR,
         )
 
@@ -1037,7 +1043,6 @@ no frequency penalty."""
             enable_gbnf=True,
             orchestrator_lm=primary_lm,
             rlm_sub_lm=sub_lm,
-            synonym_token_counter=lambda messages, **_kwargs: len(str(messages)),
         )
         proposer = RLMInstructionProposer(
             orchestrator_lm=primary_lm,
@@ -1086,8 +1091,10 @@ no frequency penalty."""
         syn_batch = SynonymEvidenceBatch(
             payload=json.dumps(
                 {
-                    "format": "synonym-evidence-v2",
+                    "format": "synonym-evidence-v3",
                     "pairs": [{"pair_id": "e0|e1", "left": "e0", "right": "e1"}],
+                    "entities": {"e0": {"sources": []}, "e1": {"sources": []}},
+                    "sources": {},
                 },
                 separators=(",", ":"),
             ),
@@ -1210,9 +1217,8 @@ no frequency penalty."""
             ExtractTriples,
             FilterTriples,
             HealSHACLViolations,
-            JudgeHierarchy,
             JudgeLabels,
-            JudgeRelated,
+            JudgeRelations,
             ProposeInstructionSignature,
             ProposeSHACLRepairs,
             ReflectiveInnerDistillerSignature,
@@ -1236,8 +1242,7 @@ no frequency penalty."""
             ExtractTriples,
             DefineMissingEntities,
             JudgeLabels,
-            JudgeHierarchy,
-            JudgeRelated,
+            JudgeRelations,
             ProposeSHACLRepairs,
             ExtractQueryIntent,
             FilterTriples,
@@ -1257,17 +1262,16 @@ no frequency penalty."""
 
         kw_enabled: dict[str, Any] = {}
         adapter._prepare_gbnf_kwargs(gbnf_lm, kw_enabled, ExtractEntities)
-        self.assertIn("extra_body", kw_enabled)
-        self.assertIn("grammar", kw_enabled["extra_body"])
+        self.assertIn("grammar", kw_enabled)
 
         kw_rlm: dict[str, Any] = {}
         adapter._prepare_gbnf_kwargs(rlm_lm, kw_rlm, ExtractEntities)
-        self.assertNotIn("extra_body", kw_rlm)
+        self.assertNotIn("grammar", kw_rlm)
 
         disabled_adapter = YawGBNFAdapter(enable_gbnf=False)
         kw_disabled: dict[str, Any] = {}
         disabled_adapter._prepare_gbnf_kwargs(gbnf_lm, kw_disabled, ExtractEntities)
-        self.assertNotIn("extra_body", kw_disabled)
+        self.assertNotIn("grammar", kw_disabled)
 
     def test_sprint1_dspy_embedding_adapter_asyncify_and_abatch_encode(self) -> None:
         import anyio
@@ -1283,24 +1287,26 @@ no frequency penalty."""
         profile = resolve_embedding_profile("embeddinggemma-300m-GGUF", "distinct-titled")
         call_records: list[dict[str, Any]] = []
 
-        def fake_embed_fn(batch_inputs: list[str], **_kwargs: Any) -> np.ndarray:
-            call_records.append(
-                {
-                    "batch_len": len(batch_inputs),
-                    "async_max_workers": dspy.settings.async_max_workers,
-                }
-            )
-            out = np.zeros((len(batch_inputs), profile.dimensions), dtype=np.float32)
-            for idx, text in enumerate(batch_inputs):
-                seed = sum(ord(ch) for ch in text) % 97
-                out[idx, seed % profile.dimensions] = 1.0
-                out[idx, (seed + 1) % profile.dimensions] = 0.5
-            return out
+        class FakeEmbeddingModel:
+            index_identity = "fixture:async-embedding"
 
-        embedder = dspy.Embedder(fake_embed_fn, batch_size=2, caching=False)
+            def __call__(self, batch_inputs: list[str], **_kwargs: Any) -> np.ndarray:
+                call_records.append(
+                    {
+                        "batch_len": len(batch_inputs),
+                        "async_max_workers": dspy.settings.async_max_workers,
+                    }
+                )
+                out = np.zeros((len(batch_inputs), profile.dimensions), dtype=np.float32)
+                for idx, text in enumerate(batch_inputs):
+                    seed = sum(ord(ch) for ch in text) % 97
+                    out[idx, seed % profile.dimensions] = 1.0
+                    out[idx, (seed + 1) % profile.dimensions] = 0.5
+                return out
+
+        embedder = dspy.Embedder(FakeEmbeddingModel(), batch_size=2, caching=False)
         adapter = DSPyEmbeddingAdapter(profile=profile, embedder=embedder, batch_size=2, caching=False)
-        self.assertTrue(issubclass(DSPyEmbeddingAdapter, dspy.Embedder))
-        self.assertIsInstance(adapter, dspy.Embedder)
+        self.assertIs(adapter.embedder, embedder)
 
         texts = [
             "# Alpha\nAlpha is the first concept.",
@@ -1315,8 +1321,7 @@ no frequency penalty."""
         with dspy.context(async_max_workers=3):
             async_vecs = anyio.run(lambda: adapter.abatch_encode(texts, batch_size=2, stage="entity_embed"))
             acall_vecs = anyio.run(lambda: adapter.acall(texts, batch_size=2, stage="entity_embed"))
-            async_fn = adapter.as_async()
-            asyncified_vecs = anyio.run(lambda: async_fn(texts, instruction=FACT_INSTRUCTION, batch_size=2))
+            asyncified_vecs = anyio.run(lambda: adapter.acall(texts, instruction=FACT_INSTRUCTION, batch_size=2))
 
         np.testing.assert_allclose(sync_vecs, async_vecs, rtol=1e-5, atol=1e-6)
         np.testing.assert_allclose(sync_vecs, acall_vecs, rtol=1e-5, atol=1e-6)
@@ -1387,11 +1392,11 @@ no frequency penalty."""
             )
 
         self.assertTrue(issubclass(YawRetriever, dspy.Retrieve))
-        qa_lm = CapabilityDummyLM([{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}])
+        qa_lm = CapabilityDummyLM([{"plan": "Montebello is in Rockland County.", "answer": "Rockland County"}])
         prog = YawProgram(orchestrator_lm=qa_lm, rlm_sub_lm=qa_lm)
         self.assertIsInstance(prog.rm, YawRM)
         self.assertIsInstance(prog.retriever, YawRetriever)
-        self.assertEqual(len(prog.named_predictors()), 12)
+        self.assertEqual(len(prog.named_predictors()), 11)
 
         prog.set_retrieval_hook(fake_hook)
         self.assertIs(prog.rm.hook, fake_hook)
@@ -1403,7 +1408,8 @@ no frequency penalty."""
         self.assertEqual(fwd_pred.answer, "Rockland County")
         self.assertEqual(len(fwd_pred.retrieved_passages), 3)
 
-        # Verify dump_state / load_state round-trip AND backward compatibility when 'retriever' is absent
+        # The native dummy engine is intentionally not serializable; detach it before state export.
+        prog.set_lm(None)
         dumped = prog.dump_state()
         self.assertIn("retriever", dumped)
         legacy_state = {k: v for k, v in dumped.items() if k != "retriever"}
@@ -1618,32 +1624,30 @@ no frequency penalty."""
         self.assertLess(lbl_bad, 1.0)
         self.assertIn("EdgeShape/closedWorld", lbl_bad_fb)
 
-        # 4b. hierarchy_judge
+        # 4b. relation_judge
         hier_ok, _ = validate_stage_invariants(
-            "hierarchy_judge",
+            "relation_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
             dspy.Prediction(
                 decisions=[
                     {
                         "pair_id": "ent-1|ent-2",
                         "reasoning": "Taxonomic parent",
-                        "broader": True,
-                        "narrower": False,
+                        "relation": "skos:broader",
                     }
                 ]
             ),
         )
         self.assertEqual(hier_ok, 1.0)
         hier_bad, hier_bad_fb = validate_stage_invariants(
-            "hierarchy_judge",
+            "relation_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
             dspy.Prediction(
                 decisions=[
                     {
                         "pair_id": "ent-1|ent-1",
                         "reasoning": "Self loop",
-                        "broader": True,
-                        "narrower": False,
+                        "relation": "skos:broader",
                     }
                 ]
             ),
@@ -1651,30 +1655,30 @@ no frequency penalty."""
         self.assertLess(hier_bad, 1.0)
         self.assertIn("EdgeShape/closedWorld", hier_bad_fb)
 
-        # 4c. related_judge
+        # 4c. relation_judge
         rel_ok, _ = validate_stage_invariants(
-            "related_judge",
+            "relation_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-2"}]'},
             dspy.Prediction(
                 decisions=[
                     {
                         "pair_id": "ent-1|ent-2",
                         "reasoning": "Associative relation",
-                        "related": True,
+                        "relation": "skos:related",
                     }
                 ]
             ),
         )
         self.assertEqual(rel_ok, 1.0)
         rel_bad, rel_bad_fb = validate_stage_invariants(
-            "related_judge",
+            "relation_judge",
             {"candidate_pairs": '[{"pair_id": "ent-1|ent-1"}]'},
             dspy.Prediction(
                 decisions=[
                     {
                         "pair_id": "ent-1|ent-1",
                         "reasoning": "Self loop",
-                        "related": True,
+                        "relation": "skos:related",
                     }
                 ]
             ),
@@ -1805,14 +1809,14 @@ no frequency penalty."""
         lm1 = CapabilityDummyLM(
             [
                 {
-                    "reasoning": "Erik Hort was born in Montebello, Rockland County.",
+                    "plan": "Erik Hort was born in Montebello, Rockland County.",
                     "answer": "Rockland County",
                 },
             ]
         )
         lm2 = CapabilityDummyLM(
             [
-                {"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"},
+                {"plan": "Montebello is in Rockland County.", "answer": "Rockland County"},
             ]
         )
 
@@ -1825,13 +1829,11 @@ no frequency penalty."""
             question="What county is Erik Hort's birthplace a part of?",
         )
         self.assertEqual(qa_ens_pred.answer, "Rockland County")
-        self.assertEqual(len(prog1.named_predictors()), 12)
-        self.assertEqual(len(prog2.named_predictors()), 12)
+        self.assertEqual(len(prog1.named_predictors()), 11)
+        self.assertEqual(len(prog2.named_predictors()), 11)
 
         # Verify YawProgram.as_async()
-        async_prog_lm = CapabilityDummyLM(
-            [{"reasoning": "Montebello is in Rockland County.", "answer": "Rockland County"}]
-        )
+        async_prog_lm = CapabilityDummyLM([{"plan": "Montebello is in Rockland County.", "answer": "Rockland County"}])
         async_prog = YawProgram(orchestrator_lm=async_prog_lm, rlm_sub_lm=async_prog_lm)
         async_prog_fn = async_prog.as_async()
         async_res = anyio.run(
@@ -1883,22 +1885,20 @@ no frequency penalty."""
         )
         from yaw.daemon.graph.inference import (
             DSPY_SHACL_REPAIR_GBNF_GRAMMAR,
-            JudgeHierarchy,
             JudgeLabels,
-            JudgeRelated,
+            JudgeRelations,
             ProposeSHACLRepairs,
-            build_dspy_hierarchy_judge_grammar,
             build_dspy_label_judge_grammar,
-            build_dspy_related_judge_grammar,
+            build_dspy_relation_judge_grammar,
             build_dspy_shacl_repair_grammar,
         )
 
         self.assertIn("hidden_label", build_dspy_label_judge_grammar(max_decisions=2))
-        self.assertIn("broader", build_dspy_hierarchy_judge_grammar(max_decisions=2))
-        self.assertIn("related", build_dspy_related_judge_grammar(max_decisions=2))
+        self.assertIn("broader", build_dspy_relation_judge_grammar(max_decisions=2))
+        self.assertIn("related", build_dspy_relation_judge_grammar(max_decisions=2))
         self.assertIn("skos:altLabel", JudgeLabels.instructions)
-        self.assertIn("skos:broader", JudgeHierarchy.instructions)
-        self.assertIn("skos:related", JudgeRelated.instructions)
+        self.assertIn("skos:broader", JudgeRelations.instructions)
+        self.assertIn("skos:related", JudgeRelations.instructions)
 
         violations_in = {"violations": [{"focus_node": "entity-a"}, {"focus_node": "entity-b"}]}
         for action in VALID_SHACL_ACTIONS:
@@ -2007,9 +2007,13 @@ no frequency penalty."""
 
         # 3. Verify DSPyEmbeddingAdapter formatting helpers
 
-        adapter = DSPyEmbeddingAdapter(
-            embedder=lambda texts, **_kw: [[1.0, 0.0] for _ in texts],
-        )
+        class FormatterEmbeddingModel:
+            index_identity = "fixture:formatter-embedding"
+
+            def __call__(self, texts: list[str]) -> list[list[float]]:
+                return [[1.0, 0.0] for _ in texts]
+
+        adapter = DSPyEmbeddingAdapter(embedder=dspy.Embedder(FormatterEmbeddingModel()))
         ptr = ChunkPointer(
             chunk_id="chunk-1",
             rel_posix_path="doc.md",
@@ -2053,8 +2057,7 @@ no frequency penalty."""
             prog.embedding_audit_trail.append({"idx": i})
             prog.entity_def_audit_trail.append({"idx": i})
             prog.label_judge_audit_trail.append({"idx": i})
-            prog.hierarchy_judge_audit_trail.append({"idx": i})
-            prog.related_judge_audit_trail.append({"idx": i})
+            prog.relation_judge_audit_trail.append({"idx": i})
             prog.shacl_audit_trail.append({"idx": i})
         bounded_trails = prog.dump_audit_trails(bounded=True)
         self.assertEqual(
@@ -2064,8 +2067,7 @@ no frequency penalty."""
                 "embedding_audit_trail",
                 "entity_def_audit_trail",
                 "label_judge_audit_trail",
-                "hierarchy_judge_audit_trail",
-                "related_judge_audit_trail",
+                "relation_judge_audit_trail",
                 "shacl_audit_trail",
             },
         )
@@ -2073,8 +2075,7 @@ no frequency penalty."""
         self.assertEqual(len(bounded_trails["embedding_audit_trail"]), 250)
         self.assertEqual(len(bounded_trails["entity_def_audit_trail"]), 250)
         self.assertEqual(len(bounded_trails["label_judge_audit_trail"]), 100)
-        self.assertEqual(len(bounded_trails["hierarchy_judge_audit_trail"]), 100)
-        self.assertEqual(len(bounded_trails["related_judge_audit_trail"]), 100)
+        self.assertEqual(len(bounded_trails["relation_judge_audit_trail"]), 100)
         self.assertEqual(len(bounded_trails["shacl_audit_trail"]), 100)
         aliased_trails = prog.dump_audit_trails(bounded=True, telemetry_key="program_telemetry")
         self.assertIn("program_telemetry", aliased_trails)

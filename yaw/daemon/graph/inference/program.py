@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import dspy
+from dspy.utils.exceptions import LMUnexpectedError
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, YawConfig, context_char_limit, scale_context_budget
 from yaw.core.types import OpenIERecord, StructuredTriple, SynonymEvidenceBatch, is_resource_label, pool_confidences
@@ -16,13 +17,12 @@ from .chat import create_dspy_lm
 from .confidence import extraction_logprob_votes, judge_logprob_votes
 from .diagnostics import DiagnosticHistory, diagnostic_boundary
 from .grammars import (
-    build_dspy_hierarchy_judge_grammar,
     build_dspy_label_judge_grammar,
     build_dspy_missing_entity_defs_grammar,
     build_dspy_ner_grammar,
     build_dspy_qa_grammar,
     build_dspy_query_intent_grammar,
-    build_dspy_related_judge_grammar,
+    build_dspy_relation_judge_grammar,
     build_dspy_rerank_grammar,
     build_dspy_shacl_repair_grammar,
     build_dspy_triples_grammar,
@@ -34,9 +34,8 @@ from .parsers import (
     extract_entity_definitions,
     extract_structured_triples,
     match_facts_to_candidate_indices,
-    parse_hierarchy_decisions,
     parse_label_decisions,
-    parse_related_decisions,
+    parse_relation_decisions,
     parse_shacl_repairs,
     shacl_repair_actions,
     text_processing,
@@ -49,15 +48,12 @@ from .prompts import (
     ExtractTriples,
     FilterTriples,
     HealSHACLViolations,
-    JudgeHierarchy,
     JudgeLabels,
-    JudgeRelated,
+    JudgeRelations,
     ProposeSHACLRepairs,
 )
-from .reflection import ServingTokenCounter
 from .retriever import YawRetriever, YawRM
 from .rlm import STAGE_RLM_DELEGATION_RULES, PositionalSafeRLM
-from .synonyms import SynonymRequestBudget
 
 
 class YawProgram(dspy.Module):
@@ -70,8 +66,7 @@ Multi-Hop QA.
        - `triples` (`ExtractTriples`)
        - `entity_definer` (`DefineMissingEntities`)
        - `label_judge` (`JudgeLabels`)
-       - `hierarchy_judge` (`JudgeHierarchy`)
-       - `related_judge` (`JudgeRelated`)
+       - `relation_judge` (`JudgeRelations`)
        - `shacl_repair` (`ProposeSHACLRepairs`)
        - `triple_filter` (`FilterTriples`)
        - `query_intent` (`ExtractQueryIntent`)
@@ -94,7 +89,7 @@ Deno/Pyodide WASM) with
         gbnf_max_entities: int | None = None,
         gbnf_max_triples: int | None = None,
         gbnf_max_facts: int = 4,
-        gbnf_max_reasoning_chars: int | None = 360,
+        gbnf_max_reasoning_chars: int | None = None,
         embedding_query_prefix: str | None = None,
         embedding_fact_prefix: str | None = None,
         embedding_document_prefix: str | None = None,
@@ -109,7 +104,6 @@ Deno/Pyodide WASM) with
         compiled_path: str | Path | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
-        synonym_token_counter: Any = None,
     ) -> None:
         super().__init__()
         if context_window_tokens is None:
@@ -119,17 +113,18 @@ Deno/Pyodide WASM) with
                 or DEFAULT_CONTEXT_WINDOW_TOKENS
             )
         if max_output_tokens is None:
-            max_output_tokens = max(
-                int((getattr(lm, "kwargs", {}) or {}).get("max_tokens") or 0) for lm in (orchestrator_lm, rlm_sub_lm)
-            ) or scale_context_budget(4096, context_window_tokens)
+            max_output_tokens = (
+                max(
+                    int((getattr(lm, "kwargs", {}) or {}).get("max_tokens") or 0)
+                    for lm in (orchestrator_lm, rlm_sub_lm)
+                )
+                or None
+            )
         if rlm_max_output_chars is None:
             rlm_max_output_chars = scale_context_budget(10000, context_window_tokens)
         context_char_limit(1, context_window_tokens, max_output_tokens)
         self.context_window_tokens = context_window_tokens
         self.max_output_tokens = max_output_tokens
-        self.synonym_token_counter = synonym_token_counter
-        self._synonym_tokenizer_settings: tuple[str, str] | None = None
-        self._synonym_budget: SynonymRequestBudget | None = None
         self.enable_gbnf: bool = enable_gbnf
         self.gbnf_max_entities: int | None = gbnf_max_entities
         self.gbnf_max_triples: int | None = gbnf_max_triples
@@ -169,8 +164,7 @@ Deno/Pyodide WASM) with
         self.embedding_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.entity_def_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.label_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
-        self.hierarchy_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
-        self.related_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
+        self.relation_judge_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
         self.shacl_audit_trail: list[dict[str, Any]] = DiagnosticHistory()
 
         # 10 Direct GBNF Predictors with distinct Signatures
@@ -178,8 +172,7 @@ Deno/Pyodide WASM) with
         self.triples = dspy.Predict(ExtractTriples)
         self.entity_definer = dspy.Predict(DefineMissingEntities)
         self.label_judge = dspy.Predict(JudgeLabels)
-        self.hierarchy_judge = dspy.Predict(JudgeHierarchy)
-        self.related_judge = dspy.Predict(JudgeRelated)
+        self.relation_judge = dspy.Predict(JudgeRelations)
         self.shacl_repair = dspy.Predict(ProposeSHACLRepairs)
         self.triple_filter = dspy.Predict(FilterTriples)
         self.query_intent = dspy.Predict(ExtractQueryIntent)
@@ -232,8 +225,7 @@ Deno/Pyodide WASM) with
             "embedding_audit_trail": 250,
             "entity_def_audit_trail": 250,
             "label_judge_audit_trail": 100,
-            "hierarchy_judge_audit_trail": 100,
-            "related_judge_audit_trail": 100,
+            "relation_judge_audit_trail": 100,
             "shacl_audit_trail": 100,
         }
         out: dict[str, list[dict[str, Any]]] = {}
@@ -254,8 +246,7 @@ Deno/Pyodide WASM) with
                 self.triples,
                 self.entity_definer,
                 self.label_judge,
-                self.hierarchy_judge,
-                self.related_judge,
+                self.relation_judge,
                 self.shacl_repair,
                 self.triple_filter,
                 self.query_intent,
@@ -308,13 +299,17 @@ Deno/Pyodide WASM) with
     @classmethod
     def from_config(cls, config: YawConfig) -> YawProgram:
         """Construct a YawProgram from a YawConfig."""
-        assert config.max_output_tokens is not None and config.rlm_max_output_chars is not None
+        config = config.resolve_inference_budgets(config.context_window_tokens)
+        assert config.rlm_max_output_chars is not None
+        assert config.workspace_root is not None
+        diagnostic_dir = config.workspace_root / "outputs" / "inference_failures"
         orch_lm = create_dspy_lm(
             config.qa_model,
             base_url=config.base_url,
             api_key=config.api_key,
             provider=config.provider,
             role="qa",
+            diagnostic_dir=diagnostic_dir,
             context_window_tokens=config.context_window_tokens,
             max_tokens=config.max_output_tokens,
         )
@@ -324,6 +319,7 @@ Deno/Pyodide WASM) with
             api_key=config.api_key,
             provider=config.provider,
             role="extraction",
+            diagnostic_dir=diagnostic_dir,
             context_window_tokens=config.context_window_tokens,
             max_tokens=config.max_output_tokens,
         )
@@ -348,7 +344,6 @@ Deno/Pyodide WASM) with
         program.shacl_healer_rlm.max_iters = config.rlm_max_iters
         program.shacl_healer_rlm.max_llm_calls = config.rlm_max_llm_calls
         program.shacl_healer_rlm.max_output_chars = config.rlm_max_output_chars
-        program._synonym_tokenizer_settings = (config.base_url, config.reflection_tokenizer_url)
         return program
 
     def _context_char_limit(self, base_chars: int) -> int:
@@ -358,6 +353,7 @@ Deno/Pyodide WASM) with
         """Serialize all DSPy predictors/RLMs plus EmbeddingGemma prefixes and GBNF structural bounds."""
         state: dict[str, Any] = super().dump_state(*args, **kwargs)
         yaw_surface: dict[str, Any] = {
+            "prompt_contract": "complete-evidence-two-stage-v1",
             "graph_schema": "scheme-free-v1",
             "shacl_tools": "canonical-report-v1",
             "gbnf_max_entities": self.gbnf_max_entities,
@@ -382,17 +378,19 @@ Deno/Pyodide WASM) with
             raise ValueError("Incompatible program graph schema; recompile against the scheme-free graph")
         if yaw_surface.get("shacl_tools") != "canonical-report-v1":
             raise ValueError("Incompatible SHACL tool contract; start a fresh optimization")
+        if yaw_surface.get("prompt_contract") != "complete-evidence-two-stage-v1":
+            raise ValueError("Incompatible prompt contract; recompile with complete evidence and two-stage judging")
         deployment_lms = {name: predictor.lm for name, predictor in self.named_predictors() if predictor.lm is not None}
         # Missing legacy predictors retain constructor defaults. Explicitly
         # saved empty demo lists must survive loading without reseeding.
         for p_name, param in self.named_parameters():
             if p_name not in state_copy and hasattr(param, "dump_state"):
                 state_copy[p_name] = param.dump_state()
-        for name in deployment_lms:
+        for name, _predictor in self.named_predictors():
             if name in state_copy:
-                # Instructions/demos are portable; explicit deployment LMs own
-                # endpoints and credentials. Do not reconstruct clients from a
-                # compiled prompt file when the caller already supplied them.
+                # Instructions/demos are portable; deployment LMs or the active
+                # DSPy context own endpoints, credentials and generation limits.
+                # Compiled prompts must never reconstruct obsolete clients.
                 state_copy[name] = {**state_copy[name], "lm": None}
         res = super().load_state(state_copy, *args, **kwargs)
         for name, predictor in self.named_predictors():
@@ -404,7 +402,6 @@ Deno/Pyodide WASM) with
             for attr in (
                 "gbnf_max_entities",
                 "gbnf_max_triples",
-                "gbnf_max_reasoning_chars",
                 "embedding_query_prefix",
                 "embedding_fact_prefix",
                 "embedding_document_prefix",
@@ -551,12 +548,12 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
             lint_shacl,
         ]
 
-    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True, adapter: dspy.Adapter | None = None):
+    def _dspy_ctx(self, lm: dspy.BaseLM | None, *, use_json_adapter: bool = True):
         ctx_kwargs: dict[str, Any] = {"warn_on_type_mismatch": False, "disable_history": True, "max_history_size": 0}
         if lm is not None:
             ctx_kwargs["lm"] = lm
         if use_json_adapter:
-            ctx_kwargs["adapter"] = adapter or self.json_adapter
+            ctx_kwargs["adapter"] = self.json_adapter
         return dspy.context(**ctx_kwargs)
 
     def _should_use_gbnf(self, use_gbnf: bool | None, lm: dspy.BaseLM | None) -> bool:
@@ -605,7 +602,6 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
         lm: Any,
         use_gbnf: bool | None,
         grammar_fn: Callable[[], str],
-        request_adapter: dspy.Adapter | None = None,
         collect_logprobs: bool = False,
         **inputs: Any,
     ) -> Any:
@@ -633,26 +629,20 @@ definition, semantic edges, reified facts, chunk pointers, and markdown_dossier.
                 predictor = direct_mod.predict if isinstance(direct_mod, dspy.ChainOfThought) else direct_mod
                 effective_lm = lm or getattr(predictor, "lm", None) or dspy.settings.lm
                 direct_inputs = dict(inputs)
-                if isinstance(direct_inputs.get("passage"), str) and len(
-                    direct_inputs["passage"]
-                ) > self._context_char_limit(24000):
-                    limit = self._context_char_limit(24000)
-                    direct_inputs["passage"] = direct_inputs["passage"][:limit]
-                if isinstance(direct_inputs.get("context"), str) and len(
-                    direct_inputs["context"]
-                ) > self._context_char_limit(40000):
-                    limit = self._context_char_limit(40000)
-                    direct_inputs["context"] = direct_inputs["context"][:limit]
                 call_kwargs: dict[str, Any] = {}
                 if lm is not None:
                     call_kwargs["lm"] = lm
                 config: dict[str, Any] = {"logprobs": True} if collect_logprobs else {}
                 if self._should_use_gbnf(use_gbnf, effective_lm):
-                    config["extra_body"] = {"grammar": grammar_fn()}
+                    config["grammar"] = grammar_fn()
                 if config:
                     call_kwargs["config"] = config
-                with self._dspy_ctx(effective_lm, use_json_adapter=True, adapter=request_adapter):
-                    pred = direct_mod(**direct_inputs, **call_kwargs)
+                with self._dspy_ctx(effective_lm, use_json_adapter=True):
+                    try:
+                        pred = direct_mod(**direct_inputs, **call_kwargs)
+                    except LMUnexpectedError as exc:
+                        exc.add_note(f"YAW stage: {stage_name}")
+                        raise
                     inv_score, inv_feedback = validate_stage_invariants(
                         stage_name,
                         direct_inputs,
@@ -881,46 +871,9 @@ chunk."""
             entity_probabilities=entity_probabilities,
         )
 
-    def synonym_request_budget(self, lm: Any = None) -> SynonymRequestBudget:
-        """Resolve a verified tokenizer for the active synonym LM, retaining one budget object."""
-        effective = lm or self.label_judge.lm or dspy.settings.lm
-        if effective is None:
-            raise ValueError("Synonym judgment requires an LM")
-        counter = self.synonym_token_counter
-        if counter is None:
-            settings = self._synonym_tokenizer_settings
-            base_url = settings[0] if settings else effective.kwargs.get("api_base")
-            if not base_url:
-                raise ValueError("Synonym judgment requires an explicit serving token counter")
-            counter = ServingTokenCounter(base_url, effective.model, settings[1] if settings else "")
-            self.synonym_token_counter = counter
-        if isinstance(counter, ServingTokenCounter):
-            counter = counter.for_model(effective.model)
-            self.synonym_token_counter = counter
-        if (
-            self._synonym_budget is None
-            or self._synonym_budget.counter is not counter
-            or self._synonym_budget.adapter is not self.json_adapter
-            or self._synonym_budget.output_tokens != self.max_output_tokens
-            or self._synonym_budget.context_tokens
-            != min(self.context_window_tokens, getattr(counter, "context_tokens", self.context_window_tokens))
-        ):
-            self._synonym_budget = SynonymRequestBudget(
-                self.json_adapter,
-                counter,
-                self.context_window_tokens,
-                self.max_output_tokens,
-            )
-        return self._synonym_budget
-
-    def semantic_adjudication_fits(self, batch: SynonymEvidenceBatch) -> bool:
-        """Check a whole pair packet including signature, demos, output budget and chat template."""
-        lm = self.label_judge.lm or dspy.settings.lm
-        return self.synonym_request_budget(lm).fits(batch, self.label_judge, lm)
-
     def _run_judge_stage(
         self,
-        stage_name: Literal["label_judge", "hierarchy_judge", "related_judge"],
+        stage_name: Literal["label_judge", "relation_judge"],
         batch: SynonymEvidenceBatch,
         *,
         lm: Any = None,
@@ -941,21 +894,27 @@ chunk."""
                 parse_label_decisions,
                 self.label_judge_audit_trail,
             ),
-            "hierarchy_judge": (
-                self.hierarchy_judge,
-                build_dspy_hierarchy_judge_grammar,
-                parse_hierarchy_decisions,
-                self.hierarchy_judge_audit_trail,
-            ),
-            "related_judge": (
-                self.related_judge,
-                build_dspy_related_judge_grammar,
-                parse_related_decisions,
-                self.related_judge_audit_trail,
+            "relation_judge": (
+                self.relation_judge,
+                build_dspy_relation_judge_grammar,
+                parse_relation_decisions,
+                self.relation_judge_audit_trail,
             ),
         }
-        predictor, grammar_fn, parser_fn, audit_trail = predictor_map[stage_name]
-        budget = self.synonym_request_budget(lm)
+        predictor, _, parser_fn, audit_trail = predictor_map[stage_name]
+        pairs = json.loads(batch.payload)["pairs"]
+        pair_ids = [pair["pair_id"] for pair in pairs]
+
+        def grammar_fn() -> str:
+            if stage_name == "relation_judge":
+                return build_dspy_relation_judge_grammar(
+                    pair_ids=pair_ids,
+                    max_reasoning_chars=self.gbnf_max_reasoning_chars,
+                    associated_pair_ids=[
+                        pair["pair_id"] for pair in pairs if pair.get("direct_facts") or pair.get("shared_role_facts")
+                    ],
+                )
+            return build_dspy_label_judge_grammar(pair_ids=pair_ids, max_reasoning_chars=self.gbnf_max_reasoning_chars)
 
         prev_telem_len = len(self.telemetry)
         local_stage_trace: list[Any] = []
@@ -967,11 +926,7 @@ chunk."""
                 is_rlm=False,
                 lm=lm,
                 use_gbnf=use_gbnf,
-                grammar_fn=lambda: grammar_fn(
-                    pair_ids=[pair["pair_id"] for pair in json.loads(batch.payload)["pairs"]],
-                    max_reasoning_chars=self.gbnf_max_reasoning_chars,
-                ),
-                request_adapter=budget,
+                grammar_fn=grammar_fn,
                 collect_logprobs=True,
                 candidate_pairs=batch.payload,
             )
@@ -994,7 +949,7 @@ chunk."""
             "packet_id": batch.cache_identity,
             "pair_count": len(batch.candidates),
             "packet_chars": len(batch.payload),
-            "input_tokens": budget.last_count,
+            "usage": pred.get_lm_usage(),
             "construction_seconds": batch.construction_seconds,
             "inference_seconds": elapsed,
             "cache_hit": False,
@@ -1035,7 +990,7 @@ chunk."""
         captured_traces: list[Any] | None = None,
         rlm_stats: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Judge candidate pairs via short-circuiting 3-stage W3C semantic cascade."""
+        """Judge candidate pairs via short-circuiting identity and relation decisions."""
         if not batch.candidates:
             return []
 
@@ -1085,75 +1040,26 @@ chunk."""
                 else:
                     stage2_pids.append(pid)
 
-        # 4. Stage 2: JudgeHierarchy (skos:broader / skos:narrower)
-        stage2_residuals: list[str] = []
+        # One relation decision for every distinct pair, with evidence-constrained choices.
         if stage2_pids:
-            stage2_batch = batch.subset(stage2_pids)
-            s2_decs = self._run_judge_stage(
-                "hierarchy_judge",
-                stage2_batch,
+            decisions = self._run_judge_stage(
+                "relation_judge",
+                batch.subset(stage2_pids),
                 lm=lm,
                 use_gbnf=use_gbnf,
                 captured_traces=captured_traces,
                 rlm_stats=rlm_stats,
             )
-            for dec in s2_decs:
-                pid = dec["pair_id"]
-                votes[pid].append(dec["llm_prob"])
-                ea, eb = pid.split("|", 1)
-                broader = bool(dec.get("broader"))
-                narrower = bool(dec.get("narrower"))
-                if broader and not narrower:
-                    dec_copy = dict(dec)
-                    dec_copy["relation"] = "skos:broader"
-                    dec_copy["source_id"] = ea
-                    dec_copy["target_id"] = eb
-                    resolved_decisions.append(dec_copy)
-                elif not broader and narrower:
-                    dec_copy = dict(dec)
-                    dec_copy["relation"] = "skos:broader"
-                    dec_copy["source_id"] = eb
-                    dec_copy["target_id"] = ea
-                    resolved_decisions.append(dec_copy)
-                elif broader and narrower:
-                    dec_copy = dict(dec)
-                    dec_copy["relation"] = "skos:related"
-                    resolved_decisions.append(dec_copy)
-                else:
-                    stage2_residuals.append(pid)
-
-        # 5. Rule W1 / W2 on Stage 2 (False, False) pairs: direct facts or shared roles -> skos:related
-        stage3_pids: list[str] = []
-        for pid in stage2_residuals:
-            p = pairs_by_id[pid]
-            if p.get("direct_facts") or p.get("shared_role_facts"):
-                resolved_decisions.append(
-                    {
-                        "pair_id": pid,
-                        "reasoning": "Deterministic skos:related via Rule W1/W2 statement role / direct fact",
-                        "relation": "skos:related",
-                    }
-                )
-            else:
-                stage3_pids.append(pid)
-
-        # 6. Stage 3: JudgeRelated (skos:related vs owl:differentFrom)
-        if stage3_pids:
-            stage3_batch = batch.subset(stage3_pids)
-            s3_decs = self._run_judge_stage(
-                "related_judge",
-                stage3_batch,
-                lm=lm,
-                use_gbnf=use_gbnf,
-                captured_traces=captured_traces,
-                rlm_stats=rlm_stats,
-            )
-            for dec in s3_decs:
-                votes[dec["pair_id"]].append(dec["llm_prob"])
-                dec_copy = dict(dec)
-                related = bool(dec.get("related"))
-                dec_copy["relation"] = "skos:related" if related else "owl:differentFrom"
-                resolved_decisions.append(dec_copy)
+            for measured_decision in decisions:
+                pid = measured_decision["pair_id"]
+                votes[pid].append(measured_decision["llm_prob"])
+                dec = dict(measured_decision)
+                relation = dec["relation"]
+                if relation in ("skos:broader", "skos:narrower"):
+                    ea, eb = pid.split("|", 1)
+                    dec["source_id"], dec["target_id"] = (ea, eb) if relation == "skos:broader" else (eb, ea)
+                    dec["relation"] = "skos:broader"
+                resolved_decisions.append(dec)
 
         # 7. Aggregate all resolved decisions and return
         for decision in resolved_decisions:
@@ -1294,7 +1200,7 @@ chunk."""
             "temperature": 1.0,
         }
         if self._should_use_gbnf(use_gbnf, effective_lm):
-            call_cfg["extra_body"] = {"grammar": build_dspy_query_intent_grammar()}
+            call_cfg["grammar"] = build_dspy_query_intent_grammar()
         with track_usage() as usage_tracker, self._dspy_ctx(effective_lm, use_json_adapter=True):
             pred = self.query_intent(question=question, config=call_cfg, **({"lm": lm} if lm is not None else {}))
         tokens = usage_tracker.get_total_tokens()

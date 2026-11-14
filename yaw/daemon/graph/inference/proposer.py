@@ -8,11 +8,13 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 import dspy
+from dspy.clients.requests import build_request
 
 from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, scale_context_budget
 
 from .adapter import YawGBNFAdapter, sum_usage_tokens
 from .diagnostics import DiagnosticHistory, diagnostic_boundary, trim_diagnostics
+from .grammars import lm_supports_gbnf
 from .invariants import STAGE_SCHEMA_CONTRACTS
 from .prompts import (
     CompressInstructionSignature,
@@ -45,7 +47,7 @@ class InstructionSynthesizerWorker(dspy.Module):
         enable_gbnf: bool = True,
         max_instruction_chars: int | None = 1500,
         max_field_chars: int = 600,
-        worker_temperature: float = 0.7,
+        worker_temperature: float | None = None,
         json_adapter: dspy.Adapter | None = None,
     ) -> None:
         super().__init__()
@@ -56,10 +58,14 @@ class InstructionSynthesizerWorker(dspy.Module):
         self.enable_gbnf = bool(enable_gbnf)
         self.max_instruction_chars = max_instruction_chars
         self.max_field_chars = max_field_chars
-        self.worker_temperature = float(worker_temperature)
+        self.worker_temperature = float(worker_temperature) if worker_temperature is not None else None
         self.json_adapter: dspy.Adapter = json_adapter or dspy.JSONAdapter()
         self._rollout_lm: Any = None
         self.sub_telemetry: list[dict[str, Any]] = []
+        if worker_temperature is not None or (worker_lm is None and orchestrator_lm is None):
+            temperature = float(worker_temperature) if worker_temperature is not None else 1.0
+            for predictor in (self.llm_proposer, self.llm_compressor):
+                predictor.config = {**predictor.config, "temperature": temperature}
 
     def get_lm(self) -> Any:
         return self._rollout_lm or self.worker_lm or self.orchestrator_lm or getattr(self.llm_proposer, "lm", None)
@@ -125,9 +131,15 @@ class InstructionSynthesizerWorker(dspy.Module):
         }
         if self.max_instruction_chars is not None:
             inputs["length_limit"] = f"The new instruction must be at most {self.max_instruction_chars} characters."
+        request_kwargs = dict(self.llm_proposer.config)
+        if isinstance(self.json_adapter, YawGBNFAdapter) and self.json_adapter.enable_gbnf and lm_supports_gbnf(lm):
+            grammar = self.json_adapter.resolve_grammar(self.llm_proposer.signature)
+            if grammar:
+                request_kwargs.setdefault("grammar", grammar)
         while isinstance(lm, ReflectionLM):
             try:
-                lm.count(self.json_adapter.format(self.llm_proposer.signature, self.llm_proposer.demos, inputs))
+                prompt = self.json_adapter.format(self.llm_proposer.signature, self.llm_proposer.demos, inputs)
+                lm.check_request(build_request(lm, prompt, request_kwargs))
                 break
             except ReflectionBudgetError:
                 if not examples:
@@ -161,8 +173,8 @@ class RLMInstructionProposer:
         max_instruction_chars: int | Literal["auto"] | None = "auto",
         max_field_chars: int | None = None,
         max_feedback_examples: int = 5,
-        reflection_temperature: float = 0.8,
-        worker_temperature: float = 0.7,
+        reflection_temperature: float | None = None,
+        worker_temperature: float | None = None,
         rlm_max_iters: int = 10,
         rlm_max_llm_calls: int = 20,
         rlm_max_output_chars: int | None = None,
@@ -170,15 +182,13 @@ class RLMInstructionProposer:
         rlm_interpreter_factory: Callable[[], Any] = dspy.PythonInterpreter,
         task_scorer: Callable[[Mapping[str, str]], float] | None = None,
         save_simba_state: Callable[[dict[str, Any]], None] | None = None,
-        reflection_input_tokens: int | None = None,
-        token_counter: Any = None,
+        reflection_input_chars: int | None = None,
         checkpoint_get: Callable[[str], Any] | None = None,
         checkpoint_put: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.context_window_tokens = (
             getattr(orchestrator_lm, "_yaw_context_window_tokens", None)
             or getattr(worker_lm, "_yaw_context_window_tokens", None)
-            or getattr(token_counter, "context_tokens", None)
             or DEFAULT_CONTEXT_WINDOW_TOKENS
         )
         if max_instruction_chars == "auto":
@@ -187,15 +197,14 @@ class RLMInstructionProposer:
             max_field_chars = scale_context_budget(600, self.context_window_tokens)
         if rlm_max_output_chars is None:
             rlm_max_output_chars = scale_context_budget(10000, self.context_window_tokens)
-        if reflection_input_tokens is None:
-            reflection_input_tokens = scale_context_budget(16384, self.context_window_tokens)
+        if reflection_input_chars is None:
+            reflection_input_chars = 65536
         if max_instruction_chars is not None and max_instruction_chars <= 0:
             raise ValueError(f"max_instruction_chars must be > 0 or None, got {max_instruction_chars!r}.")
 
-        if reflection_input_tokens < 1:
-            raise ValueError("reflection_input_tokens must be positive")
-        self.reflection_input_tokens = reflection_input_tokens
-        self.token_counter = token_counter
+        if reflection_input_chars < 1:
+            raise ValueError("reflection_input_chars must be positive")
+        self.reflection_input_chars = reflection_input_chars
         self.checkpoint_get = checkpoint_get
         self.checkpoint_put = checkpoint_put
         self.orchestrator_lm = orchestrator_lm
@@ -209,8 +218,8 @@ class RLMInstructionProposer:
         self.max_instruction_chars = int(max_instruction_chars) if max_instruction_chars is not None else None
         self.max_field_chars = max(120, int(max_field_chars))
         self.max_feedback_examples = min(5, max(1, int(max_feedback_examples)))
-        self.reflection_temperature = float(reflection_temperature)
-        self.worker_temperature = float(worker_temperature)
+        self.reflection_temperature = float(reflection_temperature) if reflection_temperature is not None else None
+        self.worker_temperature = float(worker_temperature) if worker_temperature is not None else None
         self.json_adapter: dspy.Adapter = adapter or YawGBNFAdapter(
             enable_gbnf=self.enable_gbnf,
             max_instruction_chars=self.max_instruction_chars,
@@ -241,7 +250,7 @@ class RLMInstructionProposer:
             enable_gbnf=self.enable_gbnf,
             max_instruction_chars=self.max_instruction_chars,
             max_field_chars=self.max_field_chars,
-            worker_temperature=self.worker_temperature,
+            worker_temperature=worker_temperature,
             json_adapter=self.json_adapter,
         )
 
@@ -255,8 +264,10 @@ class RLMInstructionProposer:
             sub_lm=worker_lm or orchestrator_lm,
             interpreter_factory=rlm_interpreter_factory,
         )
-        self.inner_rlm.generate_action.config = {"temperature": self.reflection_temperature}
-        self.inner_rlm.extract.config = {"temperature": self.reflection_temperature}
+        if reflection_temperature is not None or (orchestrator_lm is None and worker_lm is None):
+            temperature = float(reflection_temperature) if reflection_temperature is not None else 1.0
+            self.inner_rlm.generate_action.config = {"temperature": temperature}
+            self.inner_rlm.extract.config = {"temperature": temperature}
         self.rlm = self.inner_rlm
 
         self._bind_predictor_lms()
@@ -265,7 +276,7 @@ class RLMInstructionProposer:
         """Use native contextual writer LMs and a role-bound evidence selector."""
         # The native proposer runs under the worker's selected rollout context.
         # Leaving its predictors unbound makes DSPy's normal context precedence
-        # apply, including the verified ReflectionLM token-budget guard.
+        # apply, including the ReflectionLM character-budget guard.
         self.llm_proposer.set_lm(None)
         self.llm_compressor.set_lm(None)
         self.worker_module.llm_proposer = self.llm_proposer
@@ -288,7 +299,6 @@ class RLMInstructionProposer:
             "orchestrator_lm",
             "worker_lm",
             "json_adapter",
-            "token_counter",
             "task_scorer",
             "save_simba_state",
             "checkpoint_get",
@@ -299,9 +309,9 @@ class RLMInstructionProposer:
         return new
 
     def preflight(self) -> None:
-        """Require an exact tokenizer before any reflection or meta-learning call."""
-        if self.token_counter is None:
-            raise ReflectionBudgetError("Reflection requires a verified serving tokenizer")
+        """Bind the character guard to each reflection role before any call."""
+        if self.worker_lm is None and self.orchestrator_lm is None:
+            raise ValueError("Reflection requires an LM")
         for name in ("worker_lm", "orchestrator_lm"):
             lm = getattr(self, name)
             if lm is not None and not isinstance(lm, ReflectionLM):
@@ -310,10 +320,7 @@ class RLMInstructionProposer:
                     name,
                     ReflectionLM(
                         lm,
-                        self.token_counter,
-                        self.reflection_input_tokens,
-                        getattr(lm, "_yaw_context_window_tokens", None) or self.context_window_tokens,
-                        int(lm.kwargs.get("max_tokens") or scale_context_budget(4096, self.context_window_tokens)),
+                        self.reflection_input_chars,
                     ),
                 )
         self.inner_rlm.sub_lm = self.worker_lm or self.orchestrator_lm
@@ -499,14 +506,12 @@ class RLMInstructionProposer:
                         if key not in {"api_key", "api_token"}
                     },
                     "context": getattr(lm, "_yaw_context_window_tokens", None),
-                    "tokenizer": getattr(getattr(lm, "counter", None), "identity", None),
                 }
             )
         return {
             "version": 2,
             "models": models,
-            "tokenizer": getattr(self.token_counter, "identity", None),
-            "input_tokens": self.reflection_input_tokens,
+            "input_chars": self.reflection_input_chars,
             "settings": [
                 self.max_instruction_chars,
                 self.max_feedback_examples,
@@ -538,7 +543,7 @@ class RLMInstructionProposer:
                 "component": component_name,
                 "instruction": current_instruction,
                 "examples": originals,
-                "input_tokens": self.reflection_input_tokens,
+                "input_chars": self.reflection_input_chars,
                 "writer_settings": [
                     self.max_instruction_chars,
                     self.max_feedback_examples,
@@ -553,7 +558,6 @@ class RLMInstructionProposer:
                     self.inner_rlm.max_output_chars,
                 ],
                 "model": self.orchestrator_lm.model if self.orchestrator_lm else None,
-                "tokenizer": getattr(self.token_counter, "identity", str(self.token_counter)),
             }
         )
         get = self.checkpoint_get or (lambda key: None)
@@ -672,8 +676,7 @@ class RLMInstructionProposer:
                 "version": 2,
                 "deployment": self.cache_identity(),
                 "candidate": candidate,
-                "input_tokens": self.reflection_input_tokens,
-                "tokenizer": getattr(self.token_counter, "identity", None),
+                "input_chars": self.reflection_input_chars,
                 "writer_settings": [
                     self.max_instruction_chars,
                     self.max_feedback_examples,

@@ -14,7 +14,7 @@ import pytest
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
 from yaw.core import ChunkPointer
 from yaw.daemon.graph.engine import YawGraphEngine
-from yaw.daemon.graph.inference import YawProgram
+from yaw.daemon.graph.inference import YawProgram, create_dspy_lm
 from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter, create_dspy_embedder, resolve_embedding_profile
 from yaw.daemon.indexing import bind_native_indexing
 
@@ -34,6 +34,27 @@ def indexing_provider(request):
             self.wfile.write(raw)
 
         def do_GET(self):
+            if self.path == "/v1/models":
+                assert self.headers.get("Authorization") == "Bearer test"
+                self.send_json(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": name,
+                                "object": "model",
+                                "created": 0,
+                                "owned_by": "fixture",
+                                "loaded": True,
+                                "context_length": 131072,
+                                "alias_for": "fixture/" + name,
+                                "quant": "Q4",
+                            }
+                            for name in ("gemma-4-e4b", "embeddinggemma-2", "indexing-contract")
+                        ],
+                    }
+                )
+                return
             if self.path.endswith("health"):
                 assert isinstance(self.server, ThreadingHTTPServer)
                 self.send_json(
@@ -87,13 +108,13 @@ def indexing_provider(request):
                 self.end_headers()
                 self.wfile.write(raw)
                 return
-            prompt = str(request["messages"])
+            prompt = str(request.get("prompt", request.get("messages", "")))
             if "query_intent" in prompt:
                 stage, result = "intent", {"query_intent": "Who wrote Notes?"}
             elif "fact_before_filter" in prompt:
                 stage, result = "filter", {"fact": [["ada", "wrote", "notes"]]}
             elif "candidate_pairs" in prompt or "synonym-evidence" in prompt:
-                text = request["messages"][-1]["content"]
+                text = prompt
                 stage, result = (
                     "synonyms",
                     {
@@ -102,8 +123,8 @@ def indexing_provider(request):
                         else complete_decisions(candidate_rows(text), [], stage_text=prompt)
                     },
                 )
-            elif "reasoning" in prompt.lower():
-                stage, result = "qa", {"reasoning": "The source states Ada wrote Notes.", "answer": "Answer: 'Ada'"}
+            elif "plan" in prompt.lower():
+                stage, result = "qa", {"plan": "The source states Ada wrote Notes.", "answer": "Answer: 'Ada'"}
             elif "missing_entities" in prompt:
                 stage, result = (
                     "definitions",
@@ -165,24 +186,27 @@ def indexing_provider(request):
 
 
 def make_engine(tmp_path, url) -> YawGraphEngine:
-    lm = dspy.LM("openai/indexing-contract", api_base=url, api_key="test", cache=False, num_retries=0)
+    lm = create_dspy_lm("indexing-contract", base_url=url, api_key="test", cache=False)
     program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
 
-    def embed(texts):
-        return np.array(
-            [[byte + 1 for byte in hashlib.sha256(text.encode()).digest()[:8]] for text in texts], dtype=np.float32
-        )
+    class EmbeddingModel:
+        index_identity = "embed-fixture-v1"
+
+        def __call__(self, texts):
+            return np.array(
+                [[byte + 1 for byte in hashlib.sha256(text.encode()).digest()[:8]] for text in texts], dtype=np.float32
+            )
 
     embedder = DSPyEmbeddingAdapter(
         replace(resolve_embedding_profile(), dimensions=8),
-        create_dspy_embedder(embed, caching=False),
+        create_dspy_embedder(EmbeddingModel(), caching=False),
     )
     return bind_native_indexing(
         YawGraphEngine(db_path=tmp_path / "yaw.db", workspace_root=tmp_path, program=program, embedder=embedder)
     )
 
 
-def test_native_inference_survives_query_cache_clear_and_engine_restart(tmp_path, indexing_provider):
+def test_native_inference_survives_engine_restart(tmp_path, indexing_provider):
     url, calls = indexing_provider
     source = "Ada wrote Notes."
     (tmp_path / "source.txt").write_text(source, encoding="utf-8")
@@ -191,7 +215,6 @@ def test_native_inference_survives_query_cache_clear_and_engine_restart(tmp_path
     try:
         assert first.index_chunks([(pointer, source)]) == 1
         assert first.conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 1
-        first._encode_cached_text.cache_clear()
         checkpoint = tuple(
             first.conn.execute(
                 "SELECT program_identity, embedding_identity, extraction_json, traces_json FROM chunk_inference"

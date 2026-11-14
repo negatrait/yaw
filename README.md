@@ -140,8 +140,9 @@ no recoverable usage are recomputed once rather than scored as free. No changes
 to GEPA's optimizer or program signatures are required.
 
 GEPA reflection uses sandbox evidence selection followed by DSPy's native instruction
-writer. `inference.reflection_input_tokens` defaults to **16,384**; the complete
-rendered request is checked with the resident model's serving tokenizer. Evidence,
+writer. `inference.reflection_input_chars` defaults to **65,536 characters** and
+bounds the complete formatted request. The provider enforces token capacity and
+reports actual usage; YAW makes no tokenizer discovery requests. Evidence,
 proposals and SIMBA state checkpoint in `yaw.db`, including a pinned active request.
 See [DSPy practical improvements](docs/dspy-improvements.md).
 
@@ -154,28 +155,29 @@ diagnostic retention; the corpus and GEPA's own candidate/frontier state still
 require memory.
 
 Embedding request limits are explicit under `[graph]`: `embed_batch_size` bounds
-items, and `embed_batch_chars` bounds aggregate formatted characters (default
-3500). Both apply; the adapter no longer silently substitutes a 16-item limit.
-Larger character budgets need testing against the inference server; overflow
-splitting remains enabled. Query-prefix evolution preserves document-stage
+items (up to 64), and `embed_batch_chars` bounds aggregate formatted characters
+(default 4096). Both apply to batches; a single oversized input is sent whole.
+Larger character budgets need testing against the inference server; provider
+overflow errors propagate. Query-prefix evolution preserves document-stage
 caches, while query vectors use the effective query prefix in their own keys.
 Persistent CocoIndex parsing also invalidates when parsing helpers change.
 
-Inference capacity is explicit under `[inference]`: `context_window_tokens`
-declares the server's actual serving window (131,072 by default). Unset
-`max_output_tokens`, `reflection_input_tokens` and `rlm_max_output_chars` derive
-from capacity: 8,192 tokens, 32,768 tokens and 20,000 characters at 128K. Explicit
-values pin those limits. These settings do not resize or reload
-the external server. Extraction, QA, reflection-field and validation-input
-character safeguards scale with available input capacity; they are heuristics,
-not exact token counts. `[graph].max_context_chars` defaults to a scaled context
-budget unless explicitly set. Embedding input limits remain profile-specific.
-Synonym/SHACL prompt batches and proposal/diagnosis length limits also scale.
-`rlm_max_iters` and `rlm_max_llm_calls` independently bound SHACL and reflection
-loops. More context does not automatically mean more turns. The deployed Gemma
-profile is 128K without flash attention; the user reports approximately 65 TPS.
-Changed model/budget settings require a compatible fresh run/index; an already
-running optimizer retains its original settings.
+Runtime reads the active context lengths of the configured extraction and QA
+models from the authenticated model endpoint and uses the smaller value. The
+embedding profile uses the endpoint's active context and reported checkpoint;
+changing that deployment invalidates its vector cache identity. Model metadata
+is a server report, not independent weight attestation. Model configuration can
+be constructed offline; runtime binding requires the endpoint to be available.
+
+Unset `max_output_tokens` and `rlm_max_output_chars` derive from the active chat
+capacity: 8,192 tokens and 20,000 characters at 128K. Explicit values remain
+fixed, and an output-token budget exceeding the active context fails. The
+`reflection_input_chars` limit is independent. `[graph].max_context_chars` is
+optional; when omitted, selected source content is not cut to a character limit.
+Synonym packets retain their explicit pair and memory limits, and provider token
+overflow fails without splitting or retrying. Embedding inputs remain whole.
+`rlm_max_iters` and `rlm_max_llm_calls` bound SHACL and reflection loops.
+Changing a running process's configuration requires restarting that process.
 
 The dashboard's `scripts/watchdog.py --layout-iterations 1000` controls graph
 relaxation rounds (default 1,000). Fig. 2 shows only the largest connected
@@ -186,6 +188,14 @@ rowid, since reassertion timestamps are not stored. Full-validation progress
 uses GEPA's validation score; candidate F1/recall means include minibatches.
 
 `benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `YawProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
+
+Both runners load inference settings from `yaw.toml`; `--config <path>` selects
+another configuration. Benchmark model flags explicitly override those aliases.
+The configured endpoint, credentials, context/output limits, ingestion chunking
+and embedding batch limits reach the active clients. Reports identify configured
+profiles rather than claiming remotely verified checkpoints or devices. Parity
+reports are reused only for the same configured deployment.
+
 - **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Consolidated historical runs of upstream HippoRAG 2 on the exact same `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` local stack (archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
 - **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper results (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
 
@@ -214,7 +224,7 @@ Across the consolidated benchmark evaluations ([`outputs/benchmarks/consolidated
 
 161 offline and live-silicon integration regression tests pass (`uv run --locked pytest -q`). See [evaluation](docs/evaluation.md) for benchmark runs, closed-world SHACL validations, and live-silicon GEPA optimization results.
 
-The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse CSR PPR), native CocoIndex single-parse Rust Tree-sitter AST ingestion across 30+ formats with declarative $\pi_{\mathcal{W}, \mathcal{B}}$ key projection, title-aware `EmbeddingGemma` formatting, Dai & Callan MaxP passage aggregation, and DSPy GEPA prompt evolution with hot-reload program promotion are implemented and verified. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
+The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse entity-state HMM), native CocoIndex single-parse Rust Tree-sitter AST ingestion across 30+ formats with declarative $\pi_{\mathcal{W}, \mathcal{B}}$ key projection, title-aware `EmbeddingGemma` formatting, Dai & Callan MaxP passage aggregation, and DSPy GEPA prompt evolution with hot-reload program promotion are implemented. HMM retrieval quality and full-corpus parity remain acceptance gates. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
 
 ## Native W3C Semantic Graph & Knowledge Representation (`yaw.db`)
 
@@ -229,9 +239,9 @@ YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON 
 - **Typed Semantic Edges & Contrastive Semantics (`edges`, `edge_sources`):**
   Edges model semantic relations explicitly:
   - `passage`: Bipartite passage-to-entity links.
-  - `fact`: Directed assertion triples (`subj` $\to$ `obj`) enriched with contextual triple `skos:definition`. Predicates remain typed edge properties rather than graph concept hubs, preventing PPR super-node collapse.
-  - `skos:related`: Symmetric associative links (weighted by $\beta$) traversed by sparse CSR Personalized PageRank.
-  - `owl:differentFrom`: Symmetric contrastive non-identity links between distinct polysemous/homograph senses. These edges are strictly dominant over merging and are excluded from PPR random walks.
+  - `fact`: Directed assertion triples (`subj` $\to$ `obj`) enriched with contextual triple `skos:definition`. Predicates remain typed edge properties rather than graph concept hubs, avoiding predicate super-nodes.
+  - `skos:related`: Symmetric associative links used as positive sparse HMM entity transitions.
+  - `owl:differentFrom`: Symmetric contrastive non-identity links between distinct polysemous/homograph senses. These edges are strictly dominant over merging and are excluded from relevance transitions.
 - **Two-Channel Candidate Discovery & Source-Sense Preservation:**
   `find_entity_candidates` combines blocked cosine thresholds with sparse character-trigram similarity and exact source-label matches. Immutable `entity_candidate_vectors` preserve member evidence after merges; labels and definitions identify provisional senses independently of admission scores. A separate calibrated `auto_merge_threshold` requires extreme cosine and difflib agreement on labels and definitions. Remaining pairs enter the merge, hierarchy and relation/distinctness judges.
 - **Closed-World SHACL Validation (`lint_graph_shacl`):**
@@ -285,6 +295,6 @@ YAW is engineered directly from principles and algorithms established in the fol
     - *Key Foundations:* Standardized text serialization of RDF graphs. Implemented natively in YAW (`serialize_graph_turtle`, `yaw graph lint --turtle`) to export the closed-world knowledge graph directly to standard Turtle syntax with zero external dependency bloat.
 12. **W3C OWL 2 Web Ontology Language Document Overview**
     - *W3C OWL Working Group (W3C Recommendation, 2012)* — [W3C OWL 2 Overview](https://www.w3.org/TR/owl2-overview/)
-    - *Key Foundations:* Expressing contrastive non-identity between distinct polysemous/homograph senses using symmetric `owl:differentFrom` assertions, dominant over transitive merging and excluded from CSR PPR associative retrieval walks.
+    - *Key Foundations:* Expressing contrastive non-identity between distinct polysemous/homograph senses using symmetric `owl:differentFrom` assertions, dominant over transitive merging and excluded from HMM relevance transitions.
 
 Upstream baseline: [pinned HippoRAG source](https://github.com/OSU-NLP-Group/HippoRAG/tree/d5c8329422e0a0b834a15874545cb6a74b4f9b26).

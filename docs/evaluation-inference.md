@@ -611,6 +611,12 @@ Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM o
 
 ## 34. Evidence-driven native GEPA reflection replacement (2026-10-23)
 
+Historical evidence below describes the former tokenizer guard. As of 2026-11-13,
+`reflection_input_chars` bounds formatted requests (65536 characters by default),
+semantic packets use configured pair limits, and provider context errors abort.
+Serving tokenizer discovery and its injection APIs are retired. Current evidence
+is recorded in [the backend review](reviews/inference-backend.md).
+
 Implemented the accepted replacement: original training traces stay in the RLM
 sandbox; the selector returns validated example/field/span references and a short
 diagnosis; DSPy's native `InstructionProposer` is the sole instruction writer.

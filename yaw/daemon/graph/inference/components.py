@@ -1,6 +1,7 @@
 """CocoIndex-owned inference operations; no graph or database side effects."""
 
 import asyncio
+import queue
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -8,11 +9,11 @@ from uuid import uuid4
 
 import cocoindex as coco
 import dspy
-import numpy as np
+from dspy.utils.exceptions import LMUnexpectedError
 
 from yaw.core import ChunkPointer, OpenIERecord, SHACLViolation, SynonymEvidenceBatch
 
-from .embedding import DSPyEmbeddingAdapter, EmbeddingRequest, EmbeddingResult
+from .embedding import DSPyEmbeddingAdapter, EmbeddingRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,14 +59,29 @@ class ChunkProcessOutput:
 
 @dataclass
 class EmbeddingEndpoint:
-    adapter: DSPyEmbeddingAdapter | Any
-    admission: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
+    adapter: DSPyEmbeddingAdapter
+    _embedding_executions: queue.SimpleQueue[dict[str, Any]] = field(default_factory=queue.SimpleQueue)
+
+    def drain_embedding_executions(self) -> tuple[dict[str, Any], ...]:
+        """Transfer completed endpoint executions once to the owning engine."""
+        events = []
+        while True:
+            try:
+                events.append(self._embedding_executions.get_nowait())
+            except queue.Empty:
+                return tuple(events)
 
     @coco.fn.as_async(batching=True, max_batch_size=64)
     async def embed(self, requests: list[EmbeddingRequest]) -> list[EmbeddedText]:
         """Batch compatible contracts without database or shared history writes."""
+        return await self.execute_batch(requests)
+
+    async def execute_batch(self, requests: list[EmbeddingRequest]) -> list[EmbeddedText]:
+        """Execute one CocoIndex-scheduled batch and stage execution telemetry."""
         groups: dict[EmbeddingRequest, list[int]] = {}
         for index, request in enumerate(requests):
+            if request.index_identity != self.adapter.index_identity:
+                raise ValueError("Embedding request identity does not match the bound endpoint")
             if len(request.texts) != 1:
                 raise ValueError("Native embedding calls require exactly one text")
             groups.setdefault(replace(request, texts=()), []).append(index)
@@ -76,19 +92,9 @@ class EmbeddingEndpoint:
                 texts=tuple(requests[index].texts[0] for index in indices),
                 batch_size=min(contract.batch_size, 64),
             )
-            async with self.admission:
-                if hasattr(self.adapter, "aexecute_request"):
-                    result = await self.adapter.aexecute_request(request)
-                else:
-                    encode_fn = self.adapter.encode
-                    vecs = await asyncio.to_thread(
-                        encode_fn, list(request.texts), instruction=request.instruction or ""
-                    )
-                    result = EmbeddingResult(
-                        np.asarray(vecs, dtype=np.float32),
-                        {"stage": request.stage or "embed", "tokens_used": 0},
-                    )
+            result = await self.adapter.aexecute_request(request)
             request_id = uuid4().hex
+            self._embedding_executions.put({**result.telemetry, "request_id": request_id, "memo_replayed": False})
             for index, vector in zip(indices, result.vectors, strict=True):
                 results[index] = EmbeddedText(vector.astype("<f4", copy=False).tobytes(), request_id, result.telemetry)
         return [results[index] for index in range(len(requests))]
@@ -97,7 +103,7 @@ class EmbeddingEndpoint:
 EMBEDDING_ENDPOINT = coco.ContextKey[EmbeddingEndpoint]("yaw/embedding_endpoint")
 
 
-@coco.fn(memo=True)
+@coco.fn(memo=True, version=2)
 async def embed_text(request: EmbeddingRequest) -> EmbeddedText:
     """Persist each semantic result independently of its provider batch."""
     return await coco.use_context(EMBEDDING_ENDPOINT).embed(request)
@@ -219,7 +225,11 @@ class OpenIEEndpoint:
         lm = self._resolve_lm()
         traces: list[Any] = []
         with dspy.context(lm=lm, trace=traces):
-            record = program.extract_openie(request.chunk_id, request.passage, lm=lm)
+            try:
+                record = program.extract_openie(request.chunk_id, request.passage, lm=lm)
+            except LMUnexpectedError as exc:
+                exc.add_note(f"YAW extraction chunk: {request.chunk_id}")
+                raise
         names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
         telemetry_src = program.telemetry or self.program.telemetry
         audit_src = program.entity_def_audit_trail or self.program.entity_def_audit_trail
@@ -269,8 +279,7 @@ class OpenIEEndpoint:
         program = self.program.deepcopy()
         program.telemetry.clear()
         program.label_judge_audit_trail.clear()
-        program.hierarchy_judge_audit_trail.clear()
-        program.related_judge_audit_trail.clear()
+        program.relation_judge_audit_trail.clear()
         lm = self._resolve_lm()
         traces: list[Any] = []
         with dspy.context(lm=lm, trace=traces):
@@ -278,8 +287,7 @@ class OpenIEEndpoint:
         names = {id(predictor): name for src in (self.program, program) for name, predictor in src.named_predictors()}
         audit_trail = [
             *program.label_judge_audit_trail,
-            *program.hierarchy_judge_audit_trail,
-            *program.related_judge_audit_trail,
+            *program.relation_judge_audit_trail,
         ]
         return JudgedSynonyms(
             tuple(dict(d) for d in decisions),
@@ -349,7 +357,7 @@ async def define_missing_entities(request: MissingEntityInput) -> DefinedEntitie
         return await endpoint.define_entities(request)
 
 
-@coco.fn(memo=True, version=4)
+@coco.fn(memo=True, version=5)
 async def judge_semantics(request: SemanticAdjudicationInput) -> JudgedSynonyms:
     endpoint = coco.use_context(OPENIE_ENDPOINT)
     async with endpoint.admission:

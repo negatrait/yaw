@@ -94,7 +94,10 @@ VALUE_BEARING_SHACL_ACTIONS: frozenset[str] = frozenset(
 
 def clean_schema_definition(value: Any) -> str:
     """Strip whitespace from a definition string and reject echoed W3C schema property CURIEs."""
-    if value is None:
-        return ""
-    text = str(value).strip()
-    return "" if text.lower() in SCHEMA_PLACEHOLDER_DEFS else text
+    if value is not None and (text := f"{value!s}".strip()) and text.lower() not in SCHEMA_PLACEHOLDER_DEFS:
+        return text
+    return ""
+
+
+# Bump when retrieval semantics change; graph extraction and embedding identities remain independent.
+HMM_RETRIEVAL_VERSION = "entity-hmm-v2-projected-symmetric"

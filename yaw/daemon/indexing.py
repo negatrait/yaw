@@ -19,10 +19,9 @@ from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     EmbeddingRequest,
     YawProgram,
-    hierarchy_judge_fingerprint,
     label_judge_fingerprint,
     openie_fingerprint,
-    related_judge_fingerprint,
+    relation_judge_fingerprint,
     shacl_fingerprint,
 )
 from yaw.daemon.graph.inference.components import (
@@ -106,10 +105,7 @@ async def process_chunk(
     _ = db_identity
     embeddings = coco.use_context(EMBEDDING_ENDPOINT)
     extraction = coco.use_context(OPENIE_ENDPOINT)
-    if (
-        identity.program != extraction.program_identity
-        or identity.embedding != embeddings.adapter.profile.index_identity
-    ):
+    if identity.program != extraction.program_identity or identity.embedding != embeddings.adapter.index_identity:
         raise ValueError("Indexing identity does not match the bound inference resources")
     pointer = ChunkPointer(
         metadata.chunk_id,
@@ -144,6 +140,7 @@ async def process_chunk(
         embed_req = EmbeddingRequest(
             texts=(embedding_text,),
             profile=embeddings.adapter.profile,
+            index_identity=embeddings.adapter.index_identity,
             task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
             batch_size=64,
             max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
@@ -165,7 +162,7 @@ async def process_chunk(
         metadata.chunk_id,
         metadata.source_hash,
         extraction.program_identity,
-        embeddings.adapter.profile.index_identity,
+        embeddings.adapter.index_identity,
         json.dumps(asdict(record.record)),
         json.dumps([asdict(trace) for trace in record.traces]),
     )
@@ -538,12 +535,11 @@ def graph_plan_fingerprints(
     """Return (program_identity, embedding_identity, synonym_identity, shacl_identity)."""
     return (
         openie_fingerprint(program),
-        str(embedder.profile.index_identity),
+        str(embedder.index_identity),
         ":".join(
             (
                 label_judge_fingerprint(program),
-                hierarchy_judge_fingerprint(program),
-                related_judge_fingerprint(program),
+                relation_judge_fingerprint(program),
             )
         ),
         shacl_fingerprint(program),
@@ -595,7 +591,8 @@ def bind_native_indexing(
         context.provide(GRAPH_DB, engine.managed_conn)
         context.provide(SOURCE_ROOT, engine.workspace_root)
         context.provide(VALIDATE_SQLITE, validate_graph_state)
-        context.provide(EMBEDDING_ENDPOINT, EmbeddingEndpoint(engine.embedder))
+        embedding_endpoint = EmbeddingEndpoint(engine.embedder)
+        context.provide(EMBEDDING_ENDPOINT, embedding_endpoint)
         context.provide(
             OPENIE_ENDPOINT,
             OpenIEEndpoint(
@@ -722,7 +719,10 @@ def bind_native_indexing(
             while True:
                 context.provide(ACTIVE_BATCH_STEP, (batch_size, step_index))
                 step_index += 1
-                await app.update(live=False).result()
+                try:
+                    await app.update(live=False).result()
+                finally:
+                    engine.publish_indexing_embedding_telemetry(embedding_endpoint.drain_embedding_executions())
                 if recorded_error is not None:
                     raise recorded_error
                 component = CorpusIndexingLiveComponent.last_instance

@@ -14,7 +14,7 @@ from yaw.daemon.graph.inference.models import CHAT_MODELS
 
 class ChatTests(unittest.TestCase):
     def test_chat_models_registry_contains_supported_models(self):
-        self.assertIn("Phi-4-mini-instruct-GGUF", CHAT_MODELS)
+        self.assertNotIn("Phi-4-mini-instruct-GGUF", CHAT_MODELS)
         self.assertIn("Qwen3-4B-Instruct-2507-GGUF", CHAT_MODELS)
         self.assertIn("gemma-4-e4b", CHAT_MODELS)
         self.assertNotIn("Mistral-7B-Instruct-v0.3-Hybrid", CHAT_MODELS)
@@ -23,16 +23,20 @@ class ChatTests(unittest.TestCase):
         # Qwen3-4B extraction on Lemonade (16384 ctx window, llamacpp GPU -> GBNF supported)
         llm_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="extraction")
         self.assertEqual(llm_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertIsInstance(llm_lm.kwargs["temperature"], (int, float))
+        assert isinstance(llm_lm.kwargs["temperature"], (int, float))
         self.assertAlmostEqual(llm_lm.kwargs["temperature"], 0.35)
-        self.assertEqual(llm_lm.kwargs["max_tokens"], 4096)
+        self.assertIsNone(llm_lm.kwargs["max_tokens"])
         self.assertNotIn("frequency_penalty", llm_lm.kwargs)
         self.assertTrue(lm_supports_gbnf(llm_lm))
 
         # Qwen3-4B QA on Lemonade (llamacpp GPU -> GBNF supported for direct QA)
         llm_qa_lm = create_dspy_lm("Qwen3-4B-Instruct-2507-GGUF", role="qa")
         self.assertEqual(llm_qa_lm.model, "openai/Qwen3-4B-Instruct-2507-GGUF")
+        self.assertIsInstance(llm_qa_lm.kwargs["temperature"], (int, float))
+        assert isinstance(llm_qa_lm.kwargs["temperature"], (int, float))
         self.assertAlmostEqual(llm_qa_lm.kwargs["temperature"], 0.35)
-        self.assertEqual(llm_qa_lm.kwargs["max_tokens"], 4096)
+        self.assertIsNone(llm_qa_lm.kwargs["max_tokens"])
         self.assertNotIn("frequency_penalty", llm_qa_lm.kwargs)
         self.assertTrue(lm_supports_gbnf(llm_qa_lm))
 
@@ -43,17 +47,18 @@ class ChatTests(unittest.TestCase):
         self.assertFalse(lm_supports_gbnf(orch_lm))
         self.assertTrue(lm_supports_gbnf(sub_lm))
         self.assertNotIn("frequency_penalty", sub_lm.kwargs)
+        self.assertIsInstance(sub_lm.kwargs["temperature"], (int, float))
+        assert isinstance(sub_lm.kwargs["temperature"], (int, float))
         self.assertAlmostEqual(sub_lm.kwargs["temperature"], 1.0)
+        self.assertIsInstance(sub_lm.kwargs["top_p"], (int, float))
+        assert isinstance(sub_lm.kwargs["top_p"], (int, float))
         self.assertAlmostEqual(sub_lm.kwargs["top_p"], 0.95)
         self.assertEqual(sub_lm.kwargs["top_k"], 64)
 
-        # Gemma4 FLM recipe sets think=False, disables GBNF, and keeps temperature >= 0.3
-        flm_lm = create_dspy_lm("gemma4-it-12b-FLM", role="qa")
-        self.assertEqual(flm_lm.kwargs.get("extra_body"), {"think": False, "top_k": 64})
-        self.assertGreaterEqual(flm_lm.kwargs["temperature"], 0.3)
-        self.assertAlmostEqual(flm_lm.kwargs["top_p"], 0.95)
-        self.assertEqual(flm_lm.kwargs["top_k"], 64)
-        self.assertFalse(lm_supports_gbnf(flm_lm))
+        # Retired profiles no longer advertise grammar or recipe-specific settings.
+        unknown_lm = create_dspy_lm("gemma4-it-12b-FLM", role="qa")
+        self.assertNotIn("extra_body", unknown_lm.kwargs)
+        self.assertFalse(lm_supports_gbnf(unknown_lm))
 
         # Ollama provider configures ollama_chat/... with default temperature >= 0.3
         ollama_lm = create_dspy_lm(
@@ -64,6 +69,8 @@ class ChatTests(unittest.TestCase):
         )
         self.assertEqual(ollama_lm.model, "ollama_chat/qwen3:4b")
         self.assertEqual(ollama_lm.kwargs.get("api_base"), "http://localhost:11434")
+        self.assertIsInstance(ollama_lm.kwargs["temperature"], (int, float))
+        assert isinstance(ollama_lm.kwargs["temperature"], (int, float))
         self.assertGreaterEqual(ollama_lm.kwargs["temperature"], 0.3)
 
     def test_legacy_chat_shims_are_retired(self):

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import urllib.error
 import urllib.request
 
 BASE = "http://127.0.0.1:8888"

@@ -3,13 +3,11 @@
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from typing import Any, TypedDict
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 import dspy
-
-from yaw.core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, scale_context_budget
+from dspy.clients.requests import build_request
 
 
 def reflection_digest(value: Any) -> str:
@@ -112,157 +110,53 @@ def validate_active_checkpoint(value: object, context: str) -> ActiveReflectionC
     return {"context": context, "request": request, "records": checked}
 
 
-class ServingTokenCounter:
-    """Use the serving model's template and tokenizer, never a surrogate tokenizer.
-
-    Construction only inspects an already running backend; it never loads a model.
-    The backend URL must be supplied explicitly or advertised by Lemonade health.
-    """
-
-    def __init__(self, base_url: str, model: str, backend_url: str = "") -> None:
-        self.base_url = base_url
-        self.model = model.removeprefix("openai/")
-        health = self.request(base_url.rstrip("/") + "/health")
-        loaded = health.get("all_models_loaded", [])
-        match = next(
-            (item for item in loaded if (item.get("id", item.get("model_name")) == self.model)),
-            None,
-        )
-        if match is None:
-            raise ReflectionBudgetError(
-                f"Reflection model {self.model!r} is not resident; start the external service first"
-            )
-        self.url = (backend_url or match.get("backend_url", "")).rstrip("/")
-        if self.url.endswith("/v1"):
-            self.url = self.url[:-3]
-        if not self.url:
-            raise ReflectionBudgetError("No serving tokenizer URL advertised; set inference.reflection_tokenizer_url")
-        props = self.request(self.url + "/props")
-        model_path = str(props.get("model_path", ""))
-        command = match.get("launch_command", [])
-        weights = command[command.index("-m") + 1] if "-m" in command else ""
-        if not weights or not model_path or model_path.replace("\\", "/") != str(weights).replace("\\", "/"):
-            raise ReflectionBudgetError("Tokenizer backend weights do not match the selected model")
-        self.context_tokens = int(props.get("default_generation_settings", {}).get("n_ctx", 0))
-        if self.context_tokens <= 0:
-            raise ReflectionBudgetError("Serving backend did not report its actual context window")
-        self.identity = reflection_digest(
-            {
-                "model": self.model,
-                "checkpoint": match.get("checkpoint"),
-                "weights": model_path,
-                "template": props.get("chat_template"),
-                "context": self.context_tokens,
-                "generation_defaults": props.get("default_generation_settings"),
-            }
-        )
-        self([{"role": "user", "content": "Tokenizer preflight."}])
-
-    def for_model(self, model: str) -> ServingTokenCounter:
-        """Each reflection role must use its own verified serving tokenizer."""
-        if model.removeprefix("openai/") == self.model:
-            return self
-        return ServingTokenCounter(self.base_url, model)
-
-    @staticmethod
-    def request(url: str, payload: Any = None) -> Any:
-        data = None if payload is None else json.dumps(payload).encode("utf-8")
-        try:
-            with urlopen(Request(url, data=data, headers={"Content-Type": "application/json"}), timeout=10) as response:
-                return json.load(response)
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ReflectionBudgetError(f"Serving tokenizer unavailable at {url}: {exc}") from exc
-
-    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> int:
-        payload = {"messages": messages, "add_generation_prompt": True}
-        merged = {**kwargs, **kwargs.get("extra_body", {})}
-        for key in ("tools", "tool_choice", "chat_template_kwargs"):
-            if key in merged:
-                payload[key] = merged[key]
-        rendered = self.request(self.url + "/apply-template", payload)["prompt"]
-        return len(
-            self.request(
-                self.url + "/tokenize",
-                {
-                    "content": rendered,
-                    "add_special": False,
-                    "parse_special": True,
-                },
-            )["tokens"]
-        )
-
-
 class ReflectionLM(dspy.BaseLM):
-    """Guard the final messages of every reflection call, including SIMBA advice."""
+    """Bound complete reflection requests by characters; the provider owns token overflow."""
 
-    def __init__(
-        self,
-        target: Any,
-        counter: Any,
-        input_tokens: int | None = None,
-        context_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
-        output_tokens: int | None = None,
-    ) -> None:
-        super().__init__(model=target.model, **target.kwargs)
+    def __init__(self, target: Any, input_chars: int = 65536) -> None:
+        super().__init__(model=target.model)
+        self.kwargs = dict(target.kwargs)
+        if input_chars < 1:
+            raise ValueError("reflection_input_chars must be positive")
         self.target = target
-        counter = counter.for_model(target.model) if isinstance(counter, ServingTokenCounter) else counter
-        self.counter = counter
-        self.context_tokens = min(context_tokens, getattr(counter, "context_tokens", 0) or context_tokens)
-        self.input_tokens = (
-            input_tokens if input_tokens is not None else scale_context_budget(16384, self.context_tokens)
-        )
-        self.output_tokens = (
-            output_tokens
-            if output_tokens is not None
-            else self.kwargs.get("max_tokens") or scale_context_budget(4096, self.context_tokens)
-        )
-        self.kwargs["max_tokens"] = self.kwargs.get("max_tokens") or self.output_tokens
-        self._yaw_context_window_tokens = self.context_tokens
+        self.input_chars = input_chars
+        self._yaw_context_window_tokens = getattr(target, "_yaw_context_window_tokens", None)
         self._yaw_supports_gbnf = getattr(target, "_yaw_supports_gbnf", False)
 
-    def count(self, messages: list[dict[str, Any]], **kwargs: Any) -> int:
-        request = {**self.kwargs, **kwargs}
-        count = self.counter(messages, **request)
-        output = int(request.get("max_completion_tokens") or request.get("max_tokens") or self.output_tokens)
-        if count > self.input_tokens or count + output + 512 > self.context_tokens:
-            raise ReflectionBudgetError(
-                f"Reflection prompt has {count} tokens; input limit={self.input_tokens}, "
-                f"context={self.context_tokens}, output={output}, margin=512"
-            )
-        return count
+    def _build_adapter_request(self, prompt: Any, options: dict[str, Any] | None) -> dspy.lm15.Request:
+        return build_request(self.target, prompt, options)
 
-    def __call__(self, prompt: Any = None, messages: Any = None, **kwargs: Any) -> Any:
-        messages = messages if messages is not None else [{"role": "user", "content": prompt}]
-        self.count(messages, **kwargs)
-        request = self.request_kwargs(kwargs)
+    def check_request(self, request: dspy.lm15.Request) -> None:
+        count = len(json.dumps(asdict(request), ensure_ascii=False))
+        if count > self.input_chars:
+            raise ReflectionBudgetError(f"Reflection request has {count} characters; limit={self.input_chars}")
+
+    def __call__(self, prompt: dspy.lm15.Request | str | None = None, **kwargs: Any) -> Any:
+        if isinstance(prompt, str):
+            options = {k: v for k, v in kwargs.items() if k not in ("cache", "rollout_id")}
+            request = build_request(self.target, prompt, options)
+        elif isinstance(prompt, dspy.lm15.Request):
+            request = prompt
+        else:
+            raise TypeError("Reflection requires a native request or text prompt")
+        self.check_request(request)
         with dspy.context(disable_history=True):
-            return self.target(messages=messages, **request)
+            return self.target(prompt, **kwargs)
 
-    async def acall(self, prompt: Any = None, messages: Any = None, **kwargs: Any) -> Any:
-        messages = messages if messages is not None else [{"role": "user", "content": prompt}]
-        self.count(messages, **kwargs)
-        request = self.request_kwargs(kwargs)
+    async def acall(self, prompt: dspy.lm15.Request | str | None = None, **kwargs: Any) -> Any:
+        if isinstance(prompt, str):
+            options = {k: v for k, v in kwargs.items() if k not in ("cache", "rollout_id")}
+            request = build_request(self.target, prompt, options)
+        elif isinstance(prompt, dspy.lm15.Request):
+            request = prompt
+        else:
+            raise TypeError("Reflection requires a native request or text prompt")
+        self.check_request(request)
         with dspy.context(disable_history=True):
-            return await self.target.acall(messages=messages, **request)
-
-    def request_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        request = {**self.kwargs, **kwargs}
-        identity = getattr(self.counter, "identity", None)
-        if identity is not None:
-            # DSPy's native rollout ID participates in its disk request key but
-            # is not sent as a provider parameter. Preserve rollout diversity
-            # while invalidating responses when serving weights/defaults change.
-            request["rollout_id"] = int(reflection_digest([identity, request.get("rollout_id")])[:15], 16)
-        return request
+            return await self.target.acall(prompt, **kwargs)
 
     def copy(self, **kwargs: Any) -> Any:
-        return ReflectionLM(
-            self.target.copy(**kwargs),
-            self.counter,
-            self.input_tokens,
-            self.context_tokens,
-            self.output_tokens,
-        )
+        return ReflectionLM(self.target.copy(**kwargs), self.input_chars)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> Any:
         result = self.copy()

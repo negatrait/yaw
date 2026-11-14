@@ -21,7 +21,7 @@ from yaw.core.logger import FIFOLineRotatingHandler, SuppressThirdPartyInfoFilte
         ("graph", "max_context_chars", "0", "max_context_chars"),
         ("inference", "rlm_max_llm_calls", "0", "rlm_max_llm_calls"),
         ("inference", "rlm_max_output_chars", "0", "rlm_max_output_chars"),
-        ("inference", "reflection_input_tokens", "0", "reflection_input_tokens"),
+        ("inference", "reflection_input_chars", "0", "reflection_input_chars"),
         ("optimization", "mode", '"unknown"', "optimize_mode"),
         ("optimization", "auto", '"unknown"', "optimize_auto"),
     ],

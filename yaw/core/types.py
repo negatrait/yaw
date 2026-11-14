@@ -96,7 +96,7 @@ class SynonymEvidenceBatch:
 
     @property
     def cache_identity(self) -> str:
-        value = ["synonym-evidence-v2", self.payload, self.identifiers, self.candidates]
+        value = ["synonym-evidence-v3", self.payload, self.identifiers, self.candidates]
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     def resolve_decisions(self, decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -141,57 +141,49 @@ class SynonymEvidenceBatch:
     def subset(self, pair_ids: Collection[str]) -> SynonymEvidenceBatch:
         """Return a new SynonymEvidenceBatch containing only the requested pair IDs."""
         target_ids = set(pair_ids)
-        parsed = json.loads(self.payload)
-        all_pairs = parsed.get("pairs", [])
+        packet = json.loads(self.payload)
+        all_pairs = packet.get("pairs", [])
+        ident = self.identifiers
+        get_id = ident.get
         filtered_pairs = []
+        valid_keys: set[str] = set()
+        needed_aliases: set[str] = set()
+
         for p in all_pairs:
             alias_pair = p.get("pair_id", "")
             if "|" in alias_pair:
                 a, b = alias_pair.split("|", 1)
-                real_pair = f"{self.identifiers.get(a, a)}|{self.identifiers.get(b, b)}"
-            else:
-                real_pair = alias_pair
-            if alias_pair in target_ids or real_pair in target_ids:
+                real_pair = f"{get_id(a, a)}|{get_id(b, b)}"
+                if alias_pair in target_ids or real_pair in target_ids:
+                    filtered_pairs.append(p)
+                    valid_keys.add(alias_pair)
+                    valid_keys.add(real_pair)
+                    needed_aliases.add(a)
+                    needed_aliases.add(b)
+            elif alias_pair in target_ids:
                 filtered_pairs.append(p)
+                valid_keys.add(alias_pair)
 
-        filtered_pair_aliases = {p["pair_id"] for p in filtered_pairs}
-        filtered_pair_reals = {
-            f"{self.identifiers.get(p['pair_id'].split('|', 1)[0], p['pair_id'].split('|', 1)[0])}|"
-            f"{self.identifiers.get(p['pair_id'].split('|', 1)[1], p['pair_id'].split('|', 1)[1])}"
-            for p in filtered_pairs
-            if "|" in p.get("pair_id", "")
-        }
-
-        filtered_candidates = [
+        filtered_candidates = tuple(
             c
             for c in self.candidates
-            if c.get("pair_id") in filtered_pair_aliases
-            or c.get("pair_id") in filtered_pair_reals
-            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_reals
-            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_aliases
-        ]
-
-        needed_aliases = {
-            part for p in filtered_pairs if "|" in p.get("pair_id", "") for part in p["pair_id"].split("|", 1)
-        }
-        filtered_identifiers = {k: v for k, v in self.identifiers.items() if k in needed_aliases}
-
+            if c.get("pair_id") in valid_keys or f"{c.get('entity_a')}|{c.get('entity_b')}" in valid_keys
+        )
+        filtered_identifiers = {k: v for k, v in ident.items() if k in needed_aliases}
         ratio = (len(filtered_pairs) / len(all_pairs)) if all_pairs else 1.0
-        new_construction_seconds = self.construction_seconds * ratio
-
+        entities = {k: v for k, v in packet["entities"].items() if k in needed_aliases}
+        source_refs = {ref for entity in entities.values() for ref in entity["sources"]}
+        sources = {k: v for k, v in packet["sources"].items() if k in source_refs}
         new_payload = json.dumps(
-            {
-                "format": "synonym-evidence-v2",
-                "pairs": filtered_pairs,
-            },
+            {"format": "synonym-evidence-v3", "pairs": filtered_pairs, "entities": entities, "sources": sources},
             ensure_ascii=False,
             separators=(",", ":"),
         )
         return SynonymEvidenceBatch(
-            candidates=tuple(filtered_candidates),
+            candidates=filtered_candidates,
             payload=new_payload,
             identifiers=filtered_identifiers,
-            construction_seconds=new_construction_seconds,
+            construction_seconds=self.construction_seconds * ratio,
         )
 
 
@@ -249,7 +241,7 @@ class StructuredTriple:
 
 @dataclass(slots=True, frozen=True)
 class RelationTraversalPolicy:
-    """Relation-aware directed Markov transition multipliers for Personalized PageRank."""
+    """Relation-aware positive HMM transition and passage-emission multipliers."""
 
     passage: float = 1.0
     fact_forward: float = 1.0
@@ -257,7 +249,6 @@ class RelationTraversalPolicy:
     skos_related: float = 1.0
     skos_broader_up: float = 1.0
     skos_broader_down: float = 0.5
-    owl_different_from: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -340,6 +331,9 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
+_ASCII_TOK_RE = re.compile(r"[a-z0-9]+(?:(?:[+#%]+|[./:]|(?<=[0-9])-)[a-z0-9]+|-[0-9][a-z0-9]*)*(?:[+#%]+)?")
+
+
 @overload
 def text_processing(text: list[Any]) -> list[Any]: ...
 
@@ -355,6 +349,13 @@ def text_processing(text: Any) -> str | list[Any]:
     if not isinstance(text, str):
         text = str(text)
     folded = text.casefold()
+    tokens = folded.split()
+    if not tokens:
+        return ""
+    if "".join(tokens).isalnum():
+        return " ".join(tokens)
+    if folded.isascii():
+        return " ".join(_ASCII_TOK_RE.findall(folded))
     n = len(folded)
     out: list[str] = []
     for i, ch in enumerate(folded):
@@ -377,6 +378,46 @@ def text_processing(text: Any) -> str | list[Any]:
     return " ".join("".join(out).split())
 
 
+_SCALAR_START = frozenset("+-pPtTfF$\u20ac\u00a3\u00a5")
+_XSD_MASTER_RE = re.compile(
+    r"^(?:"
+    r"(?P<b1>true|false)|"
+    r"(?P<i1>[+-]?\d+)|"
+    r"(?P<d1>[+-]?\d+\.\d+)|"
+    r"(?P<dt>\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)|"
+    r"(?P<da>\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))|"
+    r"(?P<ti>(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?|(?:1[0-2]|0?[1-9]):[0-5]\d(?::[0-5]\d)?\s*(?:am|pm))|"
+    r"(?P<du>-?P(?=\d|T\d)(?:(?:\d+Y)?(?:\d+M)?(?:\d+D)?)(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?|(?:p\d+\s+)?\d+(?:\.\d+)?\s*(?:ns|Âµs|us|ms|s|sec|seconds?|min|minutes?|h|hours?|days?))|"
+    r"(?P<s1>[\$\u20ac\u00a3\u00a5]\s*\d+(?:\.\d+)?(?:\s*[kKmMbBtT]|(?:\s*(?:thousand|million|billion|trillion)))?|\d+(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|cents?|dollars?|%|MB|GB|KB|TB|PB|bytes?)|\d+\s+(?:events?|requests?|tokens?|queries|pods?|nodes?))"
+    r")$",
+    re.IGNORECASE,
+)
+_XSD_GROUP_MAP = {
+    "b1": "xsd:boolean",
+    "i1": "xsd:integer",
+    "d1": "xsd:decimal",
+    "dt": "xsd:dateTime",
+    "da": "xsd:date",
+    "ti": "xsd:time",
+    "du": "xsd:duration",
+    "s1": "xsd:string",
+}
+_log = math.log
+_exp = math.exp
+
+
+def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
+    """Classify clear-cut scalar literals into W3C XSD datatypes; default rdfs:Literal fallback is xsd:string."""
+    _ = definition
+    if not isinstance(text, str) or not (val := text.strip()):
+        return (False, "xsd:string")
+    c0 = val[0]
+    if not (c0.isdigit() or c0 in _SCALAR_START):
+        return (False, "xsd:string")
+    m = _XSD_MASTER_RE.match(val)
+    return (True, _XSD_GROUP_MAP[m.lastgroup]) if m and m.lastgroup else (False, "xsd:string")
+
+
 def is_resource_label(label: str) -> bool:
     """A NER resource label has lexical content: an ASCII letter or any non-ASCII character.
 
@@ -390,7 +431,7 @@ def is_scalar_label(label: str) -> bool:
     """Whether a label's normalized form is an XSD scalar literal.
 
     The single downstream classification of NER labels: normalization, materialization and
-    evidence binding must agree on which labels bind as resources (native graph spec §5.3).
+    evidence binding must agree on which labels bind as resources (native graph spec Â§5.3).
     """
     return detect_scalar_literal(text_processing(label))[0]
 
@@ -447,79 +488,21 @@ def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
     return target_path
 
 
-_XSD_BOOLEAN_RE = re.compile(r"^(?:true|false)$", re.IGNORECASE)
-_XSD_INTEGER_RE = re.compile(r"^[+-]?\d+$")
-_XSD_DECIMAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
-_XSD_DATETIME_RE = re.compile(
-    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$",
-    re.IGNORECASE,
-)
-_XSD_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
-_XSD_TIME_RE = re.compile(
-    r"^(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?|(?:1[0-2]|0?[1-9]):[0-5]\d(?::[0-5]\d)?\s*(?:am|pm))$",
-    re.IGNORECASE,
-)
-_XSD_DURATION_RE = re.compile(
-    r"^-?P(?=\d|T\d)(?:(?:\d+Y)?(?:\d+M)?(?:\d+D)?)(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$",
-    re.IGNORECASE,
-)
-_CURRENCY_PREFIX_RE = re.compile(
-    r"^[\$€£¥]\s*\d+(?:\.\d+)?(?:\s*[kKmMbBtT]|(?:\s*(?:thousand|million|billion|trillion)))?$",
-    re.IGNORECASE,
-)
-_CURRENCY_SUFFIX_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|cents?|dollars?)$", re.IGNORECASE)
-_DURATION_LATENCY_RE = re.compile(
-    r"^(?:p\d+\s+)?\d+(?:\.\d+)?\s*(?:ns|µs|us|ms|s|sec|seconds?|min|minutes?|h|hours?|days?)$",
-    re.IGNORECASE,
-)
-_PERCENT_STORAGE_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:%|MB|GB|KB|TB|PB|bytes?)$", re.IGNORECASE)
-_QUANTIFIED_COUNT_RE = re.compile(r"^\d+\s+(?:events?|requests?|tokens?|queries|pods?|nodes?)$", re.IGNORECASE)
-
-
-def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
-    """Classify clear-cut scalar literals into W3C XSD datatypes; default rdfs:Literal fallback is xsd:string."""
-    _ = definition
-    if not isinstance(text, str):
-        return (False, "xsd:string")
-    val = text.strip()
-    if not val:
-        return (False, "xsd:string")
-    if _XSD_BOOLEAN_RE.match(val):
-        return (True, "xsd:boolean")
-    if _XSD_INTEGER_RE.match(val):
-        return (True, "xsd:integer")
-    if _XSD_DECIMAL_RE.match(val):
-        return (True, "xsd:decimal")
-    if _XSD_DATETIME_RE.match(val):
-        return (True, "xsd:dateTime")
-    if _XSD_DATE_RE.match(val):
-        return (True, "xsd:date")
-    if _XSD_TIME_RE.match(val):
-        return (True, "xsd:time")
-    if _XSD_DURATION_RE.match(val) or _DURATION_LATENCY_RE.match(val):
-        return (True, "xsd:duration")
-    if (
-        _CURRENCY_PREFIX_RE.match(val)
-        or _CURRENCY_SUFFIX_RE.match(val)
-        or _PERCENT_STORAGE_RE.match(val)
-        or _QUANTIFIED_COUNT_RE.match(val)
-    ):
-        return (True, "xsd:string")
-    return (False, "xsd:string")
-
-
 def pool_confidences(*signals: float | None, eps: float = 1e-6) -> float | None:
     """Logarithmic Opinion Pool (Geometric Mean) over non-None signals in [eps, 1 - eps], or None if all None.
 
     Invariant: pool_confidences(p, p) == p, pool_confidences(p, None) == p,
     pool_confidences(None, None) is None.
     """
-    valid = [float(s) for s in signals if s is not None]
-    if not valid:
-        return None
-    clamped = [min(1.0 - eps, max(eps, s)) for s in valid]
-    log_sum = sum(math.log(s) for s in clamped)
-    return float(math.exp(log_sum / len(clamped)))
+    hi = 1.0 - eps
+    n = 0
+    acc = 0.0
+    for s in signals:
+        if s is not None:
+            v = float(s)
+            acc += _log(eps if v < eps else (hi if v > hi else v))
+            n += 1
+    return _exp(acc / n) if n else None
 
 
 def bayesian_noisy_or(confidences: Sequence[float | None], *, eps: float = 1e-6) -> float | None:
@@ -527,12 +510,15 @@ def bayesian_noisy_or(confidences: Sequence[float | None], *, eps: float = 1e-6)
 
     Each observation contributes additive Shannon evidence: -log(1 - c_i).
     """
-    valid = [float(c) for c in confidences if c is not None]
-    if not valid:
+    hi = 1.0 - eps
+    prod = 1.0
+    any_v = False
+    for c in confidences:
+        if c is not None:
+            v = float(c)
+            prod *= 1.0 - (eps if v < eps else (hi if v > hi else v))
+            any_v = True
+    if not any_v:
         return None
-    clamped = [min(1.0 - eps, max(eps, c)) for c in valid]
-    prod_complement = 1.0
-    for c in clamped:
-        prod_complement *= 1.0 - c
-    res = 1.0 - prod_complement
-    return float(min(1.0 - eps, max(eps, res)))
+    res = 1.0 - prod
+    return eps if res < eps else (hi if res > hi else res)

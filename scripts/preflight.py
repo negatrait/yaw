@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     lock = root / "uv.lock"
     identity = hashlib.sha256(lock.read_bytes() if lock.exists() else b"").hexdigest()[:16]
     mode = "full" if args.full else "incremental"
-    report = {
+    report: dict = {
         "mode": mode,
         "live": True,
         "checks": [],

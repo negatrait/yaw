@@ -1198,7 +1198,7 @@ def get_entity_doc_frequencies(
     conn: sqlite3.Connection,
     entity_ids: Sequence[str],
 ) -> dict[str, int]:
-    """Count number of passage edges incident to given entity_ids for PPR seed weighting."""
+    """Count number of passage edges incident to given entity_ids for HMM seed weighting."""
     if not entity_ids:
         return {}
     freqs: dict[str, int] = {eid: 0 for eid in entity_ids}
@@ -1277,6 +1277,10 @@ def load_graph_topology(
 
     entity_ids = tuple(entity_ids_list)
 
+    invalid_edge = conn.execute("SELECT weight FROM edges WHERE weight < 0 LIMIT 1").fetchone()
+    if invalid_edge is not None:
+        raise ValueError(f"Graph edge weight must be nonnegative: {invalid_edge[0]}")
+
     edge_cursor = conn.execute(
         """
         SELECT
@@ -1303,7 +1307,11 @@ def load_graph_topology(
             e.src_id AS src_id,
             e.dst_id AS dst_id,
             e.kind AS kind,
-            e.weight AS weight
+            CASE WHEN e.kind = 'skos:related' THEN MAX(
+                e.weight,
+                COALESCE((SELECT rev.weight FROM edges rev
+                          WHERE rev.src_id = e.dst_id AND rev.dst_id = e.src_id AND rev.kind = e.kind), e.weight)
+            ) ELSE e.weight END AS weight
         FROM edges e
         WHERE e.src_id != e.dst_id
           AND e.weight > 0.0

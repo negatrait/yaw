@@ -29,13 +29,18 @@ from yaw.core import (
 )
 from yaw.daemon.cli import build_parser, inspect_status, main
 from yaw.daemon.graph.inference import (
-    ServingTokenCounter,
     YawProgram,
     compute_task_quality_score,
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.storage import open_yaw_db
 from yaw.daemon.runtime import YawRuntime
+
+
+@pytest.fixture(autouse=True)
+def runtime_provider_url(provider, monkeypatch):
+    monkeypatch.setenv("YAW_RUNTIME_TEST_URL", provider[0])
+    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "runtime-fixture-key")
 
 
 def prepare_runtime_bundle(source: Path, *, dataset_name: str | None = None, validation_row: bool = False) -> Path:
@@ -60,7 +65,34 @@ class DeterministicTestLM(dspy.LM):
         super().__init__(model="openai/test-runtime-lm")
         self.fail_online: bool = False
 
-    def __call__(
+    @property
+    def supported_params(self) -> set[str]:
+        return set()
+
+    @property
+    def supports_reasoning(self) -> bool:
+        return False
+
+    def __call__(self, prompt: Any = None, **kwargs: Any) -> Any:
+        request = prompt
+        from dspy.lm15 import Message, Response, TextPart, Usage
+
+        messages = [
+            {"role": message.role, "content": "".join(part.text for part in message.parts if hasattr(part, "text"))}
+            for message in request.messages
+        ]
+        if request.system:
+            messages.insert(0, {"role": "system", "content": str(request.system)})
+        result = self._fixture_answer(messages=messages, **kwargs)
+        return Response(
+            id="fixture",
+            model=self.model,
+            message=Message(role="assistant", parts=(TextPart(text=result[0]),)),
+            finish_reason="stop",
+            usage=Usage(input_tokens=32, output_tokens=16),
+        )
+
+    def _fixture_answer(
         self,
         prompt: str | None = None,
         messages: list[dict[str, Any]] | None = None,
@@ -135,15 +167,19 @@ class DeterministicTestLM(dspy.LM):
             ]
         if "ExtractQueryIntent" in req_str or "query_intent" in req_str:
             return ['{"query_intent": "Alan Turing worked at Bletchley Park"}']
-        return ['{"reasoning": "Derived from retrieved passages.", "answer": "Bletchley Park"}']
+        return ['{"plan": "Derived from retrieved passages.", "answer": "Bletchley Park"}']
 
 
 class DeterministicTestEmbedder:
     """Deterministic L2-normalized 16-D embedder with EmbeddingProfile prefix support."""
 
+    @property
+    def index_identity(self) -> str:
+        return self.profile.index_identity
+
     def __init__(self, dim: int = 16) -> None:
         self.dim = dim
-        self.profile = resolve_embedding_profile("embeddinggemma-300m-GGUF", "distinct-titled")
+        self.profile = replace(resolve_embedding_profile("embeddinggemma-300m-GGUF", "distinct-titled"), dimensions=dim)
         self.fail_online: bool = False
 
     def update_prefixes(
@@ -164,6 +200,9 @@ class DeterministicTestEmbedder:
             updates["document_prefix"] = document_prefix
         if updates:
             self.profile = replace(self.profile, **updates)
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        return [vector.tolist() for vector in self.encode(texts)]
 
     def encode(self, texts: Sequence[str], instruction: str = "") -> list[np.ndarray]:
         if self.fail_online:
@@ -188,8 +227,9 @@ class DeterministicTestEmbedder:
 
 
 def _make_test_config(
-    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str = "http://127.0.0.1:8888/v1"
+    tmp_path: Path, *, queue_maxsize: int = 32, base_url: str | None = None
 ) -> tuple[YawConfig, Path]:
+    base_url = base_url or os.environ["YAW_RUNTIME_TEST_URL"]
     toml_path = tmp_path / "yaw.toml"
     toml_content = f"""
 [paths]
@@ -238,10 +278,12 @@ def _make_program_and_embedder(
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        synonym_token_counter=ServingTokenCounter(tokenizer_url, lm.model),
     )
+    from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter
+
     emb = DeterministicTestEmbedder(dim=16)
-    return prog, emb, lm, emb
+    adapter = DSPyEmbeddingAdapter(profile=emb.profile, embedder=dspy.Embedder(emb, batch_size=64))
+    return prog, adapter, lm, emb
 
 
 def test_load_config_and_fingerprint(tmp_path: Path) -> None:
@@ -279,7 +321,7 @@ def test_runtime_applies_configured_hydration_capacity(tmp_path: Path, provider)
     try:
         runtime.start(sync_on_start=False)
         assert runtime.engine is not None
-        assert runtime.engine.max_context_chars == 48000
+        assert runtime.engine.max_context_chars == config.max_context_chars
         assert runtime.engine.max_ast_expansion_hops == 2
         assert runtime.engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
     finally:
@@ -534,6 +576,10 @@ def test_second_runtime_fails_fast_on_lock(tmp_path: Path, provider) -> None:
 def test_runtime_live_ingests_files_without_sync_requests(tmp_path: Path, provider) -> None:
     cfg, _ = _make_test_config(tmp_path)
     program, embedder, _, _ = _make_program_and_embedder(provider[0])
+    # Live extraction must use the worker even when the separate QA service is unavailable.
+    qa_lm = DeterministicTestLM()
+    qa_lm.fail_online = True
+    program.orchestrator_lm = qa_lm
     cfg.corpus_root.mkdir(parents=True, exist_ok=True)
     runtime = YawRuntime(cfg, program=program, embedder=embedder, auto_poll=True)
     runtime.start()
@@ -753,7 +799,7 @@ re-extracting."""
         assert first_chunk_id in saved_openie
 
         hits = rt2.retrieve("Where did Alan Turing work?", top_k=2)
-        assert len(hits) == 2
+        assert len(hits) == 1
         assert any("Bletchley Park" in h.text for h in hits)
     finally:
         rt2.stop()
@@ -875,7 +921,7 @@ def test_optimize_and_reload_compiled_program_with_composite_fitness(tmp_path: P
         assert loaded_p.gbnf_max_entities == 6
         assert loaded_p.gbnf_max_triples == 5
         assert loaded_p.gbnf_max_facts == 3
-        assert loaded_p.gbnf_max_reasoning_chars == 160
+        assert loaded_p.gbnf_max_reasoning_chars is None
         assert rt2.engine.embedder.profile.query_prefix == "task: custom optimized query | query: "
         assert rt2.engine.embedder.profile.fact_query_prefix == "task: custom optimized fact | query: "
         assert rt2.engine.embedder.profile.document_prefix == "title: custom | text: "
@@ -1606,10 +1652,18 @@ def test_sync_now_executes_single_index_chunks_and_pre_start_stop(tmp_path: Path
         summary = rt.sync_now()
         assert len(summary.added_chunks) == 1
         assert rt.stats().chunks == 1
+        calls = rt.engine._graph_rlm_stats["embedding_calls"]
+        assert calls > 0
+        assert rt.engine._graph_rlm_stats["embedding_tokens"] is None
+        trail = rt.engine.program.embedding_audit_trail
+        assert sum(entry["num_batches"] for entry in trail) == calls
+        assert len({entry["request_id"] for entry in trail}) == len(trail)
 
         summary2 = rt.sync_now()
         assert len(summary2.added_chunks) == 0
         assert rt.stats().chunks == 1
+        assert rt.engine._graph_rlm_stats["embedding_calls"] == calls
+        assert sum(entry["num_batches"] for entry in trail) == calls
     finally:
         rt.stop()
 
@@ -1622,7 +1676,7 @@ def test_windows_live_lifecycle_create_modify_rename_delete_and_lock_release(tmp
     from yaw.daemon.runtime import is_file_locked
 
     class LiveLifecycleLM(DeterministicTestLM):
-        def __call__(
+        def _fixture_answer(
             self,
             prompt: str | None = None,
             messages: list[dict[str, Any]] | None = None,
@@ -1678,7 +1732,7 @@ def test_windows_live_lifecycle_create_modify_rename_delete_and_lock_release(tmp
                             }
                         )
                     ]
-            return super().__call__(prompt=prompt, messages=messages, **kwargs)
+            return super()._fixture_answer(prompt=prompt, messages=messages, **kwargs)
 
     cfg, _ = _make_test_config(tmp_path)
     assert cfg.corpus_root is not None
@@ -1692,11 +1746,12 @@ def test_windows_live_lifecycle_create_modify_rename_delete_and_lock_release(tmp
         enable_gbnf=False,
         orchestrator_lm=lm,
         rlm_sub_lm=lm,
-        synonym_token_counter=ServingTokenCounter(provider[0], lm.model),
     )
-    emb = DeterministicTestEmbedder(dim=16)
+    from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter
 
-    rt = YawRuntime(cfg, program=prog, embedder=emb, auto_poll=True)
+    emb = DeterministicTestEmbedder(dim=16)
+    native_emb = DSPyEmbeddingAdapter(profile=emb.profile, embedder=dspy.Embedder(emb, batch_size=64))
+    rt = YawRuntime(cfg, program=prog, embedder=native_emb, auto_poll=True)
     rt.start(sync_on_start=False)
     try:
         assert rt.engine is not None

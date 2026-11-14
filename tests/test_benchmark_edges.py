@@ -3,26 +3,24 @@
 import hashlib
 import json
 from dataclasses import replace
-from functools import partial
 from typing import Any
 
 import dspy
 import numpy as np
 import pytest
-from daemon.graph.inference.test_registry_edges import embedding_entry
-from daemon.graph.inference.test_registry_edges import registry_server as registry_server
 from daemon.graph.test_engine_edges import indexing_provider as indexing_provider
+from embedding_fixture import IdentifiedEmbeddingCallable
 from scripts.test_download_edges import download_server as download_server
+from test_benchmark import benchmark_inference_server as benchmark_inference_server
 
 import benchmark
+from yaw.core.config import YawConfig
 from yaw.daemon.graph.inference.embedding import (
-    MODEL,
     PROFILES,
     DSPyEmbeddingAdapter,
     create_dspy_embedder,
     resolve_embedding_profile,
 )
-from yaw.daemon.graph.inference.models import embedding_evidence, preflight
 from yaw.daemon.ingestion import prepare_dataset_bundle
 
 
@@ -168,7 +166,9 @@ def test_embedding_verification_compares_all_active_roles_under_reordering(mode)
         )
 
     profile = replace(resolve_embedding_profile(task_mode=mode), dimensions=8)
-    adapter = DSPyEmbeddingAdapter(profile, create_dspy_embedder(embed, caching=False))
+    adapter = DSPyEmbeddingAdapter(
+        profile, create_dspy_embedder(IdentifiedEmbeddingCallable(embed, "embed-fixture-v1"), caching=False)
+    )
     probes = benchmark.verify_embeddings(
         adapter, ["Who wrote Notes?", "Who was Ada?"], ["Title: Notes\nAda wrote Notes."]
     )
@@ -188,7 +188,7 @@ def test_embedding_verification_rejects_changed_vectors_for_identical_inputs():
 
     adapter = DSPyEmbeddingAdapter(
         replace(resolve_embedding_profile(), dimensions=2),
-        create_dspy_embedder(changing_embed, caching=False),
+        create_dspy_embedder(IdentifiedEmbeddingCallable(changing_embed, "changing_embed-fixture-v1"), caching=False),
     )
     with pytest.raises(RuntimeError, match="embeddings are unstable"):
         benchmark.verify_embeddings(adapter, ["question"], ["document"])
@@ -199,7 +199,6 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
     tmp_path, monkeypatch, indexing_provider, include_qa
 ):
     url, calls = indexing_provider
-    monkeypatch.setattr(benchmark, "BASE_URL", url)
     # Keep any retry lifecycle lookup inside this disposable environment.
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
@@ -208,6 +207,16 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
     qa.write_text("[]", encoding="utf-8")
     prepare_dataset_bundle("musique", corpus, qa, tmp_path / "outputs/datasets")
     profile = replace(resolve_embedding_profile(task_mode="distinct-titled"), dimensions=8)
+    monkeypatch.setitem(PROFILES, profile.model, profile)
+    config = YawConfig(
+        workspace_root=tmp_path,
+        base_url=url,
+        api_key="test",
+        embedding_model=profile.model,
+        extraction_model="indexing-contract",
+        qa_model="indexing-contract",
+        enable_gbnf=False,
+    )
 
     def run(report):
         benchmark.run_yaw_benchmark(
@@ -217,7 +226,7 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
             gold_docs=[["Notes\nAda wrote Notes."]],
             gold_answers=[["Ada"]],
             train_samples=[],
-            profile=profile,
+            config=config,
             extraction_model="indexing-contract",
             qa_model="indexing-contract",
             include_qa=include_qa,
@@ -247,22 +256,16 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
     assert resumed["evaluation_metrics"] == metrics
 
 
-@pytest.mark.parametrize("downloaded", [True, False])
+@pytest.mark.parametrize("authorized", [True, False])
 def test_benchmark_main_persists_success_or_failure_with_disjoint_probe_queries(
-    tmp_path, monkeypatch, registry_server, downloaded
+    tmp_path, monkeypatch, benchmark_inference_server, authorized
 ):
-    state, url = registry_server
-    profile = replace(PROFILES[MODEL], dimensions=2)
-    monkeypatch.setitem(PROFILES, MODEL, profile)
-    entry = embedding_entry(profile)
-    entry["downloaded"] = downloaded
-    state["registry"] = [entry]
-    state["loaded"] = state["after_probe"] = [entry]
+    from openai import AuthenticationError
+
+    url, requests = benchmark_inference_server
     monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(benchmark, "BASE_URL", url)
-    # Bind real identity checks to this actual service, including their defaults.
-    monkeypatch.setattr(benchmark, "preflight", partial(preflight, base_url=url))
-    monkeypatch.setattr(benchmark, "embedding_evidence", partial(embedding_evidence, base_url=url))
+    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "benchmark-key" if authorized else "wrong-key")
+    (tmp_path / "yaw.toml").write_text(f'[inference]\nbase_url = "{url}"\n', encoding="utf-8")
     data = tmp_path / "outputs" / "datasets"
     data.mkdir(parents=True)
     paragraph = {"title": "Notes", "text": "Ada wrote Notes.", "is_supporting": True}
@@ -287,10 +290,9 @@ def test_benchmark_main_persists_success_or_failure_with_disjoint_probe_queries(
             index_queries=1,
             train_queries=1,
             evolve="gepa",
-            chat_model=benchmark.DEFAULT_QA_CHAT,
         )
 
-    if downloaded:
+    if authorized:
         result = run()
         assert result["status"] == "passed" and result["query_offset"] == 1
         assert result["train_queries"] == 1 and result["num_queries"] == 1
@@ -299,9 +301,9 @@ def test_benchmark_main_persists_success_or_failure_with_disjoint_probe_queries(
         report_path = next((tmp_path / "outputs" / "benchmarks").glob("run-sample-*/report.json"))
         assert json.loads(report_path.read_text(encoding="utf-8")) == result
     else:
-        with pytest.raises(ValueError, match="not downloaded"):
+        with pytest.raises(AuthenticationError):
             run()
         report_path = next((tmp_path / "outputs" / "benchmarks").glob("run-sample-*/report.json"))
         result = json.loads(report_path.read_text(encoding="utf-8"))
-        assert result["status"] == "failed" and "not downloaded" in result["error"]
+        assert result["status"] == "failed" and "AuthenticationError" in result["error"]
         assert result["elapsed_seconds"] >= 0

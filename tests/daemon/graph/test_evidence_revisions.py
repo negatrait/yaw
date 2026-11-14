@@ -48,7 +48,7 @@ def native_environment(root, state_dir, url):
     settings = GraphPlanSettings(
         corpus_root=root,
         program_identity=identity,
-        embedding_identity=embedder.profile.index_identity,
+        embedding_identity=embedder.index_identity,
         candidate_lexical_threshold=0.55,
     )
     try:

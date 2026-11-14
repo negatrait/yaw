@@ -10,18 +10,23 @@ from pathlib import Path
 
 import dspy
 import pytest
+from embedding_fixture import IdentifiedEmbeddingCallable
 
+from daemon.graph.test_indexing_overlap import adapter as overlap_adapter
+from daemon.graph.test_indexing_overlap import provider as indexing_provider
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     RLMInstructionProposer,
-    ServingTokenCounter,
     YawProgram,
     compute_qa_em_f1,
     compute_task_quality_score,
     create_dspy_lm,
 )
+from yaw.daemon.graph.inference.embedding import DSPyEmbeddingAdapter
 from yaw.daemon.graph.inference.optimizer import configure_simba_task_learning
 from yaw.daemon.indexing import bind_native_indexing
+
+__all__ = ["indexing_provider"]
 
 GOOD = "FULL_NAME: Answer with the full name supported by the context."
 BAD = "Ignore the evidence and always answer Unknown."
@@ -74,7 +79,7 @@ def provider():
             calls.append(request)
             if "task-model" in request["model"]:
                 answer = "Alan Turing" if "FULL_NAME" in prompt else ("Unknown" if BAD in prompt else "Turing")
-                result = {"reasoning": "Use the provided evidence.", "answer": answer}
+                result = {"plan": "Use the provided evidence.", "answer": answer}
             elif "module_advice" in prompt and "discussion" in prompt:
                 result = {
                     "discussion": "Full names improve measured task answers.",
@@ -136,12 +141,20 @@ def make_learning(root, url, *, resume=False, answer="Alan Turing"):
     task = YawProgram(enable_gbnf=False, orchestrator_lm=task_lm, rlm_sub_lm=task_lm)
     task.qa.predict.signature = task.qa.predict.signature.with_instructions(BASE)
     # Context-only calibration exercises real QA without embedding/retrieval I/O.
-    engine = bind_native_indexing(YawGraphEngine(root / "yaw.db", root, task, dspy.Embedder(lambda texts: [])))
+    engine = bind_native_indexing(
+        YawGraphEngine(
+            root / "yaw.db",
+            root,
+            task,
+            DSPyEmbeddingAdapter(
+                embedder=dspy.Embedder(IdentifiedEmbeddingCallable(lambda texts: [], "simba-empty-fixture"))
+            ),
+        )
+    )
     proposer = RLMInstructionProposer(
         worker_lm=worker_lm,
         orchestrator_lm=worker_lm,
         enable_gbnf=False,
-        token_counter=ServingTokenCounter(url, worker_lm.model),
     )
     train = [
         dspy.Example(
@@ -224,6 +237,7 @@ def test_native_simba_learning_survives_process_restart(tmp_path, provider):
     script = """
 import json, runpy, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
 helpers = runpy.run_path(sys.argv[1])
 engine, proposer = helpers['make_learning'](Path(sys.argv[2]), sys.argv[3], resume=True)
 try:
@@ -333,5 +347,56 @@ def test_native_simba_failed_task_evaluation_keeps_durable_worker(tmp_path, prov
     engine, restored = make_learning(tmp_path, url, resume=True)
     try:
         assert restored.dump_simba_state() == before
+    finally:
+        engine.close()
+
+
+def test_prediction_usage_is_scoped_and_counts_all_native_events():
+    from dspy.utils.usage_tracker import track_usage
+
+    from yaw.daemon.graph.inference.optimizer import _prediction_lm_usage
+
+    # More than 20 earlier model events belong to a different prediction.
+    with track_usage() as prior:
+        for _ in range(27):
+            prior.add_usage("model", {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})
+    with track_usage() as current:
+        for _ in range(25):
+            current.add_usage("model", {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+    prediction = dspy.Prediction(answer="current")
+    prediction.set_lm_usage(current.get_total_tokens())
+    assert _prediction_lm_usage(prediction) == (125, True)
+    assert _prediction_lm_usage(dspy.Prediction(answer="retrieval only")) == (0, False)
+    assert prior.get_total_tokens()["model"]["total_tokens"] == 324
+
+
+def test_current_prediction_usage_with_fresh_candidate_indexing(tmp_path, indexing_provider):
+    from yaw.core import ChunkPointer
+    from yaw.daemon.graph.inference.optimizer import _prediction_lm_usage
+
+    url, state = indexing_provider
+    state["delay"] = 0
+    source = "Ada studies Algebra."
+    (tmp_path / "source.txt").write_text(source, encoding="utf-8")
+    lm = create_dspy_lm("overlap", base_url=url + "/v1", cache=False)
+    program = YawProgram(enable_gbnf=False, orchestrator_lm=lm, rlm_sub_lm=lm)
+    engine = bind_native_indexing(YawGraphEngine(tmp_path / "yaw.db", tmp_path, program, overlap_adapter(url)))
+    try:
+        engine._opt_chunks_pool = [(ChunkPointer("source", "source.txt", 1, 1), source)]
+        engine._in_optimization = True
+
+        def retrieval(question, program, *, item_docs=None, **kwargs):
+            engine._ensure_candidate_chunks_indexed(program, item_docs)
+            return source, (source,), (1.0,), ("source",)
+
+        engine.program.set_retrieval_hook(retrieval)
+        with dspy.context(track_usage=True):
+            prediction = engine.program(question="Who studies Algebra?", item_docs=[source], retrieve_only=True)
+        usage = _prediction_lm_usage(prediction)
+        stats = engine._query_rlm_stats_for_eval([source])
+        assert sum(kind == "chat" for kind, _, _ in state["intervals"]) == 3
+        assert usage == (0, True)
+        assert stats["relation_judge_tokens"] == 15
+        assert "openie_tokens" not in stats
     finally:
         engine.close()

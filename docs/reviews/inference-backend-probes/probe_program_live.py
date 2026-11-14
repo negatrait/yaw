@@ -11,6 +11,7 @@ assert os.environ.get("UNSLOTH_STUDIO_AUTH_TOKEN"), "export UNSLOTH_STUDIO_AUTH_
 cfg = load_config("yaw.toml")
 print("base_url:", cfg.base_url, "| models:", cfg.extraction_model, cfg.qa_model, "| key set:", bool(cfg.api_key))
 program = YawProgram.from_config(cfg)
+assert program.orchestrator_lm is not None
 print(
     "worker LM engine:",
     type(program.orchestrator_lm.engine).__name__,

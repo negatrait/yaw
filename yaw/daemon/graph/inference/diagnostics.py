@@ -29,8 +29,7 @@ def trim_diagnostics(owner: Any) -> None:
         ("embedding_audit_trail", 250),
         ("entity_def_audit_trail", 250),
         ("label_judge_audit_trail", 100),
-        ("hierarchy_judge_audit_trail", 100),
-        ("related_judge_audit_trail", 100),
+        ("relation_judge_audit_trail", 100),
         ("shacl_audit_trail", 100),
         ("simba_telemetry", 100),
     ):
@@ -103,6 +102,7 @@ def judge_stage_fingerprint(
         getattr(program, "context_window_tokens", 8192),
         getattr(program, "max_output_tokens", 1024),
     ]
+    payload["serving_identity"] = getattr(program, "_yaw_serving_identity", None)
     payload["schema_version"] = "skos-shacl-v3"
     return fingerprint_object(payload).hex()
 
@@ -112,14 +112,9 @@ def label_judge_fingerprint(program: Any) -> str:
     return judge_stage_fingerprint(program, "label_judge")
 
 
-def hierarchy_judge_fingerprint(program: Any) -> str:
-    """Compute SHA-256 fingerprint for Stage 2 hierarchy_judge predictor surface."""
-    return judge_stage_fingerprint(program, "hierarchy_judge")
-
-
-def related_judge_fingerprint(program: Any) -> str:
-    """Compute SHA-256 fingerprint for Stage 3 related_judge predictor surface."""
-    return judge_stage_fingerprint(program, "related_judge")
+def relation_judge_fingerprint(program: Any) -> str:
+    """Fingerprint the relation decision predictor."""
+    return judge_stage_fingerprint(program, "relation_judge")
 
 
 def extract_named_trace_entries(

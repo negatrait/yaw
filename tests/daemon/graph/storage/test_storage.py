@@ -13,7 +13,7 @@ from yaw.core import ChunkPointer, text_processing
 from yaw.daemon.graph.storage import (
     apply_shacl_repairs,
     canonicalize_entity_labels_edc,
-    iter_synonym_evidence,
+    iter_semantic_evidence,
     lint_graph_shacl,
     merge_entities,
     open_yaw_db,
@@ -38,7 +38,7 @@ from yaw.daemon.graph.storage.synonyms import (
     query_shared_role_facts,
 )
 from yaw.daemon.graph.storage.synonyms import (
-    iter_synonym_evidence as synonyms_iter,
+    iter_semantic_evidence as synonyms_iter,
 )
 
 
@@ -132,8 +132,8 @@ def _seed_w3c_test_graph(conn: Any, tmp_path: Path) -> dict[str, str]:
     return {eid: name for eid, name, _ in entities}
 
 
-def test_synonym_evidence_v2_denormalized_structure(tmp_path: Path) -> None:
-    """Verify synonym-evidence-v2 emits denormalized pair structures with zero pointer indirection."""
+def test_semantic_evidence_v3_shared_structure(tmp_path: Path) -> None:
+    """Verify shared entity and source records use references."""
     with closing(open_yaw_db(tmp_path / "v2_test.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
         candidates = [
@@ -145,16 +145,14 @@ def test_synonym_evidence_v2_denormalized_structure(tmp_path: Path) -> None:
                 "lexical_sim": 0.72,
             }
         ]
-        batches = list(iter_synonym_evidence(conn, candidates, tmp_path))
+        batches = list(iter_semantic_evidence(conn, candidates, tmp_path))
         assert len(batches) == 1
         batch = batches[0]
 
         parsed = json.loads(batch.payload)
-        assert parsed["format"] == "synonym-evidence-v2"
-        # Zero top-level entities, facts, or sources lookup tables
-        assert "entities" not in parsed
-        assert "facts" not in parsed
-        assert "sources" not in parsed
+        assert parsed["format"] == "synonym-evidence-v3"
+        assert "entities" in parsed
+        assert "sources" in parsed
         assert "pairs" in parsed
         assert len(parsed["pairs"]) == 1
 
@@ -165,12 +163,12 @@ def test_synonym_evidence_v2_denormalized_structure(tmp_path: Path) -> None:
         assert isinstance(pair["shared_documents"], list)
         assert isinstance(pair["shared_islands"], list)
 
-        # Inline entity_a and entity_b
+        # Resolve each entity and source reference
         for side in ("entity_a", "entity_b"):
-            ent = pair[side]
+            ent = parsed["entities"][pair[side]]
             assert "name" in ent
             assert "definition" in ent
-            assert ent["type"] == "skos:Concept"
+            assert "type" not in ent
             assert "labels" in ent
             assert "skos:prefLabel" in ent["labels"]
             assert isinstance(ent["labels"]["skos:prefLabel"], list)
@@ -181,13 +179,13 @@ def test_synonym_evidence_v2_denormalized_structure(tmp_path: Path) -> None:
             assert "sources" in ent
             assert isinstance(ent["sources"], list)
             if ent["sources"]:
-                src = ent["sources"][0]
+                src = parsed["sources"][ent["sources"][0]]
                 assert "path" in src
                 assert "title" in src
                 assert "text" in src
 
 
-def test_synonym_evidence_w3c_structural_queries(tmp_path: Path) -> None:
+def test_semantic_evidence_w3c_structural_queries(tmp_path: Path) -> None:
     """Verify Rule W1 (direct_facts) and Rule W2 (shared_role_facts)."""
     with closing(open_yaw_db(tmp_path / "w3c_rules.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
@@ -215,7 +213,7 @@ def test_synonym_evidence_w3c_structural_queries(tmp_path: Path) -> None:
                 "lexical_sim": 0.40,
             },
         ]
-        batches = list(iter_synonym_evidence(conn, candidates, tmp_path, batch_size=10))
+        batches = list(iter_semantic_evidence(conn, candidates, tmp_path, batch_size=10))
         assert len(batches) == 1
         pairs = json.loads(batches[0].payload)["pairs"]
         assert len(pairs) == 3
@@ -263,7 +261,7 @@ def test_synonym_evidence_w3c_structural_queries(tmp_path: Path) -> None:
         assert p2["shared_role_facts"] == []
 
 
-def test_synonym_evidence_batch_resolve_decisions_without_canonical(tmp_path: Path) -> None:
+def test_semantic_evidence_batch_resolve_decisions_without_canonical(tmp_path: Path) -> None:
     """Verify SynonymEvidenceBatch.resolve_decisions resolves aliases without requiring 'canonical'."""
     with closing(open_yaw_db(tmp_path / "resolve.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
@@ -276,7 +274,7 @@ def test_synonym_evidence_batch_resolve_decisions_without_canonical(tmp_path: Pa
                 "lexical_sim": 0.72,
             }
         ]
-        batch = next(iter_synonym_evidence(conn, candidates, tmp_path))
+        batch = next(iter_semantic_evidence(conn, candidates, tmp_path))
 
         # 1. Decision without 'canonical' should resolve pair_id cleanly
         decisions_no_canon = [{"pair_id": "e0|e1", "relation": "skos:related", "reasoning": "Valid test reasoning"}]
@@ -312,7 +310,7 @@ def test_synonym_evidence_batch_resolve_decisions_without_canonical(tmp_path: Pa
             batch.resolve_decisions([{"pair_id": "e0|e1", "relation": "skos:related", "canonical": "foreign"}])
 
 
-def test_synonym_evidence_batch_subset(tmp_path: Path) -> None:
+def test_semantic_evidence_batch_subset(tmp_path: Path) -> None:
     """Verify SynonymEvidenceBatch.subset() produces valid filtered packets for cascade stages."""
     with closing(open_yaw_db(tmp_path / "subset.db")) as conn:
         _seed_w3c_test_graph(conn, tmp_path)
@@ -332,7 +330,7 @@ def test_synonym_evidence_batch_subset(tmp_path: Path) -> None:
                 "lexical_sim": 0.60,
             },
         ]
-        batch = next(iter_synonym_evidence(conn, candidates, tmp_path, batch_size=10))
+        batch = next(iter_semantic_evidence(conn, candidates, tmp_path, batch_size=10))
         assert len(batch.candidates) == 2
 
         # Subset using alias pair ID
@@ -340,7 +338,7 @@ def test_synonym_evidence_batch_subset(tmp_path: Path) -> None:
         assert len(sub_alias.candidates) == 1
         assert sub_alias.candidates[0]["pair_id"] == "ent-tenants|ent-pilot-tenants"
         sub_payload = json.loads(sub_alias.payload)
-        assert sub_payload["format"] == "synonym-evidence-v2"
+        assert sub_payload["format"] == "synonym-evidence-v3"
         assert len(sub_payload["pairs"]) == 1
         assert sub_payload["pairs"][0]["pair_id"] == "e0|e1"
 
@@ -358,8 +356,8 @@ def test_synonym_evidence_batch_subset(tmp_path: Path) -> None:
         assert json.loads(sub_empty.payload)["pairs"] == []
 
 
-def test_iter_synonym_evidence_default_batch_size() -> None:
-    """Verify default micro-batch size in iter_synonym_evidence is 6."""
+def test_iter_semantic_evidence_default_batch_size() -> None:
+    """Verify default micro-batch size in iter_semantic_evidence is 6."""
     sig = inspect.signature(synonyms_iter)
     assert sig.parameters["batch_size"].default == 6
 

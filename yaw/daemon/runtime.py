@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar
@@ -45,12 +45,14 @@ from yaw.daemon.graph.inference import (
     create_dspy_rlm_pair,
     evaluate_benchmark_gate,
 )
+from yaw.daemon.graph.inference.chat import YawDSPyLM
 from yaw.daemon.graph.inference.components import (
     EMBEDDING_ENDPOINT,
     OPENIE_ENDPOINT,
     EmbeddingEndpoint,
     OpenIEEndpoint,
 )
+from yaw.daemon.graph.inference.models import resolve_serving_models
 from yaw.daemon.graph.planner import GraphPlanSettings
 from yaw.daemon.graph.storage.db import GRAPH_DB
 from yaw.daemon.graph.storage.managed_sqlite import VALIDATE_SQLITE
@@ -295,12 +297,12 @@ class YawRuntime:
         program = self.engine.program
         embedder = self.engine.embedder
         prog_id, emb_id, syn_id, shacl_id = graph_plan_fingerprints(program, embedder)
-        lm = getattr(program, "orchestrator_lm", None) or getattr(program, "rlm_sub_lm", None)
+        lm = getattr(program, "rlm_sub_lm", None) or getattr(program, "orchestrator_lm", None)
 
         yaw_dir = (self.config.workspace_root / ".yaw").resolve()
         yaw_dir.mkdir(parents=True, exist_ok=True)
 
-        self._embedding_endpoint = EmbeddingEndpoint(embedder, asyncio.Semaphore(4))
+        self._embedding_endpoint = EmbeddingEndpoint(embedder)
         self._openie_endpoint = OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1))
 
         state_dir = resolve_coco_state_root(self.config.state_dir)
@@ -339,7 +341,7 @@ class YawRuntime:
             semantic_adjudication_batch_size=self.config.semantic_adjudication_batch_size,
             ast_context_hops=self.config.ast_context_hops,
             context_window_tokens=self.config.context_window_tokens,
-            max_output_tokens=self.config.max_output_tokens,
+            max_output_tokens=program.max_output_tokens,
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap,
             min_chunk_size=self.config.min_chunk_size,
@@ -364,9 +366,17 @@ class YawRuntime:
         workspace_root: Path | None = None,
         compiled_program_override: Path | str | None = None,
     ) -> tuple[YawProgram, DSPyEmbeddingAdapter, YawGraphEngine]:
+        models = resolve_serving_models(
+            cfg.base_url, cfg.api_key, {cfg.extraction_model, cfg.qa_model, cfg.embedding_model}
+        )
+        context = min(models[cfg.extraction_model].context_tokens, models[cfg.qa_model].context_tokens)
+        requested_cfg = replace(cfg, context_window_tokens=context)
+        bound_cfg = requested_cfg.resolve_inference_budgets(context)
+        if cfg is self.config:
+            self.config = requested_cfg
+        cfg = bound_cfg
         assert cfg.corpus_root is not None
         assert cfg.db_path is not None
-        assert cfg.max_context_chars is not None
 
         program = self._custom_program if self._custom_program is not None else YawProgram.from_config(cfg)
         comp_path = compiled_program_override or cfg.compiled_program_path
@@ -374,6 +384,39 @@ class YawRuntime:
             program.load(str(comp_path))
 
         embedder = self._custom_embedder if self._custom_embedder is not None else DSPyEmbeddingAdapter.from_config(cfg)
+        deployment = models[cfg.embedding_model]
+        embedder.profile = replace(
+            embedder.profile, checkpoint=deployment.checkpoint, context_tokens=deployment.context_tokens
+        )
+        if isinstance(embedder.embedder.model, str):
+            # DSPy's native cache includes SDK kwargs: namespace the same alias
+            # by the active deployment without altering the requested model ID.
+            embedder.embedder.default_kwargs["extra_headers"] = {
+                "X-Yaw-Embedding-Deployment": embedder.profile.index_identity
+            }
+        program.context_window_tokens = context
+        assert cfg.rlm_max_output_chars is not None
+        program.max_output_tokens = cfg.max_output_tokens
+        program.shacl_healer_rlm.max_output_chars = cfg.rlm_max_output_chars
+        identities = {
+            "qa": (cfg.base_url, cfg.qa_model, models[cfg.qa_model].checkpoint, models[cfg.qa_model].context_tokens),
+            "extraction": (
+                cfg.base_url,
+                cfg.extraction_model,
+                models[cfg.extraction_model].checkpoint,
+                models[cfg.extraction_model].context_tokens,
+            ),
+        }
+        program._yaw_serving_identity = identities
+        for role, lm in (("qa", program.orchestrator_lm), ("extraction", program.rlm_sub_lm)):
+            if lm is not None:
+                lm._yaw_context_window_tokens = context
+                lm.kwargs["max_tokens"] = cfg.max_output_tokens
+                if isinstance(lm, YawDSPyLM):
+                    identity = hashlib.sha256(json.dumps(identities[role]).encode()).hexdigest()
+                    lm._yaw_deployment_identity = identity
+                    if "yaw_completion_identity" in lm.kwargs:
+                        lm.kwargs["yaw_completion_identity"] = identity
         src_settings = SourceSettings(
             included_patterns=tuple(cfg.included_patterns),
             excluded_patterns=tuple(cfg.excluded_patterns),
@@ -407,12 +450,12 @@ class YawRuntime:
             state_root=cfg.state_dir,
             source_settings=src_settings,
         )
+        engine.config = cfg
         return program, embedder, engine
 
     def _open_components(self) -> None:
         assert self.config.state_dir is not None
         _, _, self.engine = self._create_bound_engine(self.config)
-        self.engine.config = self.config
         self._build_coco_app()
         fp = self.config.config_fingerprint()
         self.engine.set_meta(_CONFIG_FP_META_KEY, fp)
@@ -435,6 +478,10 @@ class YawRuntime:
             self._embedding_endpoint = None
             self.engine = None
 
+    def _drain_embedding_telemetry(self) -> None:
+        if self.engine is not None and self._embedding_endpoint is not None:
+            self.engine.publish_indexing_embedding_telemetry(self._embedding_endpoint.drain_embedding_executions())
+
     def _start_live_update(self) -> None:
         """Host the native live update; CocoIndex owns filesystem and inference work."""
         if not self.auto_poll or self._stop_event.is_set() or self._live_thread is not None:
@@ -456,6 +503,7 @@ class YawRuntime:
                 if event.stats.total.num_errors:
                     raise YawRuntimeError("CONSISTENCY_ERROR", "CocoIndex live update reported component errors.")
                 if event.stats.total.num_in_progress == 0:
+                    self._drain_embedding_telemetry()
                     self._refresh_published_state()
                 if event.status == coco.UpdateStatus.READY and not ready.done():
                     ready.set_result(None)
@@ -470,6 +518,7 @@ class YawRuntime:
                 self._update_state(sync_state="error", last_error=str(exc)[:300])
                 self.request_stop()
             finally:
+                self._drain_embedding_telemetry()
                 if not ready.done():
                     ready.set_exception(RuntimeError("Live update ended before readiness"))
 
@@ -492,6 +541,7 @@ class YawRuntime:
                 asyncio.run(drain())
         finally:
             thread.join()
+            self._drain_embedding_telemetry()
             self._live_thread = None
         if self._live_error is not None:
             error = self._live_error
@@ -861,7 +911,10 @@ class YawRuntime:
             return handle.stats()
 
         self._pop_indexing_error()
-        update_stats = asyncio.run(_run_coco_update(self._coco_app))
+        try:
+            update_stats = asyncio.run(_run_coco_update(self._coco_app))
+        finally:
+            self._drain_embedding_telemetry()
         err = self._pop_indexing_error()
         if err is not None:
             raise err
@@ -935,7 +988,7 @@ class YawRuntime:
         query: str,
         top_k: int = 5,
     ) -> Future[list[HydratedPassage]]:
-        """Validate query and enqueue hybrid PPR + 1-indexed disk line hydration."""
+        """Validate query and enqueue hybrid HMM + 1-indexed disk line hydration."""
         cleaned = validate_query_input(query)
         if not isinstance(top_k, int) or top_k < 1 or top_k > 20:
             raise YawRuntimeError("INVALID_INPUT", "top_k must be an integer between 1 and 20.")
@@ -1407,7 +1460,6 @@ class YawRuntime:
             assert bench_cfg.corpus_root is not None
             assert bench_cfg.state_dir is not None
             assert bench_cfg.db_path is not None
-            assert bench_cfg.max_context_chars is not None
 
             if progress_callback is not None:
                 progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")

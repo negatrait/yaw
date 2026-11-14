@@ -1,75 +1,67 @@
-"""Sparse CSR matrix Personalized PageRank (PPR) power iteration engine."""
+"""Sparse entity-state HMM relevance inference with separate passage emissions (H1)."""
+
+from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import scipy.sparse as sp
 
-from yaw.core import RelationTraversalPolicy, bayesian_noisy_or, pool_confidences
-
-GraphActivation = Literal[
-    "linear",
-    "scaled_tanh",
-    "hard_tanh",
-    "shifted_tanh",
-    "threshold_relu",
-]
-
-DEFAULT_ACTIVATION_PARAMS: dict[str, float] = {
-    "scaled_tanh": 5.0,
-    "hard_tanh": 0.1,
-    "shifted_tanh": 0.001,
-    "threshold_relu": 1e-4,
-}
+from yaw.core import RelationTraversalPolicy
 
 
-def apply_graph_activation(
-    x: np.ndarray,
-    activation: GraphActivation | str = "linear",
-    param: float | None = None,
-) -> np.ndarray:
-    """Apply 1-Lipschitz non-linear activation pointwise (arXiv:2609.32929v1)."""
-    if activation == "linear":
-        return x
-    if activation == "scaled_tanh":
-        c = float(param) if param is not None and param > 0.0 else DEFAULT_ACTIVATION_PARAMS["scaled_tanh"]
-        return np.tanh(c * x) / c
-    if activation == "hard_tanh":
-        c = float(param) if param is not None and param > 0.0 else DEFAULT_ACTIVATION_PARAMS["hard_tanh"]
-        return np.clip(x, 0.0, c)
-    if activation == "shifted_tanh":
-        c = float(param) if param is not None and param >= 0.0 else DEFAULT_ACTIVATION_PARAMS["shifted_tanh"]
-        return np.maximum(0.0, np.tanh(np.maximum(0.0, x) - c))
-    if activation == "threshold_relu":
-        theta = float(param) if param is not None and param >= 0.0 else DEFAULT_ACTIVATION_PARAMS["threshold_relu"]
-        return np.maximum(0.0, x - theta)
-    raise ValueError(f"Unknown graph activation: {activation}")
+def min_max_normalize(scores: np.ndarray) -> np.ndarray:
+    """Normalize dense retrieval features into [0, 1]."""
+    arr = np.asarray(scores, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    span = float(arr.max() - arr.min())
+    return (arr - arr.min()) / span if span else np.ones_like(arr)
+
+
+@dataclass(frozen=True, slots=True)
+class HMMOperators:
+    """Entity transition potentials, passage emissions and independent source likelihoods."""
+
+    forward: sp.csr_matrix
+    backward: sp.csr_matrix
+    emissions: sp.csr_matrix
+    likelihoods: np.ndarray
+    forward_dangling: np.ndarray
+    backward_dangling: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
 class CSRGraph:
-    """Precomputed column-stochastic CSR graph operator for sub-millisecond PPR power iteration."""
-
     node_ids: tuple[str, ...]
     node_to_idx: Mapping[str, int]
     chunk_indices: np.ndarray
     chunk_ids: tuple[str, ...]
     transition_t: sp.csr_matrix
     dangling_mask: np.ndarray
+    hmm: HMMOperators
 
 
-def min_max_normalize(scores: np.ndarray) -> np.ndarray:
-    """Min-max normalize a float array into [0, 1] range matching upstream HippoRAG."""
-    arr = np.asarray(scores, dtype=np.float64)
-    if arr.size == 0:
-        return arr
-    min_val = float(np.min(arr))
-    max_val = float(np.max(arr))
-    if max_val == min_val:
-        return np.ones_like(arr, dtype=np.float64)
-    return (arr - min_val) / (max_val - min_val)
+def _noisy_or(shape: tuple[int, int], rows: list[int], cols: list[int], weights: list[float]) -> sp.csr_matrix:
+    if not weights:
+        return sp.csr_matrix(shape, dtype=np.float64)
+    with np.errstate(divide="ignore"):
+        failures = np.log1p(-np.asarray(weights, dtype=np.float64))
+    matrix = sp.coo_matrix((failures, (rows, cols)), shape=shape).tocsr()
+    matrix.data = -np.expm1(matrix.data)
+    matrix.eliminate_zeros()
+    return matrix
+
+
+def _normalize_potential(matrix: sp.csr_matrix, beta: float) -> tuple[sp.csr_matrix, np.ndarray]:
+    incoming = np.asarray(matrix.sum(axis=1)).ravel()
+    outgoing = np.asarray(matrix.sum(axis=0)).ravel()
+    row_scale = np.zeros_like(incoming)
+    col_scale = np.zeros_like(outgoing)
+    np.power(incoming, -beta, out=row_scale, where=incoming > 0)
+    np.power(outgoing, beta - 1.0, out=col_scale, where=outgoing > 0)
+    return (sp.diags(row_scale) @ matrix @ sp.diags(col_scale)).tocsr(), outgoing == 0
 
 
 def build_transition_matrix(
@@ -82,243 +74,213 @@ def build_transition_matrix(
     directed: bool = False,
     node_priors: Mapping[str, float | None] | None = None,
 ) -> CSRGraph:
-    """Construct a CSR transition operator W(beta) = D_in^-beta A D_out^-(1-beta) (arXiv:2609.32929v1)."""
-    ordered_chunks = list(dict.fromkeys(chunk_ids))
-    chunk_set = set(ordered_chunks)
-    ordered_entities = [e for e in dict.fromkeys(entity_ids) if e not in chunk_set]
-
-    all_nodes = tuple(ordered_chunks + ordered_entities)
-    node_to_idx = {nid: i for i, nid in enumerate(all_nodes)}
-    n_total = len(all_nodes)
-
-    chunk_indices = np.arange(len(ordered_chunks), dtype=np.int32)
-    tuple_chunk_ids = tuple(ordered_chunks)
-
-    if n_total == 0:
-        empty_csr = sp.csr_matrix((0, 0), dtype=np.float64)
-        return CSRGraph(
-            node_ids=(),
-            node_to_idx={},
-            chunk_indices=np.array([], dtype=np.int32),
-            chunk_ids=(),
-            transition_t=empty_csr,
-            dangling_mask=np.array([], dtype=bool),
-        )
-
-    pol = policy or RelationTraversalPolicy()
-    is_asymmetric = bool(
-        directed
-        or (
-            policy is not None
-            and (pol.fact_forward != pol.fact_reverse or pol.skos_broader_up != pol.skos_broader_down)
-        )
-    )
-
-    pair_weights: dict[tuple[int, int], list[float]] = {}
-
-    def _add_transition(from_idx: int, to_idx: int, to_node_id: str, edge_w: float, multiplier: float) -> None:
-        if multiplier <= 0.0 or edge_w <= 0.0:
-            return
-        prior = node_priors.get(to_node_id) if node_priors is not None else None
-        if prior is not None:
-            pooled = pool_confidences(edge_w, prior)
-            w_eff = float(multiplier) * (float(pooled) if pooled is not None else float(edge_w))
-        else:
-            w_eff = float(multiplier) * float(edge_w)
-        if w_eff > 0.0:
-            # Transition from from_idx (column) to to_idx (row)
-            pair_weights.setdefault((to_idx, from_idx), []).append(w_eff)
-
+    """Build positive entity potentials and passage emissions; the full matrix is an inspection view."""
+    if not np.isfinite(beta) or not 0 <= beta <= 1:
+        raise ValueError("beta must be finite and between 0 and 1")
+    chunks = tuple(dict.fromkeys(chunk_ids))
+    chunk_lookup = {key: i for i, key in enumerate(chunks)}
+    entities = tuple(key for key in dict.fromkeys(entity_ids) if key not in chunk_lookup)
+    entity_lookup = {key: i for i, key in enumerate(entities)}
+    nodes = chunks + entities
+    n_c, n_e = len(chunks), len(entities)
+    relation_policy = policy or RelationTraversalPolicy()
+    if any(not np.isfinite(value) or not 0 <= value <= 1 for value in relation_policy.to_dict().values()):
+        raise ValueError("Relation policy weights must be finite and between 0 and 1")
+    multipliers = {
+        "fact": (relation_policy.fact_forward, relation_policy.fact_reverse),
+        "skos:broader": (relation_policy.skos_broader_up, relation_policy.skos_broader_down),
+        "skos:related": (relation_policy.skos_related, relation_policy.skos_related),
+    }
+    emissions: dict[tuple[int, int], float] = {}
+    contributions: dict[str, tuple[list[int], list[int], list[float]]] = {kind: ([], [], []) for kind in multipliers}
     for edge in edges:
-        src = edge[0]
-        dst = edge[1]
-        u = node_to_idx.get(src)
-        v = node_to_idx.get(dst)
-        if u is None or v is None or u == v:
+        source, target = edge[:2]
+        weight = float(edge[-1])
+        if not np.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError("Graph evidence weights must be finite and between 0 and 1")
+        if source == target or weight == 0:
             continue
-
-        if len(edge) == 4:
-            kind = str(edge[2])
-            base_w = float(edge[3])
-        else:
-            kind = "passage"
-            base_w = float(edge[2])
-
-        if base_w <= 0.0 or kind == "owl:differentFrom":
+        kind = str(edge[2]) if len(edge) == 4 else "fact"
+        if kind == "owl:differentFrom":
             continue
-
-        if kind == "skos:broader":
-            is_asymmetric = True
-            _add_transition(u, v, dst, base_w, pol.skos_broader_up)
+        if source in chunk_lookup and target in entity_lookup:
             if not directed:
-                _add_transition(v, u, src, base_w, pol.skos_broader_down)
-        elif kind == "fact":
-            _add_transition(u, v, dst, base_w, pol.fact_forward)
-            if not directed:
-                _add_transition(v, u, src, base_w, pol.fact_reverse)
-        elif kind == "passage":
-            _add_transition(u, v, dst, base_w, pol.passage)
-            if not directed:
-                _add_transition(v, u, src, base_w, pol.passage)
-        else:
-            _add_transition(u, v, dst, base_w, pol.skos_related)
-            if not directed:
-                _add_transition(v, u, src, base_w, pol.skos_related)
-
-    if pair_weights:
-        rows: list[int] = []
-        cols: list[int] = []
-        data: list[float] = []
-        for (r, c), w_list in pair_weights.items():
-            w_compound = bayesian_noisy_or(w_list) if len(w_list) > 1 else w_list[0]
-            if w_compound is not None and w_compound > 0.0:
-                rows.append(r)
-                cols.append(c)
-                data.append(w_compound)
-
-        adj = sp.csr_matrix(
-            (np.asarray(data, dtype=np.float64), (np.asarray(rows, dtype=np.int32), np.asarray(cols, dtype=np.int32))),
-            shape=(n_total, n_total),
-            dtype=np.float64,
-        )
-    else:
-        adj = sp.csr_matrix((n_total, n_total), dtype=np.float64)
-
-    in_degrees = np.asarray(adj.sum(axis=1)).ravel()
-    out_degrees = np.asarray(adj.sum(axis=0)).ravel() if is_asymmetric else in_degrees
-    dangling_mask = out_degrees == 0.0
-    in_nonzero = in_degrees > 0.0
-
-    if adj.nnz > 0:
-        if beta == 0.0:
-            inv_deg = np.zeros(n_total, dtype=np.float64)
-            inv_deg[~dangling_mask] = 1.0 / out_degrees[~dangling_mask]
-            # Standard random-walk P^T = (D_out^-1 A_dir)^T = A D_out^-1 -> scale columns in-place
-            adj.data *= inv_deg[adj.indices]
-        elif beta == 0.5:
-            inv_sqrt_in = np.zeros(n_total, dtype=np.float64)
-            inv_sqrt_in[in_nonzero] = 1.0 / np.sqrt(in_degrees[in_nonzero])
-            inv_sqrt_out = (
-                inv_sqrt_in
-                if not is_asymmetric
-                else np.where(~dangling_mask, 1.0 / np.sqrt(np.where(~dangling_mask, out_degrees, 1.0)), 0.0)
-            )
-            row_indices = np.repeat(np.arange(n_total, dtype=np.int32), np.diff(adj.indptr))
-            # Generalized GCN normalization: W = D_in^-0.5 A D_out^-0.5
-            adj.data *= inv_sqrt_in[row_indices] * inv_sqrt_out[adj.indices]
-        elif beta == 1.0:
-            inv_deg = np.zeros(n_total, dtype=np.float64)
-            inv_deg[in_nonzero] = 1.0 / in_degrees[in_nonzero]
-            row_indices = np.repeat(np.arange(n_total, dtype=np.int32), np.diff(adj.indptr))
-            # Row-stochastic normalization: W = D_in^-1 A
-            adj.data *= inv_deg[row_indices]
-        else:
-            b = float(beta)
-            r_scale = np.zeros(n_total, dtype=np.float64)
-            c_scale = np.zeros(n_total, dtype=np.float64)
-            r_scale[in_nonzero] = in_degrees[in_nonzero] ** (-b)
-            c_scale[~dangling_mask] = out_degrees[~dangling_mask] ** (-(1.0 - b))
-            row_indices = np.repeat(np.arange(n_total, dtype=np.int32), np.diff(adj.indptr))
-            # Generalized degree normalization: W = D_in^-beta A D_out^-(1-beta)
-            adj.data *= r_scale[row_indices] * c_scale[adj.indices]
-
+                key = (chunk_lookup[source], entity_lookup[target])
+                emissions[key] = max(emissions.get(key, 0.0), weight)
+        elif target in chunk_lookup and source in entity_lookup:
+            key = (chunk_lookup[target], entity_lookup[source])
+            emissions[key] = max(emissions.get(key, 0.0), weight)
+        elif source in entity_lookup and target in entity_lookup:
+            if kind not in contributions:
+                raise ValueError(f"Unsupported entity relation kind: {kind!r}")
+            rows, cols, weights = contributions[kind]
+            rows.append(entity_lookup[target])
+            cols.append(entity_lookup[source])
+            weights.append(weight)
+    emission_matrix = sp.csr_matrix((n_c, n_e), dtype=np.float64)
+    if emissions and relation_policy.passage:
+        coordinates = tuple(emissions)
+        emission_matrix = sp.coo_matrix(
+            (
+                [emissions[key] * relation_policy.passage for key in coordinates],
+                ([key[0] for key in coordinates], [key[1] for key in coordinates]),
+            ),
+            shape=(n_c, n_e),
+        ).tocsr()
+    entity_rows: list[int] = []
+    entity_cols: list[int] = []
+    entity_weights: list[float] = []
+    for kind, (rows, cols, weights) in contributions.items():
+        observation = _noisy_or((n_e, n_e), rows, cols, weights)
+        if kind == "skos:related" and not directed:
+            # Opposing rows are copies of one symmetric observation. Pool
+            # same-direction evidence first, then keep the stronger copy once.
+            observation = sp.triu(observation.maximum(observation.T), k=1, format="csr")
+        observation = observation.tocoo()
+        forward_weight, reverse_weight = multipliers[kind]
+        if forward_weight:
+            entity_rows.extend(observation.row.tolist())
+            entity_cols.extend(observation.col.tolist())
+            entity_weights.extend((observation.data * forward_weight).tolist())
+        if reverse_weight and not directed:
+            entity_rows.extend(observation.col.tolist())
+            entity_cols.extend(observation.row.tolist())
+            entity_weights.extend((observation.data * reverse_weight).tolist())
+    adjacency = _noisy_or((n_e, n_e), entity_rows, entity_cols, entity_weights)
+    forward, forward_dangling = _normalize_potential(adjacency, beta)
+    backward, backward_dangling = _normalize_potential(adjacency.T.tocsr(), beta)
+    likelihoods = np.ones(n_e, dtype=np.float64)
+    for name, value in (node_priors or {}).items():
+        if value is not None:
+            if not np.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("Entity confidence must be finite and between 0 and 1")
+            if name in entity_lookup:
+                likelihoods[entity_lookup[name]] = value
+    full = sp.bmat(
+        [
+            [sp.csr_matrix((n_c, n_c)), emission_matrix],
+            [sp.csr_matrix((n_e, n_c)) if directed else emission_matrix.T, forward],
+        ],
+        format="csr",
+    )
+    dangling = np.asarray(full.sum(axis=0)).ravel() == 0
     return CSRGraph(
-        node_ids=all_nodes,
-        node_to_idx=node_to_idx,
-        chunk_indices=chunk_indices,
-        chunk_ids=tuple_chunk_ids,
-        transition_t=adj,
-        dangling_mask=dangling_mask,
+        nodes,
+        {key: i for i, key in enumerate(nodes)},
+        np.arange(n_c),
+        chunks,
+        full,
+        dangling,
+        HMMOperators(forward, backward, emission_matrix, likelihoods, forward_dangling, backward_dangling),
     )
 
 
-def run_ppr(
+def _filter(
+    potential: sp.csr_matrix,
+    dangling: np.ndarray,
+    seed: np.ndarray,
+    likelihoods: np.ndarray,
+    damping: float,
+    max_iter: int,
+    tol: float,
+) -> np.ndarray:
+    state = seed * likelihoods
+    total = float(state.sum())
+    if total == 0:
+        return state
+    state /= total
+    for _ in range(max_iter):
+        next_state = likelihoods * (
+            damping * (potential @ state + float(state[dangling].sum()) * seed) + (1 - damping) * seed
+        )
+        total = float(next_state.sum())
+        if total == 0:
+            return next_state
+        next_state /= total
+        if float(np.abs(next_state - state).sum()) <= tol:
+            return next_state
+        state = next_state
+    return state
+
+
+def _emit(emissions: sp.csr_matrix, state: np.ndarray) -> np.ndarray:
+    result = np.zeros(emissions.shape[0], dtype=np.float64)
+    nonempty = np.flatnonzero(np.diff(emissions.indptr))
+    if nonempty.size:
+        failure = 1 - emissions.data * state[emissions.indices]
+        result[nonempty] = 1 - np.multiply.reduceat(failure, emissions.indptr[nonempty])
+    return result
+
+
+def run_hmm(
     graph: CSRGraph,
     reset_weights: Mapping[str, float] | np.ndarray,
     *,
     damping: float = 0.5,
     max_iter: int = 100,
     tol: float = 1e-6,
-    activation: GraphActivation | str = "scaled_tanh",
-    activation_param: float | None = 5.0,
-    renormalize: bool = False,
-    dual_weight: float | None = 0.5,
 ) -> np.ndarray:
-    """Run Personalized PageRank or non-linear graph propagation (arXiv:2609.32929v1)."""
-    n_nodes = len(graph.node_ids)
-    if n_nodes == 0:
-        return np.array([], dtype=np.float64)
-
+    """Infer entity relevance and emit passage relevance; the two layers do not share one mass."""
+    if not np.isfinite(damping) or not 0 <= damping <= 1:
+        raise ValueError("damping must be finite and between 0 and 1")
+    if type(max_iter) is not int or max_iter < 0 or not np.isfinite(tol) or tol < 0:
+        raise ValueError("max_iter and tol must be nonnegative finite bounds")
     if isinstance(reset_weights, Mapping):
-        p0 = np.zeros(n_nodes, dtype=np.float64)
-        for nid, w in reset_weights.items():
-            idx = graph.node_to_idx.get(nid)
-            if idx is not None and w > 0.0:
-                p0[idx] += float(w)
+        seed = np.zeros(len(graph.node_ids), dtype=np.float64)
+        for name, weight in reset_weights.items():
+            if not np.isfinite(weight) or weight < 0:
+                raise ValueError("Seed evidence must be finite and nonnegative")
+            if name in graph.node_to_idx:
+                seed[graph.node_to_idx[name]] += weight
     else:
-        p0 = np.asarray(reset_weights, dtype=np.float64).copy()
-        if p0.size != n_nodes:
-            raise ValueError(f"Reset vector size {p0.size} does not match graph nodes {n_nodes}")
-
-    total_w = float(np.sum(p0))
-    if total_w <= 0.0:
-        p0 = np.ones(n_nodes, dtype=np.float64) / n_nodes
+        seed = np.array(reset_weights, dtype=np.float64, copy=True).ravel()
+        if seed.size != len(graph.node_ids):
+            raise ValueError(f"Reset vector size {seed.size} does not match graph nodes {len(graph.node_ids)}")
+        if not np.all(np.isfinite(seed)) or np.any(seed < 0):
+            raise ValueError("Seed evidence must be finite and nonnegative")
+    total = float(seed.sum())
+    if total == 0:
+        return seed
+    seed /= total
+    n_c = len(graph.chunk_ids)
+    operators = graph.hmm
+    entity_seed = seed[n_c:] + operators.emissions.T @ seed[:n_c]
+    total = float(entity_seed.sum())
+    if total == 0:
+        return seed
+    entity_seed /= total
+    forward = _filter(
+        operators.forward, operators.forward_dangling, entity_seed, operators.likelihoods, damping, max_iter, tol
+    )
+    if np.count_nonzero(entity_seed) > 1:
+        backward = _filter(
+            operators.backward, operators.backward_dangling, entity_seed, operators.likelihoods, damping, max_iter, tol
+        )
+        posterior = forward * backward
+        mass = float(posterior.sum())
+        if mass > 0:
+            posterior /= mass
     else:
-        p0 /= total_w
-
-    p = p0.copy()
-    alpha = float(damping)
-    teleport = (1.0 - alpha) * p0
-    p_raw = p.copy()
-
-    for _ in range(max_iter):
-        dangling_mass = float(np.sum(p[graph.dangling_mask]))
-        p_raw = alpha * (graph.transition_t.dot(p) + dangling_mass * p0) + teleport
-        if activation != "linear":
-            p_next = apply_graph_activation(p_raw, activation, activation_param)
-            if renormalize:
-                s = float(np.sum(p_next))
-                if s > 0.0:
-                    p_next = p_next / s
-        else:
-            p_next = p_raw
-
-        err = float(np.sum(np.abs(p_next - p)))
-        p = p_next
-        if err < tol:
-            break
-
-    if dual_weight is not None and activation != "linear":
-        lam = float(np.clip(dual_weight, 0.0, 1.0))
-        y_norm = min_max_normalize(p_raw)
-        z_norm = min_max_normalize(p)
-        return (1.0 - lam) * y_norm + lam * z_norm
-
-    return p
+        posterior = forward
+    passage = 1 - (1 - _emit(operators.emissions, posterior)) * (1 - seed[:n_c])
+    return np.concatenate((passage, posterior))
 
 
-def rank_passages_by_ppr(
-    graph: CSRGraph,
-    ppr_scores: np.ndarray,
-    top_k: int = 10,
-) -> list[tuple[str, float]]:
-    """Extract and sort passage node PPR probabilities in descending score order."""
-    if len(graph.chunk_indices) == 0 or top_k <= 0 or ppr_scores.size == 0:
+def rank_passages_by_hmm(graph: CSRGraph, scores: np.ndarray, top_k: int = 10) -> list[tuple[str, float]]:
+    """Rank actual emitted passage relevance with stable graph-order ties."""
+    if scores.size != len(graph.node_ids):
+        raise ValueError("HMM score size does not match graph nodes")
+    if top_k <= 0:
         return []
-    passage_scores = ppr_scores[graph.chunk_indices]
-    k = min(top_k, len(graph.chunk_indices))
-    # Negative argsort for descending order
-    order = np.argsort(-passage_scores)[:k]
-    return [(graph.chunk_ids[i], float(passage_scores[i])) for i in order]
+    order = np.argsort(-scores[: len(graph.chunk_ids)], kind="stable")
+    return [(graph.chunk_ids[i], float(scores[i])) for i in order if scores[i] > 0][:top_k]
 
 
 __all__ = [
     "CSRGraph",
-    "DEFAULT_ACTIVATION_PARAMS",
-    "GraphActivation",
-    "apply_graph_activation",
+    "HMMOperators",
     "build_transition_matrix",
     "min_max_normalize",
-    "rank_passages_by_ppr",
-    "run_ppr",
+    "rank_passages_by_hmm",
+    "run_hmm",
 ]

@@ -51,7 +51,7 @@ from yaw.daemon.graph.storage import (
     get_entity_metadata_batch,
     get_meta,
     inspect_focus_node,
-    iter_synonym_evidence,
+    iter_semantic_evidence,
     lint_graph_shacl,
     load_affected_neighborhood,
     merge_entities,
@@ -113,7 +113,7 @@ class GraphPlanSettings:
     semantic_adjudication_batch_size: int = 5
     ast_context_hops: int = 1
     context_window_tokens: int = 32768
-    max_output_tokens: int = 4096
+    max_output_tokens: int | None = None
     chunk_size: int = 1000
     chunk_overlap: int = 150
     min_chunk_size: int = 100
@@ -170,8 +170,7 @@ class GraphPlanResult:
     telemetry: tuple[dict[str, Any], ...] = ()
     entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
     label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    relation_judge_audit_trail: tuple[dict[str, Any], ...] = ()
     shacl_audit_trail: tuple[dict[str, Any], ...] = ()
     rlm_stats: dict[str, Any] = field(default_factory=dict)
 
@@ -185,8 +184,7 @@ class GraphPlanSummary:
     telemetry: tuple[dict[str, Any], ...] = ()
     entity_def_audit_trail: tuple[dict[str, Any], ...] = ()
     label_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    hierarchy_judge_audit_trail: tuple[dict[str, Any], ...] = ()
-    related_judge_audit_trail: tuple[dict[str, Any], ...] = ()
+    relation_judge_audit_trail: tuple[dict[str, Any], ...] = ()
     shacl_audit_trail: tuple[dict[str, Any], ...] = ()
     rlm_stats: dict[str, Any] = field(default_factory=dict)
 
@@ -198,8 +196,7 @@ def summarize_graph_plan(plan: GraphPlanResult) -> GraphPlanSummary:
         telemetry=plan.telemetry,
         entity_def_audit_trail=plan.entity_def_audit_trail,
         label_judge_audit_trail=plan.label_judge_audit_trail,
-        hierarchy_judge_audit_trail=plan.hierarchy_judge_audit_trail,
-        related_judge_audit_trail=plan.related_judge_audit_trail,
+        relation_judge_audit_trail=plan.relation_judge_audit_trail,
         shacl_audit_trail=plan.shacl_audit_trail,
         rlm_stats=dict(plan.rlm_stats),
     )
@@ -779,7 +776,7 @@ async def plan_graph_publication(
     extraction = coco.use_context(OPENIE_ENDPOINT)
     if (
         settings.program_identity != extraction.program_identity
-        or settings.embedding_identity != embeddings.adapter.profile.index_identity
+        or settings.embedding_identity != embeddings.adapter.index_identity
     ):
         raise ValueError("Graph plan settings identity does not match the bound inference endpoints")
 
@@ -787,8 +784,7 @@ async def plan_graph_publication(
     all_telemetry: list[dict[str, Any]] = []
     entity_def_audit: list[dict[str, Any]] = []
     label_judge_audit: list[dict[str, Any]] = []
-    hierarchy_judge_audit: list[dict[str, Any]] = []
-    related_judge_audit: list[dict[str, Any]] = []
+    relation_judge_audit: list[dict[str, Any]] = []
     shacl_audit: list[dict[str, Any]] = []
     rlm_stats: dict[str, Any] = {
         "missing_entity_defs_count": 0,
@@ -796,8 +792,7 @@ async def plan_graph_publication(
         "homograph_splits": 0,
         "candidate_pairs": 0,
         "label_judge_tokens": 0,
-        "hierarchy_judge_tokens": 0,
-        "related_judge_tokens": 0,
+        "relation_judge_tokens": 0,
         "merged_entities": 0,
         "different_from_edges": 0,
         "broader_edges": 0,
@@ -891,6 +886,7 @@ async def plan_graph_publication(
             else EmbeddingRequest(
                 texts=(t,),
                 profile=embeddings.adapter.profile,
+                index_identity=embeddings.adapter.index_identity,
                 task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
                 batch_size=64,
                 max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
@@ -902,7 +898,6 @@ async def plan_graph_publication(
         vec_by_text: dict[str, np.ndarray] = {}
         for t, emb in zip(unique_texts, embedded_unique, strict=True):
             vec_by_text[t] = deserialize_f32_vector(emb.vector_f32)
-            all_telemetry.append(dict(emb.telemetry))
         return [vec_by_text[t] for t in texts]
 
     # 1. Normalize OpenIE records & synthesize missing entity definitions via memoized define_missing_entities
@@ -1095,23 +1090,16 @@ async def plan_graph_publication(
             if candidates:
                 constraints = SynonymConstraints(staging_conn, tuple(materialized.fact_linked_pairs))
                 candidate_order = {str(c["pair_id"]): index for index, c in enumerate(candidates)}
-                # Cognitive Load Safeguard: clamp batch_limit to max 4 pairs. Smaller models (4B-8B)
-                # suffer attention dispersion and conservative rejection when evaluating too many pairs at once.
-                # Actual prompt context fit is strictly governed by fits=extraction.program.semantic_adjudication_fits
-                # via DSPy adapter token counting. max_dossier_chars serves purely as a generous in-memory backstop
-                # (context_window_tokens * 3) to prevent unbounded memory growth before tokenization, ensuring
-                # individual pairs with rich context/excerpts are never prematurely split or rejected by
-                # character heuristics.
-                batch_limit = max(1, min(settings.semantic_adjudication_batch_size, 4))
+                # Pair count bounds requests; the provider enforces actual token capacity.
+                batch_limit = settings.semantic_adjudication_batch_size
                 max_dossier_chars = max(40000, settings.context_window_tokens * 3)
-                evidence_batches = iter_synonym_evidence(
+                evidence_batches = iter_semantic_evidence(
                     staging_conn,
                     candidates,
                     settings.corpus_root,
                     ast_context_hops=settings.ast_context_hops,
                     batch_size=batch_limit,
                     max_chars=max_dossier_chars,
-                    fits=extraction.program.semantic_adjudication_fits,
                 )
                 for batch_idx, ev in enumerate(evidence_batches, start=1):
                     original_count = len(ev.candidates)
@@ -1144,10 +1132,8 @@ async def plan_graph_publication(
                     all_telemetry.extend(judged.telemetry)
                     for entry in judged.audit_trail:
                         pred_name = entry.get("predictor") or entry.get("stage")
-                        if pred_name == "hierarchy_judge":
-                            hierarchy_judge_audit.append(entry)
-                        elif pred_name == "related_judge":
-                            related_judge_audit.append(entry)
+                        if pred_name == "relation_judge":
+                            relation_judge_audit.append(entry)
                         else:
                             label_judge_audit.append(entry)
                     rlm_stats["label_judge_tokens"] += sum(
@@ -1155,15 +1141,10 @@ async def plan_graph_publication(
                         for x in (judged.audit_trail or judged.telemetry)
                         if (x.get("predictor") or x.get("stage")) == "label_judge"
                     )
-                    rlm_stats["hierarchy_judge_tokens"] += sum(
+                    rlm_stats["relation_judge_tokens"] += sum(
                         int(x.get("tokens_used", 0))
                         for x in (judged.audit_trail or judged.telemetry)
-                        if (x.get("predictor") or x.get("stage")) == "hierarchy_judge"
-                    )
-                    rlm_stats["related_judge_tokens"] += sum(
-                        int(x.get("tokens_used", 0))
-                        for x in (judged.audit_trail or judged.telemetry)
-                        if (x.get("predictor") or x.get("stage")) == "related_judge"
+                        if (x.get("predictor") or x.get("stage")) == "relation_judge"
                     )
 
             judged_merges, _ = apply_synonym_adjudication(
@@ -1354,8 +1335,7 @@ async def plan_graph_publication(
             telemetry=tuple(all_telemetry),
             entity_def_audit_trail=tuple(entity_def_audit),
             label_judge_audit_trail=tuple(label_judge_audit),
-            hierarchy_judge_audit_trail=tuple(hierarchy_judge_audit),
-            related_judge_audit_trail=tuple(related_judge_audit),
+            relation_judge_audit_trail=tuple(relation_judge_audit),
             shacl_audit_trail=tuple(shacl_audit),
             rlm_stats=rlm_stats,
         )

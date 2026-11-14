@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -29,26 +30,19 @@ from scripts.evaluation import (
 from scripts.evaluation import (
     RetrievalRecall as ScriptRetrievalRecall,
 )
+from yaw.core.config import YawConfig, load_config
 from yaw.core.logger import configure_logging
 from yaw.daemon.graph.inference import check_benchmark_integrity
 from yaw.daemon.graph.inference.embedding import (
     FACT_INSTRUCTION,
     GEMMA_TASK_MODES,
-    MODEL,
     PASSAGE_INSTRUCTION,
     PROFILES,
     DSPyEmbeddingAdapter,
-    create_dspy_embedder,
     resolve_embedding_profile,
 )
 from yaw.daemon.graph.inference.models import (
-    BASE_URL,
     CHAT_MODELS,
-    DEFAULT_EXTRACTION_CHAT,
-    DEFAULT_QA_CHAT,
-    chat_evidence,
-    embedding_evidence,
-    preflight,
 )
 from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import (
@@ -56,6 +50,7 @@ from yaw.daemon.ingestion import (
 )
 from yaw.daemon.ingestion import (
     DATASETS,
+    SourceSettings,
     build_benchmark_slice,
     get_gold_answers,
     get_gold_docs,
@@ -194,7 +189,7 @@ def run_yaw_benchmark(
     gold_docs: list[list[str]] | None,
     gold_answers: list[list[str]],
     train_samples: list[dict],
-    profile: Any,
+    config: YawConfig,
     extraction_model: str,
     qa_model: str,
     include_qa: bool,
@@ -213,11 +208,7 @@ def run_yaw_benchmark(
     damping: float = DAMPING,
     passage_seed_pool_k: int = PASSAGE_SEED_POOL_K,
     fts_seed_pool_k: int = FTS_SEED_POOL_K,
-    graph_activation: str = "scaled_tanh",
-    graph_activation_param: float | None = 5.0,
-    graph_activation_renormalize: bool = False,
     graph_beta: float = 0.5,
-    graph_dual_weight: float | None = 0.5,
 ) -> dict[str, Any]:
     """Execute live benchmark using native YawGraphEngine and DSPy HippoRAG 2 pipeline."""
     import dspy
@@ -229,13 +220,29 @@ def run_yaw_benchmark(
         create_dspy_rlm_pair,
     )
 
+    assert config.workspace_root is not None
+    diagnostic_dir = config.workspace_root / "outputs" / "inference_failures"
     extraction_lm = create_dspy_lm(
         model_name=extraction_model,
-        base_url=BASE_URL,
+        diagnostic_dir=diagnostic_dir,
+        base_url=config.base_url,
+        api_key=config.api_key,
+        provider=config.provider,
+        context_window_tokens=config.context_window_tokens,
+        max_tokens=config.max_output_tokens,
         role="extraction",
     )
     qa_lm = (
-        create_dspy_lm(model_name=qa_model, base_url=BASE_URL, role="qa")
+        create_dspy_lm(
+            model_name=qa_model,
+            diagnostic_dir=diagnostic_dir,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            provider=config.provider,
+            context_window_tokens=config.context_window_tokens,
+            max_tokens=config.max_output_tokens,
+            role="qa",
+        )
         if qa_model != extraction_model
         else extraction_lm
     )
@@ -244,11 +251,19 @@ def run_yaw_benchmark(
         rlm_sub_lm=extraction_lm,
         enable_gbnf=enable_gbnf,
         compiled_path=compiled_program,
+        context_window_tokens=config.context_window_tokens,
+        max_output_tokens=config.max_output_tokens,
+        gbnf_max_entities=config.gbnf_max_entities,
+        gbnf_max_triples=config.gbnf_max_triples,
+        gbnf_max_facts=config.gbnf_max_facts,
+        gbnf_max_reasoning_chars=config.gbnf_max_reasoning_chars,
+        rlm_max_iters=config.rlm_max_iters,
+        rlm_max_llm_calls=config.rlm_max_llm_calls,
+        rlm_max_output_chars=config.rlm_max_output_chars,
     )
     dspy.settings.configure(lm=qa_lm)
 
-    embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
-    embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
+    embedder = DSPyEmbeddingAdapter.from_config(config)
 
     index_dir.mkdir(parents=True, exist_ok=True)
     db_path = index_dir / "yaw.db"
@@ -270,13 +285,25 @@ def run_yaw_benchmark(
             damping=damping,
             passage_seed_pool_k=passage_seed_pool_k,
             fts_seed_pool_k=fts_seed_pool_k,
-            activation=graph_activation,
-            activation_param=graph_activation_param,
-            activation_renormalize=graph_activation_renormalize,
             beta=graph_beta,
-            dual_weight=graph_dual_weight,
-        )
+            semantic_adjudication_batch_size=config.semantic_adjudication_batch_size,
+            embed_batch_size=config.embed_batch_size,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            min_chunk_size=config.min_chunk_size,
+        ),
+        state_root=config.state_dir,
+        source_settings=SourceSettings(
+            config.included_patterns,
+            config.excluded_patterns,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            min_chunk_size=config.min_chunk_size,
+            json_keys_whitelist=config.json_keys_whitelist,
+            json_keys_blacklist=config.json_keys_blacklist,
+        ),
     )
+    yaw_engine.config = config
     try:
         index_start = perf_counter()
         num_docs = len(document_ids)
@@ -336,9 +363,13 @@ def run_yaw_benchmark(
                     for q, ga, gd in disjoint_val
                 ]
             ref_lm, ref_worker_lm = create_dspy_rlm_pair(
-                orchestrator_model=DEFAULT_QA_CHAT,
+                orchestrator_model=qa_model,
                 sub_model=extraction_model,
-                base_url=BASE_URL,
+                base_url=config.base_url,
+                api_key=config.api_key,
+                provider=config.provider,
+                context_window_tokens=config.context_window_tokens,
+                max_tokens=config.max_output_tokens,
                 reflection=True,
             )
             yaw_engine.evolve_prompts(
@@ -566,9 +597,6 @@ def run_yaw_benchmark(
             "damping": damping,
             "passage_seed_pool_k": passage_seed_pool_k,
             "fts_seed_pool_k": fts_seed_pool_k,
-            "graph_activation": graph_activation,
-            "graph_activation_param": graph_activation_param,
-            "graph_activation_renormalize": graph_activation_renormalize,
         }
         expected_doc_count = (
             int(report["graph"]["num_passage_nodes"])
@@ -596,17 +624,18 @@ def main(
     index_queries: int | None = None,
     full_corpus: bool = False,
     mode: str = "eval",
-    enable_gbnf: bool = False,
+    enable_gbnf: bool | None = None,
     query_offset: int = 0,
     evolve: str = "none",
     train_queries: int = 0,
     compiled_program: str | None = None,
     chat_model: str | None = None,
-    embedding_model: str = MODEL,
-    extraction_model: str = DEFAULT_EXTRACTION_CHAT,
-    qa_model: str = DEFAULT_QA_CHAT,
-    embedding_task_mode: str = "distinct-titled",
+    embedding_model: str | None = None,
+    extraction_model: str | None = None,
+    qa_model: str | None = None,
+    embedding_task_mode: str | None = None,
     fresh_index: bool = False,
+    config_path: Path | str | None = None,
     linking_top_k: int = LINKING_TOP_K,
     fact_candidate_pool_k: int = FACT_CANDIDATE_POOL_K,
     fact_fts_pool_k: int = FACT_FTS_POOL_K,
@@ -614,18 +643,25 @@ def main(
     fact_fts_weight: float = FACT_FTS_WEIGHT,
     passage_node_weight: float = PASSAGE_NODE_WEIGHT,
     fts_weight: float = FTS_WEIGHT,
-    damping: float = DAMPING,
+    damping: float | None = None,
     passage_seed_pool_k: int = PASSAGE_SEED_POOL_K,
     fts_seed_pool_k: int = FTS_SEED_POOL_K,
-    graph_activation: str = "scaled_tanh",
-    graph_activation_param: float | None = 5.0,
-    graph_activation_renormalize: bool = False,
     graph_beta: float = 0.5,
-    graph_dual_weight: float | None = 0.5,
 ):
+    config = load_config(config_path or PROJECT_ROOT / "yaw.toml")
+    config = replace(
+        config,
+        embedding_model=embedding_model if embedding_model is not None else config.embedding_model,
+        extraction_model=extraction_model if extraction_model is not None else config.extraction_model,
+        qa_model=qa_model if qa_model is not None else config.qa_model,
+        embedding_task_mode=embedding_task_mode if embedding_task_mode is not None else config.embedding_task_mode,
+        enable_gbnf=enable_gbnf if enable_gbnf is not None else config.enable_gbnf,
+    )
     if chat_model is not None:
-        extraction_model = chat_model
-        qa_model = chat_model
+        config = replace(config, extraction_model=chat_model, qa_model=chat_model)
+    damping = config.damping if damping is None else damping
+    embedding_model, extraction_model, qa_model = config.embedding_model, config.extraction_model, config.qa_model
+    embedding_task_mode, enable_gbnf = config.embedding_task_mode, config.enable_gbnf
     include_qa = mode not in ("embeddings", "retrieval")
     profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
 
@@ -678,7 +714,9 @@ def main(
     run_dir = Path(tempfile.mkdtemp(prefix=f"run-{dataset}-", dir=root))
 
     slice_hash = hashlib.sha256("\n".join(docs).encode("utf-8")).hexdigest()[:10]
-    id_hash = hashlib.sha256(f"yaw|{profile.index_identity}|{extraction_model}".encode()).hexdigest()[:10]
+    id_hash = hashlib.sha256(
+        f"yaw|{profile.index_identity}|{config.config_fingerprint()}|{config.provider}|{config.base_url}".encode()
+    ).hexdigest()[:10]
     index_dir = run_dir / "index" if fresh_index else root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
 
     configure_logging(log_file=run_dir / "run.log", max_lines=500)
@@ -705,7 +743,9 @@ def main(
         "num_docs": num_docs,
         "full_corpus": full_corpus,
         "embedding_model": profile.model,
-        "checkpoint": profile.checkpoint,
+        "configured_checkpoint": profile.checkpoint,
+        "identity_source": "configured-profile",
+        "config_fingerprint": config.config_fingerprint(),
         "embedding_task_mode": embedding_task_mode,
         "query_instruction_mode": profile.query_instruction_mode,
         "parse_document_title": profile.parse_document_title,
@@ -714,7 +754,9 @@ def main(
         "chat_model": (
             extraction_model if not include_qa or extraction_model == qa_model else f"{extraction_model} -> {qa_model}"
         ),
-        "base_url": BASE_URL,
+        "base_url": config.base_url,
+        "context_window_tokens": config.context_window_tokens,
+        "max_output_tokens": config.max_output_tokens,
         "index_identity": profile.index_identity,
         "index_dir": str(index_dir),
         "run_dir": str(run_dir),
@@ -729,44 +771,27 @@ def main(
         "damping": damping,
         "passage_seed_pool_k": passage_seed_pool_k,
         "fts_seed_pool_k": fts_seed_pool_k,
-        "graph_activation": graph_activation,
-        "graph_activation_param": graph_activation_param,
-        "graph_activation_renormalize": graph_activation_renormalize,
         "graph_beta": graph_beta,
-        "graph_dual_weight": graph_dual_weight,
     }
     print(
         f"\n[Native YAW] Benchmark run: {run_dir} (dataset={dataset}, queries={len(queries)}, docs={num_docs})",
         flush=True,
     )
     try:
-        report["model_registry"] = preflight(
-            profile,
-            None if mode == "embeddings" else extraction_model,
-            None if not include_qa or qa_model == extraction_model else qa_model,
-        )
         if mode in ("embeddings", "all"):
-            embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
-            embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
+            embedder = DSPyEmbeddingAdapter.from_config(config)
             report["embedding_probes"] = verify_embeddings(embedder, queries, embedding_probe_docs)
-            report["server"] = embedding_evidence(profile)
-            report["index_identity"] = report["server"]["resolved_index_identity"]
             if mode == "embeddings":
                 report["status"] = "passed"
                 return report
-        report["chat_backends"] = {
-            "extraction": chat_evidence(extraction_model),
-            "qa": chat_evidence(qa_model) if include_qa else None,
-        }
-        report["status"] = "passed"
-        return run_yaw_benchmark(
+        result = run_yaw_benchmark(
             dataset=dataset,
             document_ids=docs,
             queries=queries,
             gold_docs=gold_docs,
             gold_answers=gold_answers,
             train_samples=train_samples,
-            profile=profile,
+            config=config,
             extraction_model=extraction_model,
             qa_model=qa_model,
             include_qa=include_qa,
@@ -785,13 +810,11 @@ def main(
             damping=damping,
             passage_seed_pool_k=passage_seed_pool_k,
             fts_seed_pool_k=fts_seed_pool_k,
-            graph_activation=graph_activation,
-            graph_activation_param=graph_activation_param,
-            graph_activation_renormalize=graph_activation_renormalize,
             graph_beta=graph_beta,
-            graph_dual_weight=graph_dual_weight,
         )
-    except Exception as error:
+        report["status"] = "passed"
+        return result
+    except BaseException as error:
         report["status"] = "failed"
         report["error"] = f"{type(error).__name__}: {error}"
         raise
@@ -808,6 +831,9 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=DATASETS, default="sample")
+    parser.add_argument(
+        "--config", type=Path, default=None, help="Inference and ingestion settings (default: yaw.toml)."
+    )
     parser.add_argument(
         "--max-queries",
         type=int,
@@ -838,10 +864,10 @@ if __name__ == "__main__":
         default=None,
         help="Override both extraction and QA chat models with a single model.",
     )
-    parser.add_argument("--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT)
-    parser.add_argument("--qa-model", choices=tuple(CHAT_MODELS), default=DEFAULT_QA_CHAT)
-    parser.add_argument("--embedding-model", choices=tuple(PROFILES), default=MODEL)
-    parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled")
+    parser.add_argument("--extraction-model", choices=tuple(CHAT_MODELS), default=None)
+    parser.add_argument("--qa-model", choices=tuple(CHAT_MODELS), default=None)
+    parser.add_argument("--embedding-model", choices=tuple(PROFILES), default=None)
+    parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default=None)
     parser.add_argument(
         "--fresh-index",
         action="store_true",
@@ -850,7 +876,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable-gbnf",
         action="store_true",
-        default=False,
+        default=None,
         help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.",
     )
     parser.add_argument(
@@ -911,7 +937,7 @@ if __name__ == "__main__":
         "--passage-node-weight",
         type=float,
         default=PASSAGE_NODE_WEIGHT,
-        help="Weight applied to passage reset distribution in PPR (default: 0.05).",
+        help="Weight applied to passage reset distribution in HMM (default: 0.05).",
     )
     parser.add_argument(
         "--fts-weight",
@@ -922,8 +948,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--damping",
         type=float,
-        default=DAMPING,
-        help="PPR damping restart probability parameter (default: 0.5).",
+        default=None,
+        help="HMM transition weight; restart weight is 1 - damping (default: graph.damping in yaw.toml).",
     )
     parser.add_argument(
         "--passage-seed-pool-k",
@@ -937,40 +963,18 @@ if __name__ == "__main__":
         default=FTS_SEED_POOL_K,
         help="FTS5 lexical passage candidate pool size (default: 50).",
     )
-    parser.add_argument(
-        "--graph-activation",
-        choices=["linear", "scaled_tanh", "hard_tanh", "shifted_tanh", "threshold_relu"],
-        default="scaled_tanh",
-        help="Graph propagation activation (arXiv:2609.32929v1, default: scaled_tanh).",
-    )
-    parser.add_argument(
-        "--graph-activation-param",
-        type=float,
-        default=5.0,
-        help="Optional parameter for graph activation (scale for scaled_tanh, cap for hard_tanh, "
-        "threshold for relu, default: 5.0).",
-    )
-    parser.add_argument(
-        "--graph-activation-renormalize",
-        action="store_true",
-        help="Renormalize L1 mass to 1.0 after non-linear activation at each step (default: False).",
-    )
+
     parser.add_argument(
         "--graph-beta",
         type=float,
         default=0.5,
-        help="Normalization exponent beta for W = D^-beta A D^-(1-beta) (arXiv:2609.32929v1: 0.0=random "
-        "walk, 0.5=symmetric GCN, default: 0.5).",
+        help="Entity degree normalization exponent (default: 0.5).",
     )
-    parser.add_argument(
-        "--graph-dual-weight",
-        type=float,
-        default=0.5,
-        help="Weight lambda in [0, 1] for dual combination (1-lambda)*y + lambda*z (arXiv:2609.32929v1, default: 0.5).",
-    )
+
     args = parser.parse_args()
     main(
         dataset=args.dataset,
+        config_path=args.config,
         max_queries=args.max_queries,
         index_queries=args.index_queries,
         full_corpus=args.full_corpus,
@@ -996,9 +1000,5 @@ if __name__ == "__main__":
         damping=args.damping,
         passage_seed_pool_k=args.passage_seed_pool_k,
         fts_seed_pool_k=args.fts_seed_pool_k,
-        graph_activation=args.graph_activation,
-        graph_activation_param=args.graph_activation_param,
-        graph_activation_renormalize=args.graph_activation_renormalize,
         graph_beta=args.graph_beta,
-        graph_dual_weight=args.graph_dual_weight,
     )

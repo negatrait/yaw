@@ -11,7 +11,7 @@ import pytest
 from daemon.graph.candidate_fixtures import seed_candidate_vectors
 
 from yaw.core.types import detect_scalar_literal
-from yaw.daemon.graph.ppr import build_transition_matrix, run_ppr
+from yaw.daemon.graph.ppr import build_transition_matrix, run_hmm
 from yaw.daemon.graph.storage.db import initialize_schema, open_managed_yaw_db
 from yaw.daemon.graph.storage.graph_ops import (
     bayesian_noisy_or,
@@ -399,7 +399,7 @@ def test_markov_walk_divergence_and_turtle_payload(tmp_path: Path) -> None:
 
         # 1. Build transition matrix with real calibrated Bayesian node priors
         csr_calibrated = build_transition_matrix(chunk_ids, entity_ids, topo_edges, node_priors=priors)
-        ppr_calibrated = run_ppr(csr_calibrated, {"chunk-s": 1.0})
+        ppr_calibrated = run_hmm(csr_calibrated, {"chunk-s": 1.0})
 
         idx_t1 = csr_calibrated.node_to_idx["ent-t1"]
         idx_t2 = csr_calibrated.node_to_idx["ent-t2"]

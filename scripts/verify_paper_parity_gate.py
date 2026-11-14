@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ if callable(reconfigure_stdout):
 
 import benchmark  # noqa: E402
 from benchmark import BASELINES  # noqa: E402
+from yaw.core.config import load_config  # noqa: E402
 from yaw.daemon.graph.inference import evaluate_benchmark_gate  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
@@ -58,7 +60,7 @@ def build_monkeypatched_baseline_report(
     return {
         "engine": "hipporag",
         "status": "passed",
-        "qa_model": benchmark.DEFAULT_QA_CHAT,
+        "qa_model": b.get("qa_model"),
         "num_docs": 0,
         "num_queries": queries_per_dataset,
         "indexing_seconds": float(b.get("indexing_seconds", 0.0)),
@@ -1134,8 +1136,21 @@ def run_parity_gate(
     output_json: Path = PROJECT_ROOT / "outputs" / "benchmarks" / "paper_parity_gate.json",
     output_md: Path = PROJECT_ROOT / "outputs" / "benchmarks" / "paper_parity_gate.md",
     fresh: bool = False,
+    config_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the 7-dataset head-to-head parity gate and persist JSON + Markdown reports."""
+    config_file = Path(config_path) if config_path is not None else PROJECT_ROOT / "yaw.toml"
+    inference_config = load_config(config_file)
+    program_path = Path(compiled_program).resolve()
+    deployment = {
+        "config_fingerprint": inference_config.config_fingerprint(),
+        "base_url": inference_config.base_url,
+        "provider": inference_config.provider,
+        "compiled_program": {
+            "path": str(program_path),
+            "sha256": hashlib.sha256(program_path.read_bytes()).hexdigest() if program_path.is_file() else None,
+        },
+    }
     canonical_datasets = list(datasets)
     existing_datasets: dict[str, dict[str, Any]] = {}
 
@@ -1145,7 +1160,11 @@ def run_parity_gate(
     if not fresh and output_json.exists():
         try:
             loaded = json.loads(output_json.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and isinstance(loaded.get("datasets"), dict):
+            if (
+                isinstance(loaded, dict)
+                and isinstance(loaded.get("datasets"), dict)
+                and loaded.get("config", {}).get("inference") == deployment
+            ):
                 existing_datasets = loaded["datasets"]
         except json.JSONDecodeError, OSError:
             existing_datasets = {}
@@ -1158,7 +1177,8 @@ def run_parity_gate(
             "index_queries": index_queries,
             "compiled_program": compiled_program,
             "mode": mode,
-            "qa_model": benchmark.DEFAULT_QA_CHAT,
+            "qa_model": inference_config.qa_model,
+            "inference": deployment,
         },
         "datasets": {},
         "summary": {},
@@ -1172,7 +1192,7 @@ def run_parity_gate(
             queries_per_dataset=queries_per_dataset,
             index_queries=index_queries,
             mode=mode,
-            qa_model=benchmark.DEFAULT_QA_CHAT,
+            qa_model=inference_config.qa_model,
         ):
             gate_payload["datasets"][ds] = existing_datasets[ds]
             print(
@@ -1199,6 +1219,7 @@ def run_parity_gate(
         )
         yaw_report = benchmark.main(
             dataset=ds,
+            config_path=config_file,
             max_queries=queries_per_dataset,
             index_queries=index_queries,
             mode=mode,
@@ -1237,6 +1258,7 @@ def run_parity_gate(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=None, help="Inference settings (default: yaw.toml).")
     parser.add_argument(
         "--datasets",
         nargs="*",
@@ -1291,6 +1313,7 @@ if __name__ == "__main__":
     cli_args = parse_args()
     run_parity_gate(
         datasets=cli_args.datasets,
+        config_path=cli_args.config,
         queries_per_dataset=cli_args.queries_per_dataset,
         index_queries=cli_args.index_queries,
         compiled_program=cli_args.compiled_program,

@@ -391,6 +391,6 @@ def test_graph_publication_failure_aborts_optimization_fast(tmp_path, monkeypatc
         devset = [dspy.Example(question="Q?", gold_titles=["Doc"], answer="A").with_inputs("question")]
 
         with pytest.raises(ValueError, match="Resource '429' does not have one resolved NER sense"):
-            engine.evolve_prompts(devset, mode="gepa", reflection_token_counter=lambda text: len(str(text).split()))
+            engine.evolve_prompts(devset, mode="gepa")
     finally:
         engine.close()

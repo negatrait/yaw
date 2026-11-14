@@ -1,11 +1,21 @@
 """Executable specifications for HippoRAG benchmark slicing, evaluation, and integrity gates."""
 
+import hashlib
 import json
+import sqlite3
 import tempfile
+import threading
 import unittest
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pytest
+from embedding_fixture import IdentifiedEmbeddingCallable
+
+import benchmark
 from benchmark import (
     BASELINES,
     DATASET_REGISTRY,
@@ -16,7 +26,7 @@ from benchmark import (
     get_gold_docs,
     load_dataset_files,
 )
-from yaw.daemon.graph.inference import YawProgram
+from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_embedder
 from yaw.daemon.indexing import bind_native_indexing
 from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name
 from yaw.daemon.ingestion.bundles import document_identity
@@ -824,32 +834,24 @@ class PaperParityGateTests(unittest.TestCase):
             profile = resolve_embedding_profile(task_mode="distinct-titled")
             formatted_doc_inputs: list[str] = []
 
-            class TitleCheckingEmbedder:
-                def __init__(self, prof):
-                    self.profile = prof
-                    self.dimensions = 4
+            def title_checking_embedder(texts):
+                formatted_doc_inputs.extend(t for t in texts if t.startswith("title: "))
+                out = []
+                for t in texts:
+                    v = np.array(
+                        [
+                            1.0 if "montebello" in t.lower() or "erik hort" in t.lower() else 0.1,
+                            1.0 if "rockland" in t.lower() else 0.1,
+                            0.5,
+                            0.2,
+                        ],
+                        dtype=np.float32,
+                    )
+                    v /= np.linalg.norm(v)
+                    out.append(v)
+                return np.vstack(out)
 
-                def encode(self, texts, *, instruction=""):
-                    if not instruction:
-                        for t in texts:
-                            formatted_doc_inputs.append(self.profile.format(t, query=False))
-                    out = []
-                    for t in texts:
-                        v = np.array(
-                            [
-                                1.0 if "montebello" in t.lower() or "erik hort" in t.lower() else 0.1,
-                                1.0 if "rockland" in t.lower() else 0.1,
-                                0.5,
-                                0.2,
-                            ],
-                            dtype=np.float32,
-                        )
-                        v /= np.linalg.norm(v)
-                        out.append(v)
-                    return np.vstack(out)
-
-                def batch_encode(self, texts, *, instruction="", batch_size=64):
-                    return self.encode(texts, instruction=instruction)
+            profile = replace(profile, dimensions=4)
 
             class MinimalProgram(YawProgram):
                 context_window_tokens = 32768
@@ -898,9 +900,6 @@ class PaperParityGateTests(unittest.TestCase):
                 def judge_semantics(self, candidates, *args, **kwargs):
                     return []
 
-                def semantic_adjudication_fits(self, batch):
-                    return True
-
                 def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
                     return []
 
@@ -909,7 +908,12 @@ class PaperParityGateTests(unittest.TestCase):
                     db_path=tmp_path / "yaw.db",
                     workspace_root=corpus_dir,
                     program=MinimalProgram(),
-                    embedder=TitleCheckingEmbedder(profile),
+                    embedder=DSPyEmbeddingAdapter(
+                        profile,
+                        create_dspy_embedder(
+                            IdentifiedEmbeddingCallable(title_checking_embedder, "title-checking-fixture")
+                        ),
+                    ),
                     retrieval_top_k=5,
                 ),
                 source_settings=SourceSettings(("**/*",), (), chunk_size=180, chunk_overlap=20, min_chunk_size=30),
@@ -970,3 +974,243 @@ class PaperParityGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.fixture
+def benchmark_inference_server():
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            auth = self.headers.get("Authorization")
+            requests.append((self.path, auth, None))
+            if auth != "Bearer benchmark-key":
+                self.send_error(401)
+                return
+            if self.path != "/v1/models":
+                self.send_error(404)
+                return
+            data = [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "fixture",
+                    "loaded": True,
+                    "context_length": 131072,
+                    "alias_for": "fixture/" + name,
+                    "quant": "Q4",
+                }
+                for name in ("gemma-4-e4b", "embeddinggemma-2")
+            ]
+            raw = json.dumps({"object": "list", "data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            auth = self.headers.get("Authorization")
+            requests.append((self.path, auth, body))
+            if auth != "Bearer benchmark-key":
+                self.send_error(401)
+                return
+            if self.path == "/v1/embeddings":
+                assert body["model"] == "embeddinggemma-2"
+                values = []
+                for text in body["input"]:
+                    seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "little")
+                    vector = np.random.default_rng(seed).standard_normal(768)
+                    vector /= np.linalg.norm(vector)
+                    values.append(vector.tolist())
+                response = {
+                    "object": "list",
+                    "model": body["model"],
+                    "data": [{"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(values)],
+                    "usage": {"prompt_tokens": 20, "total_tokens": 20},
+                }
+            elif self.path == "/v1/completions":
+                assert body["model"] == "gemma-4-e4b"
+                assert body["max_tokens"] == 1024
+                grammar = body["grammar"]
+                if "named_entities" in grammar:
+                    result = {
+                        "named_entities": [["Alan Turing", "A mathematician."], ["Cambridge", "A university city."]]
+                    }
+                elif "triples" in grammar:
+                    result = {
+                        "triples": [
+                            {
+                                "sub": "Alan Turing",
+                                "pred": "worked in",
+                                "obj": "Cambridge",
+                                "def": "Alan Turing worked in Cambridge.",
+                            }
+                        ]
+                    }
+                elif "query_intent" in grammar:
+                    result = {"query_intent": "Alan Turing worked in a city."}
+                elif "fact" in grammar:
+                    result = {"fact": [["Alan Turing", "worked in", "Cambridge"]]}
+                else:
+                    assert "answer" in grammar
+                    result = {"plan": "The source names Cambridge.", "answer": "Cambridge"}
+                response = {
+                    "id": "benchmark-completion",
+                    "model": body["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop", "text": json.dumps(result)}],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+                }
+            else:
+                self.send_error(404)
+                return
+            raw = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+@pytest.mark.parametrize("mode", ["embeddings", "all"])
+def test_benchmark_uses_configured_inference_without_registry_plumbing(
+    tmp_path, monkeypatch, benchmark_inference_server, mode
+):
+    base_url, requests = benchmark_inference_server
+    corpus = tmp_path / "documents.json"
+    questions = tmp_path / "questions.json"
+    text = "Alan Turing worked in Cambridge. " * 7
+    corpus.write_text(json.dumps([{"idx": "turing", "title": "Alan Turing", "text": text}]), encoding="utf-8")
+    questions.write_text(
+        json.dumps(
+            [
+                {
+                    "question": "Where did Alan Turing work?",
+                    "answer": "Cambridge",
+                    "context": [["Alan Turing", [text]]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    prepare_dataset_bundle("sample", corpus, questions, tmp_path / "outputs" / "datasets")
+    config_path = tmp_path / "yaw.toml"
+    config_path.write_text(
+        f'[inference]\nbase_url = "{base_url}"\nembedding_model = "embeddinggemma-2"\n'
+        'extraction_model = "gemma-4-e4b"\nqa_model = "gemma-4-e4b"\n'
+        "context_window_tokens = 32768\nmax_output_tokens = 1024\nenable_gbnf = true\n"
+        "[ingestion]\nchunk_size = 96\nchunk_overlap = 16\nmin_chunk_size = 30\n",
+        encoding="utf-8",
+    )
+    # Only the workspace and credential source change; the benchmark and inference stack run intact.
+    monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "benchmark-key")
+    report = benchmark.main(config_path=config_path, mode=mode, max_queries=1, fresh_index=True)
+    assert report["status"] == "passed"
+    assert report["base_url"] == base_url
+    assert report["embedding_model"] == "embeddinggemma-2"
+    assert report["context_window_tokens"] == 32768
+    assert report["max_output_tokens"] == 1024
+    assert report["identity_source"] == "configured-profile"
+    assert "model_registry" not in report and "chat_backends" not in report and "server" not in report
+    serialized = (Path(report["run_dir"]) / "report.json").read_text(encoding="utf-8")
+    assert "benchmark-key" not in serialized
+    assert requests and all(auth == "Bearer benchmark-key" for _, auth, _ in requests)
+    assert {route for route, _, _ in requests} <= {"/v1/embeddings", "/v1/completions"}
+    assert report["embedding_probes"]
+    if mode == "all":
+        assert any(route == "/v1/completions" for route, _, _ in requests)
+        assert report["records"][0]["answer"] == "Cambridge"
+        with sqlite3.connect(Path(report["index_dir"]) / "yaw.db") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 1
+            assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    else:
+        assert {route for route, _, _ in requests} == {"/v1/embeddings"}
+
+
+def test_parity_gate_propagates_configuration_and_invalidates_old_deployment(
+    tmp_path, monkeypatch, benchmark_inference_server
+):
+    from scripts import verify_paper_parity_gate as gate
+
+    base_url, requests = benchmark_inference_server
+    corpus, questions = tmp_path / "corpus.json", tmp_path / "questions.json"
+    text = "Alan Turing worked in Cambridge."
+    corpus.write_text(json.dumps([{"idx": "turing", "title": "Alan Turing", "text": text}]), encoding="utf-8")
+    questions.write_text(
+        json.dumps(
+            [
+                {
+                    "question": "Where did Alan Turing work?",
+                    "answer": "Cambridge",
+                    "context": [["Alan Turing", [text]]],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    prepare_dataset_bundle("musique", corpus, questions, tmp_path / "outputs" / "datasets")
+    config_path = tmp_path / "yaw.toml"
+    config_text = (
+        f'[inference]\nbase_url = "{base_url}"\ncontext_window_tokens = 32768\n'
+        "max_output_tokens = 1024\nenable_gbnf = true\n[ingestion]\nmin_chunk_size = 1\n"
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "benchmark-key")
+
+    def run_gate():
+        return gate.run_parity_gate(
+            datasets=["musique"],
+            queries_per_dataset=1,
+            index_queries=1,
+            compiled_program=str(tmp_path / "uncompiled.json"),
+            mode="eval",
+            config_path=config_path,
+            output_json=tmp_path / "gate.json",
+            output_md=tmp_path / "gate.md",
+        )
+
+    first = run_gate()
+    assert first["config"]["qa_model"] == "gemma-4-e4b"
+    assert first["config"]["inference"]["base_url"] == base_url
+    assert first["datasets"]["musique"]["gate_passed"]
+    first_run = first["datasets"]["musique"]["yaw"]["run_dir"]
+    count = len(requests)
+    repeated = run_gate()
+    assert repeated["datasets"]["musique"]["yaw"]["run_dir"] == first_run
+    assert len(requests) == count
+    config_path.write_text(config_text.replace("32768", "65536"), encoding="utf-8")
+    changed = run_gate()
+    assert changed["config"]["inference"] != first["config"]["inference"]
+    assert changed["datasets"]["musique"]["yaw"]["run_dir"] != first_run
+    artifact = tmp_path / "uncompiled.json"
+    YawProgram().save(str(artifact))
+    changed_program = run_gate()
+    assert changed_program["config"]["inference"] != changed["config"]["inference"]
+    assert changed_program["datasets"]["musique"]["yaw"]["run_dir"] != changed["datasets"]["musique"]["yaw"]["run_dir"]
+    artifact.write_bytes(artifact.read_bytes() + b"\n")
+    changed_bytes = run_gate()
+    assert changed_bytes["config"]["inference"] != changed_program["config"]["inference"]
+    assert (
+        changed_bytes["datasets"]["musique"]["yaw"]["run_dir"]
+        != changed_program["datasets"]["musique"]["yaw"]["run_dir"]
+    )
+    assert all(auth == "Bearer benchmark-key" for _, auth, _ in requests)
+    assert {route for route, _, _ in requests} <= {"/v1/embeddings", "/v1/completions"}

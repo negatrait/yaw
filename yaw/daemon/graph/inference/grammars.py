@@ -1,16 +1,20 @@
 """Pure-JSON Context-Free Grammars (GBNF) for DSPy."""
 
+from __future__ import annotations
+
 import json
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from typing import Any
 
 import dspy
 
 from yaw.core import clean_schema_definition, text_processing
 
-# ---------------------------------------------------------------------------
-# Pure-JSON Context-Free Grammars (GBNF) for dspy.JSONAdapter on llama.cpp
-# ---------------------------------------------------------------------------
+_SEQ = (list, tuple)
+_CACHE = lru_cache(64)
+_DUMP_UTF8 = json.JSONEncoder(ensure_ascii=False).encode
+_DUMP_ASCII = json.JSONEncoder().encode
 
 # A resource label needs lexical content (yaw.core.is_resource_label): punctuation, numbers, dates and
 # other data values are literals, which only the triple stage may introduce as objects.
@@ -18,13 +22,13 @@ _NER_PAIR_GBNF_RULES = r"""entity-pair ::= "[" label ", " string "]"
 label ::= "\"" non-letter* letter char* "\""
 letter ::= [a-zA-Z\x80-\U0010FFFF]
 non-letter ::= [\x20\x21\x23-\x40\x5B\x5D-\x60\x7B-\x7E]
-string ::= "\"" char{1,512} "\""
+string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 DSPY_NER_GBNF_GRAMMAR = (
     'root ::= "{\\"named_entities\\": " entity-list "}"\n'
-    'entity-list ::= "[]" | "[" entity-pair (", " entity-pair){0,39} "]"\n' + _NER_PAIR_GBNF_RULES
+    'entity-list ::= "[]" | "[" entity-pair (", " entity-pair)* "]"\n' + _NER_PAIR_GBNF_RULES
 )
 
 _STATEMENT_GBNF_RULES = r"""literal-statement ::= literal-pred ", \"obj\": " literal-slot
@@ -32,7 +36,7 @@ resource-pred ::= string | "[" string ", \"owl:ObjectProperty\"]"
 literal-pred ::= string | "[" string ", \"owl:DatatypeProperty\"]"
 literal-slot ::= "{\"value\": " string ", \"datatype\": " string ", \"lang\": " language "}"
 language ::= "\"" char* "\""
-string ::= "\"" char{1,512} "\""
+string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
@@ -44,7 +48,7 @@ _OPEN_TRIPLE_GBNF_RULES = (
 
 DSPY_TRIPLES_GBNF_GRAMMAR = (
     'root ::= "{\\"triples\\": " triple-list "}"\n'
-    'triple-list ::= "[]" | "[" triple (", " triple){0,39} "]"\n' + _OPEN_TRIPLE_GBNF_RULES
+    'triple-list ::= "[]" | "[" triple (", " triple)* "]"\n' + _OPEN_TRIPLE_GBNF_RULES
 )
 
 DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR = r"""root ::= "{\"entity_definitions\": " entity-list "}"
@@ -54,22 +58,28 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
-    'root ::= "{\\"repairs\\": " repair-list "}"\n'
-    'repair-list ::= "[]" | "[" repair (", " repair)* "]"\n'
-    'repair ::= "{\\"focus_node\\": " string ", \\"action\\": " action-kind ", \\"value\\": " string '
-    '"}"\n'
+_SHACL_ACTION_KIND = (
     'action-kind ::= "\\"set_definition\\"" | "\\"set_pref_label\\"" | '
     '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
     '"\\"add_different_from\\"" | "\\"assert_related\\"" | '
     '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
     '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
     '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
-    'label ::= "\\"" non-letter* letter char* "\\""\n'
+)
+
+_SHACL_TAIL = (
+    _SHACL_ACTION_KIND + 'label ::= "\\"" non-letter* letter char* "\\""\n'
     "letter ::= [a-zA-Z\\x80-\\U0010FFFF]\n"
     "non-letter ::= [\\x20\\x21\\x23-\\x40\\x5B\\x5D-\\x60\\x7B-\\x7E]\n"
     'string ::= "\\"" char+ "\\""\n'
     'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
+)
+
+DSPY_SHACL_REPAIR_GBNF_GRAMMAR = (
+    'root ::= "{\\"repairs\\": " repair-list "}"\n'
+    'repair-list ::= "[]" | "[" repair (", " repair)* "]"\n'
+    'repair ::= "{\\"focus_node\\": " string ", \\"action\\": " action-kind ", \\"value\\": " string "}"\n'
+    + _SHACL_TAIL
 )
 
 DSPY_RERANK_GBNF_GRAMMAR = r"""root ::= "{\"fact\": [" fact-list "]}"
@@ -79,7 +89,7 @@ string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
-DSPY_QA_GBNF_GRAMMAR = r"""root ::= "{\"reasoning\": " string ", \"answer\": " string "}"
+DSPY_QA_GBNF_GRAMMAR = r"""root ::= "{\"plan\": " string ", \"answer\": " string "}"
 string ::= "\"" char+ "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
@@ -95,244 +105,211 @@ char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 """
 
 
+@_CACHE
+def _seq(sym, n):
+    return f"""({(sym + ' (", " ') * (k := n - 1)}{sym}{")?" * k})?"""
+
+
+def _jesc(s):
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _ju(obj):
+    return _jesc(_DUMP_UTF8(obj))
+
+
+def _ja(obj):
+    return _jesc(_DUMP_ASCII(obj))
+
+
 def gbnf_escape_literal(text: str) -> str:
-    escaped = (
-        text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
+    return _jesc(text).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 
+@_CACHE
 def build_dspy_ner_grammar(max_entities: int | None = None) -> str:
     """Build pure-JSON GBNF grammar for ExtractEntities, optionally capping entity count for sizecoding."""
-    if max_entities is None or max_entities <= 0:
+    if not max_entities or max_entities < 0:
         return DSPY_NER_GBNF_GRAMMAR
-    seq = "entity-pair"
-    for _ in range(max_entities - 1):
-        seq = f'entity-pair (", " {seq})?'
-    return f'root ::= "{{\\"named_entities\\": [" entity-list "]}}"\nentity-list ::= ({seq})?\n' + _NER_PAIR_GBNF_RULES
+    return (
+        'root ::= "{\\"named_entities\\": [" entity-list "]}"\n'
+        f"entity-list ::= {_seq('entity-pair', max_entities)}\n{_NER_PAIR_GBNF_RULES}"
+    )
 
 
-def build_dspy_triples_grammar(
-    max_triples: int | None = None,
-    known_entities: Sequence[Any] | None = None,
-) -> str:
+def build_dspy_triples_grammar(max_triples: int | None = None, known_entities: Sequence[Any] | None = None) -> str:
     """Pin resource endpoints to NER labels; only literal objects may introduce values."""
-    deduped_known: list[str] = []
-    if known_entities:
+    if known_entities is not None:
+        deduped = {}
+        clean_pairs = {}
+        def_lookup = {}
+        defs_seen = {}
+        ambiguous = set()
         for item in known_entities:
-            if isinstance(item, str):
-                name = item.strip()
-            elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
-                name = item[0].strip()
-            else:
-                continue
-            if name and name not in deduped_known:
-                deduped_known.append(name)
-
-    if known_entities is not None and not deduped_known:
-        return 'root ::= "{\\"triples\\": []}"\n'
-    if (max_triples is None or max_triples <= 0) and not deduped_known:
+            is_seq = isinstance(item, _SEQ)
+            raw = item[0] if is_seq and item else item
+            if isinstance(raw, str) and (name := raw.strip()):
+                deduped[name] = None
+                if is_seq and len(item) > 1 and (clean_v := clean_schema_definition(item[1]).strip()):
+                    def_lookup.setdefault(name, clean_v)
+                    if norm_k := f"{text_processing(name)!s}":
+                        def_lookup.setdefault(norm_k, clean_v)
+                    if defs_seen.setdefault(name, clean_v) != clean_v:
+                        ambiguous.add(name)
+                    clean_pairs[name, clean_v] = None
+        if not deduped:
+            return 'root ::= "{\\"triples\\": []}"\n'
+    elif not max_triples or max_triples < 0:
         return DSPY_TRIPLES_GBNF_GRAMMAR
 
-    if max_triples is None or max_triples <= 0:
-        root_line = 'root ::= "{\\"triples\\": " triple-list "}"\n'
-        list_line = 'triple-list ::= "[]" | "[" triple (", " triple){0,39} "]"\n'
-    else:
-        seq = "triple"
-        for _ in range(max_triples - 1):
-            seq = f'triple (", " {seq})?'
-        root_line = 'root ::= "{\\"triples\\": [" triple-list "]}"\n'
-        list_line = f"triple-list ::= ({seq})?\n"
+    header = (
+        f'root ::= "{{\\"triples\\": [" triple-list "]}}"\ntriple-list ::= {_seq("triple", max_triples)}\n'
+        if max_triples and max_triples > 0
+        else 'root ::= "{\\"triples\\": " triple-list "}"\ntriple-list ::= "[]" | "[" triple (", " triple)* "]"\n'
+    )
+    if known_entities is None:
+        return header + _OPEN_TRIPLE_GBNF_RULES
 
-    if not deduped_known:
-        return root_line + list_line + _OPEN_TRIPLE_GBNF_RULES
+    records = []
+    subs = []
+    for ep in (*deduped, *clean_pairs):
+        t = isinstance(ep, tuple)
+        label = ep[0] if t else ep
+        if (label in ambiguous) != t:
+            continue
+        raw_def = ep[1] if t else defs_seen.get(label, "")
+        norm_label = f"{text_processing(label)!s}"
+        clean_def = (
+            clean_schema_definition(raw_def).strip()
+            or def_lookup.get(label, "")
+            or def_lookup.get(norm_label, "")
+            or ""
+        )
+        i = len(records)
+        records.append((ep, (norm_label, clean_def.strip().casefold()), f"endpoint-{i}"))
+        subs.append(f"subject-{i}")
 
-    clean_pairs: list[list[str]] = []
-    def_lookup: dict[str, str] = {}
-    for item in known_entities or ():
-        if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[0], str):
-            clean_k = item[0].strip()
-            clean_v = clean_schema_definition(item[1]).strip()
-            if clean_k and clean_v:
-                norm_k = str(text_processing(clean_k))
-                def_lookup.setdefault(clean_k, clean_v)
-                if norm_k:
-                    def_lookup.setdefault(norm_k, clean_v)
-                pair = [clean_k, clean_v]
-                if pair not in clean_pairs:
-                    clean_pairs.append(pair)
-
-    ambiguous = {name for name in deduped_known if len({p[1] for p in clean_pairs if p[0] == name}) > 1}
-    endpoints: list[Any] = [name for name in deduped_known if name not in ambiguous]
-    endpoints.extend(p for p in clean_pairs if p[0] in ambiguous and p not in endpoints)
-    definition_of = {p[0]: p[1] for p in clean_pairs if p[0] not in ambiguous}
-
-    def sense(endpoint: Any) -> tuple[str, str]:
-        if isinstance(endpoint, (list, tuple)) and len(endpoint) >= 2:
-            label = str(endpoint[0]).strip()
-            definition = clean_schema_definition(endpoint[1]).strip()
-        else:
-            label = str(endpoint).strip()
-            definition = clean_schema_definition(definition_of.get(label, "")).strip()
-        norm_label = str(text_processing(label))
-        clean_def = definition or def_lookup.get(label, "") or def_lookup.get(norm_label, "")
-        return norm_label, clean_def.strip().casefold()
-
-    # A statement never relates a resource sense to itself (native graph spec §5.3).
-    senses = [sense(endpoint) for endpoint in endpoints]
+    # A statement never relates a resource sense to itself (native graph spec Ã‚Â§5.3).
     lines = [
-        root_line,
-        list_line,
-        'triple ::= "{\\"sub\\": " statement ", \\"def\\": " string "}"\n',
-        "statement ::= " + " | ".join(f"subject-{i}" for i in range(len(endpoints))) + "\n",
+        f'{header}triple ::= "{{\\"sub\\": " statement ", \\"def\\": " string "}}"\nstatement ::= {" | ".join(subs)}\n'
     ]
-    for i, endpoint in enumerate(endpoints):
-        lines.append(f"endpoint-{i} ::= {gbnf_escape_literal(json.dumps(endpoint, ensure_ascii=False))}\n")
-        others = [f"endpoint-{j}" for j in range(len(endpoints)) if senses[j] != senses[i]]
-        if others:
-            lines.append(f"objects-{i} ::= {' | '.join(others)}\n")
-            branch = f'(resource-pred ", \\"obj\\": " objects-{i} | literal-statement)'
-        else:
-            branch = "literal-statement"
-        lines.append(f'subject-{i} ::= endpoint-{i} ", \\"pred\\": " {branch}\n')
-    return "".join(lines) + _STATEMENT_GBNF_RULES
+    for i, (ep, si, ename) in enumerate(records):
+        others = []
+        for _, s, en in records:
+            if s != si:
+                others.append(en)
+        obj_line = f"objects-{i} ::= {' | '.join(others)}\n" if others else ""
+        rhs = f'(resource-pred ", \\"obj\\": " objects-{i} | literal-statement)' if others else "literal-statement"
+        lines.append(f'{ename} ::= {_ju(ep)}\n{obj_line}subject-{i} ::= {ename} ", \\"pred\\": " {rhs}\n')
+    lines.append(_STATEMENT_GBNF_RULES)
+    return "".join(lines)
 
 
-def build_dspy_missing_entity_defs_grammar(
-    missing_names: Sequence[str] | None = None,
-) -> str:
+def build_dspy_missing_entity_defs_grammar(missing_names: Sequence[str] | None = None) -> str:
     """Build pure-JSON GBNF grammar for DefineMissingEntities (`{"entity_definitions": [[name, def], ...]}`)."""
-    deduped: list[str] = []
+    deduped = {}
     if missing_names:
         for name in missing_names:
-            if isinstance(name, str) and name.strip() and name.strip() not in deduped:
-                deduped.append(name.strip())
+            if isinstance(name, str) and (s := name.strip()) and s not in deduped:
+                deduped[s] = _ju(s)
     if not deduped:
         return DSPY_MISSING_ENTITY_DEFS_GBNF_GRAMMAR
-    seq = "entity-pair"
-    for _ in range(len(deduped) - 1):
-        seq = f'entity-pair (", " {seq})?'
-    name_rule = " | ".join(gbnf_escape_literal(json.dumps(name, ensure_ascii=False)) for name in deduped)
     return (
         'root ::= "{\\"entity_definitions\\": [" entity-list "]}"\n'
-        f"entity-list ::= ({seq})?\n"
+        f"entity-list ::= {_seq('entity-pair', len(deduped))}\n"
         'entity-pair ::= "[" entity-name ", " string "]"\n'
-        f"entity-name ::= {name_rule}\n"
+        f"entity-name ::= {' | '.join(deduped.values())}\n"
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
-def _build_pair_boolean_grammar(
-    bool_fields: Sequence[str],
-    *,
-    pair_ids: Sequence[str] | None = None,
-    max_decisions: int | None = None,
-    max_reasoning_chars: int | None = 360,
-    custom_suffix: str | None = None,
-    extra_rules: Sequence[str] = (),
-) -> str:
+def _judge_grammar(suffix, pair_ids, max_decisions, max_reasoning_chars, extra=""):
     r_limit = f"{{1,{int(max_reasoning_chars)}}}" if max_reasoning_chars and max_reasoning_chars > 0 else "+"
-    bool_suffix = (
-        custom_suffix
-        if custom_suffix is not None
-        else " ".join(f"{gbnf_escape_literal(f', "{field}": ')} boolean" for field in bool_fields)
-    )
-    rules: list[str] = []
     if pair_ids is not None:
         if not pair_ids or len(set(pair_ids)) != len(pair_ids):
             raise ValueError("Synonym grammar requires nonempty, unique pair IDs")
+        decs = []
+        dnames = []
         for i, pair_id in enumerate(pair_ids):
             ids = pair_id.split("|")
             if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
                 raise ValueError(f"Invalid synonym pair ID {pair_id!r}")
-            prefix = gbnf_escape_literal('{"pair_id": ' + json.dumps(pair_id) + ', "reasoning": ')
-            rules.append(f"decision-{i} ::= {prefix} reasoning-str {bool_suffix} {gbnf_escape_literal('}')}")
-        seq = ' ", " '.join(f"decision-{i}" for i in range(len(pair_ids)))
-        rules.insert(0, f"root ::= {gbnf_escape_literal('{"decisions": [')} {seq} {gbnf_escape_literal(']}')}")
+            dnames.append(dn := f"decision-{i}")
+            pfx = _jesc(f'{{"pair_id": {_DUMP_ASCII(pair_id)}, "reasoning": ')
+            decs.append(f'{dn} ::= {pfx} reasoning-str {suffix} "}}"')
+        head = f"""root ::= "{{\\"decisions\\": [" {' ", " '.join(dnames)} "]}}"\n""" + "\n".join(decs) + "\n"
     else:
-        dec_pfx = gbnf_escape_literal('{"pair_id": ')
-        dec_rsn = gbnf_escape_literal(', "reasoning": ')
-        dec_cls = gbnf_escape_literal("}")
-        dec_rule = f"decision ::= {dec_pfx} string {dec_rsn} reasoning-str {bool_suffix} {dec_cls}"
-        if max_decisions is not None and max_decisions > 0:
-            seq = "decision"
-            for _ in range(max_decisions - 1):
-                seq = f'decision (", " {seq})?'
-            rules.extend(
-                [
-                    'root ::= "{\\"decisions\\": [" decision-list "]}"',
-                    f"decision-list ::= ({seq})?",
-                    dec_rule,
-                ]
-            )
-        else:
-            rules.extend(
-                [
-                    'root ::= "{\\"decisions\\": [" decision-list "]}"',
-                    'decision-list ::= (decision (", " decision)*)?',
-                    dec_rule,
-                ]
-            )
-        rules.append('string ::= "\\"" char+ "\\""')
-    rules.extend(extra_rules)
-    rules.extend(
-        [
-            f'reasoning-str ::= "\\"" char{r_limit} "\\""',
-            'boolean ::= "true" | "false"',
-            'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})',
-        ]
+        dlist = (
+            _seq("decision", max_decisions) if max_decisions and max_decisions > 0 else '(decision (", " decision)*)?'
+        )
+        head = (
+            'root ::= "{\\"decisions\\": [" decision-list "]}"\n'
+            f"decision-list ::= {dlist}\n"
+            f'decision ::= "{{\\"pair_id\\": " string ", \\"reasoning\\": " reasoning-str {suffix} "}}"\n'
+            'string ::= "\\"" char+ "\\""\n'
+        )
+    return (
+        f"{head}{extra}"
+        f'reasoning-str ::= "\\"" char{r_limit} "\\""\n'
+        'boolean ::= "true" | "false"\n'
+        'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
-    return "\n".join(rules) + "\n"
 
 
 def build_dspy_label_judge_grammar(
-    max_decisions: int | None = None,
-    *,
-    pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 360,
+    max_decisions: int | None = None, *, pair_ids: Sequence[str] | None = None, max_reasoning_chars: int | None = None
 ) -> str:
     """Build pure-JSON GBNF grammar for JudgeLabels with conditional equivalent/hidden_label branching."""
-    equiv_prefix = gbnf_escape_literal(', "equivalent": ')
-    true_prefix = gbnf_escape_literal('true, "definition": ')
-    hid_key = gbnf_escape_literal(', "hidden_label": ')
-    return _build_pair_boolean_grammar(
-        (),
-        pair_ids=pair_ids,
-        max_decisions=max_decisions,
-        max_reasoning_chars=max_reasoning_chars,
-        custom_suffix=f"{equiv_prefix} equiv-branch",
-        extra_rules=(f'equiv-branch ::= {true_prefix} reasoning-str {hid_key} boolean | "false"',),
+    return _judge_grammar(
+        '", \\"equivalent\\": " equiv-branch',
+        pair_ids,
+        max_decisions,
+        max_reasoning_chars,
+        'equiv-branch ::= "true, \\"definition\\": " reasoning-str ", \\"hidden_label\\": " boolean | "false"\n',
     )
 
 
-def build_dspy_hierarchy_judge_grammar(
+def build_dspy_relation_judge_grammar(
     max_decisions: int | None = None,
     *,
     pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 360,
+    max_reasoning_chars: int | None = None,
+    associated_pair_ids: Sequence[str] = (),
 ) -> str:
-    """Build pure-JSON GBNF grammar for JudgeHierarchy."""
-    return _build_pair_boolean_grammar(
-        ("broader", "narrower"),
-        pair_ids=pair_ids,
-        max_decisions=max_decisions,
-        max_reasoning_chars=max_reasoning_chars,
-    )
-
-
-def build_dspy_related_judge_grammar(
-    max_decisions: int | None = None,
-    *,
-    pair_ids: Sequence[str] | None = None,
-    max_reasoning_chars: int | None = 360,
-) -> str:
-    """Build pure-JSON GBNF grammar for JudgeRelated."""
-    return _build_pair_boolean_grammar(
-        ("related",),
-        pair_ids=pair_ids,
-        max_decisions=max_decisions,
-        max_reasoning_chars=max_reasoning_chars,
+    """Constrain fact-associated pairs to non-negative relations before sampling."""
+    choices = ("skos:broader", "skos:narrower", "skos:related", "owl:differentFrom")
+    if pair_ids is None:
+        return _judge_grammar(
+            '", \\"relation\\": " relation',
+            None,
+            max_decisions,
+            max_reasoning_chars,
+            "relation ::= " + " | ".join(_ja(x) for x in choices) + "\n",
+        )
+    if not pair_ids or len(set(pair_ids)) != len(pair_ids):
+        raise ValueError("Synonym grammar requires nonempty, unique pair IDs")
+    associated = set(associated_pair_ids)
+    rules = []
+    for i, pair_id in enumerate(pair_ids):
+        ids = pair_id.split("|")
+        if len(ids) != 2 or not all(ids) or ids[0] == ids[1]:
+            raise ValueError(f"Invalid synonym pair ID {pair_id!r}")
+        prefix = _jesc(f'{{"pair_id": {_DUMP_ASCII(pair_id)}, "reasoning": ')
+        allowed = choices[:3] if pair_id in associated else choices
+        rules.append(
+            f'decision-{i} ::= {prefix} reasoning-str ", \\"relation\\": " ({" | ".join(_ja(x) for x in allowed)}) "}}"'
+        )
+    limit = f"{{1,{int(max_reasoning_chars)}}}" if max_reasoning_chars and max_reasoning_chars > 0 else "+"
+    return (
+        'root ::= "{\\"decisions\\": [" '
+        + ' ", " '.join(f"decision-{i}" for i in range(len(pair_ids)))
+        + ' "]}"\n'
+        + "\n".join(rules)
+        + "\n"
+        + f'reasoning-str ::= "\\"" char{limit} "\\""\n'
+        + 'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
@@ -344,62 +321,51 @@ def build_dspy_shacl_repair_grammar(
         if max_repairs is not None:
             raise ValueError("Report-bound repair coverage cannot use a generic repair-count cap")
         branches = []
+        cov = []
+        rnames = []
         for i, (focus, actions) in enumerate(sorted(allowed_actions.items())):
-            choices = " | ".join(gbnf_escape_literal(json.dumps(action)) for action in sorted(actions))
-            value_rule = "label" if actions == {"set_pref_label"} else "string"
+            rnames.append(rn := f"repair-{i}")
+            cov.append(f'{rn} (", " {rn})*')
+            choices = " | ".join(map(_ja, sorted(actions)))
+            vrule = "label" if actions == {"set_pref_label"} else "string"
             branches.append(
-                f'repair-{i} ::= "{{\\"focus_node\\": " {gbnf_escape_literal(json.dumps(focus))} '
-                f'", \\"action\\": " ({choices}) ", \\"value\\": " {value_rule} "}}"'
+                f'{rn} ::= "{{\\"focus_node\\": " {_ja(focus)} '
+                f'", \\"action\\": " ({choices}) ", \\"value\\": " {vrule} "}}"'
             )
-        grammar = DSPY_SHACL_REPAIR_GBNF_GRAMMAR
-        coverage = ' ", " '.join(f'repair-{i} (", " repair-{i})*' for i in range(len(branches)))
         return (
-            "\n".join(
-                "repair ::= " + " | ".join(f"repair-{i}" for i in range(len(branches)))
-                if line.startswith("repair ::=")
-                else f'repair-list ::= "[]" | "[" {coverage} "]"'
-                if line.startswith("repair-list ::=")
-                else line
-                for line in grammar.splitlines()
-            )
-            + "\n"
-            + "\n".join(branches)
+            'root ::= "{\\"repairs\\": " repair-list "}"\n'
+            f"""repair-list ::= "[]" | "[" {' ", " '.join(cov)} "]"\n"""
+            f"repair ::= {' | '.join(rnames)}\n{_SHACL_TAIL}" + "\n".join(branches)
         )
-    if max_repairs is None or max_repairs <= 0:
+    if not max_repairs or max_repairs < 0:
         return DSPY_SHACL_REPAIR_GBNF_GRAMMAR
-    seq = "repair"
-    for _ in range(max_repairs - 1):
-        seq = f'repair (", " {seq})?'
     return (
         'root ::= "{\\"repairs\\": [" repair-list "]}"\n'
-        f"repair-list ::= ({seq})?\n"
+        f"repair-list ::= {_seq('repair', max_repairs)}\n"
         'repair ::= "{\\"focus_node\\": " string ", \\"action\\": " action-kind ", \\"value\\": " string "}"\n'
-        'action-kind ::= "\\"set_definition\\"" | "\\"set_pref_label\\"" | '
-        '"\\"demote_to_alt_label\\"" | "\\"merge_altLabel\\"" | "\\"merge_hiddenLabel\\"" | '
-        '"\\"add_different_from\\"" | "\\"assert_related\\"" | '
-        '"\\"assert_broader\\"" | "\\"invert_broader\\"" | "\\"demote_sibling_to_related\\"" | '
-        '"\\"remove_hierarchy_cycle\\"" | "\\"remove_conflicting_related\\"" | '
-        '"\\"delete_dangling\\"" | "\\"delete_invalid_fact\\""\n'
+        f"{_SHACL_ACTION_KIND}"
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
+@_CACHE
 def build_dspy_qa_grammar(max_reasoning_chars: int | None = None) -> str:
-    """Build pure-JSON GBNF grammar for AnswerQuestion, optionally capping reasoning length."""
-    if max_reasoning_chars is None or max_reasoning_chars <= 0:
+    """Constrain DSPy 3.5's wire-level plan, which it restores as QA reasoning."""
+    if not max_reasoning_chars or max_reasoning_chars < 0:
         return DSPY_QA_GBNF_GRAMMAR
     return (
-        'root ::= "{\\"reasoning\\": " reasoning-str ", \\"answer\\": " string "}"\n'
+        'root ::= "{\\"plan\\": " reasoning-str ", \\"answer\\": " string "}"\n'
         f'reasoning-str ::= "\\"" char{{1,{int(max_reasoning_chars)}}} "\\""\n'
         'string ::= "\\"" char+ "\\""\n'
         'char ::= [^"\\\\\\x7F\\x00-\\x1F] | "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})\n'
     )
 
 
+@_CACHE
 def build_dspy_instruction_proposal_grammar(max_chars: int | None = 1500) -> str:
     """Build pure-JSON GBNF grammar for GEPA/MIPROv2 instruction synthesis on local LLM (`llama.cpp` GPU)."""
-    if max_chars is None or max_chars <= 0:
+    if not max_chars or max_chars < 0:
         return DSPY_INSTRUCTION_PROPOSAL_GBNF_GRAMMAR
     return (
         'root ::= "{\\"new_instruction\\": " instruction-str "}"\n'
@@ -413,43 +379,35 @@ def build_dspy_query_intent_grammar() -> str:
     return DSPY_QUERY_INTENT_GBNF_GRAMMAR
 
 
-def build_dspy_rerank_grammar(
-    candidate_facts: Sequence[tuple[str, str, str] | list[str]],
-    max_facts: int = 4,
-) -> str:
+def build_dspy_rerank_grammar(candidate_facts: Sequence[tuple[str, str, str] | list[str]], max_facts: int = 4) -> str:
     """Build dynamic candidate-literal pure-JSON GBNF grammar for DSPy FilterTriples (JSONAdapter)."""
-    candidates: list[str] = []
+    candidates = {}
     for item in candidate_facts:
-        if not isinstance(item, (list, tuple)) or len(item) != 3 or not all(isinstance(x, str) for x in item):
+        if not (
+            isinstance(item, _SEQ)
+            and len(item) == 3
+            and isinstance(item[0], str)
+            and isinstance(item[1], str)
+            and isinstance(item[2], str)
+        ):
             return DSPY_RERANK_GBNF_GRAMMAR
-        serialized = json.dumps(list(item), ensure_ascii=False)
-        if serialized not in candidates:
-            candidates.append(serialized)
-
+        candidates[_ju(item)] = None
     if not candidates:
         return 'root ::= "{\\"fact\\": []}"\n'
-
-    limit = min(max_facts, len(candidates))
-    seq = "triple"
-    for _ in range(limit - 1):
-        seq = f'triple (", " {seq})?'
-    triple_rule = " | ".join(gbnf_escape_literal(c) for c in candidates)
-    return f'root ::= "{{\\"fact\\": [" fact-list "]}}"\nfact-list ::= ({seq})?\ntriple ::= {triple_rule}\n'
+    return (
+        'root ::= "{\\"fact\\": [" fact-list "]}"\n'
+        f"fact-list ::= {_seq('triple', min(max_facts, len(candidates)))}\n"
+        f"triple ::= {' | '.join(candidates)}\n"
+    )
 
 
 def lm_supports_gbnf(lm: Any = None) -> bool:
     """Return True if `lm` runs on a `llama.cpp` backend that supports GBNF grammars."""
-    target_lm = lm if lm is not None else getattr(dspy.settings, "lm", None)
-    if target_lm is None:
+    if (target := lm if lm is not None else getattr(dspy.settings, "lm", None)) is None:
         return True
-    explicit = getattr(target_lm, "_yaw_supports_gbnf", None)
-    if isinstance(explicit, bool):
+    if isinstance(explicit := getattr(target, "_yaw_supports_gbnf", None), bool):
         return explicit
-    recipe = getattr(target_lm, "_yaw_recipe", None)
-    if recipe == "flm":
-        return False
-    model_name = str(getattr(target_lm, "model", "")).lower()
-    return "flm" not in model_name
+    return getattr(target, "_yaw_recipe", None) != "flm" and "flm" not in f"{getattr(target, 'model', '')!s}".lower()
 
 
 __all__ = [
@@ -465,9 +423,8 @@ __all__ = [
     "build_dspy_ner_grammar",
     "build_dspy_triples_grammar",
     "build_dspy_missing_entity_defs_grammar",
-    "build_dspy_hierarchy_judge_grammar",
     "build_dspy_label_judge_grammar",
-    "build_dspy_related_judge_grammar",
+    "build_dspy_relation_judge_grammar",
     "build_dspy_shacl_repair_grammar",
     "build_dspy_qa_grammar",
     "build_dspy_instruction_proposal_grammar",

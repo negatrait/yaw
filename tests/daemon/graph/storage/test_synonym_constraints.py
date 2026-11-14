@@ -23,12 +23,14 @@ def packet(pairs):
         candidates,
         json.dumps(
             {
-                "format": "synonym-evidence-v2",
+                "format": "synonym-evidence-v3",
+                "entities": {e: {"name": e, "sources": []} for pair in pairs for e in pair},
+                "sources": {},
                 "pairs": [
                     {
                         **candidate,
-                        "entity_a": {"name": candidate["entity_a"], "definition": "A resource."},
-                        "entity_b": {"name": candidate["entity_b"], "definition": "Another resource."},
+                        "entity_a": candidate["entity_a"],
+                        "entity_b": candidate["entity_b"],
                         "direct_facts": [],
                         "shared_role_facts": [],
                     }
@@ -74,13 +76,13 @@ def test_separation_skips_labels_but_keeps_real_judge_votes(tmp_path, provider):
         )
         result = app.update_blocking()
         assert isinstance(result, JudgedSynonyms)
-        assert {entry["predictor"] for entry in result.audit_trail} == {"hierarchy_judge", "related_judge"}
-        assert result.decisions[0]["llm_prob"] == pytest.approx(math.sqrt(0.64 * 0.81))
-        assert len(state["synonym_requests"]) == 2
+        assert {entry["predictor"] for entry in result.audit_trail} == {"relation_judge"}
+        assert result.decisions[0]["llm_prob"] == pytest.approx(0.81)
+        assert len(state["synonym_requests"]) == 1
         assert all(request["logprobs"] is True for request in state["synonym_requests"])
         assert all("logprobs" not in trace.outputs for trace in result.traces)
         assert app.update_blocking() == result
-        assert len(state["synonym_requests"]) == 2
+        assert len(state["synonym_requests"]) == 1
 
 
 def test_decision_permutations_preserve_graph_and_bayesian_weights(tmp_path):

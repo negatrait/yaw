@@ -4,8 +4,8 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Generator, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
 from pathlib import Path
 
 import cocoindex as coco
@@ -239,21 +239,28 @@ def batched(items: Sequence[str], size: int = SQL_BATCH_SIZE) -> Iterator[Sequen
         yield items[i : i + size]
 
 
-@contextmanager
-def write_tx(conn: sqlite3.Connection) -> Generator[None]:
+class write_tx:
     """Acquire an immediate write transaction lock or join an active outer transaction."""
-    owns_tx = not conn.in_transaction
-    if owns_tx:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except Exception:
-        if owns_tx and conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
-    else:
-        if owns_tx and conn.in_transaction:
-            conn.execute("COMMIT")
+
+    __slots__ = ("_c",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._c = conn
+
+    def __enter__(self) -> None:
+        c = self._c
+        assert c is not None, "A joined transaction context cannot be reused"
+        if c.in_transaction:
+            self._c = None
+        else:
+            c.execute("BEGIN IMMEDIATE")
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if (c := self._c) is not None and c.in_transaction:
+            if exc_type is None:
+                c.execute("COMMIT")
+            elif issubclass(exc_type, Exception):
+                c.execute("ROLLBACK")
 
 
 def _configure_connection_pragmas(

@@ -59,7 +59,7 @@ _PUBLIC_API: dict[str, str] = {
     "format_entity_skos_markdown": ".shacl",
     "format_pair_disambiguation_dossier": ".shacl",
     "inspect_entity_or_fact": ".shacl",
-    "iter_synonym_evidence": ".synonyms",
+    "iter_semantic_evidence": ".synonyms",
     "lint_graph_shacl": ".shacl",
     "apply_shacl_repairs": ".shacl",
     "serialize_graph_turtle": ".shacl",
