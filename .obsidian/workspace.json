@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": ".agents/skills/owl/SKILL.md",
+                "file": "docs/hmm-graph-substate-manifold-research.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "SKILL"
+              "title": "hmm-graph-substate-manifold-research"
             }
           }
         ]
@@ -190,6 +190,9 @@
   },
   "active": "2f7347019df76f95",
   "lastOpenFiles": [
+    "Untitled.md",
+    "docs/hmm-graph-substate-manifold-research.md",
+    ".agents/skills/owl/SKILL.md",
     ".yaw/deno_dir/node_analysis_cache_v2-shm",
     "tests/__pycache__/embedding_fixture.cpython-314.pyc",
     "outputs/wiring-audit/engine-native-fixtures-v3.txt",
@@ -200,9 +203,7 @@
     "outputs/wiring-audit/prompt-integrity/embedding-final.xml",
     "tests/daemon/graph/__pycache__/test_engine.cpython-314-pytest-9.2.0.pyc.55236",
     ".yaw/dspy_cache/005/cache.db-wal",
-    ".yaw/dspy_cache/005/cache.db-shm",
     ".agents/skills/owl/refefrences/02-RDFS-FOUNDATIONS.md",
-    ".agents/skills/owl/SKILL.md",
     ".agents/skills/owl/refefrences/03-OWL-CLASSES.md",
     ".agents/skills/owl/README.md",
     "referencces/03-OWL-CLASSES.md",
@@ -219,7 +220,6 @@
     "docs/reviews/prompt-context-integrity.md",
     "probmath-inefficiencies.md",
     ".agents/skills/dspy-gepa-optimizer/reference.md",
-    "Untitled.md",
     "docs/epistemic-confidence-spec.md",
     "docs/native-cocoindex-graph.md",
     "docs/native-cocoindex-indexing.md",
