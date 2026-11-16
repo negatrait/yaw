@@ -19,7 +19,6 @@ from typing import Any, Literal, NamedTuple
 import cocoindex as coco
 import dspy
 import numpy as np
-import spacy
 import sqlite_vec
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
@@ -38,6 +37,7 @@ from yaw.core import (
     render_document_text,
     resolve_coco_state_root,
 )
+from yaw.retrieval import extract_text_features
 
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/pipeline/sqlite_db")
 EMBED_FN = coco.ContextKey[Callable[[list[str]], NDArray[np.float32]]]("yaw/pipeline/embed_fn")
@@ -59,58 +59,8 @@ _CHUNK_AUXILIARY_COLS: list[str] = [
 _SPLITTER = RecursiveSplitter()
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'_-]*")
-_CAP_SPAN_RE = re.compile(r"(?:[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z0-9][A-Za-z0-9_-]*)*)")
-_BRIDGE_CONN = frozenset({"of", "the", "and", "-", "de", "la", "van", "von"})
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _EMBED_BATCH_SIZE = 64
-_SPACY_LOCK = threading.Lock()
-_SPACY_NLP: Any = None
-
-
-def _get_spacy_nlp() -> Any:
-    global _SPACY_NLP
-    with _SPACY_LOCK:
-        if _SPACY_NLP is None:
-            _SPACY_NLP = spacy.load("en_core_web_sm", exclude=["ner"])
-        return _SPACY_NLP
-
-
-def _extract_terms(text: str, stops: set[str]) -> list[str]:
-    words = [w for m in _WORD_RE.finditer(text) if len(w := m.group(0).lower()) > 1 and w not in stops]
-    return words + [f"{words[k]}__{words[k + 1]}" for k in range(len(words) - 1)]
-
-
-def _extract_entities(doc: Any, stops: set[str], *, include_attr: bool = False) -> list[str]:
-    spans: list[str] = []
-    toks = list(doc)
-    idx = 0
-    while idx < len(toks):
-        end = idx + 1
-        if toks[idx].pos_ == "PROPN":
-            while end < len(toks) and (
-                toks[end].pos_ == "PROPN"
-                or (end + 1 < len(toks) and toks[end + 1].pos_ == "PROPN" and toks[end].text.lower() in _BRIDGE_CONN)
-                or (end > idx and toks[end - 1].text == "-" and toks[end].is_alpha)
-                or (end + 1 < len(toks) and toks[end].text == "-" and toks[end + 1].is_alpha)
-            ):
-                end += 1
-            spans.append(doc[idx:end].text)
-        idx = end
-    if doc.has_annotation("DEP"):
-        spans.extend(nc.text for nc in doc.noun_chunks if nc.root.pos_ == "PROPN")
-        if include_attr:
-            for sent in list(doc.sents)[:2]:
-                for tok in sent:
-                    if tok.pos_ == "NOUN" and not tok.is_stop and tok.dep_ == "attr":
-                        spans.append(tok.text)
-                        spans.extend(c.text for c in tok.conjuncts if c.pos_ == "NOUN" and not c.is_stop)
-    dedup: dict[str, str] = {}
-    for raw in spans or _CAP_SPAN_RE.findall(doc.text):
-        clean = raw.strip(" \t\n\r\"'()[]{}:;,.?!")
-        if len(clean) >= 2 and _extract_terms(clean, stops):
-            dedup.setdefault(re.sub(r"\s+", " ", clean).lower(), clean)
-    return list(dedup.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,13 +443,8 @@ async def _compute_chunk_features(
     vec_bytes = await _embed_formatted_texts((embed_fn, formatted))
 
     def _nlp_features() -> tuple[str, str]:
-        nlp = _get_spacy_nlp()
-        stops = set(nlp.Defaults.stop_words)
-        terms = list(dict.fromkeys(_extract_terms(f"{title}\n{body}", stops)))
-        doc_main = nlp(body[:1600])
-        doc_attr = nlp(body[:320]) if len(body) > 320 else doc_main
-        ents = [_extract_entities(doc_main, stops)[:16], _extract_entities(doc_attr, stops, include_attr=True)[:8]]
-        return json.dumps(terms, ensure_ascii=False), json.dumps(ents, ensure_ascii=False)
+        terms, ents = extract_text_features(title, body)
+        return json.dumps(terms, ensure_ascii=False), json.dumps(list(ents), ensure_ascii=False)
 
     tokens_json, entities_json = await asyncio.to_thread(_nlp_features)
     return vec_bytes, tokens_json, entities_json
@@ -782,16 +727,6 @@ def close_pipeline(session: PipelineSession) -> None:
         session.env.close()
     finally:
         session.conn_mgr.close()
-
-
-def extract_pipeline_terms_and_entities(title: str, body: str) -> tuple[list[str], tuple[list[str], list[str]]]:
-    """Expose indexing tokenization and spaCy entity spans cleanly for downstream consumers."""
-    nlp = _get_spacy_nlp()
-    stops = set(nlp.Defaults.stop_words)
-    terms = list(dict.fromkeys(_extract_terms(f"{title}\n{body}", stops)))
-    doc_main = nlp(body[:1600])
-    doc_attr = nlp(body[:320]) if len(body) > 320 else doc_main
-    return terms, (_extract_entities(doc_main, stops)[:16], _extract_entities(doc_attr, stops, include_attr=True)[:8])
 
 
 def list_user_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
