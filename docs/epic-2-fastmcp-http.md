@@ -4,8 +4,17 @@ Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Prerequisite: [Epic 1](epic-1-hippor
 
 ## Status and entry gate — reconciled 2026-10-27
 
-This is a planned implementation, reconciled against `dev`. **Epic 1 acceptance
-`D1-A6` remains open.** Runtime and ingestion checks do not establish Tier 2
+This is a planned implementation, reconciled against `dev`. **2026-11-15 / 2026-11-16 Updates
+([Epic 1 Decisions 19–20](epic-1-hipporag-daemon.md#decisions)):** Following the
+validated `E1-M1` Pass-4 shootout and Decision 20's zero-backward-compatibility
+clean-slate rebuild, the [Bare-Bones YAW Replacement Sprint](reviews/bare-bones-replacement-sprint.md)
+replaces `yaw/daemon/**` internals onto four bare-bones layers where `FastMCP`
+Streamable HTTP (`yaw/mcp_server.py`) and CLI sit directly on top of zero-LLM
+`recall` (`VectorSearch` in `yaw/retrieval.py`) and bare `dspy.ReAct` `qa`
+(`yaw/qa.py`).
+
+Historic note on the prior pre-bare-bones baseline: **Epic 1 acceptance
+`D1-A6` remained open under the legacy OpenIE/`ppr.py` path.** Runtime and ingestion checks do not establish Tier 2
 full-corpus parity. Record disjoint holdout results, corpus/query coverage, model
 identities and comparison against both consolidated targets in
 [evaluation](evaluation.md) before starting Epic 2 implementation. A sampled gate
@@ -16,84 +25,87 @@ After that gate passes, the first implementation packet is Sprint 1 dependency
 and containment verification. Its observable exit is a project-locked FastMCP
 import on Python 3.14.9 and passing adapter-boundary tests. Package resolution,
 installation, HTTP acceptance and model quality are separate evidence. Because
-`yaw/daemon/mcp_server.py` delegates exclusively to `runtime.retrieve` /
-`runtime.rag_qa` and `ChunkPointer.source_content_hash`, this external transport
-boundary remains completely decoupled from [Epic 3](epic-3-performance.md)'s
-internal retrieval, W3C symbolic pruning, and demoscene speed optimizations.
+`yaw/mcp_server.py` delegates exclusively to `runtime.recall` /
+`runtime.ask` / `runtime.get_status` and `ChunkPointer.source_hash`, this external
+transport boundary remains decoupled from [Epic 3](epic-3-performance.md)'s
+future retrieval and performance experiments.
 
 ## Verified baseline and required work
 
-| Area | Current code | Planned requirement |
+| Area | Pre-cutover baseline (`b8b65ec`) | Clean-slate planned requirement (`CS-3a`–`CS-3b`) |
 | --- | --- | --- |
-| Transport | No `fastmcp` dependency, `mcp_server.py` or MCP HTTP tests; host/port/path settings exist | Add the locked dependency and thin adapter; an old isolated dependency probe does not establish project compatibility |
-| Ownership | One runtime, database lock, worker and bounded queue | Preserve ownership; serve HTTP in the same daemon process |
-| Containment | Package-level rules allow daemon imports too broadly for the adapter | Enforce a module-specific boundary |
-| Citations | Some hydration paths lose metadata; runtime reports freshness without a source-content comparison | Persist indexed source fingerprints and preserve typed hydration results |
-| Queue | Cancelled futures retain capacity until consumed; admission precedes the queued callback | Own a cancellable pending queue; guarantee progress order and immediate reclamation |
-| Sync | Pending-sync lookup and publication are separate critical sections | Atomically coalesce concurrent requests |
-| Startup | Initial sync blocks startup; CLI runs a headless runtime | Expose health during deferred sync; couple shutdown through public APIs |
-| Validation | Boolean top_k is accepted; empty-index validation can precede lifecycle validation | Strict inputs and consistent error precedence |
+| Transport | No `fastmcp` dependency, `yaw/mcp_server.py`, or MCP HTTP tests; host/port/path config exists (`http_port = 8889` before `CS-4a` switch to `13306`) | Add locked `fastmcp` dependency in `CS-3a` and thin `yaw/mcp_server.py` adapter in `CS-3b`; old isolated probes do not prove project compatibility |
+| Ownership | Legacy `yaw/daemon/runtime.py` | Clean-slate `yaw/runtime.py`: single `YawRuntime`, `FileLock`, live `PipelineSession`, `BoundedSemaphore(32)` (`query_sem`), `Semaphore(1)` (`lm_sem`), atomic `VectorSearch` swap |
+| Containment | Legacy daemon package rules | Enforce module-specific `yaw.mcp_server` import boundary (`yaw.runtime`, `yaw.core.*` only) in `tests/core/test_architecture.py` |
+| Citations | Pointer provenance (`source_hash`) + `stale_on_disk` hydration without DB chunk text | Preserve `ChunkPointer.source_hash`, strict `chunk_id: int` (`chunks` `vec0` PK), MaxP coalescing (`pool_k = max(top_k * 4, 50)`), and `stale_on_disk` verification |
+| Admission | Queued worker internals in legacy daemon | Non-blocking `BoundedSemaphore(32)` admission returning `BUSY` when saturated; lock-free `daemon_status()` snapshot reads |
+| Sync | Manual `request_sync()` alongside watcher | Continuous live `CocoIndex` watcher (`localfs.walk_dir(..., live=True)`) swapping `VectorSearch` outside `index_lock` on `PRAGMA data_version` change |
+| Startup | Blocking/deferred initial sync | Deferred/non-blocking initial readiness on `/readyz` vs `/healthz`; Win32 named stop event (`Local\yaw-stop-<hash16>`) + POSIX signals wired via `yaw/cli.py` |
+| Validation | Permissive or duplicate validation paths | Validate strict query/question (`<= 1,024` UTF-8 bytes) and strict `int` `top_k` (`1..20`, rejecting `bool`/`str`/`float`) before lifecycle checks |
 
-Prepared bundles and persistent CocoIndex snapshots are the current ingestion
-contract. Scan document roots only; do not restore monolithic corpus discovery,
-evaluation-field ingestion, cache resets or legacy-layout fallbacks. Preserve
-generic production JSON projection and physical source coordinates.
+Prepared bundles and persistent CocoIndex snapshots (`coco_lmdb`) are the current
+ingestion contract. Scan document roots only; do not restore monolithic corpus
+discovery, evaluation-field ingestion, cache resets or legacy-layout fallbacks.
+Preserve generic production JSON projection and physical 1-indexed source coordinates.
 
 ## Containment and transport contract
 
-- The new `yaw/daemon/mcp_server.py` may import `yaw.daemon.runtime`,
-  `yaw.core.*` and public transport-library/stdlib APIs. No direct graph,
-  ingestion, storage or inference imports, or cross-module private access.
-- Default endpoint: `http://127.0.0.1:13306/mcp`, using existing HTTP settings.
-  Validate a loopback bind address. No separate server process, stdio/SSE entry
-  points, remote bind or wildcard CORS in this epic.
-- One database owner and worker; default capacity is **32 pending operations**,
-  excluding the active operation. Status reads bypass the queue.
-- Validate Host and Origin before dispatch, including health routes. Sprint 2
-  defines the guard; install it with Sprint 1's initial HTTP mount.
-- `/healthz` returns 200 while HTTP is responsive. `/readyz` returns 200 only
-  for `lifecycle == "ready"`, including a successfully synchronized empty corpus;
-  otherwise 503. A bound socket does not prove successful startup.
+- The new `yaw/mcp_server.py` may import ONLY `yaw.runtime`, `yaw.core.*`, and
+  public transport-library/stdlib APIs (`fastmcp`, `starlette`, `uvicorn`). No
+  direct ingestion, retrieval, pipeline, or `qa` imports, and no private
+  cross-module access.
+- Default endpoint: `http://127.0.0.1:13306/mcp` (`YawConfig.http_host`/`http_port`/`http_path`
+  in `CS-4a`). Reject non-loopback binds (`INVALID_INPUT`). No separate server
+  process, stdio/SSE entry points, remote bind or wildcard CORS in this epic.
+- One database owner (`PipelineSession`) and `YawRuntime`; default admission
+  capacity is **32 concurrent `recall` calls** (`BoundedSemaphore(32)`).
+  `daemon_status()` reads lock-free without acquiring `query_sem`, `lm_sem`, or `index_lock`.
+- Validate Host and Origin before dispatch, including health routes (`/mcp`,
+  `/healthz`, `/readyz`), returning HTTP `403` on rejection.
+- `/healthz` returns `200` `{"status": "ok"}` while HTTP is responsive.
+  `/readyz` returns `200` `{"status": "ready"}` only when
+  `get_status(rt).lifecycle == "ready"`, including a synchronized empty corpus;
+  otherwise `503` `{"status": lifecycle}`. A bound socket alone does not prove readiness.
 
-## Five tool contracts
+## Three tool contracts
 
 Query/question inputs must be strings, trimmed, non-empty and at most 1,024 UTF-8
-bytes. `top_k` is a strict integer in 1–20, default 5; booleans and coerced
-strings/floats are invalid. Runtime validation remains authoritative.
+bytes. `top_k` is a strict integer (`type(top_k) is int and 1 <= top_k <= 20`),
+default 5; booleans and coerced strings/floats are invalid (`INVALID_INPUT`).
+Runtime validation remains authoritative.
 
 | Tool | Execution and result | readOnly / destructive / idempotent / openWorld hints |
 | --- | --- | --- |
-| `retrieve(query, top_k=5)` | Await queued retrieval; `{query, top_k, results: Passage[]}` | true / false / true / false |
-| `rag_qa(question)` | Await queued QA; `{question, answer, reasoning, evidence: Passage[], last_sync_at: float or null}`; at most five evidence passages from the context actually used to answer | true / false / false / false |
-| `index_stats()` | Cached `runtime.stats().to_dict()`; no worker/database wait | true / false / true / false |
-| `daemon_status()` | Cached `runtime.status().to_dict()`, including redacted errors; no worker/database wait | true / false / true / false |
-| `sync_sources()` | Immediate `{scan_id, status: "accepted" or "already_pending"}` receipt; concurrent requests share the pending/running scan | false / true / true / false |
+| `recall(query, top_k=5)` | Delegates to `runtime.recall`; returns `{"query": str, "top_k": int, "results": list[PassageDict]}` (zero LM calls; `pool_k = max(top_k * 4, 50)` before MaxP) | true / false / true / false |
+| `qa(question)` | Delegates to `runtime.ask`; returns `{"question": str, "answer": str, "termination_reason": str, "turns": int, "citations": list[PassageDict]}` (`<= 5` verified citations from tool-seen passages) | true / false / false / false |
+| `daemon_status()` | Lock-free `runtime.get_status(rt).to_dict()`: `{"lifecycle", "provider_ready", "sync_state", "queue_depth", "active_op", "last_error", "last_sync_at", "pid", "num_chunks"}` with redacted errors | true / false / true / false |
 
-`Passage` has `{rank, text, score, chunk_id, content_hash, stale_on_disk, source}`;
-`source` has `{rel_posix_path, start_line, end_line, title}` with physical,
-1-indexed coordinates. Preserve MaxP aggregation by canonical passage span.
-`content_hash` is `sha256:` plus the SHA-256 of the **returned text's UTF-8 bytes**.
-It is distinct from the durable indexed source fingerprint used for freshness.
-The latter requires a small provenance schema extension specified in Sprint 1;
-the database still stores no chunk text.
+Legacy `sync_sources` and `index_stats` proposals are retired under Decision 20:
+live `CocoIndex` keeps `yaw.db` synchronized continuously without a separate manual
+sync tool, and `daemon_status()` exposes `num_chunks` alongside lifecycle state.
 
-## Execution, progress and errors
+`PassageDict` has `{"rank": int, "chunk_id": int, "text": str, "score": float, "stale_on_disk": bool, "content_hash": str, "source": {"rel_posix_path": str, "start_line": int, "end_line": int, "title": str}}`
+with physical, 1-indexed coordinates. Preserve MaxP aggregation by canonical passage
+span `(rel_posix_path, start_line, end_line)`. `content_hash` is `"sha256:"` plus
+the SHA-256 of the **returned text's UTF-8 bytes**. It is distinct from
+`ChunkPointer.source_hash` (persisted in `chunks` for freshness checks); SQLite
+still stores no raw chunk text.
 
-- Await worker futures without blocking ASGI. On successful retrieval/QA,
-  requested progress is `queued` (1/3), `started` (2/3), `ready` (3/3), in
-  order. Failed/cancelled operations emit only the stages reached.
-- `sync_sources` acknowledges admission rather than awaiting the scan. An
-  accepted receipt may report `queued`; later state is read through
-  `daemon_status`. Never retain its MCP request context after returning.
-- Explicit cancellation before execution removes pending work immediately.
-  Running work finishes its transaction; detach the cancelled caller. A transport
-  disconnect is not automatically MCP cancellation: test both against the locked
-  transport and clean up request-local progress tasks in every case.
-- Tool failures use `isError=true` and `[CODE]` prefixes: `INVALID_INPUT`,
-  `NOT_READY`, `EMPTY_INDEX` (QA only), `BUSY`, `MODEL_ERROR`,
-  `CONSISTENCY_ERROR`, `SHUTTING_DOWN`. Redact secrets on all exposed paths.
-  Validate input, then lifecycle, then operation-specific conditions/admission;
-  an empty index cannot override a starting/stopping lifecycle error.
+## Execution and error contracts
+
+- Offload blocking synchronous `runtime.recall` / `runtime.ask` execution off the
+  ASGI event loop (`asyncio.to_thread` or dedicated worker thread) so `/healthz`,
+  `/readyz`, and `daemon_status` remain non-blocking while inference runs.
+- On client disconnect or MCP cancellation, clean up request-local async tasks
+  cleanly without leaking handles or corrupting active `VectorSearch` state.
+- Tool failures map `YawRuntimeError` to redacted `ToolError(f"[{exc.code}] {msg}")`
+  using `[CODE]` prefixes: `INVALID_INPUT`, `SHUTTING_DOWN`, `NOT_READY`, `BUSY`,
+  `EMPTY_INDEX` (`qa` only; `recall` returns `results: []` on an empty ready index),
+  `MODEL_ERROR`, and `CONSISTENCY_ERROR`. Redact secrets (`api_key`, `Bearer ...`,
+  `sk-...`, URL userinfo) on every exposed path.
+- Validate inputs FIRST, then lifecycle (`SHUTTING_DOWN` / `NOT_READY`), then
+  operation-specific conditions/admission (`BUSY`, `EMPTY_INDEX`, `CONSISTENCY_ERROR`,
+  `MODEL_ERROR`); an empty index cannot override a `starting`/`stopping` lifecycle error.
 
 ---
 
@@ -106,8 +118,8 @@ the database still stores no chunk text.
   Python 3.14.9. Use that version's public APIs; old isolated resolution evidence
   does not prove project installation or transport behavior.
 - Extend [architecture tests](../tests/core/test_architecture.py) with a
-  module-specific rule for `yaw.daemon.mcp_server`: internal imports limited to
-  `yaw.daemon.runtime` and `yaw.core.*`. Test allowed/rejected imports.
+  module-specific rule for `yaw.mcp_server`: internal imports limited to
+  `yaw.runtime` and `yaw.core.*`. Test allowed/rejected imports.
   No private cross-module access or relaxed domain rules.
 - Exit: locked import and boundary tests pass, with versions/results recorded.
 
@@ -118,75 +130,70 @@ one physical record span, hydration can coalesce/expand spans, and bundle paths
 can be namespaced after chunk construction. Recomputing a chunk ID from hydrated
 text and its returned path therefore marks unchanged content stale.
 
-Add mandatory `source_content_hash` provenance to `ChunkPointer` and its
-persisted chunk representation: `sha256:` plus SHA-256 of the original source
-file bytes used to parse the chunk. All chunks from the same source snapshot share
-it. Capture bytes and fingerprint together; do not reread after parsing to assign
-a potentially newer hash. No source text is stored in SQLite.
+Persist mandatory `source_hash` provenance on `ChunkPointer` and in the `chunks`
+`vec0` table alongside `chunk_id: int` (`CHUNK_SCHEMA` in `yaw/pipeline.py`):
+`sha256` hex of the original normalized source span/file snapshot captured at
+chunk creation. All chunks from the same snapshot carry deterministic IDs and
+provenance without storing raw chunk text in SQLite.
 
-Carry the fingerprint through typed ingestion results, `SyncDelta`, persistent
-CocoIndex memo results, snapshots, optimization pool/cache serialization and graph
-commits. Commit each chunk and its fingerprint together, including resumed or
-partial indexing batches; a mutable per-file digest must not relabel old chunks
-as newly indexed. Update all constructors, consumers and persisted-format
-identities. Require fresh incompatible indexes/caches with a clear diagnostic;
-no default-empty provenance, migration shim or reset of unrelated experiments.
+Carry the fingerprint through CocoIndex rows and `VectorSearch` snapshots. Require
+fresh incompatible indexes/caches with clear diagnostics; no default-empty
+provenance, migration shim, or reset of unrelated experiments.
 
-At hydration, read each distinct source once per request, hash that same byte
-snapshot and validate complete physical span bounds before decoding/projection.
-Bound retained buffers; never keep a resident corpus copy. Metadata-only file
-stats are not proof of unchanged bytes. Preserve strict JSON whitelist/blacklist
-projection, nested exclusions and bundle document/evaluation isolation.
+At hydration (`hydrate_passage`), validate complete physical span bounds
+(`1 <= start_line <= end_line`, span `<= 5000`) and verify the disk span hash against
+`ptr.source_hash`. Bound retained buffers; never keep a resident corpus copy.
+Preserve strict JSON projection, AST island expansion (`include_island=True` for
+QA `read_chunk`), and bundle document/evaluation isolation.
 
 Missing, changed or truncated sources produce `stale_on_disk=True` and empty
 returned text while preserving the indexed source pointer. Do not expose changed
 raw JSON as a fallback. Propagate other read/parser failures explicitly. When
-coalescing passages, validate every contributing pointer's source fingerprint;
-aggregation must not erase stale state or mix incompatible source versions.
+coalescing passages via MaxP span deduplication (`pool_k = max(top_k * 4, 50)`),
+preserve canonical span ordering without mixing incompatible source versions.
 
-- Refactor graph retrieval to return `HydratedPassage` without discarding
-  stale/empty hits. Refactor callers rather than adding compatibility wrappers.
-- Serialize centrally in the runtime using the exact schema above.
-- QA uses verified fresh passages and returns evidence from the same captured
-  context actually supplied to its predictor. If stale sources leave no usable
-  context, return `CONSISTENCY_ERROR` requesting sync; a genuinely empty ready
-  index returns `EMPTY_INDEX`.
+- `search_vectors` + `hydrate_ranked_passages` return `tuple[HydratedPassage, ...]`
+  preserving `stale_on_disk` flags cleanly; refactor callers rather than adding
+  compatibility wrappers.
+- Serialize centrally in `yaw/mcp_server.py` using the `PassageDict` schema above.
+- QA uses verified fresh passages and cites inline `[chunk_id=<int>]` verified
+  against tool-seen IDs and `vs.id_to_pos` (`MODEL_ERROR` otherwise). If any
+  cited passage has `stale_on_disk=True`, return `CONSISTENCY_ERROR`; a
+  genuinely empty ready index returns `EMPTY_INDEX` (`recall` returns `results: []`).
 
-### 1.3 Queue, sync and lifecycle packet
+### 1.3 Concurrency, live sync and lifecycle packet
 
-Own a small bounded pending FIFO with explicit admission, removal, dequeue and
-shutdown methods (e.g. a `collections.deque` protected by a `threading.Condition`).
-Do not mutate Python queue internals. Capacity defaults to 32 pending items,
-excluding the active operation; status must reflect that rule.
-
-- A cancelled pending future is physically removed immediately, releases capacity
-  and never executes. If execution won the race, complete its transaction and
-  detach the caller.
-- Ensure `queued` precedes `started`, even with an idle worker and immediate
-  operation. Serialize per-operation stage delivery; emit `ready` only after
-  success. Invoke external callbacks outside queue/state locks.
-- Atomically reserve and publish the pending-sync future/scan ID with admission.
-  Concurrent `request_sync()` callers see one pending/running scan and the same
-  ID. Roll back reservations on failed admission; clear on completion,
-  cancellation or failure. Retain partial-scan deletion protection.
+Own bounded admission and lock hygiene inside `yaw/runtime.py`:
+- `query_sem` (`BoundedSemaphore(32)`): non-blocking acquisition in `recall()`
+  raising `YawRuntimeError("BUSY", ...)` immediately when 32 concurrent calls are
+  active; always released in `finally`.
+- `lm_sem` (`Semaphore(1)`): serializes local LM requests during `qa()`.
+- `index_lock` (`threading.RLock`): protects ONLY atomic swap of `(vector_search,
+  index_data_version)` in `get_vector_search(rt, conn)` after querying
+  `PRAGMA data_version` on a short-lived `with contextlib.closing(open_readonly_db(...))`
+  handle and rebuilding `build_vector_search(...)` outside locks — never hold
+  `index_lock` across embedder or LM HTTP calls.
+- Live `CocoIndex` watcher (`start_pipeline(..., live=True)`) updates `chunks` and
+  `chunk_fts` continuously in the background; no manual `sync_sources` tool.
 
 ### 1.4 Guarded HTTP mount and daemon packet
 
-Create `yaw/daemon/mcp_server.py` with a server factory and one HTTP runner wrapping
-the existing runtime. Use existing host/port/path settings, reject non-loopback
-binds and install the Host/Origin guard immediately.
+Create `yaw/mcp_server.py` with `create_mcp_app` and `serve_http` wrapping
+`YawRuntime`. Reject non-loopback `cfg.http_host` binds (`INVALID_INPUT`) and
+install the pre-dispatch Host/Origin guard immediately on `/mcp`, `/healthz`,
+and `/readyz`.
 
-Support deferred initial sync through a public runtime startup API. HTTP must bind
-while sync remains in `starting`; successful sync transitions to `ready`,
-including an empty corpus. Perform blocking startup/stop work off the ASGI event
-loop. Startup failure must leave readiness false and release resources acquired
-so far; a bound socket alone does not prove success.
+Support deferred initial readiness via `start_runtime(..., wait_for_ready=False)`
+with background readiness transition so HTTP binds while initial sync is `starting`,
+returning `503` on `/readyz` until `ready` (including an empty corpus). Perform
+blocking startup/stop work off the ASGI event loop. Startup failure leaves
+`/readyz` false and releases acquired locks/handles cleanly.
 
-Expose public runtime stop observation; never inspect its private event. Preserve
-Windows named-event and POSIX signal behavior. On stop, reject new work, settle
-pending futures, finish the active transaction, join the worker before closing
-resources, then release the database lock. Wire existing `yaw daemon run` and the
-`yaw daemon start` child into this runner.
+Preserve Windows named-event (`Local\yaw-stop-<hash16>` hashed from normalized
+`cfg.lock_path`) and POSIX signal stop handling. On stop, set `lifecycle="stopping"`,
+reject new tool work (`SHUTTING_DOWN`), join/close `close_pipeline`, set
+`"stopped"`, and release `FileLock`. Wire `yaw daemon run|start|stop|status`
+(`yaw/cli.py`) into this runtime and server runner.
 
 ---
 
@@ -194,23 +201,21 @@ resources, then release the database lock. Wire existing `yaw daemon run` and th
 
 ### 2.1 Thin transport implementation
 
-Register `retrieve`, `rag_qa`, `index_stats`, `daemon_status` and `sync_sources`
-with strict schemas and all four annotations. Delegate to public runtime APIs;
-never import graph/ingestion or own a second database writer.
+Register `recall`, `qa`, and `daemon_status` with strict schemas and all four
+`ToolAnnotations`. Delegate exclusively to `yaw.runtime`; never import
+`retrieval`/`pipeline`/`qa` or own a second database writer.
 
-Await retrieval/QA futures with `asyncio.wrap_future`. Status/statistics read
-cached snapshots directly. `sync_sources` returns its accepted/already-pending
-receipt immediately. Use strict transport types so schema validation cannot coerce
-`true`, `"5"` or `5.0` to integer `top_k`. Malformed JSON-RPC remains a protocol
-error, not a runtime tool failure.
+Offload `runtime.recall` / `runtime.ask` off the ASGI loop; `daemon_status`
+calls lock-free `runtime.get_status(rt).to_dict()` directly. Use strict Python /
+Pydantic typing so transport validation cannot coerce `true`, `"5"`, or `5.0` to
+integer `top_k`. Malformed JSON-RPC remains a protocol error, not a tool failure.
 
-### 2.2 Progress, cancellation and sync receipts
+### 2.2 Cancellation and disconnect cleanup
 
-Bridge synchronous callbacks into the active loop with `loop.call_soon_threadsafe`
-and a bounded per-request progress channel. Await `Context.report_progress`
-through public APIs of the locked FastMCP version. Detach callbacks and stop/await
-progress tasks on every completion, failure, or cancellation path. Test explicit
-MCP cancellation and dropped connections separately.
+Handle client disconnects and explicit MCP request cancellation cleanly across
+offloaded tool calls without corrupting `VectorSearch`, leaking readonly SQLite
+handles (impossible under `contextlib.closing`), or deadlocking `query_sem`/`lm_sem`.
+Test explicit cancellation and dropped connections separately against live TCP HTTP.
 
 ### 2.3 Loopback Host and Origin guard
 
@@ -228,15 +233,14 @@ Apply to `/mcp`, `/healthz` and `/readyz` before route dispatch.
 
 | Test packet | Required evidence |
 | --- | --- |
-| Lifespan/containment (`E2-A1`) | Health/readiness during blocked initial sync, empty-ready, failure and stopping; bind/startup cleanup; lock reacquisition; adapter import boundary |
-| Five tools (`E2-A2`) | Exact names, schemas and four annotations; calls without progress; ordered immediate/slow success; valid prefixes on error/cancellation |
-| Citations (`E2-A2`) | Actual text/physical coordinates for Markdown/code and prepared JSON; shared-record subchunks, namespaced paths and MaxP coalescing; unchanged fresh-process restart; edit/delete/truncate detection without excluded-data leaks; text hashes and QA evidence match captured predictor context |
-| Errors (`E2-A2`) | All seven codes from real validation/provider/storage/lifecycle conditions; empty/oversized UTF-8 and non-string query, `top_k` bounds/bool/string/float; lifecycle before empty-index errors; redaction |
-| Responsive reads (`E2-A3`) | Two clients; `daemon_status`, `index_stats`, `/healthz` and `/readyz` finish within two seconds while inference remains blocked on an explicit event |
-| Capacity/cancellation (`E2-A3`) | One blocked active operation plus 32 actual pending items; overflow `BUSY`; pending cancellation reduces depth and permits replacement before releasing the worker; cancelled work never executes; running cancellation finishes safely |
-| Atomic sync (`E2-A3`) | Simultaneously released clients get one `accepted` and remaining `already_pending` receipts with one scan ID; one actual scan; failed admission leaves no reservation; failed scans retry; partial scans never delete sources |
-| Live update (`E2-A3`) | CocoIndex source edit plus sync; new consistent citation/provenance after commit; unchanged warm scans reuse persistent results |
-| Security/disconnects (`E2-A3`) | Raw duplicate headers, IPv6, missing Origin, hostile hosts and non-loopback bind rejection; separate cancellation/disconnect/reconnect evidence; no leaked progress tasks |
+| Lifespan/containment (`E2-A1`) | Health/readiness during blocked initial sync, empty-ready, failure and stopping; bind/startup cleanup; lock reacquisition; `yaw.mcp_server` import boundary |
+| Three tools (`E2-A2`) | Exact `recall`, `qa`, `daemon_status` names, schemas, and four `ToolAnnotations`; `sync_sources`/`index_stats` absent; valid `[CODE]` prefixes on errors |
+| Citations (`E2-A2`) | Actual text/physical coordinates for Markdown/code and prepared JSON; shared-record subchunks, namespaced paths and MaxP coalescing (`pool_k = max(4k, 50)`); edit/delete/truncate detection (`stale_on_disk=True`, zero raw JSON leaks); `content_hash` and `qa.citations` verified against tool-seen `[chunk_id=<int>]` IDs |
+| Errors (`E2-A2`) | All seven `[CODE]` errors from real validation/provider/storage/lifecycle conditions; empty/oversized (`> 1,024` UTF-8 bytes) and non-string query, `top_k` bounds/bool/string/float; lifecycle before empty-index errors; secret redaction |
+| Responsive reads (`E2-A3`) | Two TCP clients; `daemon_status`, `/healthz`, and `/readyz` finish within two seconds while `qa` (`lm_sem`) remains blocked on an explicit event |
+| Capacity/release (`E2-A3`) | 32 concurrent active/blocked `recall` slots via `BoundedSemaphore(32)`; 33rd concurrent `recall` returns `BUSY`; releasing waiters restores immediate admission cleanly |
+| Live update (`E2-A3`) | Live CocoIndex file edit reflected via `PRAGMA data_version` swap in `VectorSearch` without server restart; new consistent citation/provenance on next `recall`/`qa` |
+| Security/disconnects (`E2-A3`) | Raw duplicate headers, IPv6, missing Origin, hostile hosts and non-loopback bind rejection; separate cancellation/disconnect/reconnect evidence |
 
 ---
 
@@ -244,19 +248,12 @@ Apply to `/mcp`, `/healthz` and `/readyz` before route dispatch.
 
 | Sprint | Work | Observable exit |
 | --- | --- | --- |
-| `E2-S1` | Dependency/boundary, provenance, typed hydration, cancellation/coalescing/order, deferred startup, guarded mount and existing CLI integration | Real loopback health/lifecycle tests; runtime/provenance tests; adapter containment |
-| `E2-S2` | Five tools, progress/error mapping and complete multi-client acceptance | Real TCP schemas, citations, security, cancellation, capacity, coalescing and responsive status |
+| `E2-S1` | `fastmcp` dependency/containment (`CS-3a`), `source_hash` provenance, `ChunkPointer` `int` IDs, bounded `query_sem`/`lm_sem`, lock-free status, guarded HTTP mount & `yaw/cli.py` integration | Real loopback health/lifecycle tests; runtime/provenance tests; adapter containment |
+| `E2-S2` | Three tools (`recall`, `qa`, `daemon_status`), error mapping, and multi-client TCP acceptance (`CS-3b`) | Real TCP schemas, citations, security, cancellation, 32-slot saturation, live update, and responsive status |
 
-- [ ] **E2-A1:** One HTTP/runtime lifespan, database owner and public shutdown path;
-  health/readiness observe startup, empty-ready, failure and shutdown; dependency
-  and containment checks pass.
-- [ ] **E2-A2:** Exactly five tools with specified annotations/errors; ordered
-  successful progress; source-isolated citations and QA evidence with correct
-  coordinates, hashes and freshness behavior.
-- [ ] **E2-A3:** Two TCP clients share one writer; all four status/health surfaces
-  respond within two seconds while inference remains blocked; actual 32-slot
-  overflow and immediate cancellation reclamation; atomic sync coalescing;
-  Host/Origin rejection and post-commit citation updates.
+- [ ] **E2-A1:** One HTTP/runtime lifespan, CocoIndex DB owner (`PipelineSession`), and public shutdown path; health/readiness observe startup, empty-ready, failure and shutdown; dependency and containment checks pass.
+- [ ] **E2-A2:** Exactly three read-only tools (`recall`, `qa`, `daemon_status`) with specified annotations/errors; source-isolated citations (`<= 5` for `qa`) and exact coordinates, hashes and freshness behavior.
+- [ ] **E2-A3:** Two TCP clients share one runtime; `daemon_status`, `/healthz`, and `/readyz` respond within two seconds while `qa` inference remains blocked; 32-slot `BUSY` saturation + release; live CocoIndex file updates swap `VectorSearch` cleanly; Host/Origin `403` rejection passes.
 
 Use workspace CocoIndex and engineering-real-tests skills during implementation.
 Record actual checks/failures in [evaluation](evaluation.md). Loopback inference
@@ -269,3 +266,14 @@ Retain these proposals for a separate decision in [Epic 3](epic-3-performance.md
 optimization/evaluation, numerical traversal tuning, grouping traversal/policy/
 seeding settings, and editable seed instructions/demonstrations. They are neither
 Epic 2 prerequisites nor accepted replacements for current interfaces.
+
+---
+
+## Decisions
+
+- 2026-11-15 `[Superseded on 2026-11-16 by Epic 1 Decision 20]`: User authorized the `4`-layer bare-bones architecture uniting FastMCP HTTP, CLI, constant live CocoIndex indexing, zero-LLM `SubStateManifoldHMM` `recall`, and `dspy.RLM` `qa` in the [Bare-Bones YAW Replacement Sprint](reviews/bare-bones-replacement-sprint.md) ([Epic 1 Decisions 18–19](epic-1-hipporag-daemon.md#decisions)): *"Retain & refine, but remove the ppr.py default. replace with the graphless graph. Pointless to keep ppr.py if we can beat it with less compute. So the mission was a success after all! This means you’ll need to map out a proper replacement sprint where all the bells and whistles of current yaw internals are reduced to utter bare bones. 1. cocoindex owns indexing, constant live daemon mode. 2. DSPy RLM sits on top of that pipeline. QA is routed to the RLM which uses tools to explore the ”graph”. 3. Recall@N passes through verbatim without the RLM 4. FastMCP and CLI sit on top of this, exposing the ”recall” and ”qa” tools (2. and 3.) Your goal has been met. We’ll explore the fancier math in Epic 3."* Open scope detail (`Open 1`: strictly `2` MCP tools `recall` + `qa` vs retaining `daemon_status` + `sync_sources` as transport health/sync controls alongside `/healthz` and `/readyz`) is tracked in [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md#1-scope--non-goals) pending user sign-off before execution.
+
+- 2026-11-16: Following the user's clean-slate zero-backward-compatibility directive ([Epic 1 Decision 20](epic-1-hipporag-daemon.md#decisions), [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md)), update the FastMCP HTTP and CLI contract:
+  - Clean-slate `yaw/mcp_server.py` (`FastMCP("yaw")`, Streamable HTTP on `127.0.0.1:13306/mcp` + `Host`/`Origin` `403` + `/healthz`/`/readyz`) exposes **exact `3` read-only tools**: `recall(query: str, top_k: int = 5)`, `qa(question: str)`, and `daemon_status()` (dropping `sync_sources` and `index_stats`), delegating to `VectorSearch` (`yaw/retrieval.py`) and bare `dspy.ReAct` (`yaw/qa.py`).
+  - `chunk_id` in cited passages is `int` (from `chunks` `vec0` `INTEGER primary key` matching physical `(rel_path, start_line, end_line)` + `source_hash` / `stale_on_disk`).
+  - CLI `yaw index` / `yaw graph` are deleted: `yaw daemon run|start` brings FastMCP HTTP and live CocoIndex online together.

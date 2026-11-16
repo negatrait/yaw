@@ -1287,7 +1287,10 @@ def check_benchmark_integrity(
         errors.extend(f"qa_llm: {err}" for err in qa_errors)
     if expected_doc_count is not None and graph_info.get("num_passage_nodes") != expected_doc_count:
         errors.append(f"Index passage count mismatch: {graph_info.get('num_passage_nodes')} != {expected_doc_count}")
-    if not (graph_info.get("num_extracted_triples") or graph_info.get("num_fact_nodes")):
+    if graph_info.get("retriever_mode") == "manifold":
+        if int(graph_info.get("num_chunk_vectors", 0)) <= 0:
+            errors.append("No chunk vectors indexed during manifold indexing")
+    elif not (graph_info.get("num_extracted_triples") or graph_info.get("num_fact_nodes")):
         errors.append("No triples extracted during OpenIE indexing")
     if include_qa:
         for idx, record in enumerate(records):

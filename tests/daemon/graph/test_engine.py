@@ -13,8 +13,9 @@ import pytest
 
 from daemon.graph.inference.test_reflection import provider as provider
 from daemon.graph.synonym_protocol import candidate_rows, complete_decisions
-from yaw.core import ChunkPointer
+from yaw.core import ChunkPointer, YawConfig
 from yaw.daemon.graph.engine import YawGraphEngine
+from yaw.daemon.graph.hmm import ManifoldHyperparams
 from yaw.daemon.graph.inference import (
     ActiveTraceComponentSelector,
     YawProgram,
@@ -3168,3 +3169,115 @@ def test_passage_only_query_traverses_real_entity_graph(test_engine, monkeypatch
     assert len(hits) == 2
     assert "Turing" in hits[0][2] and "Lovelace" in hits[1][2]
     assert hits[1][1] > 0
+
+
+def test_manifold_hop0_fallback_emits_seed_telemetry(test_engine) -> None:
+    """When 1-hop query has empty multi-hop witness route, manifold retrieval emits hop_0 seed telemetry."""
+
+    class IsolatedEmbedder(DeterministicMockEmbedder):
+        def encode(self, texts, instruction="", *, stage=None):
+            vectors = super().encode(texts, instruction, stage=stage)
+            for idx, (text, vector) in enumerate(zip(texts, vectors, strict=True)):
+                vector.fill(0)
+                if "curie" in text.lower() or "polonium" in text.lower():
+                    vector[0] = 1.0
+                else:
+                    vector[(idx % 60) + 1] = 1.0
+            return vectors
+
+    embedder = IsolatedEmbedder()
+    embedder.profile = EmbeddingProfile("deterministic", "isolated-hop0-fixture-v1", 64, 2048, "mean", "", "")
+    test_engine.embedder = _native_embedding(embedder)
+    test_engine.retriever_mode = "manifold"
+    test_engine.index(
+        [
+            "Marie Curie isolated polonium inside her Paris laboratory.",
+            "Harbor crane maintenance finishes on Friday afternoon.",
+            "Quarterly cafeteria supply invoice arrived this morning.",
+            "Library catalog backup archives finished overnight cleanly.",
+            "Municipal water pressure nominal across southern pipes.",
+            "Ceramic glaze firing uses high temperature stoneware.",
+            "Subway signal upgrade testing completes this weekend.",
+            "Orchard pruning yields stronger autumn fruit harvests.",
+        ]
+    )
+    hits, seeds = test_engine.retrieve_with_seeds("Who discovered polonium?", top_k=2)
+    assert len(hits) >= 1
+    assert "Curie" in hits[0][2]
+    assert test_engine._last_evidence_route == ()
+    assert len(seeds) == 1
+    cid, role, snippet = seeds[0]
+    assert role == "hop_0"
+    assert cid == hits[0][0].chunk_id
+    assert "polonium" in snippet.lower()
+    assert test_engine._last_query_seeds == seeds
+
+
+def test_engine_manifold_config_binding_and_cache_invalidation(tmp_path: Path, test_engine: YawGraphEngine) -> None:
+    """Binding YawConfig with [manifold] overrides updates active manifold params and invalidates stale caches."""
+    cfg_v1 = YawConfig(
+        workspace_root=tmp_path,
+        retriever_mode="manifold",
+        manifold_overrides=(("peclet", 0.55), ("alpha_sprt", 0.04), ("coalition_coupling", 0.30)),
+    )
+    test_engine.config = cfg_v1
+    assert test_engine.retriever_mode == "manifold"
+    test_engine.index(
+        [
+            "Marie Curie isolated polonium inside her Paris laboratory.",
+            "Harbor crane maintenance finishes on Friday afternoon.",
+            "Quarterly cafeteria supply invoice arrived this morning.",
+            "Library catalog backup archives finished overnight cleanly.",
+        ]
+    )
+
+    corpus = test_engine.load_manifold_corpus()
+    assert len(corpus.chunk_pointers) == 4
+    assert corpus.chunk_vectors.shape[0] == 4
+    assert len(corpus.chunk_texts) == 4
+
+    hits_v1, _ = test_engine.retrieve_with_seeds("Who discovered polonium?", top_k=2)
+    assert hits_v1
+    assert test_engine._substate_manifold is not None
+    first_manifold = test_engine._substate_manifold
+    assert first_manifold.params.peclet == pytest.approx(0.55)
+    assert first_manifold.params.alpha_sprt == pytest.approx(0.04)
+    assert first_manifold.params.coalition_coupling == pytest.approx(0.30)
+
+    cfg_v2 = YawConfig(
+        workspace_root=tmp_path,
+        retriever_mode="manifold",
+        manifold_overrides=(("peclet", 0.72), ("alpha_sprt", 0.06)),
+    )
+    test_engine.config = cfg_v2
+    assert test_engine._substate_manifold is None
+    assert test_engine._manifold_cache_key is None
+    hits_v2, _ = test_engine.retrieve_with_seeds("Who discovered polonium?", top_k=2)
+    assert hits_v2
+    assert test_engine._substate_manifold is not None
+    assert test_engine._substate_manifold is not first_manifold
+    assert test_engine._substate_manifold.params.peclet == pytest.approx(0.72)
+    assert test_engine._substate_manifold.params.alpha_sprt == pytest.approx(0.06)
+
+    test_engine.manifold_params = ManifoldHyperparams.from_overrides({"redundancy_curvature": 1.1})
+    assert test_engine._substate_manifold is None
+    test_engine.retrieve_with_seeds("Who discovered polonium?", top_k=2)
+    assert test_engine._substate_manifold is not None
+    assert test_engine._substate_manifold.params.redundancy_curvature == pytest.approx(1.1)
+
+    cfg_graph = YawConfig(workspace_root=tmp_path, retriever_mode="graph")
+    test_engine.config = cfg_graph
+    assert test_engine.retriever_mode == "graph"
+    assert test_engine._substate_manifold is None
+    assert test_engine._manifold_cache_key is None
+    assert test_engine._csr_graph is None
+    assert test_engine._csr_cache_key is None
+
+    test_engine.manifold_params = None
+    bad_cfg = YawConfig(
+        workspace_root=tmp_path,
+        retriever_mode="manifold",
+        manifold_overrides=(("nonexistent_manifold_param", 0.5),),
+    )
+    with pytest.raises(ValueError, match="Unknown ManifoldHyperparams field"):
+        test_engine.config = bad_cfg

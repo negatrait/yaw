@@ -91,11 +91,13 @@ from yaw.daemon.graph.storage.evidence import (
 )
 from yaw.daemon.graph.storage.managed_sqlite import create_table
 from yaw.daemon.graph.storage.rows import (
+    GRAPH_TABLES,
     DesiredTable,
     empty_delta_graph_tables,
     empty_graph_tables,
     graph_tables,
     snapshot_table_rows,
+    validate_graph_state,
 )
 from yaw.daemon.graph.storage.synonyms import SynonymConstraints
 
@@ -107,6 +109,7 @@ class GraphPlanSettings:
     embedding_identity: str
     synonym_identity: str = ""
     shacl_identity: str = ""
+    retriever_mode: str = "graph"
     candidate_dense_threshold: float = 0.85
     candidate_lexical_threshold: float = 0.675
     auto_merge_threshold: float = 0.98
@@ -773,12 +776,20 @@ async def plan_graph_publication(
 ) -> GraphPlanResult:
     """Plan a complete SHACL-conformant PreparedGraphRows without holding any yaw.db write transaction."""
     embeddings = coco.use_context(EMBEDDING_ENDPOINT)
-    extraction = coco.use_context(OPENIE_ENDPOINT)
-    if (
-        settings.program_identity != extraction.program_identity
-        or settings.embedding_identity != embeddings.adapter.index_identity
-    ):
-        raise ValueError("Graph plan settings identity does not match the bound inference endpoints")
+    if settings.retriever_mode == "manifold":
+        if (
+            settings.program_identity != "manifold-v3"
+            or settings.embedding_identity != embeddings.adapter.index_identity
+        ):
+            raise ValueError("Graph plan settings identity does not match the bound inference endpoints")
+        extraction = None
+    else:
+        extraction = coco.use_context(OPENIE_ENDPOINT)
+        if (
+            settings.program_identity != extraction.program_identity
+            or settings.embedding_identity != embeddings.adapter.index_identity
+        ):
+            raise ValueError("Graph plan settings identity does not match the bound inference endpoints")
 
     all_traces: list[PredictorTrace] = []
     all_telemetry: list[dict[str, Any]] = []
@@ -854,6 +865,54 @@ async def plan_graph_publication(
             chunk_ids=tuple(out.chunk_id for out in ordered_outputs),
             rlm_stats=rlm_stats,
         )
+
+    if settings.retriever_mode == "manifold":
+        chunks = [(out.pointer, out.text) for out in outputs_to_process]
+        chunk_vec_pairs = [(out.chunk_id, deserialize_f32_vector(out.vector_f32)) for out in outputs_to_process]
+        manifold_rows = PreparedGraphRows(
+            chunks=tuple(chunks),
+            entities=(),
+            entity_labels=(),
+            facts=(),
+            fact_sources=(),
+            edges=(),
+            chunk_vectors=tuple(chunk_vec_pairs),
+            entity_vectors=(),
+            fact_vectors=(),
+            mentions=(),
+            assertions=(),
+        )
+        schemas = await evidence_schemas()
+        staging_conn = open_yaw_db(":memory:")
+        try:
+            with write_tx(staging_conn):
+                for schema in schemas:
+                    create_table(staging_conn, schema)
+            seeded_rows_by_table: dict[str, dict[tuple[Any, ...], Any]] | None = None
+            if incremental:
+                seeded_rows_by_table = {name: {} for name, _, _ in GRAPH_TABLES}
+            elif published_inputs and has_chunks_table:
+                with coco.use_context(GRAPH_DB).readonly() as ro_conn:
+                    seeded_rows_by_table = snapshot_table_rows(ro_conn)
+            with staging_conn:
+                staging_conn.execute("BEGIN")
+                stage_graph_rows(staging_conn, manifold_rows)
+                validate_graph_state(staging_conn)
+            return GraphPlanResult(
+                tables=graph_tables(
+                    staging_conn,
+                    chunks if incremental else complete_chunks,
+                    tuple(sorted(input_fingerprints.items())),
+                    seeded_rows_by_table=seeded_rows_by_table,
+                    db_identity=resolved_db_identity,
+                ),
+                chunk_ids=tuple(out.chunk_id for out in ordered_outputs),
+                rlm_stats=rlm_stats,
+            )
+        finally:
+            staging_conn.close()
+
+    assert extraction is not None
 
     chunks: list[tuple[ChunkPointer, str]] = []
     all_records: list[OpenIERecord] = []

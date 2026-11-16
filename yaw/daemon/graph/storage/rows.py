@@ -6,11 +6,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
+import numpy as np
+
 from yaw.core import ChunkPointer
 
+from .db import DEFAULT_VEC_DIMENSION
 from .evidence import EVIDENCE_INDEXES, CandidateVector, EntityMention, FactAssertion
 from .managed_sqlite import ManagedTableTarget, VecSpec, mount_table
 from .shacl import lint_graph_shacl
+from .vectors import deserialize_f32_vector
 
 
 class ChunkRow(NamedTuple):
@@ -374,3 +378,41 @@ def validate_graph_state(conn: sqlite3.Connection) -> None:
         "OR (a.fact_id IS NOT NULL AND f.fact_id IS NULL) LIMIT 1"
     ).fetchone():
         raise ValueError("Invalid source assertion binding")
+
+
+def load_manifold_chunks(
+    conn: sqlite3.Connection,
+) -> tuple[list[ChunkPointer], np.ndarray]:
+    """Load persisted chunks and chunk_vec embeddings in deterministic order."""
+    rows = conn.execute(
+        "SELECT c.chunk_id, c.rel_posix_path, c.start_line, c.end_line, c.title, "
+        "c.ast_island_start, c.ast_island_end, v.embedding "
+        "FROM chunks c LEFT JOIN chunk_vec v ON v.chunk_id = c.chunk_id "
+        "ORDER BY c.chunk_id"
+    ).fetchall()
+    vec_count = int(conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0])
+    if vec_count != len(rows):
+        raise ValueError(f"chunk_vec/chunks count mismatch: {vec_count} != {len(rows)}")
+    if not rows:
+        return [], np.zeros((0, DEFAULT_VEC_DIMENSION), dtype=np.float32)
+    chunk_pointers: list[ChunkPointer] = []
+    vectors: list[np.ndarray] = []
+    for row in rows:
+        chunk_id = str(row[0])
+        emb_blob = row[7]
+        if emb_blob is None:
+            raise ValueError(f"Missing chunk_vec embedding for chunk_id={chunk_id!r}")
+        chunk_pointers.append(
+            ChunkPointer(
+                chunk_id=chunk_id,
+                rel_posix_path=str(row[1]),
+                start_line=int(row[2]),
+                end_line=int(row[3]),
+                title=str(row[4] or ""),
+                ast_island_start=int(row[5] or 0),
+                ast_island_end=int(row[6] or 0),
+            )
+        )
+        vectors.append(deserialize_f32_vector(bytes(emb_blob)))
+    matrix = np.vstack(vectors).astype(np.float32, copy=False)
+    return chunk_pointers, matrix

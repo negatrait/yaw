@@ -343,9 +343,7 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
-_ASCII_TOK_RE = re.compile(
-    r"[a-z0-9]+(?:(?:[+#%]+|[./:]|(?<=[0-9])-)[a-z0-9]+|-[0-9][a-z0-9]*)*(?:[+#%]+)?"
-)
+_ASCII_TOK_RE = re.compile(r"[a-z0-9]+(?:(?:[+#%]+|[./:]|(?<=[0-9])-)[a-z0-9]+|-[0-9][a-z0-9]*)*(?:[+#%]+)?")
 _SENT_SPLIT_RE = re.compile(r'(?:(?<=[.!?])\s+(?=[A-Z0-9"\'(\[])|\n\s*\n|\r?\n(?=[-#*•]|\d+\.\s))')
 
 
@@ -372,10 +370,7 @@ def split_subchunk_spans(text: str, *, max_spans: int = 6, min_chars: int = 24) 
     if len(merged) <= max_spans:
         return tuple(merged)
     n = len(merged)
-    return tuple(
-        " ".join(merged[(i * n) // max_spans : ((i + 1) * n) // max_spans])
-        for i in range(max_spans)
-    )
+    return tuple(" ".join(merged[(i * n) // max_spans : ((i + 1) * n) // max_spans]) for i in range(max_spans))
 
 
 @overload
@@ -962,7 +957,7 @@ def _lut_arr(
 ) -> np.ndarray:
     try:
         return np.frombuffer(array(tc, map(lut.__getitem__, map(getter, items))), dt)
-    except (KeyError, TypeError):
+    except KeyError, TypeError:
         dd = defaultdict(default.__int__, lut)
         src = map(getter, items)
         return np.frombuffer(array(tc, map(dd.__getitem__, src if tc == "i" else map(str, src))), dt)
@@ -1011,11 +1006,7 @@ def _norm_op(adj: sp.csr_matrix, beta: float) -> tuple[sp.csr_matrix, np.ndarray
         if exp != 0.0:
             s = np.zeros(n, "f8")
             nz = deg > 0.0
-            s[nz] = (
-                1.0 / np.sqrt(deg[nz])
-                if exp == 0.5
-                else (1.0 / deg[nz] if exp == 1.0 else deg[nz] ** (-exp))
-            )
+            s[nz] = 1.0 / np.sqrt(deg[nz]) if exp == 0.5 else (1.0 / deg[nz] if exp == 1.0 else deg[nz] ** (-exp))
             adj.data *= np.repeat(s, np.diff(adj.indptr)) if is_row else s[adj.indices]
     return adj, dangling
 
@@ -1425,8 +1416,22 @@ def build_substate_manifold(
         z_f4 = np.empty((0, 0), "f4")
         z_csr = sp.csr_matrix((0, 0), dtype="f8")
         return SubStateManifold(
-            (), (), z_i4, np.zeros(1, "i4"), z_f4, z_f4, z_f8, z_f8,
-            z_csr, z_csr, z_csr, {}, (), z_f8, z_f8, z_f8,
+            (),
+            (),
+            z_i4,
+            np.zeros(1, "i4"),
+            z_f4,
+            z_f4,
+            z_f8,
+            z_f8,
+            z_csr,
+            z_csr,
+            z_csr,
+            {},
+            (),
+            z_f8,
+            z_f8,
+            z_f8,
         )
 
     counts = np.fromiter((max(1, len(sp_t)) for sp_t in sub_texts_per_chunk), "i4", n_c)
@@ -1512,9 +1517,15 @@ def build_substate_manifold(
         nnz_f = len(f_rows)
         ip_f, cj_f, cx_f = np.empty(n_c + 1, "i4"), np.empty(nnz_f, "i4"), np.empty(nnz_f, "f8")
         _coo_tocsr(
-            n_c, n_v, nnz_f,
-            np.frombuffer(f_rows, "i4"), np.frombuffer(f_cols, "i4"), np.ones(nnz_f, "f8"),
-            ip_f, cj_f, cx_f,
+            n_c,
+            n_v,
+            nnz_f,
+            np.frombuffer(f_rows, "i4"),
+            np.frombuffer(f_cols, "i4"),
+            np.ones(nnz_f, "f8"),
+            ip_f,
+            cj_f,
+            cx_f,
         )
         _csr_sort_indices(n_c, ip_f, cj_f, cx_f)
         fts_c2t = sp.csr_matrix((cx_f, cj_f, ip_f), shape=(n_c, n_v), copy=False)
@@ -1531,13 +1542,31 @@ def build_substate_manifold(
         f_self_w = np.zeros(n_c, "f8")
 
     return SubStateManifold(
-        c_tup, sub_tup, sub_to_chunk, offsets, embs, c_embs,
-        w_sib, w_self, w_inter, fts_c2t, fts_t2c, vocab, inv_vocab, idf, idf_hop, f_self_w,
+        c_tup,
+        sub_tup,
+        sub_to_chunk,
+        offsets,
+        embs,
+        c_embs,
+        w_sib,
+        w_self,
+        w_inter,
+        fts_c2t,
+        fts_t2c,
+        vocab,
+        inv_vocab,
+        idf,
+        idf_hop,
+        f_self_w,
     )
 
 
 def _manifold_inter(
-    m: SubStateManifold, x_in: np.ndarray, out_sub: np.ndarray, c_buf: np.ndarray, v_buf: np.ndarray,
+    m: SubStateManifold,
+    x_in: np.ndarray,
+    out_sub: np.ndarray,
+    c_buf: np.ndarray,
+    v_buf: np.ndarray,
 ) -> None:
     n_s, n_c = x_in.size, len(m.chunk_ids)
     out_sub.fill(0.0)
@@ -1602,7 +1631,7 @@ def run_substate_hmm(
     obs_sub = np.maximum(0.0, (manifold.sub_embs @ qv).astype("f8"))
     lex_sub = lex_p[manifold.sub_to_chunk]
 
-    a0 = (0.65 * lex_sub + 0.35 * (obs_sub ** 3)) * (obs_sub ** 2) if float(lex_p.max()) > 0.0 else (obs_sub ** 4)
+    a0 = (0.65 * lex_sub + 0.35 * (obs_sub**3)) * (obs_sub**2) if float(lex_p.max()) > 0.0 else (obs_sub**4)
     if (a0_max := float(a0.max())) <= 0.0:
         return SubStateResult(tuple((manifold.chunk_ids[i], 0.0) for i in range(min(top_k, n_c))), (), 0.0)
     a0 = np.where(a0 >= 0.30 * a0_max, a0, 0.0)
@@ -1618,7 +1647,7 @@ def run_substate_hmm(
         qv_rem = qv
 
     obs_rem = np.maximum(0.0, (manifold.sub_embs @ qv_rem).astype("f8"))
-    gate = (obs_rem ** 4) + 1e-5
+    gate = (obs_rem**4) + 1e-5
 
     alphas = [a0]
     c_buf, v_buf = np.empty(n_c, "f8"), np.empty(max(n_v, 1), "f8")
@@ -1641,7 +1670,7 @@ def run_substate_hmm(
     for h in range(n_h - 2, -1, -1):
         inter_b = np.empty(n_s, "f8")
         _manifold_inter(manifold, b_cur, inter_b, c_buf, v_buf)
-        b_prev = _manifold_intra(manifold, inter_b) * (gate if h > 0 else (obs_sub ** 2 + 1e-5))
+        b_prev = _manifold_intra(manifold, inter_b) * (gate if h > 0 else (obs_sub**2 + 1e-5))
         if (bs := float(b_prev.sum())) > 0.0:
             b_prev *= 1.0 / bs
         betas[h] = b_prev
@@ -1701,7 +1730,11 @@ def run_substate_hmm(
         for pa in prev_cands:
             if b_toks:
                 a_toks = c2t.indices[c2t.indptr[pa] : c2t.indptr[pa + 1]].tolist()
-                common = [t for t in a_toks if t in b_toks and t not in q_tids and len(manifold.inv_vocab[t]) >= 3 and manifold.idf[t] > 3.5]
+                common = [
+                    t
+                    for t in a_toks
+                    if t in b_toks and t not in q_tids and len(manifold.inv_vocab[t]) >= 3 and manifold.idf[t] > 3.5
+                ]
                 if common:
                     bt = max(common, key=manifold.idf.__getitem__)
                     if (w_l := float(manifold.idf[bt])) > best_link:
@@ -1715,7 +1748,9 @@ def run_substate_hmm(
                 ia, _ = divmod(int(np.argmax(sim_mat)), s_b1 - s_b0)
                 best_lbl = f'latent bridge ({max_cos:.2f}): "{manifold.sub_texts[s_a0 + ia][:48].strip()}"'
 
-        route.append(EvidenceHop(manifold.chunk_ids[best_parent], manifold.chunk_ids[ci], hi, best_lbl, passages[idx_ord][1]))
+        route.append(
+            EvidenceHop(manifold.chunk_ids[best_parent], manifold.chunk_ids[ci], hi, best_lbl, passages[idx_ord][1])
+        )
 
     return SubStateResult(tuple(passages), tuple(route), z_val)
 
@@ -1729,7 +1764,9 @@ def format_evidence_route(result: SubStateResult) -> str:
         if hop.from_chunk_id is None:
             lines.append(f"- Query --({hop.bridge_label})--> [{hop.to_chunk_id}]")
         else:
-            lines.append(f"- [{hop.from_chunk_id}] --({hop.bridge_label})--> [{hop.to_chunk_id}] (hop {hop.hop_index + 1})")
+            lines.append(
+                f"- [{hop.from_chunk_id}] --({hop.bridge_label})--> [{hop.to_chunk_id}] (hop {hop.hop_index + 1})"
+            )
     return "\n".join(lines)
 
 

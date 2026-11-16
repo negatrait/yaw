@@ -3,7 +3,7 @@
 Grammar:
   yaw daemon {start|stop|status|run} [--config <path>]
   yaw graph {build|rebuild|lint} [--config <path>] [--turtle]
-  yaw dspy {optimize|load-program|benchmark} [--flags]
+  yaw dspy {optimize|load-program|benchmark|tune-manifold} [--flags]
   yaw config {get|set} [--flags]
 """
 
@@ -49,6 +49,7 @@ from yaw.daemon.graph.storage import (
     serialize_graph_turtle,
 )
 from yaw.daemon.ingestion import load_dataset_splits, resolve_dataset_bundle
+from yaw.daemon.manifold_optuna import DEFAULT_STUDY_DB, DEFAULT_STUDY_NAME, tune_manifold
 from yaw.daemon.runtime import YawRuntime, is_file_locked
 
 logger = logging.getLogger(__name__)
@@ -390,6 +391,20 @@ def build_parser() -> argparse.ArgumentParser:
                             ),
                         ),
                         (
+                            "--retriever",
+                            (
+                                ("choices", ("graph", "manifold", "shootout")),
+                                ("default", "graph"),
+                                (
+                                    "help",
+                                    (
+                                        "Retrieval architecture: 'graph' (HippoRAG 2 + OpenIE),"
+                                        " 'manifold' (SubStateManifold HMM), or 'shootout' (A/B comparison)"
+                                    ),
+                                ),
+                            ),
+                        ),
+                        (
                             "--compiled-program",
                             (
                                 ("type", "str"),
@@ -400,6 +415,102 @@ def build_parser() -> argparse.ArgumentParser:
                         (
                             "--fresh",
                             (("action", "store_true"), ("help", "Wipe existing benchmark sandbox before indexing")),
+                        ),
+                    ),
+                ),
+                (
+                    "tune-manifold",
+                    "Run persistent single-study Optuna TPESampler tuning over SubStateManifold hyperparameters",
+                    (
+                        (
+                            "--dataset",
+                            (("nargs", "*"), ("help", "One or more dataset names or JSON files to tune on")),
+                        ),
+                        (
+                            "--query-offset",
+                            (
+                                ("type", "int"),
+                                ("default", 10),
+                                ("help", "Disjoint starting query offset per dataset (default: 10)"),
+                            ),
+                        ),
+                        (
+                            "--max-queries",
+                            (
+                                ("type", "int"),
+                                ("default", 20),
+                                ("help", "Total tuning queries (train + val) per dataset (default: 20)"),
+                            ),
+                        ),
+                        (
+                            "--train-queries",
+                            (
+                                ("type", "int"),
+                                ("default", 12),
+                                ("help", "Training queries per dataset inside Optuna loop (default: 12)"),
+                            ),
+                        ),
+                        (
+                            "--index-queries",
+                            (
+                                ("type", "int"),
+                                ("default", 20),
+                                ("help", "Queries pooled for corpus indexing (default: 20)"),
+                            ),
+                        ),
+                        (
+                            "--trials",
+                            (
+                                ("type", "int"),
+                                ("default", 64),
+                                ("help", "Optuna TPESampler trial budget (default: 64)"),
+                            ),
+                        ),
+                        (
+                            "--study-db",
+                            (
+                                ("type", "str"),
+                                ("default", DEFAULT_STUDY_DB),
+                                ("help", f"SQLite study DB path (default: {DEFAULT_STUDY_DB})"),
+                            ),
+                        ),
+                        (
+                            "--study-name",
+                            (
+                                ("type", "str"),
+                                ("default", DEFAULT_STUDY_NAME),
+                                ("help", f"Optuna study name prefix (default: {DEFAULT_STUDY_NAME})"),
+                            ),
+                        ),
+                        (
+                            "--seed",
+                            (("type", "int"), ("default", 42), ("help", "Deterministic sampler seed (default: 42)")),
+                        ),
+                        (
+                            "--fresh",
+                            (("action", "store_true"), ("help", "Reset Optuna study database before starting")),
+                        ),
+                        (
+                            "--fresh-indexes",
+                            (("action", "store_true"), ("help", "Rebuild cached benchmark manifold indexes")),
+                        ),
+                        (
+                            "--apply",
+                            (
+                                ("action", "store_true"),
+                                ("help", "Persist winning hyperparameters to [manifold] in yaw.toml"),
+                            ),
+                        ),
+                        (
+                            "--allow-eval-overlap",
+                            (
+                                ("action", "store_true"),
+                                ("help", "Allow query_offset < 10 overlapping held-out [0, 10) slice"),
+                            ),
+                        ),
+                        (
+                            "--output",
+                            (("type", "str"), ("help", "Optional extra path to write tuning summary JSON")),
                         ),
                     ),
                 ),
@@ -1080,12 +1191,49 @@ def handle_dspy_benchmark(
         query_offset=int(getattr(args, "query_offset", 0) or 0),
         full_corpus=bool(getattr(args, "full_corpus", False)),
         mode=getattr(args, "mode", "eval") or "eval",
+        retriever=getattr(args, "retriever", "graph") or "graph",
         compiled_program=getattr(args, "compiled_program", None),
         output_path=getattr(args, "output", None),
         fresh=bool(getattr(args, "fresh", False)),
         target=getattr(args, "target", None),
     )
-    return _emit(res, 0 if res.get("overall_gate_passed", True) else 1)
+    is_shootout = res.get("retriever") == "shootout"
+    ok = bool(res.get("integrity_passed", True)) and (
+        bool(res.get("overall_gate_passed", True)) if (not is_shootout or gate_path is not None) else True
+    )
+    return _emit(res, 0 if ok else 1)
+
+
+def handle_dspy_tune_manifold(
+    config: YawConfig,
+    args: argparse.Namespace,
+    *,
+    config_path: Path | None = None,
+    program: YawProgram | None = None,
+    embedder: DSPyEmbeddingAdapter | None = None,
+) -> int:
+    """Run persistent single-study Optuna TPESampler tuning over SubStateManifold hyperparameters."""
+    res = tune_manifold(
+        config,
+        datasets=getattr(args, "dataset", None),
+        query_offset=int(getattr(args, "query_offset", 10) if getattr(args, "query_offset", None) is not None else 10),
+        max_queries=int(getattr(args, "max_queries", 20) or 20),
+        train_queries=int(getattr(args, "train_queries", 12) or 12),
+        index_queries=int(getattr(args, "index_queries", 20) or 20),
+        trials=int(getattr(args, "trials", 64) if getattr(args, "trials", None) is not None else 64),
+        study_db=getattr(args, "study_db", DEFAULT_STUDY_DB) or DEFAULT_STUDY_DB,
+        study_name=getattr(args, "study_name", DEFAULT_STUDY_NAME) or DEFAULT_STUDY_NAME,
+        seed=int(getattr(args, "seed", 42) if getattr(args, "seed", None) is not None else 42),
+        fresh=bool(getattr(args, "fresh", False)),
+        fresh_indexes=bool(getattr(args, "fresh_indexes", False)),
+        apply=bool(getattr(args, "apply", False)),
+        allow_eval_overlap=bool(getattr(args, "allow_eval_overlap", False)),
+        output_path=getattr(args, "output", None),
+        config_path=config_path,
+        program=program,
+        embedder=embedder,
+    )
+    return _emit(res, 0)
 
 
 def handle_config_get(config: YawConfig, key: str | None = None, config_path: Path | None = None) -> int:
@@ -1144,6 +1292,8 @@ def main(
                 return handle_dspy_load_program(config, args.file)
             if action == "benchmark":
                 return handle_dspy_benchmark(config, args, program=program, embedder=embedder)
+            if action == "tune-manifold":
+                return handle_dspy_tune_manifold(config, args, config_path=cfg_path, program=program, embedder=embedder)
         elif domain == "config":
             if action == "get":
                 return handle_config_get(config, key=args.key, config_path=cfg_path)
@@ -1151,7 +1301,7 @@ def main(
                 return handle_config_set(config, key=args.key, value_raw=args.value, config_path=cfg_path)
         parser.print_help(sys.stderr)
         return 2
-    except (YawRuntimeError, ValueError, FileNotFoundError) as err:
+    except (YawRuntimeError, ValueError, KeyError, FileNotFoundError) as err:
         code, msg = (err.code, err.message) if isinstance(err, YawRuntimeError) else ("INVALID_INPUT", str(err))
         sys.stderr.write(json.dumps({"error": code, "message": msg}) + "\n")
         return 1
@@ -1173,6 +1323,7 @@ __all__ = [
     "handle_dspy_benchmark",
     "handle_dspy_load_program",
     "handle_dspy_optimize",
+    "handle_dspy_tune_manifold",
     "handle_graph_build",
     "handle_graph_lint",
     "handle_graph_rebuild",

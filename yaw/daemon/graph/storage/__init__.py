@@ -31,6 +31,7 @@ _PUBLIC_API: dict[str, str] = {
     "search_chunks_fts": ".vectors",
     "search_facts_fts": ".vectors",
     # Chunk metadata, OpenIE checkpoints, SKOS/RDF/OWL graph CRUD & candidate mining
+    "load_manifold_chunks": ".rows",
     "canonicalize_entity_labels_edc": ".graph_ops",
     "deserialize_openie_record": ".graph_ops",
     "find_entity_candidates": ".graph_ops",

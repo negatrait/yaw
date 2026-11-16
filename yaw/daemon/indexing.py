@@ -13,7 +13,7 @@ from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
-from yaw.core import ChunkPointer, resolve_coco_state_root
+from yaw.core import ChunkPointer, OpenIERecord, resolve_coco_state_root
 from yaw.daemon.graph.engine import YawGraphEngine
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
@@ -71,6 +71,7 @@ class SyncOutcome:
 class InferenceIdentity:
     program: str
     embedding: str
+    retriever_mode: str = "graph"
 
 
 ACTIVE_SOURCE_SETTINGS = coco.ContextKey[SourceSettings | None]("yaw/active_source_settings", detect_change=True)
@@ -104,9 +105,14 @@ async def process_chunk(
     """Declare a complete inference artifact only after both operations succeed."""
     _ = db_identity
     embeddings = coco.use_context(EMBEDDING_ENDPOINT)
-    extraction = coco.use_context(OPENIE_ENDPOINT)
-    if identity.program != extraction.program_identity or identity.embedding != embeddings.adapter.index_identity:
-        raise ValueError("Indexing identity does not match the bound inference resources")
+    if identity.retriever_mode == "manifold":
+        if identity.program != "manifold-v3" or identity.embedding != embeddings.adapter.index_identity:
+            raise ValueError("Indexing identity does not match the bound inference resources")
+        extraction = None
+    else:
+        extraction = coco.use_context(OPENIE_ENDPOINT)
+        if identity.program != extraction.program_identity or identity.embedding != embeddings.adapter.index_identity:
+            raise ValueError("Indexing identity does not match the bound inference resources")
     pointer = ChunkPointer(
         metadata.chunk_id,
         metadata.rel_posix_path,
@@ -133,19 +139,40 @@ async def process_chunk(
         "format_chunk_for_embedding",
         lambda p, t: DSPyEmbeddingAdapter.format_chunk_for_embedding(embeddings.adapter, p, t),
     )
-    embedding_text = fmt_chunk(pointer, chunk_text)
-    if hasattr(embeddings.adapter, "prepare_request"):
-        embed_req = embeddings.adapter.prepare_request([embedding_text], batch_size=64, stage="chunk_embed")
-    else:
-        embed_req = EmbeddingRequest(
-            texts=(embedding_text,),
+
+    def _make_embed_req(text: str, *, stage: str) -> EmbeddingRequest:
+        if hasattr(embeddings.adapter, "prepare_request"):
+            return embeddings.adapter.prepare_request([text], batch_size=64, stage=stage)
+        return EmbeddingRequest(
+            texts=(text,),
             profile=embeddings.adapter.profile,
             index_identity=embeddings.adapter.index_identity,
             task_mode=getattr(embeddings.adapter, "task_mode", "distinct-titled"),
             batch_size=64,
             max_batch_chars=getattr(embeddings.adapter, "max_batch_chars", 3500),
-            stage="chunk_embed",
+            stage=stage,
         )
+
+    if identity.retriever_mode == "manifold":
+        embedded = await embed_text(_make_embed_req(fmt_chunk(pointer, chunk_text), stage="chunk_embed"))
+        row = ChunkInference(
+            metadata.chunk_id,
+            metadata.source_hash,
+            "manifold-v3",
+            embeddings.adapter.index_identity,
+            json.dumps(asdict(OpenIERecord(chunk_id=metadata.chunk_id, entities=(), triples=()))),
+            "[]",
+        )
+        target.declare_row(row=row)
+        return ChunkProcessOutput(
+            pointer=pointer,
+            text=chunk_text,
+            inference=row,
+            embedding=embedded.vector_f32,
+        )
+
+    assert extraction is not None
+    embed_req = _make_embed_req(fmt_chunk(pointer, chunk_text), stage="chunk_embed")
     openie_passage = chunk_text
     if settings is not None and pointer.start_line > 1:
         source_root = coco.use_context(SOURCE_ROOT)
@@ -531,8 +558,12 @@ async def indexing_app_main(
 def graph_plan_fingerprints(
     program: YawProgram,
     embedder: DSPyEmbeddingAdapter,
+    *,
+    retriever_mode: str = "graph",
 ) -> tuple[str, str, str, str]:
     """Return (program_identity, embedding_identity, synonym_identity, shacl_identity)."""
+    if retriever_mode == "manifold":
+        return ("manifold-v3", str(embedder.index_identity), "none", "none")
     return (
         openie_fingerprint(program),
         str(embedder.index_identity),
@@ -575,8 +606,9 @@ def bind_native_indexing(
             shared = acquire_coco_environment(resolved_state_root)
 
         active_program = program if program is not None else engine.program
+        retriever_mode = engine.retriever_mode
         program_identity, embedding_identity, synonym_identity, shacl_identity = graph_plan_fingerprints(
-            active_program, engine.embedder
+            active_program, engine.embedder, retriever_mode=retriever_mode
         )
         context = shared.context
         recorded_error: BaseException | None = None
@@ -593,15 +625,16 @@ def bind_native_indexing(
         context.provide(VALIDATE_SQLITE, validate_graph_state)
         embedding_endpoint = EmbeddingEndpoint(engine.embedder)
         context.provide(EMBEDDING_ENDPOINT, embedding_endpoint)
-        context.provide(
-            OPENIE_ENDPOINT,
-            OpenIEEndpoint(
-                active_program,
-                active_program.rlm_sub_lm or active_program.orchestrator_lm,
-                program_identity,
-                progress_callback=engine.emit_indexing_progress,
-            ),
-        )
+        if retriever_mode != "manifold":
+            context.provide(
+                OPENIE_ENDPOINT,
+                OpenIEEndpoint(
+                    active_program,
+                    active_program.rlm_sub_lm or active_program.orchestrator_lm,
+                    program_identity,
+                    progress_callback=engine.emit_indexing_progress,
+                ),
+            )
         base_src = source_settings if source_settings is not None else SourceSettings((), ())
         settings = GraphPlanSettings(
             corpus_root=engine.workspace_root,
@@ -609,6 +642,7 @@ def bind_native_indexing(
             embedding_identity=embedding_identity,
             synonym_identity=synonym_identity,
             shacl_identity=shacl_identity,
+            retriever_mode=retriever_mode,
             candidate_dense_threshold=engine.candidate_dense_threshold,
             candidate_lexical_threshold=engine.candidate_lexical_threshold,
             auto_merge_threshold=engine.auto_merge_threshold,
@@ -694,7 +728,7 @@ def bind_native_indexing(
         context.provide(ACTIVE_SOURCE_SETTINGS, src_settings)
         context.provide(
             ACTIVE_INFERENCE_IDENTITY,
-            InferenceIdentity(program=program_identity, embedding=embedding_identity),
+            InferenceIdentity(program=program_identity, embedding=embedding_identity, retriever_mode=retriever_mode),
         )
         context.provide(ACTIVE_GRAPH_SETTINGS, settings)
 
@@ -704,7 +738,9 @@ def bind_native_indexing(
                 coco.AppConfig(name="yaw_indexing", environment=shared.environment, max_inflight_components=4),
                 indexing_app_main,
                 replace(src_settings, included_files=None),
-                InferenceIdentity(program=program_identity, embedding=embedding_identity),
+                InferenceIdentity(
+                    program=program_identity, embedding=embedding_identity, retriever_mode=retriever_mode
+                ),
                 settings,
                 watch_reload_signal=False,
                 live=False,

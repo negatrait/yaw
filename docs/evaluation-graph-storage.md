@@ -1,6 +1,6 @@
 # Evaluation Record: Graph, Storage & Benchmarks
 
-Domain evaluation ledger for `yaw.db` (`sqlite-vec`, contentless FTS5), sparse CSR Personalized PageRank, W3C SKOS/RDF/OWL/SHACL build-time validation, and Tier 0 / Tier 1 HippoRAG 2 benchmark baselines. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
+Domain evaluation ledger for `yaw.db` (`sqlite-vec`, contentless FTS5), sparse CSR Personalized PageRank, W3C SKOS/RDF/OWL/SHACL build-time validation, Tier 0 / Tier 1 HippoRAG 2 benchmark baselines, and the bounded `E1-M1` sub-state manifold shootout ([Epic 1 Hard Gates](epic-1-hipporag-daemon.md#hard-gates), [Epic 3 `E1-M1`](epic-3-performance.md#early-epic-1-exception-sub-state-manifold-shootout-e1-m1), [substate-manifold-shootout.md](reviews/substate-manifold-shootout.md)). See the [Evaluation Index](evaluation.md) for all other domain ledgers.
 
 ## Installed baseline
 
@@ -793,3 +793,214 @@ Contract and implementation record: [native graph publication](native-cocoindex-
 - Full-suite evidence: pending `outputs/provenance-repair/full-suite.xml`.
   Out-of-band target corruption recovery and live inference performance were
   not established by this evaluation.
+
+---
+
+## 2026-11-14: Bounded `E1-M1` Sub-State Manifold Baseline, Optuna 3-Point Study & Pass-3 Pre-Fix Diagnostics
+
+Bounded `E1-M1` benchmark evaluation ([Epic 1 Hard Gates](epic-1-hipporag-daemon.md#hard-gates),
+[Epic 3 `E1-M1`](epic-3-performance.md#early-epic-1-exception-sub-state-manifold-shootout-e1-m1),
+[substate-manifold-shootout.md](reviews/substate-manifold-shootout.md))
+comparing `Current YAW` (`ppr.py`, `retriever_mode="graph"`) against
+`SubStateManifoldHMM` (`hmm.py`, `retriever_mode="manifold"`), `monkeypatched_hipporag`,
+and `PAPER_BASELINES` across `4` dev datasets (`2wikimultihopqa`, `musique`, `hotpotqa`,
+`popqa`; `offset=0, max_queries=10`), plus persistent Optuna MOTPE tuning telemetry
+(`offset=10, max_queries=20`) and read-only pre-Pass-3 5-point `Recall@{1, 2, 5, 10, 20}`
+diagnostics on commit `63c9c00` (uncommitted `E1-M1` working tree).
+
+### Initial `E1-M1` 4-Dataset CLI Shootout (`offset=0`, `n=40`)
+
+Source artifact: `outputs/benchmarks/shootout_4ds_10q_initial.json` (`mode="eval"`,
+`retriever="shootout"`, `status="failed"`, `integrity_passed=false`), `outputs/benchmarks/manifold_retrieval_4ds_10q_initial.json`
+(`overall_gate_status="FAIL"`, `datasets_passed=0/4`), and
+`outputs/benchmarks/manifold_spectral_telemetry_initial.json`:
+
+| Dataset (`n=10`) | `Current YAW` `R@1/2/5` (`EM`/`F1`) | `Manifold` `R@1/2/5` (`EM`/`F1`) | `HippoRAG` Local `R@5` | `Paper 70B` `R@5` | `Manifold` Stalk `min/p50/mean/max` (`abtt=8`) |
+| --- | --- | --- | --- | --- | --- |
+| `2wikimultihopqa` (`C=105, S=269`) | `0.425 / 0.70 / 0.95` (`0.20 / 0.28`) | `0.425 / 0.70 / 0.80` (`0.40 / 0.4555`) | `0.9091` | `0.904` | `2 / 3.0 / 3.3619 / 8` |
+| `musique` (`C=212, S=801`) | `0.1333 / 0.2083 / 0.3583` (`0.10 / 0.1364`) | `0.3083 / 0.3417 / 0.475` (`0.10 / 0.10`) | `0.6818` | `0.747` | `2 / 5.0 / 5.3868 / 11` |
+| `hotpotqa` (`C=102, S=454`) | `0.35 / 0.70 / 0.90` (`0.0 / 0.1867`) | `0.50 / 0.70 / 0.80` (`0.0 / 0.1418`) | `0.90` | `0.963` | `2 / 6.0 / 6.1863 / 11` |
+| `popqa` (`C=30, S=115`) | `0.45 / 0.60 / 0.60` (`0.10 / 0.2566`) | `0.50 / 0.55 / 0.70` (`0.0 / 0.3436`) | `1.0` | `0.517` | `2 / 5.0 / 4.7 / 9` |
+| **Macro (`n=40`)** | **`0.3396 / 0.5521 / 0.7021`** (`0.10 / 0.2149`) | **`0.4333 / 0.5729 / 0.6938`** (`0.125 / 0.2602`) | **`0.8727` (`R@5`)** | **`0.7828` (`R@5`)** | — |
+
+- Total wall-clock shootout time (`outputs/benchmarks/shootout_4ds_10q_initial.json`):
+  `Current YAW` `759.8571 s` vs. `SubStateManifoldHMM` `144.44 s` (`5.2607x` end-to-end
+  speedup; `41.5398x` indexing speedup, `0.7736x` evaluation speedup).
+- Integrity failure in initial Pass-1 (`manifold_retrieval_4ds_10q_initial.json`):
+  `queries_with_graph_seeds` was `2/10` (`2wikimultihopqa`), `0/10` (`musique`),
+  `3/10` (`hotpotqa`), and `0/10` (`popqa`), causing `musique` and `popqa` to fail
+  the engine's non-empty `graph_seeds` integrity check.
+
+### Pass-2 Stage-3 `offset=0` Offline Recall & Initial 3-Point Optuna Study (`offset=10`)
+
+- **Pass-2 Stage-3 (`offset=0, n=40`)** (`docs/reviews/substate-manifold-shootout.md`,
+  re-verified by read-only `scripts/probe_manifold.py -> outputs/benchmarks/probe_manifold_pre_pass3.json` below): Macro `R@1/2/5 = 0.4208 / 0.5833 / 0.7854`
+  (`+0.0917 R@5` vs Pass-1, `0` cycles, `40/40` telemetry seeds via Hop-0 fallback).
+- **Initial 3-point Optuna MOTPE study (`outputs/benchmarks/optuna_manifold_study.json`,
+  `query_offset=10, max_queries=20, train_queries=12, val_queries=8, applied=true`,
+  `64` Stage-A + `28` Stage-B trials):**
+  - Baseline `ManifoldHyperparams()`: `train` (`n=48`) `r1=0.38715, r2=0.62153, r5=0.79340, combined=0.60069`;
+    `val` (`n=32`) `r1=0.41927, r2=0.62500, r5=0.81510, combined=0.61979`.
+  - Selected `stage_a` winner (`17` overrides written to `[manifold]` in `yaw.toml`,
+    `selection_score=0.63669`): `train` `r1=0.45833, r2=0.69618, r5=0.78472, combined=0.64641`;
+    `val` `r1=0.46615, r2=0.65625, r5=0.76823, combined=0.63021` — lifted `val.combined`
+    solely via `R@1/2` while regressing held-out `val.r5` by `-0.04688` because
+    `_select_candidate_from_trials` did not enforce per-horizon `val["r5"]` non-regression
+    and used a 3-point (`Recall@{1, 2, 5}`) horizon instead of 5-point `Recall@{1, 2, 5, 10, 20}`.
+
+### Pre-Pass-3 5-Point Retrieval & Structural Diagnostics (Read-Only Probe on Cached DBs)
+
+Read-only SQLite probe (`[measured: scripts/probe_manifold.py -> outputs/benchmarks/probe_manifold_pre_pass3.json, 63c9c00, dirty]`)
+over cached `offset=10` (`2wikimultihopqa_765a8de7_manifold`, `musique_2f605046_manifold`,
+`hotpotqa_4124865a_manifold`, `popqa_7f5edc71_manifold`; `n=80`) and `offset=0`
+(`2wikimultihopqa_28e7b384_manifold`, `musique_4da8e714_manifold`,
+`hotpotqa_eecbfe18_manifold`, `popqa_3558225d_manifold`; `n=40`) on `63c9c00` dirty tree
+(`pool_limit=40`, `k_list=(1, 2, 5, 10, 20)`):
+
+| Slice & Arm | `R@1` | `R@2` | `R@5` | `R@10` | `R@20` | Structural Telemetry |
+| --- | --- | --- | --- | --- | --- | --- |
+| `offset=10` (`n=80`) `default` | `0.4000` | `0.6229` | `0.8021` | `0.8833` | `0.9677` | `hw_tail_all_zero`: `8/80` (`PopQA`: `7/20`; `any<0.20`: `33/80`); `fts_lt_half`: `80/80`; `vec_lt_half`: `20/80` (`musique`: `20/20`) |
+| `offset=10` (`n=80`) `default_hop0_only` | `0.3854` | `0.5875` | `0.7219` | `0.7948` | `0.8854` | `gold_doc_gt32`: `14/174` Hop-0 posterior (`15/174` `hop0_only`), `4/174` final; `own_shrunk`: `0/899` |
+| `offset=10` (`n=80`) `vec_hits` (`k=200`) | `0.4406` | `0.6260` | `0.7865` | `0.9021` | `0.9448` | Raw `vec0` baseline (beats `default` on `R@1/2/10`) |
+| `offset=10` (`n=80`) `active_config` (`yaw.toml`) | `0.4615` | `0.6802` | `0.7781` | `0.8771` | `0.9531` | Regresses `R@5/10/20` vs `default` (`val n=32 R@5`: `0.7682 vs 0.8151`) |
+| `offset=0` (`n=40`) `default` | `0.4208` | `0.5833` | `0.7854` | `0.9125` | `0.9792` | `hw_tail_all_zero`: `10/40`; `fts_lt_half`: `40/40`; `gold_2h`: `148/148` (`40/40` queries) |
+| `offset=0` (`n=40`) `default_hop0_only` | `0.4417` | `0.5729` | `0.6813` | `0.8625` | `0.9271` | `hop0_only` beats `default` `R@1` (`musique`: `0.3417 vs 0.2583`) |
+| `offset=0` (`n=40`) `vec_hits` (`k=200`) | `0.4125` | `0.5875` | `0.7208` | `0.8896` | `0.9604` | — |
+| `offset=0` (`n=40`) `active_config` (`yaw.toml`) | `0.4125` | `0.5729` | `0.7438` | `0.8938` | `0.9875` | Holdout `R@5` regresses `-0.0417` vs `default` (`0.74375 vs 0.78542`) |
+
+- **Sheaf Lexical-Bridge Transport Collapse (`||T_e u_src||^2`):** Across `offset=10`
+  (`136,666` lexical-only edges vs `5,912` dense-assisted edges), lexical-only edges retain
+  mean `0.1176` (`119,305/136,666` = `87.30% < 0.25`) vs dense-assisted mean
+  `0.6360` (`415/5,912` = `7.02% < 0.25`). Across `offset=0` (`61,169`
+  lexical-only vs `2,650` dense-assisted), lexical-only mean is `0.0918` (`56,070/61,169` = `91.66% < 0.25`)
+  vs dense-assisted mean `0.5719` (`420/2,650` = `15.85% < 0.25`). Meanwhile, multi-gold chunk pairs
+  (`224` eligible pairs on `offset=10`, `148` eligible pairs on `offset=0`) are `223/224` (`99.55%`, `80/80` queries any-pair / `79/80` all-pairs)
+  and `148/148` (`100%`, `40/40` queries) reachable within `2` hops (`197/224 = 87.95%` / `142/148 = 95.95%` directly 1-hop connected),
+  with `lexical_only` edges supplying `184/224` (`offset=10`) and `130/148` (`offset=0`) 1-hop links (`223/224` and `148/148` within `2` hops).
+- **Does not establish:** Cached read-only slice diagnostics do not measure post-Pass-3
+  fixes, full-corpus `50k+` scale latency, or downstream QA `EM`/`F1` gains (deferred
+  until Pass-3 code & Checkpoint `4` / `5` gates run).
+
+---
+
+## 2026-11-15: Pass-3 E1-M1 5-Parameter Kraus Sheaf Sub-Span HMM Zero-Shot Probe, Live 4-Dataset Shootout & Ablations
+
+Evaluation of Pass-3 `E1-M1` (`yaw/daemon/graph/hmm.py`) under the frozen `5`-parameter Hydrodynamic / RMT / Null-Sketch Reduction (`peclet=0.65`, `alpha_sprt=0.05 -> num_hops=8, max_silent_hops=2`, `redundancy_curvature=0.75`, `coalition_coupling=0.45`, `external_trust=0.35`; `yaw.toml` `[manifold] = {}` with zero Optuna tuning sweeps) plus Decision `13` query-embedding flow calibration (`peclet_q`, channel-SNR external split, seed-orthogonal multi-hop arrival bonus).
+
+### Zero-Shot `G3` 5-Point Retrieval Probe (`outputs/benchmarks/probe_manifold_pass3_final.json`)
+
+Read-only SQLite probe over cached `offset=10` (`n=80`, `20q/dataset`, `pool_limit=40`) and unseen `offset=0` (`n=40`, `10q/dataset`, `pool_limit=40`), `k_list=(1, 2, 5, 10, 20)`, `cycles = 0` on all slices:
+
+| Slice & Arm (`[manifold] = {}`) | `R@1` | `R@2` | `R@5` | `R@10` | `R@20` | Measured Hop & Structural Highlights |
+| --- | --- | --- | --- | --- | --- | --- |
+| `offset=10` (`n=80`) `default` (Pass-3) | `0.4417` | `0.6562` | `0.8156` | `0.8833` | `0.9385` | Beats Pre-Pass-3 (`0.8021 R@5`, `+0.0135`) & `vec_hits` (`0.7865`); `PopQA hw[1]=0.1013 < 0.15`; `2wiki 0.900, musique 0.7375, hotpot 0.950, popqa 0.675 R@5` |
+| `offset=10` (`n=80`) `default_hop0_only` | `0.4646` | `0.6688` | `0.7677` | `0.8521` | `0.9125` | Multi-hop Pass-3 adds `+0.0479 R@5` |
+| `offset=10` (`n=80`) `vec_hits` (`k=200`) | `0.4406` | `0.6260` | `0.7865` | `0.9021` | `0.9448` | Raw `vec0` baseline |
+| `offset=0` (`n=40`) `default` (Pass-3) | `0.4021` | `0.6542` | `0.7854` | `0.9062` | `0.9729` | Matches Pre-Pass-3 `R@5` (`0.7854`) with `+0.0708 R@2` (`0.6542 vs 0.5833`); `PopQA hw[1]=0.0000`; `2wiki 0.925, musique 0.5167, hotpot 0.900, popqa 0.800 R@5` |
+| `offset=0` (`n=40`) `default_hop0_only` | `0.4333` | `0.5729` | `0.7229` | `0.8896` | `0.9667` | Multi-hop Pass-3 adds `+0.0812 R@2` & `+0.0625 R@5` |
+| `offset=0` (`n=40`) `vec_hits` (`k=200`) | `0.4125` | `0.5875` | `0.7208` | `0.8896` | `0.9604` | Multi-hop Pass-3 leads by `+0.0646 R@5` |
+
+### Live 4-Dataset CLI Shootout (`outputs/benchmarks/manifold_retrieval_4ds_10q.json` & `outputs/benchmarks/shootout_4ds_10q.json`)
+
+Executed against local `gemma-4-e4b` + `embeddinggemma-2` (`http://127.0.0.1:8888/v1`, `--max-queries 10 --index-queries 10 --gate data/benchmarks/baselines.json` on warm caches):
+
+| Dataset (`10q`) | `Current YAW` (`graph`) `R@1/2/5/10/20` (`EM / F1`, seeds, tot s) | `SubStateManifoldHMM` (`manifold`) `R@1/2/5/10/20` (`EM / F1`, seeds, tot s) | `monkeypatched_hipporag` `R@5` (`EM / F1`) | `paper_70b` `R@5` |
+| --- | --- | --- | --- | --- |
+| `2wikimultihopqa` (`C=105, S=269`) | `0.4250 / 0.7000 / 0.9500 / 1.0000 / 1.0000` (`0.3000 / 0.3397`, `7/10`, `17.6340 s`) | `0.4000 / 0.7250 / 0.9250 / 0.9750 / 1.0000` (`0.2000 / 0.3434`, `10/10`, `17.6743 s`) | `0.9091` (`0.6364 / 0.7227`) | `0.904` |
+| `musique` (`C=212, S=801`) | `0.1333 / 0.2083 / 0.3583 / 0.5167 / 0.7000` (`0.0000 / 0.0000`, `8/10`, `20.8657 s`) | `0.3083 / 0.4917 / 0.5667 / 0.8000 / 0.8917` (`0.0000 / 0.0571`, `10/10`, `20.1729 s`) | `0.6818` (`0.4091 / 0.5485`) | `0.747` |
+| `hotpotqa` (`C=102, S=454`) | `0.3500 / 0.7000 / 0.9000 / 0.9500 / 1.0000` (`0.1000 / 0.2332`, `9/10`, `17.8801 s`) | `0.4000 / 0.7500 / 0.9000 / 0.9000 / 1.0000` (`0.2000 / 0.2821`, `10/10`, `17.1751 s`) | `0.9000` (`0.4500 / 0.6426`) | `0.963` |
+| `popqa` (`C=30, S=115`) | `0.4500 / 0.6000 / 0.6000 / 0.8500 / 1.0000` (`0.0000 / 0.2126`, `10/10`, `14.6294 s`) | `0.5000 / 0.6500 / 0.7500 / 0.9500 / 1.0000` (`0.1000 / 0.3912`, `10/10`, `9.5356 s`) | `1.0000` (`0.6800 / 0.7419`) | `0.517` |
+| **Macro (`n=40`)** | **`0.3396 / 0.5521 / 0.7021 / 0.8292 / 0.9250`** (`0.1000 / 0.1964`, `71.0092 s`) | **`0.4021 / 0.6542 / 0.7854 / 0.9062 / 0.9729`** (`0.1250 / 0.2684`, `64.5579 s`) | **`0.8727`** (`0.5439 / 0.6639`) | **`0.7828`** |
+
+- **Gate & Paired-Outcome Breakdown:**
+  - `shootout_4ds_10q.json` top-level `status: "passed"` and `integrity_passed: true`; `SubStateManifoldHMM` achieved `10/10` non-empty graph seeds (`dpr_fallback_count = 0`) across all `4` datasets (vs `Current YAW` `7/10`, `8/10`, `9/10`, `10/10` and Pass-1 `2/0/3/0`), strictly beat `Current YAW` on every macro metric (`+0.0625 R@1`, `+0.1021 R@2`, `+0.0833 R@5`, `+0.0770 R@10`, `+0.0479 R@20`, `+0.0250 EM`, `+0.0720 F1`), beat `Current YAW` wall-clock (`64.5579 s vs 71.0092 s`, `speedup_x = 1.0999` warm; `indexing_speedup_x = 1.0367`, `evaluation_speedup_x = 1.1068`), beat `standard_dpr` (`0.7292 R@5`, `+0.0563`), and cleared `PAPER_BASELINES` macro `R@5` (`0.7854 >= 0.7828`, `+0.0027`). (Note: CLI hydration vs `probe_manifold.py` `pool_limit=40` trades `musique` `0.5667 vs 0.5167` against `popqa` `0.7500 vs 0.8000` with identical `0.7854` macro `R@5`.)
+  - However, `evaluate_benchmark_gate` (`--gate data/benchmarks/baselines.json`, `primary_target = "monkeypatched_hipporag"`, `per_dataset_tolerance = 0.0`) returned `gate.datasets_passed = 0/4` (`overall_gate_passed = false`, process exit `1`) for **both** `Current YAW` and `SubStateManifoldHMM` under un-evolved `YawProgram()` (with `manifold_retrieval_4ds_10q.json` clearing `2/4` retrieval-only datasets: `2wikimultihopqa` & `hotpotqa`, trailing on `musique` `-0.1151` and `popqa` `-0.2500`).
+
+### Spectral Telemetry & Kill-Switch Ablations (`outputs/benchmarks/manifold_spectral_telemetry.json`, `outputs/benchmarks/manifold_ablations_4ds_10q.json`)
+
+- **Spectral Telemetry (`abtt_removed_dims = 8` everywhere):**
+  - `offset=0` (`hotpotqa` / `2wiki` / `musique` / `popqa`): `rmt_lambda_plus = 0.002529 / 0.00336 / 0.001927 / 0.004418`, `d_eff = 135.82 / 144.44 / 171.17 / 101.29`, `sigma_pair = 0.0858 / 0.0832 / 0.0764 / 0.0994`, mean `stalk_dim = 6.71 / 4.72 / 6.58 / 5.90` (`max = 8`), mean `stalk_eff_rank = 5.03 / 2.99 / 4.34 / 4.53`, `mean_particles = 1.2 / 1.4 / 1.3 / 1.0`, `hw[1] = 0.4159 / 0.5807 / 0.1745 / 0.0000`.
+  - `offset=10` (`hotpotqa` / `2wiki` / `musique` / `popqa`): `rmt_lambda_plus = 0.001891 / 0.00222 / 0.001511 / 0.003338`, `d_eff = 163.56 / 149.58 / 202.26 / 105.46`, `sigma_pair = 0.0782 / 0.0818 / 0.0703 / 0.0974`, mean `stalk_dim = 7.14 / 5.42 / 6.54 / 5.95` (`max = 8`), mean `stalk_eff_rank = 4.76 / 3.46 / 4.07 / 4.80`, `mean_particles = 1.35 / 1.15 / 1.40 / 1.00`, `hw[1] = 0.3293 / 0.5186 / 0.4344 / 0.1013`.
+
+| Ablation Arm (`0` cycles on all arms) | `offset=0` (`n=40`) `R@1 / R@2 / R@5 / R@10 / R@20` | `offset=10` (`n=80`) `R@1 / R@2 / R@5 / R@10 / R@20` | Finding vs. [`§4.3`](reviews/substate-manifold-shootout.md#43-mandatory-kill-switch-falsification-ablations-wp5) Predeclared Targets |
+| --- | --- | --- | --- |
+| `full_pass3` | `0.4021 / 0.6542 / 0.7854 / 0.9062 / 0.9729` | `0.4417 / 0.6562 / 0.8156 / 0.8833 / 0.9385` | Default Pass-3 baseline |
+| `hop0_only` (`num_hops=1`) | `0.4333 / 0.5729 / 0.7229 / 0.8896 / 0.9667` | `0.4646 / 0.6688 / 0.7677 / 0.8521 / 0.9125` | Multi-hop propagation adds `+0.0625 R@5` (`offset=0`) and `+0.0479 R@5` (`offset=10`); dataset-blind `hw[1]` clears `PopQA < 0.15` (`0.0000`, `0.1013`), `2wiki >= 0.35` (`0.5807`, `0.5186`), `hotpot offset=0` (`0.4159`), and `musique offset=10` (`0.4344`), with shortfalls on `musique offset=0` (`0.1745`) and `hotpot offset=10` (`0.3293`) |
+| `no_backward` (`gammas=alpha`, `kraus_synergy={}`) | `0.4021 / 0.6417 / 0.7854 / 0.9125 / 0.9729` | `0.4292 / 0.6219 / 0.8219 / 0.8771 / 0.9385` | **Shortfall vs `>= 0.02 R@5` target** on both slices (`+0.0000` / `-0.0063` `R@5`), while backward smoothing improves `R@2` (`+0.0125` on `offset=0`, `+0.0344` on `offset=10`; `musique R@2 +0.0500` / `+0.0750`) & `offset=10 R@1` (`+0.0125`) |
+| `scalar_rank1` (`_MAX_STALK_DIM=1`) | `0.3875 / 0.6479 / 0.7667 / 0.9042 / 0.9812` | `0.4323 / 0.6406 / 0.8125 / 0.8906 / 0.9510` | **Passes:** Heterogeneous stalks outperform scalar rank-1 on `R@1/2/5` on both slices (`+0.0188 R@5` on `offset=0` led by `2wiki +0.0500` & `musique +0.0750`; `+0.0031 R@5` on `offset=10`) |
+| `no_cptp_rescue` (`inter_rescue_eta=0`) | `0.4021 / 0.6292 / 0.7854 / 0.9208 / 0.9604` | `0.4354 / 0.6594 / 0.8281 / 0.8990 / 0.9448` | **Shortfall vs `>= 0.015 R@5` target** on these slices (`+0.0000` / `-0.0125` `R@5`), while CPTP rescue improves `offset=0 R@2` (`+0.0250`: `hotpotqa +0.0500`, `musique +0.0500`) & `R@20` (`+0.0125`) |
+| `no_coalition_coupling` (`coalition_coupling=0`) | `0.4167 / 0.6542 / 0.7854 / 0.9083 / 0.9729` | `0.4302 / 0.6531 / 0.7990 / 0.8708 / 0.9344` | **Passes `>= 0.015 R@5` target on `offset=10`** (`+0.0167 R@5`, led by `musique +0.0417` & `hotpotqa +0.0250`; clears all 5 horizons `R@1..20`); ties on `offset=0` (`R@5`) where `mean_particles = 1.0..1.4` |
+
+- **Outcome Decision (`Retain & Refine`):** Retain `yaw/daemon/graph/hmm.py` (`retriever_mode="manifold"`, `yaw.toml` `[manifold] = {}`) for [`§4.5`](reviews/substate-manifold-shootout.md#45-principled-extension--improvement-roadmap-post-e1-m1) discourse/anaphora + declarative CocoIndex sheaf refinement and `D1-A6` `GEPA` QA evolution, while keeping `yaw/daemon/graph/ppr.py` (`retriever_mode="graph"`, `0` diff lines) as the active default until strict `monkeypatched_hipporag` parity is cleared.
+- **Does not establish:** Full-corpus `50k+`-subspan throughput, post-`GEPA` QA parity under `D1-A6`, or declarative CocoIndex sheaf persistence performance (`§4.5`).
+
+---
+
+## 2026-11-15: Pass-4 E1-M1 Pure-Chunk "manifold-v3" Probes, 64-Trial 5-Horizon Optuna Study & Live 4-Dataset Shootout
+
+Evaluation of Pass-4 `E1-M1` (`yaw/daemon/graph/hmm.py` under pure-chunk `"manifold-v3"`, Decision 17) following empirical ablation demonstrating zero recall benefit from sub-spans over whole passages:
+- **Pure-chunk architecture:** Sub-span tables (`chunk_subspans`, `subspan_vec`) and prose/code sub-span splitting removed completely in favor of pure-chunk storage and retrieval (`chunks + chunk_fts + chunk_vec` alone).
+- **Minimal math kernel:** `yaw/daemon/graph/hmm.py` reduced to `499` lines (`<= 500`), retaining `ManifoldHyperparams` with 5 boundary fields (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) with zero internal fallback paths.
+- **Textbook single-study Optuna MOTPE:** `yaw/daemon/manifold_optuna.py` reduced to `597` lines (`<= 600`), replacing two-stage wrappers with single-study Optuna `5.0.0` `TPESampler(seed=42, multivariate=True, constant_liar=True)` simultaneously optimizing all 5 `Recall@{1, 2, 5, 10, 20}` objectives (`directions=["maximize"] * 5`) with native `trial.set_constraint(...)` blocking cycles, seed deficit, and validation regression on any horizon, plus `PedAnovaImportanceEvaluator(target=lambda t: -mean(r1..r20))`. Unified `--trials` (default `64`) across `cli.py`, `manifold_optuna.py`, and `scripts/tune_manifold.py`.
+
+### Benchmark Slice Probes (`yaw.toml [manifold] = {}` Untuned Defaults)
+
+Evaluated across cached and held-out slice benchmarks:
+- **`outputs/benchmarks/manifold_v3_off10_20q.json` (`offset=10`, `max_queries=20`, `80q`):** Clears `monkeypatched_hipporag` `Recall@5` on **3/4** datasets (`hotpotqa` `0.975 vs 0.9000`, `2wikimultihopqa` `0.975 vs 0.9091`, `musique` `0.8333 vs 0.8229`; `popqa` `0.575 vs 1.0000` -> Macro `R@1/2/5 = 0.4479 / 0.6823 / 0.8396`, Macro `R@5` delta `-0.0331`). `dpr_fallback_count = 0` (`80/80` seeded).
+- **`outputs/benchmarks/probe_manifold_pass4_v3.json` (Refreshed deterministic `default` & Optuna `active_config` vs `hop0_only` vs raw `vec_hits` on `499`-line `hmm.py`, `0` cycles across all slices):**
+
+| Slice | Arm | `R@1` | `R@2` | `R@5` | `R@10` | `R@20` | Telemetry & Hop Diagnostics |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `offset=10` (`80q`) | `default` (Pass-4 untuned) | `0.4479` | `0.6760` | `0.8333` | `0.8969` | `0.9417` | `10.169 ms/q`, `silent_hop_rate = 0.1125` |
+| `offset=10` (`80q`) | `active_config` (`yaw.toml [manifold]`) | `0.4479` | `0.6740` | `0.8427` | `0.9094` | `0.9417` | `9.816 ms/q`, `silent_hop_rate = 0.1125`, `popqa_silent_hop_rate = 0.45` |
+| `offset=10` (`80q`) | `default_hop0_only` | `0.4479` | `0.6365` | `0.7552` | `0.8625` | `0.9167` | `7.758 ms/q`, multi-hop adds `+0.0781 R@5` |
+| `offset=10` (`80q`) | `active_hop0_only` | `0.4479` | `0.6302` | `0.7740` | `0.8813` | `0.9229` | `8.022 ms/q`, multi-hop adds `+0.0687 R@5` |
+| `offset=10` (`80q`) | raw `vec_hits` (`k=200`) | `0.4406` | `0.6260` | `0.7865` | `0.9000` | `0.9448` | `active_config` beats raw vectors across `R@1..10` |
+| `offset=0` (`40q`) | `default` (Pass-4 untuned) | `0.4333` | `0.6771` | `0.8021` | `0.8938` | `0.9854` | `8.236 ms/q`, `silent_hop_rate = 0.15` |
+| `offset=0` (`40q`) | `active_config` (`yaw.toml [manifold]`) | `0.4333` | `0.6583` | `0.8146` | `0.9000` | `0.9854` | `8.068 ms/q`, `silent_hop_rate = 0.15`, `popqa_silent_hop_rate = 0.60` |
+| `offset=0` (`40q`) | `default_hop0_only` | `0.4333` | `0.5771` | `0.6979` | `0.8708` | `0.9729` | `6.283 ms/q`, multi-hop adds `+0.1042 R@5` |
+| `offset=0` (`40q`) | `active_hop0_only` | `0.4333` | `0.5771` | `0.6854` | `0.8708` | `0.9729` | `6.501 ms/q`, multi-hop adds `+0.1292 R@5` |
+| `offset=0` (`40q`) | raw `vec_hits` (`k=200`) | `0.4125` | `0.5875` | `0.7333` | `0.8896` | `0.9604` | `active_config` beats raw vectors across `R@1..20` |
+
+- **`outputs/benchmarks/pooled_distractors_v3_probe.json` (`1,348` pooled chunks across all `120` queries):** `default` scores `0.4389 / 0.6563 / 0.7958 / 0.8590 / 0.8868` (`100.894 ms/q`, `silent_rate = 0.0833`) vs `hop0_only` `0.4389 / 0.6021 / 0.7167 / 0.7958 / 0.8326` (`6.892 ms/q`) -> **`+0.0792 R@5`** and **`+0.0542 R@20`** multi-hop lift under 4-dataset pooled distractors.
+  > [!NOTE] Honest empirical finding: `PopQA` `hw[1]` exceeds Pass-3 `< 0.15` target (`0.1851` on `offset=10`, `0.1237` on `offset=0`), accepted without dataset-specific overfitting.
+
+### Live 64-Trial 5-Horizon Optuna Study (`outputs/benchmarks/optuna_manifold_pass4_v3_64t.json`)
+
+Study executed on disjoint `[10, 30)` slice (`48` train / `32` val queries across all 4 datasets), `--apply` -> persisted to `yaw.toml [manifold]`:
+- **Study outcome:** `best_source = "optuna_pareto"`, `completed_trials = 64`, `feasible_trials = 36`, `pareto_count = 3`.
+- **Selected overrides:** `peclet = 0.3375533823900754`, `alpha_sprt = 0.07953934952508675`, `redundancy_curvature = 0.834659004285133`, `coalition_coupling = 0.3887505167779042`, `external_trust = 0.26842185514853145`.
+- **Held-out validation (`32q`) `Recall@{1, 2, 5, 10, 20}`:** baseline `0.4557 / 0.6927 / 0.8307 / 0.9036 / 0.9375` (`combined = 0.7641`) $\to$ selected `0.4557 / 0.7083 / 0.8464 / 0.9193 / 0.9375` (`combined = 0.7734`).
+- **`PedAnovaImportanceEvaluator`:** `coalition_coupling = 0.2841`, `external_trust = 0.2362`, `redundancy_curvature = 0.2211`, `alpha_sprt = 0.1672`, `peclet = 0.0915`.
+
+### Live 4-Dataset Paired Shootouts on Held-Out `[0, 10)` (`40q`)
+
+Evaluated against local `gemma-4-e4b` + `embeddinggemma-2` (`http://127.0.0.1:8888/v1`, `--max-queries 10 --query-offset 0`, `integrity_passed = True`, `10/10` seeds per dataset):
+
+| Candidate & Configuration | Macro `R@1 / R@2 / R@5 / R@10 / R@20` | QA `EM` | QA `F1` | Total Eval Time | Gate vs Upstream |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `Current YAW` (`ppr.py`, baseline) | `0.3396 / 0.5521 / 0.7021 / 0.8292 / 0.9250` | `0.0750` | `0.1908` | `34.3296 s` | `0/4` (`FAIL`) |
+| `SubStateManifoldHMM` (Pass-4 untuned, `shootout_pass4_v3_untuned_4ds_10q.json`) | `0.4333 / 0.6771 / 0.8021 / 0.8938 / 0.9854` | `0.1000` | `0.2185` | `93.2237 s` | `0/4` (`FAIL`) |
+| `SubStateManifoldHMM` (Pass-4 Post-Optuna active, `shootout_pass4_v3_4ds_10q.json`) | **`0.4333 / 0.6583 / 0.8146 / 0.8938 / 0.9854`** | **`0.1250`** | **`0.2482`** | `45.4962 s` | `0/4` (`FAIL`) |
+| **Deltas (`Optuna Manifold - Current YAW`)** | **`+0.0937 / +0.1062 / +0.1125 / +0.0646 / +0.0604`** | **`+0.0500`** | **`+0.0574`** | `+11.1666 s` | Clears `PAPER_BASELINES` `R@5` (`0.8146 >= 0.7828`) |
+| `monkeypatched_hipporag` (target baseline) | — / — / `0.8727` / — / — | `0.5439` | `0.6639` | — | — |
+| `PAPER_BASELINES` (`70b` reference) | — / — / `0.7828` / — / — | — | — | — | — |
+
+**Per-Dataset Breakdown (`Optuna Manifold` vs `Current YAW` on Held-Out `[0, 10)`):**
+- `2wikimultihopqa`: `0.425 / 0.750 / 0.925 / 1.000 / 1.000` (`EM = 0.2000`, `F1 = 0.3023`) vs `Current YAW` `0.425 / 0.700 / 0.950 / 1.000 / 1.000` (`EM = 0.2000`, `F1 = 0.2539`).
+- `musique`: `0.3083 / 0.4333 / 0.6333 / 0.825 / 0.9417` (`EM = 0.1000`, `F1 = 0.1000`) vs `Current YAW` `0.1333 / 0.2083 / 0.3583 / 0.5167 / 0.7000` (`EM = 0.0000`, `F1 = 0.0000`) -> **`+0.2750 R@5`** and **`+0.1000 EM`**.
+- `hotpotqa`: `0.500 / 0.850 / 1.000 / 1.000 / 1.000` (`EM = 0.1000`, `F1 = 0.2320`) vs `Current YAW` `0.350 / 0.700 / 0.900 / 0.950 / 1.000` (`EM = 0.1000`, `F1 = 0.2621`) -> `+0.1000 R@5`, `+0.1500 R@1/2`.
+- `popqa`: `0.500 / 0.600 / 0.700 / 0.750 / 1.000` (`EM = 0.1000`, `F1 = 0.3584`) vs `Current YAW` `0.450 / 0.600 / 0.600 / 0.850 / 1.000` (`EM = 0.0000`, `F1 = 0.2473`) -> `+0.1000 R@5`, `+0.1111 F1`.
+
+### Verification Suite & Quality Gates
+
+- `tests/daemon/graph/test_hmm.py` + `tests/core/test_architecture.py` + `tests/daemon/graph/test_engine.py` + `tests/daemon/ingestion/test_corpus.py`: `75 passed`.
+- `tests/daemon/test_cli.py` + `tests/core/test_architecture.py`: `21 passed`.
+- `ty check`, `ruff check`, and `git diff --check`: clean (`0` violations).
+
+### Outcome Decision: `Clean-Slate Replacement` ([Epic 1 Decision 20](epic-1-hipporag-daemon.md#decisions))
+
+- **Historical Measurements Pinned:** Historical Pass-4 pure-chunk `"manifold-v3"` measurements above remain preserved verbatim on baseline `63c9c00, dirty`.
+- **Clean-Slate Replacement (`Decision 20`, `2026-11-16`):** Retire `ppr.py` and the legacy `yaw/daemon/graph/{storage,inference}` hierarchy completely for a zero-backward-compatibility clean-slate rewrite: refactor `hmm.py` into `yaw/retrieval.py` (`RetrievalIndex`, `rank_chunks`, eliminating `"manifold"`/`"hmm"` naming across code and config), use native declarative `cocoindex.connectors.sqlite` (`vec0` + `fts5`), `dspy.ReAct` QA at Gemma 4 `temperature = 1.0`, and `FastMCP` `recall`/`qa`/`daemon_status` HTTP transport with unified CLI `yaw optimize {dspy|optuna}`.
+- **Bare-Bones Replacement Sprint ([bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md)):** Governs the 15-file flat clean-slate core (9 clean domain modules + 4 `yaw/core/` modules + `yaw/__init__.py` + `yaw/__main__.py`, `<= 3,200` LOC target) across sprints `CS-1`..`CS-6`, deleting persistent graph tables, `DatabaseSink`, and OpenIE/W3C/OWL/SKOS/`shacl.py` constructs.
+- **Does not establish:** Post-replacement `dspy.ReAct` QA parity under `D1-A6` or full-corpus academic scaling (`Epic 3`).

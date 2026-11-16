@@ -309,7 +309,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: verify zero N+1 SQLite queries inside `_Packet` when computing `shared_role_facts`, and verify context-budget halving in `iter_semantic_evidence` preserves all pair fields.
 - **Simplification Round**:
-  - Delegate to `simplifier`: remove `_Packet.fact()`, `_Packet.source()`, `_Packet.facts`, `_Packet.sources`, and `_Packet.spans` indirection methods.
+  - Delegate to `implementer`: remove `_Packet.fact()`, `_Packet.source()`, `_Packet.facts`, `_Packet.sources`, and `_Packet.spans` indirection methods.
 - **Deprecated Code Removal**:
   - `git grep -w "synonym-evidence-v1"` returns `0` matches across `yaw/` and `tests/`.
 
@@ -333,7 +333,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: verify `canonicalize_entity_labels_edc` runs inside `write_tx(conn)`, handles entities with only 1 label safely (never leaving an entity with 0 `skos:prefLabel` rows), and introduces zero SHACL S13 regressions.
 - **Simplification Round**:
-  - Delegate to `simplifier`: streamline SQL aggregation of `chunk_count` and `chunks.title` into a single batched query.
+  - Delegate to `implementer`: streamline SQL aggregation of `chunk_count` and `chunks.title` into a single batched query.
 - **Deprecated Code Removal**:
   - Remove redundant post-merge label fixup branches superseded by `canonicalize_entity_labels_edc`.
 
@@ -360,7 +360,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: verify that the GBNF grammars strictly constrain `"reasoning"` before the boolean fields, reject empty reasoning strings (`char{1,360}`), and wire all three signatures cleanly in `YawGBNFAdapter` and `invariants.py`.
 - **Simplification Round**:
-  - Delegate to `simplifier`: ensure all three GBNF functions share `_build_pair_boolean_grammar` (~25 lines total) and all three parser functions share common `pair_id` + `reasoning` validation.
+  - Delegate to `implementer`: ensure all three GBNF functions share `_build_pair_boolean_grammar` (~25 lines total) and all three parser functions share common `pair_id` + `reasoning` validation.
 - **Deprecated Code Removal**:
   - Remove `JudgeSynonyms`, `DSPY_SEMANTIC_JUDGE_GBNF_GRAMMAR`, `build_dspy_semantic_judge_grammar`, `parse_synonym_decisions`, and `semantic_judge_tokens` from `prompts.py`, `grammars.py`, `parsers.py`, `adapter.py`, `invariants.py`, and `__init__.py`.
 
@@ -400,7 +400,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: audit the end-to-end cascade in `program.py`, `diagnostics.py`, `optimizer.py`, `engine.py`, and `planner.py` for short-circuit completeness, per-stage cache isolation, GEPA predictor registration, per-stage audit trails/tokens, and domain boundary compliance.
 - **Simplification Round**:
-  - Delegate to `simplifier`: remove all legacy `"canonical"` string matching branches and unify per-stage execution/caching into a single clean helper.
+  - Delegate to `implementer`: remove all legacy `"canonical"` string matching branches and unify per-stage execution/caching into a single clean helper.
 - **Deprecated Code Removal**:
   - Verify `git grep -w` returns `0` matches across the entire repository (`yaw/`, `tests/`, `scripts/`) for all retired symbols in the Oblivion Demolition Table below.
 
@@ -430,7 +430,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 For each slice (`Slice 1` $\to$ `Slice 2` $\to$ `Slice 3` $\to$ `Slice 4`):
 1. **Implementer (`flash` subagent)**: Writes real-substrate tests (`tmp_path`, real SQLite `yaw.db`) and minimal implementation for that slice's files.
 2. **Critic (`critic` subagent)**: Audits the slice against W3C SKOS/OWL invariants, GEPA predictor registration, per-stage cache/trail isolation, domain boundaries, and zero fallbacks.
-3. **Simplifier (`simplifier` subagent)**: Resolves all Critic findings, removes dead code, and verifies the slice's Oblivion Gate (`git grep -w` == 0).
+3. **Implementer (`implementer` subagent)**: Resolves all Critic findings, removes dead code, and verifies the slice's Oblivion Gate (`git grep -w` == 0).
 
 ### Mandatory Quality Gates (End of Each Slice & Final Completion)
 ```powershell

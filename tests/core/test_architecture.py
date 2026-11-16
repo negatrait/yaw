@@ -303,7 +303,10 @@ class ArchitectureTests(unittest.TestCase):
 
         # Graph orchestration and deterministic transforms remain in their owning domain.
         graph_files = {f.name for f in (YAW_DIR / "daemon" / "graph").glob("*.py")}
-        self.assertEqual(graph_files, {"__init__.py", "engine.py", "ppr.py", "normalization.py", "planner.py"})
+        self.assertEqual(
+            graph_files,
+            {"__init__.py", "engine.py", "hmm.py", "normalization.py", "planner.py", "ppr.py"},
+        )
 
         # Verify storage public facade
         import yaw.daemon.graph.storage as storage
@@ -516,6 +519,7 @@ class ArchitectureTests(unittest.TestCase):
             + [YAW_DIR / "daemon" / "indexing.py"]
             + sorted((YAW_DIR / "daemon" / "ingestion").glob("*.py"))
             + [
+                YAW_DIR / "daemon" / "graph" / "hmm.py",
                 YAW_DIR / "daemon" / "graph" / "planner.py",
                 YAW_DIR / "daemon" / "graph" / "normalization.py",
                 YAW_DIR / "daemon" / "graph" / "ppr.py",
@@ -638,7 +642,7 @@ class ArchitectureTests(unittest.TestCase):
 
     def test_custom_subagents_yaml_frontmatter_and_tool_validity(self):
         """Rule 8: Custom subagents in .agents/agents/*/agent.md mount visibly with valid tools and current stack."""
-        expected_agents = {"critic", "simplifier", "ontologist"}
+        expected_agents = {"critic", "implementer", "ontologist"}
         agent_files = {p.parent.name: p for p in AGENTS_DIR.glob("*/agent.md")}
         self.assertEqual(set(agent_files.keys()), expected_agents)
 
@@ -788,21 +792,46 @@ class ArchitectureTests(unittest.TestCase):
         """Rule 12: Canonical Category A modules preserve strict AST import purity and behavioral boundaries."""
         stdlib = sys.stdlib_module_names
 
-        # 1. ppr.py: pure numpy/scipy/yaw.core sparse math operator (zero sqlite3, dspy, cocoindex, or daemon imports)
-        ppr_path = YAW_DIR / "daemon" / "graph" / "ppr.py"
-        for lineno, mod in parse_module_imports(ppr_path):
-            top = mod.split(".")[0]
-            self.assertIn(
-                top,
-                stdlib | {"numpy", "scipy", "yaw"},
-                f"ppr.py:{lineno} imports forbidden package '{mod}'",
-            )
-            self.assertNotEqual(top, "sqlite3", f"ppr.py:{lineno} must not import sqlite3")
-            if top == "yaw":
-                self.assertTrue(
-                    mod == "yaw.core" or mod.startswith("yaw.core."),
-                    f"ppr.py:{lineno} must only import yaw.core, got '{mod}'",
+        # 1. ppr.py & hmm.py: pure numpy/scipy/yaw.core sparse math operators
+        #    (zero sqlite3, dspy, cocoindex, or daemon imports; hmm.py permits spacy per Decision 16)
+        allowed_by_module = {
+            "ppr.py": stdlib | {"numpy", "scipy", "yaw"},
+            "hmm.py": stdlib | {"numpy", "scipy", "spacy", "yaw"},
+        }
+        for math_name in ("ppr.py", "hmm.py"):
+            math_path = YAW_DIR / "daemon" / "graph" / math_name
+            for lineno, mod in parse_module_imports(math_path):
+                top = mod.split(".")[0]
+                self.assertIn(
+                    top,
+                    allowed_by_module[math_name],
+                    f"{math_name}:{lineno} imports forbidden package '{mod}'",
                 )
+                self.assertNotEqual(top, "sqlite3", f"{math_name}:{lineno} must not import sqlite3")
+                if math_name == "hmm.py":
+                    self.assertFalse(
+                        mod == "scipy.sparse._sparsetools" or mod.startswith("scipy.sparse._sparsetools."),
+                        f"hmm.py:{lineno} must not import private module '{mod}'",
+                    )
+                    self.assertFalse(
+                        any(part.startswith("_") for part in mod.split(".")),
+                        f"hmm.py:{lineno} must not import private submodule '{mod}'",
+                    )
+                if top == "yaw":
+                    self.assertTrue(
+                        mod == "yaw.core" or mod.startswith("yaw.core."),
+                        f"{math_name}:{lineno} must only import yaw.core, got '{mod}'",
+                    )
+
+        hmm_path = YAW_DIR / "daemon" / "graph" / "hmm.py"
+        hmm_tree = ast.parse(hmm_path.read_text(encoding="utf-8"), filename=str(hmm_path))
+        for node in ast.walk(hmm_tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    self.assertFalse(
+                        alias.name.startswith("_"),
+                        f"hmm.py:{node.lineno} must not import private symbol '{alias.name}'",
+                    )
 
         # 2. normalization.py: stateless OpenIE normalization (zero sqlite3, dspy, cocoindex, network, or storage)
         norm_path = YAW_DIR / "daemon" / "graph" / "normalization.py"

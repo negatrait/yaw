@@ -269,10 +269,10 @@ Thresholds are not loosened after seeing a run.
 | ID | Slice | Pipeline | Exit gate |
 | --- | --- | --- | --- |
 | B0 (Route chosen: B) | Review record created; resolve the four Open items with the user and the capability probes | `research` → parent | Decisions recorded verbatim in §6.8 |
-| B1 | Client path: `create_dspy_lm`/`create_dspy_embedder` reduced to `dspy.LM("openai/...")` + `dspy.Embedder`; `api_key_env` | `simplifier` → `critic (flash)` | G1 greps for chat/embedding code; unit tests on a loopback server |
-| B2 | Retire `ServingTokenCounter` and registry evidence; usage-based accounting | `simplifier` → `critic (flash)` | removal-inventory greps; full suite |
-| B3 | Structured output and logprobs per §6.4 decisions | `ontologist` → `simplifier` → `critic (flash)` | G2/G3 loopback capture fixtures; parity tests green |
-| B4 | Watchdog telemetry from usage; docs and test sweep | `simplifier` → `critic (flash)` | G1 grep over repo |
+| B1 | Client path: `create_dspy_lm`/`create_dspy_embedder` reduced to `dspy.LM("openai/...")` + `dspy.Embedder`; `api_key_env` | `implementer` → `critic (flash)` | G1 greps for chat/embedding code; unit tests on a loopback server |
+| B2 | Retire `ServingTokenCounter` and registry evidence; usage-based accounting | `implementer` → `critic (flash)` | removal-inventory greps; full suite |
+| B3 | Structured output and logprobs per §6.4 decisions | `ontologist` → `implementer` → `critic (flash)` | G2/G3 loopback capture fixtures; parity tests green |
+| B4 | Watchdog telemetry from usage; docs and test sweep | `implementer` → `critic (flash)` | G1 grep over repo |
 | B5 | Live acceptance (G4) on Unsloth | parent | `--fresh` batch of 64 chunks published; evidence in the review record |
 
 ### 6.8 Verification

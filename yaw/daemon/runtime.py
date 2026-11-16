@@ -36,6 +36,7 @@ from yaw.core import (
     write_text_atomic,
 )
 from yaw.daemon.graph.engine import YawGraphEngine
+from yaw.daemon.graph.hmm import ManifoldHyperparams
 from yaw.daemon.graph.inference import (
     DSPyEmbeddingAdapter,
     YawProgram,
@@ -296,14 +297,17 @@ class YawRuntime:
 
         program = self.engine.program
         embedder = self.engine.embedder
-        prog_id, emb_id, syn_id, shacl_id = graph_plan_fingerprints(program, embedder)
+        retriever_mode = self.config.retriever_mode
+        prog_id, emb_id, syn_id, shacl_id = graph_plan_fingerprints(program, embedder, retriever_mode=retriever_mode)
         lm = getattr(program, "rlm_sub_lm", None) or getattr(program, "orchestrator_lm", None)
 
         yaw_dir = (self.config.workspace_root / ".yaw").resolve()
         yaw_dir.mkdir(parents=True, exist_ok=True)
 
         self._embedding_endpoint = EmbeddingEndpoint(embedder)
-        self._openie_endpoint = OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1))
+        self._openie_endpoint = (
+            OpenIEEndpoint(program, lm, prog_id, asyncio.Semaphore(1)) if retriever_mode != "manifold" else None
+        )
 
         state_dir = resolve_coco_state_root(self.config.state_dir)
         shared = acquire_coco_environment(state_dir)
@@ -315,7 +319,8 @@ class YawRuntime:
         context.provide(VALIDATE_SQLITE, validate_graph_state)
         context.provide(SOURCE_ROOT, Path(self.config.corpus_root).resolve())
         context.provide(EMBEDDING_ENDPOINT, self._embedding_endpoint)
-        context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
+        if self._openie_endpoint is not None:
+            context.provide(OPENIE_ENDPOINT, self._openie_endpoint)
         context.provide(RELOAD_SIGNAL_ROOT, yaw_dir)
         context.provide(RELOAD_SIGNAL_HANDLER, self._on_reload_signal)
         context.provide(INDEXING_ERROR_SINK, self._record_indexing_error)
@@ -335,6 +340,7 @@ class YawRuntime:
             embedding_identity=emb_id,
             synonym_identity=syn_id,
             shacl_identity=shacl_id,
+            retriever_mode=retriever_mode,
             candidate_dense_threshold=self.config.candidate_dense_threshold,
             candidate_lexical_threshold=self.config.candidate_lexical_threshold,
             auto_merge_threshold=self.config.auto_merge_threshold,
@@ -352,7 +358,7 @@ class YawRuntime:
                 coco.AppConfig(name="yaw_indexing", environment=self._coco_env, max_inflight_components=4),
                 indexing_app_main,
                 src_settings,
-                InferenceIdentity(program=prog_id, embedding=emb_id),
+                InferenceIdentity(program=prog_id, embedding=emb_id, retriever_mode=retriever_mode),
                 graph_settings,
                 self.auto_poll,
             )
@@ -446,6 +452,8 @@ class YawRuntime:
                 chunk_size=cfg.chunk_size,
                 chunk_overlap=cfg.chunk_overlap,
                 min_chunk_size=cfg.min_chunk_size,
+                retriever_mode=cfg.retriever_mode,
+                manifold_params=ManifoldHyperparams.from_overrides(cfg.manifold_overrides),
             ),
             state_root=cfg.state_dir,
             source_settings=src_settings,
@@ -1330,10 +1338,11 @@ class YawRuntime:
         def _run_reload() -> dict[str, Any]:
             if self.engine is None:
                 raise YawRuntimeError("NOT_READY", "Graph engine is not initialized.")
-            old_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
+            retriever_mode = self.config.retriever_mode
+            old_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder, retriever_mode=retriever_mode)
             self.engine.program.load(str(p))
             self.engine.refresh_program_bindings()
-            new_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder)
+            new_fps = graph_plan_fingerprints(self.engine.program, self.engine.embedder, retriever_mode=retriever_mode)
             if self._openie_endpoint is not None:
                 self._openie_endpoint.program_identity = new_fps[0]
             if self._embedding_endpoint is not None:
@@ -1355,6 +1364,122 @@ class YawRuntime:
 
         return self.submit("reload_program", _run_reload)
 
+    @staticmethod
+    def _extract_benchmark_metrics(dataset_report: dict[str, Any], mode: str) -> dict[str, float]:
+        hippo = dataset_report.get("evaluation_metrics", {}).get("hipporag", {})
+        ret = hippo.get("retrieval", {}) if isinstance(hippo, dict) else {}
+        qa = hippo.get("qa", {}) if isinstance(hippo, dict) else {}
+        out: dict[str, float] = {}
+        for k in ("Recall@1", "Recall@2", "Recall@5", "Recall@10", "Recall@20"):
+            if k in ret:
+                out[k] = float(ret[k])
+        if mode == "eval":
+            for k in ("ExactMatch", "F1"):
+                if k in qa:
+                    out[k] = float(qa[k])
+        return out
+
+    @classmethod
+    def _build_shootout_comparison(
+        cls,
+        cand_graph: dict[str, Any],
+        cand_manifold: dict[str, Any],
+        mode: str,
+        gate_spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        g_datasets = cand_graph.get("datasets", {})
+        m_datasets = cand_manifold.get("datasets", {})
+        ds_names = [ds for ds in g_datasets if ds in m_datasets]
+        per_ds: dict[str, dict[str, Any]] = {}
+        metric_sum_g: dict[str, float] = {}
+        metric_sum_m: dict[str, float] = {}
+        metric_cnt: dict[str, int] = {}
+        sum_g_idx = 0.0
+        sum_m_idx = 0.0
+        sum_g_eval = 0.0
+        sum_m_eval = 0.0
+
+        for ds in ds_names:
+            g_rep = g_datasets[ds]
+            m_rep = m_datasets[ds]
+            g_m = cls._extract_benchmark_metrics(g_rep, mode)
+            m_m = cls._extract_benchmark_metrics(m_rep, mode)
+            deltas = {k: round(m_m.get(k, 0.0) - g_m.get(k, 0.0), 4) for k in set(g_m) | set(m_m)}
+            for k in set(g_m) & set(m_m):
+                metric_sum_g[k] = metric_sum_g.get(k, 0.0) + g_m[k]
+                metric_sum_m[k] = metric_sum_m.get(k, 0.0) + m_m[k]
+                metric_cnt[k] = metric_cnt.get(k, 0) + 1
+
+            g_graph = g_rep.get("graph", {})
+            m_graph = m_rep.get("graph", {})
+            g_idx = float(g_graph.get("indexing_seconds", 0.0))
+            m_idx = float(m_graph.get("indexing_seconds", 0.0))
+            g_eval = float(g_graph.get("evaluation_seconds", 0.0))
+            m_eval = float(m_graph.get("evaluation_seconds", 0.0))
+            g_tot = g_idx + g_eval
+            m_tot = m_idx + m_eval
+            sum_g_idx += g_idx
+            sum_m_idx += m_idx
+            sum_g_eval += g_eval
+            sum_m_eval += m_eval
+
+            per_ds[ds] = {
+                "current_yaw": {
+                    **g_m,
+                    "indexing_seconds": round(g_idx, 4),
+                    "evaluation_seconds": round(g_eval, 4),
+                    "total_seconds": round(g_tot, 4),
+                },
+                "substate_manifold_hmm": {
+                    **m_m,
+                    "indexing_seconds": round(m_idx, 4),
+                    "evaluation_seconds": round(m_eval, 4),
+                    "total_seconds": round(m_tot, 4),
+                },
+                "deltas": deltas,
+                "indexing_speedup_x": round(g_idx / m_idx, 4) if m_idx > 0.0 else None,
+                "evaluation_speedup_x": round(g_eval / m_eval, 4) if m_eval > 0.0 else None,
+                "speedup_x": round(g_tot / m_tot, 4) if m_tot > 0.0 else None,
+            }
+
+        macro_g = {k: round(metric_sum_g[k] / metric_cnt[k], 4) for k in sorted(metric_cnt)}
+        macro_m = {k: round(metric_sum_m[k] / metric_cnt[k], 4) for k in sorted(metric_cnt)}
+        macro_deltas = {k: round(macro_m[k] - macro_g[k], 4) for k in sorted(metric_cnt)}
+        sum_g_tot = sum_g_idx + sum_g_eval
+        sum_m_tot = sum_m_idx + sum_m_eval
+        all_integrity_passed = bool(cand_graph.get("integrity_passed", True)) and bool(
+            cand_manifold.get("integrity_passed", True)
+        )
+        return {
+            "status": "passed" if all_integrity_passed else "failed",
+            "retriever": "shootout",
+            "mode": mode,
+            "integrity_passed": all_integrity_passed,
+            "overall_gate_passed": (
+                all_integrity_passed
+                and bool(cand_graph.get("overall_gate_passed", False))
+                and bool(cand_manifold.get("overall_gate_passed", False))
+            ),
+            "candidates": {
+                "current_yaw": {"name": "Current YAW", **cand_graph},
+                "substate_manifold_hmm": {"name": "SubStateManifold HMM YAW", **cand_manifold},
+            },
+            "baselines": gate_spec.get("baselines") or gate_spec.get("targets", {}),
+            "comparison": {
+                "datasets": per_ds,
+                "macro_average": {
+                    "current_yaw": macro_g,
+                    "substate_manifold_hmm": macro_m,
+                    "deltas": macro_deltas,
+                    "current_yaw_total_seconds": round(sum_g_tot, 4),
+                    "substate_manifold_hmm_total_seconds": round(sum_m_tot, 4),
+                    "indexing_speedup_x": round(sum_g_idx / sum_m_idx, 4) if sum_m_idx > 0.0 else None,
+                    "evaluation_speedup_x": round(sum_g_eval / sum_m_eval, 4) if sum_m_eval > 0.0 else None,
+                    "speedup_x": round(sum_g_tot / sum_m_tot, 4) if sum_m_tot > 0.0 else None,
+                },
+            },
+        }
+
     def benchmark(
         self,
         datasets: Sequence[str] | str | None = None,
@@ -1365,6 +1490,7 @@ class YawRuntime:
         query_offset: int = 0,
         full_corpus: bool = False,
         mode: Literal["eval", "retrieval"] = "eval",
+        retriever: Literal["graph", "manifold", "shootout"] | None = None,
         compiled_program: Path | str | None = None,
         compiled_program_path: Path | str | None = None,
         output_path: Path | str | None = None,
@@ -1374,6 +1500,12 @@ class YawRuntime:
         progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Run isolated per-dataset HippoRAG 2 + DPR benchmark evaluation and optional gate verification."""
+        effective_retriever: Literal["graph", "manifold", "shootout"] = (
+            self.config.retriever_mode if retriever is None else retriever
+        )
+        if effective_retriever not in ("graph", "manifold", "shootout"):
+            raise YawRuntimeError("INVALID_INPUT", f"Unsupported retriever mode: {effective_retriever!r}")
+
         gate_spec: dict[str, Any] | None = None
         if gate_path is not None:
             gp = Path(gate_path).resolve()
@@ -1418,7 +1550,7 @@ class YawRuntime:
                 )
             )
 
-        dataset_reports: dict[str, dict[str, Any]] = {}
+        dataset_slices: list[tuple[Any, str, list[str], list[str], list[list[str]] | None, list[list[str]], str]] = []
         for ds_arg in raw_datasets:
             bundle = resolve_dataset_bundle(ds_arg, workspace_root=self.config.workspace_root)
             canonical_ds = bundle.dataset
@@ -1450,186 +1582,7 @@ class YawRuntime:
                     sort_keys=True,
                 ).encode("utf-8")
             ).hexdigest()[:8]
-
-            bench_cfg = self.config.for_benchmark(
-                canonical_ds,
-                slice_hash,
-                index_root=Path(index_root) if index_root else None,
-                fresh=fresh,
-            )
-            assert bench_cfg.corpus_root is not None
-            assert bench_cfg.state_dir is not None
-            assert bench_cfg.db_path is not None
-
-            if progress_callback is not None:
-                progress_callback(f"benchmarking {canonical_ds}: indexing {len(docs)} docs")
-
-            effective_corpus_root = bundle.root
-            prog, _, bench_engine = self._create_bound_engine(
-                bench_cfg,
-                workspace_root=effective_corpus_root,
-                compiled_program_override=compiled_program or compiled_program_path,
-            )
-            matched_files = (
-                tuple(doc.path for doc in bundle.documents if doc.document_id in docs)
-                if docs
-                else tuple(doc.path for doc in bundle.documents)
-            )
-            try:
-                index_batches = bench_engine.index_chunks(included_files=matched_files)
-
-                if progress_callback is not None:
-                    progress_callback(f"benchmarking {canonical_ds}: evaluating {len(queries)} queries")
-
-                top_k = max(bench_cfg.retrieval_top_k, 5)
-                hippo_r1, hippo_r2, hippo_r5 = 0.0, 0.0, 0.0
-                dpr_r1, dpr_r2, dpr_r5 = 0.0, 0.0, 0.0
-                hippo_em, hippo_f1 = 0.0, 0.0
-                dpr_em, dpr_f1 = 0.0, 0.0
-                seeds_count = 0
-                bench_records: list[dict[str, Any]] = []
-
-                for q_idx, q in enumerate(queries):
-                    g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
-                    ens_pred = bench_engine.ensemble(
-                        question=q,
-                        retrieve_only=(effective_mode != "eval"),
-                        k=top_k,
-                    )
-                    ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
-                    ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
-                    hits = bench_engine.hydrate_ranked_chunks(
-                        list(zip(ens_cids, ens_scores, strict=False)),
-                        top_k,
-                    )
-                    seeds = list(getattr(bench_engine, "_last_query_seeds", ()))
-                    dpr_hits = bench_engine.retrieve_dpr(q, top_k=top_k)
-                    if seeds:
-                        seeds_count += 1
-                    ret_texts = [t for _, _, t in hits]
-                    dpr_texts = [t for _, _, t in dpr_hits]
-
-                    if gold_docs is not None:
-                        g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
-                        h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5))
-                        d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5))
-                        hippo_r1 += h_rec.get(1, 0.0)
-                        hippo_r2 += h_rec.get(2, 0.0)
-                        hippo_r5 += h_rec.get(5, 0.0)
-                        dpr_r1 += d_rec.get(1, 0.0)
-                        dpr_r2 += d_rec.get(2, 0.0)
-                        dpr_r5 += d_rec.get(5, 0.0)
-
-                    pred_ans = ""
-                    dpr_ans: str | None = None
-                    dpr_qa_metrics: dict[str, float] | None = None
-                    if effective_mode == "eval":
-                        pred_ans = str(getattr(ens_pred, "answer", "") or "").strip()
-                        em_val, f1_val = compute_qa_em_f1(pred_ans, g_ans)
-                        hippo_em += em_val
-                        hippo_f1 += f1_val
-
-                        dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:5], include_subgraph=False)
-                        dpr_pred = (
-                            prog.answer_question(context=dpr_ctx_str, question=q)
-                            if hasattr(prog, "answer_question")
-                            else prog(question=q)
-                        )
-                        dpr_ans = str(getattr(dpr_pred, "answer", dpr_pred) or "").strip()
-                        d_em_val, d_f1_val = compute_qa_em_f1(dpr_ans, g_ans)
-                        dpr_em += d_em_val
-                        dpr_f1 += d_f1_val
-                        dpr_qa_metrics = {"ExactMatch": d_em_val, "F1": d_f1_val}
-
-                    bench_records.append(
-                        {
-                            "question": q,
-                            "graph_seeds": seeds,
-                            "answer": pred_ans,
-                            "dpr_answer": dpr_ans,
-                            "dpr_qa_metrics": dpr_qa_metrics,
-                        }
-                    )
-
-                n_q = max(len(queries), 1)
-                fallback_count = len(queries) - seeds_count
-                num_facts = int(bench_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
-                graph_info = {
-                    "num_passage_nodes": int(bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
-                    "num_entity_nodes": int(bench_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
-                    "num_fact_nodes": num_facts,
-                    "num_extracted_triples": num_facts,
-                    "num_edges": int(bench_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
-                }
-                expected_doc_count = (
-                    int(graph_info["num_passage_nodes"])
-                    if int(graph_info["num_passage_nodes"]) >= len(docs) and len(docs) > 0
-                    else len(docs)
-                )
-                integrity_errors = check_benchmark_integrity(
-                    bench_records,
-                    graph_info,
-                    expected_doc_count=expected_doc_count,
-                    include_qa=(effective_mode == "eval"),
-                )
-
-                dataset_reports[canonical_ds] = {
-                    "dataset": canonical_ds,
-                    "mode": effective_mode,
-                    "queries": len(queries),
-                    "docs": len(docs),
-                    "index_dir": str(bench_cfg.workspace_root),
-                    "index_batches": index_batches,
-                    "graph": graph_info,
-                    "integrity": {"passed": len(integrity_errors) == 0, "errors": integrity_errors},
-                    "evaluation_metrics": {
-                        "hipporag": {
-                            "retrieval": (
-                                {
-                                    "Recall@1": round(hippo_r1 / n_q, 4),
-                                    "Recall@2": round(hippo_r2 / n_q, 4),
-                                    "Recall@5": round(hippo_r5 / n_q, 4),
-                                }
-                                if gold_docs is not None
-                                else {}
-                            ),
-                            "qa": (
-                                {
-                                    "ExactMatch": round(hippo_em / n_q, 4),
-                                    "F1": round(hippo_f1 / n_q, 4),
-                                }
-                                if effective_mode == "eval"
-                                else {}
-                            ),
-                        },
-                        "standard_dpr": {
-                            "retrieval": (
-                                {
-                                    "Recall@1": round(dpr_r1 / n_q, 4),
-                                    "Recall@2": round(dpr_r2 / n_q, 4),
-                                    "Recall@5": round(dpr_r5 / n_q, 4),
-                                }
-                                if gold_docs is not None
-                                else {}
-                            ),
-                            "qa": (
-                                {
-                                    "ExactMatch": round(dpr_em / n_q, 4),
-                                    "F1": round(dpr_f1 / n_q, 4),
-                                }
-                                if effective_mode == "eval"
-                                else {}
-                            ),
-                        },
-                        "recognition_memory": {
-                            "queries_with_graph_seeds": seeds_count,
-                            "dpr_fallback_count": fallback_count,
-                            "dpr_fallback_rate": round(fallback_count / n_q, 4),
-                        },
-                    },
-                }
-            finally:
-                bench_engine.close()
+            dataset_slices.append((bundle, canonical_ds, docs, queries, gold_docs, gold_answers, slice_hash))
 
         if gate_spec is not None:
             effective_gate_spec = gate_spec
@@ -1642,23 +1595,273 @@ class YawRuntime:
                 "require_mean_recall5_parity": True,
                 "require_mean_f1_parity": effective_mode == "eval",
                 "require_mean_em_parity": effective_mode == "eval",
-                "baselines": {ds_key: default_baselines.get(ds_key, {}) for ds_key in dataset_reports},
+                "baselines": {
+                    canonical_ds: default_baselines.get(canonical_ds, {})
+                    for _, canonical_ds, _, _, _, _, _ in dataset_slices
+                },
             }
-        gate_eval = evaluate_benchmark_gate(
-            dataset_reports,
-            effective_gate_spec,
-            mode=effective_mode,
-            target=target,
-        )
 
-        result_payload: dict[str, Any] = {
-            "status": "passed" if gate_eval["overall_gate_passed"] else "failed",
-            "mode": effective_mode,
-            "overall_gate_passed": gate_eval["overall_gate_passed"],
-            "overall_gate_status": gate_eval["overall_gate_status"],
-            "datasets": dataset_reports,
-            "gate": gate_eval,
-        }
+        def _run_candidate(candidate_mode: Literal["graph", "manifold"]) -> dict[str, Any]:
+            base_cfg = (
+                replace(self.config, retriever_mode=candidate_mode)
+                if self.config.retriever_mode != candidate_mode
+                else self.config
+            )
+            dataset_reports: dict[str, dict[str, Any]] = {}
+            for bundle, canonical_ds, docs, queries, gold_docs, gold_answers, slice_hash in dataset_slices:
+                bench_cfg = base_cfg.for_benchmark(
+                    canonical_ds,
+                    slice_hash,
+                    index_root=Path(index_root) if index_root else None,
+                    fresh=fresh,
+                )
+                assert bench_cfg.corpus_root is not None
+                assert bench_cfg.state_dir is not None
+                assert bench_cfg.db_path is not None
+
+                if progress_callback is not None:
+                    progress_callback(f"benchmarking {canonical_ds} [{candidate_mode}]: indexing {len(docs)} docs")
+
+                effective_corpus_root = bundle.root
+                prog, _, bench_engine = self._create_bound_engine(
+                    bench_cfg,
+                    workspace_root=effective_corpus_root,
+                    compiled_program_override=compiled_program or compiled_program_path,
+                )
+                matched_files = (
+                    tuple(doc.path for doc in bundle.documents if doc.document_id in docs)
+                    if docs
+                    else tuple(doc.path for doc in bundle.documents)
+                )
+                try:
+                    t_idx_start = time.perf_counter()
+                    index_batches = bench_engine.index_chunks(included_files=matched_files)
+                    indexing_seconds = round(time.perf_counter() - t_idx_start, 4)
+
+                    if progress_callback is not None:
+                        progress_callback(
+                            f"benchmarking {canonical_ds} [{candidate_mode}]: evaluating {len(queries)} queries"
+                        )
+
+                    t_eval_start = time.perf_counter()
+                    qa_top_k = min(5, bench_cfg.retrieval_top_k)
+                    eval_top_k = max(bench_cfg.retrieval_top_k, 20)
+                    hippo_r1, hippo_r2, hippo_r5, hippo_r10, hippo_r20 = 0.0, 0.0, 0.0, 0.0, 0.0
+                    dpr_r1, dpr_r2, dpr_r5, dpr_r10, dpr_r20 = 0.0, 0.0, 0.0, 0.0, 0.0
+                    hippo_em, hippo_f1 = 0.0, 0.0
+                    dpr_em, dpr_f1 = 0.0, 0.0
+                    seeds_count = 0
+                    bench_records: list[dict[str, Any]] = []
+
+                    for q_idx, q in enumerate(queries):
+                        g_ans = gold_answers[q_idx] if q_idx < len(gold_answers) else []
+                        if effective_mode == "eval":
+                            ens_pred = bench_engine.ensemble(
+                                question=q,
+                                retrieve_only=False,
+                                k=qa_top_k,
+                            )
+                            if eval_top_k > qa_top_k:
+                                hits, _ = bench_engine.retrieve_with_seeds(q, top_k=eval_top_k)
+                            else:
+                                ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
+                                ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
+                                hits = bench_engine.hydrate_ranked_chunks(
+                                    list(zip(ens_cids, ens_scores, strict=False)),
+                                    eval_top_k,
+                                )
+                        else:
+                            ens_pred = bench_engine.ensemble(
+                                question=q,
+                                retrieve_only=True,
+                                k=eval_top_k,
+                            )
+                            ens_cids = tuple(str(c) for c in getattr(ens_pred, "retrieved_chunk_ids", ()))
+                            ens_scores = tuple(float(s) for s in getattr(ens_pred, "retrieved_scores", ()))
+                            hits = bench_engine.hydrate_ranked_chunks(
+                                list(zip(ens_cids, ens_scores, strict=False)),
+                                eval_top_k,
+                            )
+                        seeds = list(getattr(bench_engine, "_last_query_seeds", ()))
+                        dpr_hits = bench_engine.retrieve_dpr(q, top_k=eval_top_k)
+                        if seeds:
+                            seeds_count += 1
+                        ret_texts = [t for _, _, t in hits]
+                        dpr_texts = [t for _, _, t in dpr_hits]
+
+                        if gold_docs is not None:
+                            g_docs = gold_docs[q_idx] if q_idx < len(gold_docs) else []
+                            h_rec = compute_retrieval_recalls(g_docs, ret_texts, k_list=(1, 2, 5, 10, 20))
+                            d_rec = compute_retrieval_recalls(g_docs, dpr_texts, k_list=(1, 2, 5, 10, 20))
+                            hippo_r1 += h_rec.get(1, 0.0)
+                            hippo_r2 += h_rec.get(2, 0.0)
+                            hippo_r5 += h_rec.get(5, 0.0)
+                            hippo_r10 += h_rec.get(10, 0.0)
+                            hippo_r20 += h_rec.get(20, 0.0)
+                            dpr_r1 += d_rec.get(1, 0.0)
+                            dpr_r2 += d_rec.get(2, 0.0)
+                            dpr_r5 += d_rec.get(5, 0.0)
+                            dpr_r10 += d_rec.get(10, 0.0)
+                            dpr_r20 += d_rec.get(20, 0.0)
+
+                        pred_ans = ""
+                        dpr_ans: str | None = None
+                        dpr_qa_metrics: dict[str, float] | None = None
+                        if effective_mode == "eval":
+                            pred_ans = str(getattr(ens_pred, "answer", "") or "").strip()
+                            em_val, f1_val = compute_qa_em_f1(pred_ans, g_ans)
+                            hippo_em += em_val
+                            hippo_f1 += f1_val
+
+                            dpr_ctx_str = bench_engine.format_qa_context(dpr_hits[:qa_top_k], include_subgraph=False)
+                            dpr_pred = (
+                                prog.answer_question(context=dpr_ctx_str, question=q)
+                                if hasattr(prog, "answer_question")
+                                else prog(question=q)
+                            )
+                            dpr_ans = str(getattr(dpr_pred, "answer", dpr_pred) or "").strip()
+                            d_em_val, d_f1_val = compute_qa_em_f1(dpr_ans, g_ans)
+                            dpr_em += d_em_val
+                            dpr_f1 += d_f1_val
+                            dpr_qa_metrics = {"ExactMatch": d_em_val, "F1": d_f1_val}
+
+                        bench_records.append(
+                            {
+                                "question": q,
+                                "graph_seeds": seeds,
+                                "answer": pred_ans,
+                                "dpr_answer": dpr_ans,
+                                "dpr_qa_metrics": dpr_qa_metrics,
+                            }
+                        )
+
+                    evaluation_seconds = round(time.perf_counter() - t_eval_start, 4)
+                    n_q = max(len(queries), 1)
+                    fallback_count = len(queries) - seeds_count
+                    num_facts = int(bench_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
+                    graph_info = {
+                        "retriever_mode": candidate_mode,
+                        "num_passage_nodes": int(
+                            bench_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                        ),
+                        "num_chunk_vectors": int(
+                            bench_engine.conn.execute("SELECT COUNT(*) FROM chunk_vec").fetchone()[0]
+                        ),
+                        "num_entity_nodes": int(
+                            bench_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+                        ),
+                        "num_fact_nodes": num_facts,
+                        "num_extracted_triples": num_facts,
+                        "num_edges": int(bench_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
+                        "indexing_seconds": indexing_seconds,
+                        "evaluation_seconds": evaluation_seconds,
+                    }
+                    expected_doc_count = (
+                        int(graph_info["num_passage_nodes"])
+                        if int(graph_info["num_passage_nodes"]) >= len(docs) and len(docs) > 0
+                        else len(docs)
+                    )
+                    integrity_errors = check_benchmark_integrity(
+                        bench_records,
+                        graph_info,
+                        expected_doc_count=expected_doc_count,
+                        include_qa=(effective_mode == "eval"),
+                    )
+
+                    dataset_reports[canonical_ds] = {
+                        "dataset": canonical_ds,
+                        "mode": effective_mode,
+                        "retriever": candidate_mode,
+                        "queries": len(queries),
+                        "docs": len(docs),
+                        "index_dir": str(bench_cfg.workspace_root),
+                        "index_batches": index_batches,
+                        "graph": graph_info,
+                        "integrity": {"passed": len(integrity_errors) == 0, "errors": integrity_errors},
+                        "evaluation_metrics": {
+                            "hipporag": {
+                                "retrieval": (
+                                    {
+                                        "Recall@1": round(hippo_r1 / n_q, 4),
+                                        "Recall@2": round(hippo_r2 / n_q, 4),
+                                        "Recall@5": round(hippo_r5 / n_q, 4),
+                                        "Recall@10": round(hippo_r10 / n_q, 4),
+                                        "Recall@20": round(hippo_r20 / n_q, 4),
+                                    }
+                                    if gold_docs is not None
+                                    else {}
+                                ),
+                                "qa": (
+                                    {
+                                        "ExactMatch": round(hippo_em / n_q, 4),
+                                        "F1": round(hippo_f1 / n_q, 4),
+                                    }
+                                    if effective_mode == "eval"
+                                    else {}
+                                ),
+                            },
+                            "standard_dpr": {
+                                "retrieval": (
+                                    {
+                                        "Recall@1": round(dpr_r1 / n_q, 4),
+                                        "Recall@2": round(dpr_r2 / n_q, 4),
+                                        "Recall@5": round(dpr_r5 / n_q, 4),
+                                        "Recall@10": round(dpr_r10 / n_q, 4),
+                                        "Recall@20": round(dpr_r20 / n_q, 4),
+                                    }
+                                    if gold_docs is not None
+                                    else {}
+                                ),
+                                "qa": (
+                                    {
+                                        "ExactMatch": round(dpr_em / n_q, 4),
+                                        "F1": round(dpr_f1 / n_q, 4),
+                                    }
+                                    if effective_mode == "eval"
+                                    else {}
+                                ),
+                            },
+                            "recognition_memory": {
+                                "queries_with_graph_seeds": seeds_count,
+                                "dpr_fallback_count": fallback_count,
+                                "dpr_fallback_rate": round(fallback_count / n_q, 4),
+                            },
+                        },
+                    }
+                finally:
+                    bench_engine.close()
+
+            gate_eval = evaluate_benchmark_gate(
+                dataset_reports,
+                effective_gate_spec,
+                mode=effective_mode,
+                target=target,
+            )
+            all_integrity_passed = all(rep["integrity"]["passed"] for rep in dataset_reports.values())
+            gate_passed = bool(gate_eval["overall_gate_passed"]) and all_integrity_passed
+            return {
+                "status": "passed" if gate_passed else "failed",
+                "mode": effective_mode,
+                "retriever": candidate_mode,
+                "integrity_passed": all_integrity_passed,
+                "overall_gate_passed": gate_passed,
+                "overall_gate_status": gate_eval["overall_gate_status"] if all_integrity_passed else "FAIL",
+                "datasets": dataset_reports,
+                "gate": gate_eval,
+            }
+
+        if effective_retriever == "shootout":
+            cand_graph = _run_candidate("graph")
+            cand_manifold = _run_candidate("manifold")
+            result_payload = self._build_shootout_comparison(
+                cand_graph,
+                cand_manifold,
+                effective_mode,
+                effective_gate_spec,
+            )
+        else:
+            result_payload = _run_candidate(effective_retriever)
+
         if output_path is not None:
             write_text_atomic(Path(output_path).resolve(), json.dumps(result_payload, indent=2))
         return result_payload

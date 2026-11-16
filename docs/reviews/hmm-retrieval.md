@@ -32,7 +32,11 @@ claim. Existing PPR experiment measurements remain historical evidence.
   multiple entity observations, use the reverse potential to compute a backward
   message and normalize their elementwise product; single-observation retrieval
   uses the forward message alone. These are retrieval relevance scores, not
-  calibrated truth probabilities or a convergence theorem for PPR.
+  calibrated truth probabilities or a convergence theorem for PPR. For the
+  companion epistemic grounding of query-induced hidden states vs. corpus
+  emissions, primary structural failure modes (pronoun/alias coreference
+  ceilings), mandatory kill-switch ablations, and post-`E1-M1` factor-graph
+  extensions, see [substate-manifold-shootout.md](substate-manifold-shootout.md).
 - Passage relevance is Noisy-OR over B_ce * entity relevance, combined by Noisy-OR
   with the normalized direct passage seed. Entity state mass and passage
   relevance belong to separate layers; their concatenation need not sum to one.

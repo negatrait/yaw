@@ -10,8 +10,10 @@ from yaw.core import (
     YawConfig,
     YawRuntimeError,
     get_config_value,
+    load_config,
     parse_dataset_list,
     set_config_value,
+    write_manifold_section,
     write_via_temp_atomic,
 )
 
@@ -239,3 +241,58 @@ def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pyt
         write_text_atomic(target, '{"status": "fallback"}\n', retries=2)
     assert target.read_text(encoding="utf-8") == '{"status": "recovered"}\n'
     assert not list(target.parent.glob(".*tmp*"))
+
+
+def test_manifold_toml_section_roundtrip_and_validation(tmp_path: Path) -> None:
+    """[manifold] parses strictly, excludes config_fingerprint, supports get/set, and replaces atomically."""
+    toml_path = tmp_path / "yaw.toml"
+    toml_path.write_text(
+        '[paths]\ncorpus_dir = "corpus"\n\n[retrieval]\nretriever_mode = "manifold"\n\n[runtime]\nhttp_port = 8765\n',
+        encoding="utf-8",
+    )
+    cfg_plain = load_config(toml_path)
+    assert cfg_plain.manifold_overrides == ()
+    fp_plain = cfg_plain.config_fingerprint()
+
+    with pytest.raises(KeyError):
+        get_config_value(toml_path, "manifold.peclet")
+
+    updated_key, updated_val = set_config_value("manifold.peclet", "0.55", toml_path)
+    assert updated_key == "manifold.peclet"
+    assert updated_val == pytest.approx(0.55)
+    assert get_config_value(toml_path, "manifold.peclet") == pytest.approx(0.55)
+    assert get_config_value(toml_path, "manifold") == {"peclet": pytest.approx(0.55)}
+
+    cfg_overridden = load_config(toml_path)
+    assert dict(cfg_overridden.manifold_overrides) == {"peclet": pytest.approx(0.55)}
+    assert cfg_overridden.config_fingerprint() == fp_plain
+
+    for bad_raw in ("true", "nan", "inf", "not_a_number"):
+        with pytest.raises(ValueError):
+            set_config_value("manifold.peclet", bad_raw, toml_path)
+    assert get_config_value(toml_path, "manifold.peclet") == pytest.approx(0.55)
+
+    written_path = write_manifold_section({"alpha_sprt": 0.04, "external_trust": 0.4}, toml_path)
+    assert written_path == toml_path.resolve()
+    reloaded = load_config(toml_path)
+    assert dict(reloaded.manifold_overrides) == {
+        "alpha_sprt": pytest.approx(0.04),
+        "external_trust": pytest.approx(0.4),
+    }
+    assert reloaded.http_port == 8765
+    assert reloaded.retriever_mode == "manifold"
+    assert reloaded.config_fingerprint() == fp_plain
+    with pytest.raises(KeyError):
+        get_config_value(toml_path, "manifold.peclet")
+
+    bad_toml = tmp_path / "bad_manifold.toml"
+    for bad_doc in (
+        "[manifold]\npeclet = true\n",
+        "[manifold]\npeclet = nan\n",
+        '[manifold]\npeclet = "invalid"\n',
+        'manifold = "not_a_table"\n',
+        "manifold = [1, 2, 3]\n",
+    ):
+        bad_toml.write_text(bad_doc, encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config(bad_toml)

@@ -1,4 +1,4 @@
-# YAW Native HippoRAG 2 Daemon Configuration
+# YAW Vector Search & QA Daemon Configuration
 
 [paths]
 corpus_root = "corpus"
@@ -63,3 +63,17 @@ auto = "light"
 sleep_seconds = 0.0
 max_bootstrapped_demos = 1
 max_labeled_demos = 1
+
+[retrieval]
+peclet = 0.3375533823900754
+alpha_sprt = 0.07953934952508675
+redundancy_curvature = 0.834659004285133
+coalition_coupling = 0.3887505167779042
+external_trust = 0.26842185514853145
+
+[manifold]
+peclet = 0.3375533823900754
+alpha_sprt = 0.07953934952508675
+redundancy_curvature = 0.834659004285133
+coalition_coupling = 0.3887505167779042
+external_trust = 0.26842185514853145

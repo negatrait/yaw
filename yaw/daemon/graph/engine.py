@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +22,15 @@ from yaw.core import (
     compute_chunk_id,
     render_document_text,
     write_text_atomic,
+)
+from yaw.daemon.graph.hmm import (
+    EvidenceHop,
+    ManifoldHyperparams,
+    SubStateManifold,
+    build_substate_manifold,
+    derive_manifold_telemetry,
+    format_evidence_route,
+    run_substate_hmm,
 )
 from yaw.daemon.graph.inference import (
     FACT_INSTRUCTION,
@@ -66,6 +75,7 @@ from yaw.daemon.graph.storage import (
     inspect_focus_node,
     lint_graph_shacl,
     load_graph_topology,
+    load_manifold_chunks,
     make_ast_island_hydrator,
     make_chunk_hydrator,
     open_managed_yaw_db,
@@ -80,6 +90,15 @@ from yaw.daemon.graph.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ManifoldCorpusData:
+    """Loaded SQLite + disk chunk manifold inputs for SubStateManifold construction."""
+
+    chunk_pointers: list[ChunkPointer]
+    chunk_texts: dict[str, str]
+    chunk_vectors: np.ndarray
 
 
 class YawGraphEngine:
@@ -116,7 +135,11 @@ class YawGraphEngine:
         chunk_overlap: int = 120,
         min_chunk_size: int = 100,
         traversal_policy: RelationTraversalPolicy | None = None,
+        retriever_mode: Literal["graph", "manifold"] = "graph",
+        manifold_params: ManifoldHyperparams | None = None,
     ) -> None:
+        if retriever_mode not in ("graph", "manifold"):
+            raise ValueError(f"Unsupported retriever_mode: {retriever_mode!r}")
         self.workspace_root = Path(workspace_root).resolve()
         self.db_path = db_path
         db_path_str = str(db_path)
@@ -130,7 +153,8 @@ class YawGraphEngine:
         self.conn: sqlite3.Connection = self.managed_conn._conn
         self.program = program
         self.embedder = embedder
-        self.config: Any = None
+        self._config: Any = None
+        self._explicit_manifold_params: ManifoldHyperparams | None = manifold_params
         self.indexing_runner: Callable[..., GraphPlanSummary] | None = None
         self._close_callbacks: list[Callable[[], None]] = []
 
@@ -158,9 +182,13 @@ class YawGraphEngine:
         self.embed_batch_size = embed_batch_size
         self.beta = beta
         self.traversal_policy: RelationTraversalPolicy | None = traversal_policy
+        self.retriever_mode: Literal["graph", "manifold"] = retriever_mode
 
         self._csr_graph: CSRGraph | None = None
+        self._substate_manifold: SubStateManifold | None = None
         self._csr_cache_key: tuple[Any, ...] | None = None
+        self._manifold_cache_key: tuple[Any, ...] | None = None
+        self._last_evidence_route: tuple[EvidenceHop, ...] = ()
         self._graph_rlm_stats: dict[str, Any] = self._empty_graph_rlm_stats()
         self._chunk_rlm_stats: dict[str, dict[str, float]] = {}
         self._active_query_rlm_stats: dict[str, int] | None = None
@@ -189,6 +217,50 @@ class YawGraphEngine:
         self._bind_program_hooks()
         self._apply_program_embedding_prefixes()
         self._hydrate_indexed_cids_from_db()
+
+    @property
+    def config(self) -> Any:
+        """Bound YawConfig instance for embedding cache identity and manifold overrides."""
+        return self._config
+
+    @config.setter
+    def config(self, value: Any) -> None:
+        if self._explicit_manifold_params is None and value is not None:
+            overrides = getattr(value, "manifold_overrides", None)
+            if overrides:
+                ManifoldHyperparams.from_overrides(overrides)
+        mode = getattr(value, "retriever_mode", None)
+        if mode in ("graph", "manifold"):
+            self.retriever_mode = mode
+        self._config = value
+        self._csr_graph = None
+        self._csr_cache_key = None
+        self._substate_manifold = None
+        self._manifold_cache_key = None
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
+
+    @property
+    def manifold_params(self) -> ManifoldHyperparams | None:
+        """Explicit ManifoldHyperparams override when supplied directly."""
+        return self._explicit_manifold_params
+
+    @manifold_params.setter
+    def manifold_params(self, value: ManifoldHyperparams | None) -> None:
+        self._explicit_manifold_params = value
+        self._substate_manifold = None
+        self._manifold_cache_key = None
+        self._query_retrieval_memo.clear()
+        self._last_memo_question = None
+
+    def _active_manifold_params(self) -> ManifoldHyperparams:
+        if self._explicit_manifold_params is not None:
+            return self._explicit_manifold_params
+        cfg = self._config
+        overrides = getattr(cfg, "manifold_overrides", None) if cfg is not None else None
+        if overrides:
+            return ManifoldHyperparams.from_overrides(overrides)
+        return ManifoldHyperparams()
 
     def _embedding_cache_namespace(self, instruction: str = "") -> str:
         profile = getattr(self.embedder, "profile", None)
@@ -228,6 +300,11 @@ class YawGraphEngine:
     def _corpus_sources(self) -> dict[str, str]:
         return {hashlib.sha256(text.encode("utf-8")).hexdigest(): text for _, text in self._opt_chunks_pool}
 
+    def _active_indexing_fingerprint(self, program: YawProgram) -> tuple[str, str]:
+        if self.retriever_mode == "manifold":
+            return ("manifold-v3", "manifold-v3")
+        return (extraction_fingerprint(program), openie_fingerprint(program))
+
     def _hydrate_indexed_cids_from_db(
         self,
         program: YawProgram | None = None,
@@ -239,15 +316,14 @@ class YawGraphEngine:
         self._active_extraction_fingerprint = None
         if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='chunk_inference'").fetchone():
             return
-        curr_ext_fp = extraction_fingerprint(active_prog)
-        curr_openie_fp = openie_fingerprint(active_prog)
+        curr_ext_fp, curr_program_fp = self._active_indexing_fingerprint(active_prog)
         ready_cids = {
             str(row[0])
             for row in self.conn.execute(
                 "SELECT c.chunk_id FROM chunks c JOIN chunk_inference i ON c.chunk_id=i.chunk_id "
                 "JOIN chunk_vec v ON v.chunk_id=c.chunk_id "
                 "WHERE i.program_identity=? AND i.embedding_identity=?",
-                (curr_openie_fp, self.embedder.index_identity),
+                (curr_program_fp, self.embedder.index_identity),
             )
         }
         if ready_cids:
@@ -473,7 +549,9 @@ class YawGraphEngine:
                     current_key = self._current_csr_cache_key()
                     if self._csr_cache_key != current_key:
                         self._csr_graph = None
+                        self._substate_manifold = None
                         self._csr_cache_key = current_key
+                        self._manifold_cache_key = None
                         self._query_retrieval_memo.clear()
                         self._last_memo_question = None
                 if q_str != self._last_memo_question:
@@ -684,13 +762,47 @@ class YawGraphEngine:
         data_version = int(data_version_row[0]) if data_version_row is not None else 0
         graph_fp = get_meta(self.conn, "graph_input_fingerprints") or ""
         policy = self.traversal_policy or RelationTraversalPolicy()
+        chunk_count_row = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+        chunk_count = int(chunk_count_row[0]) if chunk_count_row is not None else 0
         return (
             data_version,
             int(self.conn.total_changes),
             graph_fp,
             float(self.beta),
             policy,
+            self.retriever_mode,
+            chunk_count,
         )
+
+    def load_manifold_corpus(self) -> ManifoldCorpusData:
+        """Load persisted chunk pointers, hydrated texts, and vectors from yaw.db."""
+        with self._lock:
+            chunk_pointers, chunk_vectors = load_manifold_chunks(self.conn)
+            hydrator = make_chunk_hydrator(self.conn, self.workspace_root)
+            chunk_texts = {ptr.chunk_id: hydrator(ptr.chunk_id) for ptr in chunk_pointers}
+            return ManifoldCorpusData(
+                chunk_pointers=chunk_pointers,
+                chunk_texts=chunk_texts,
+                chunk_vectors=chunk_vectors,
+            )
+
+    def _ensure_substate_manifold(self) -> SubStateManifold:
+        with self._lock:
+            params = self._active_manifold_params()
+            cache_key = (*self._current_csr_cache_key(), params)
+            if self._substate_manifold is None or self._manifold_cache_key != cache_key:
+                if self._manifold_cache_key != cache_key:
+                    self._query_retrieval_memo.clear()
+                    self._last_memo_question = None
+                corpus = self.load_manifold_corpus()
+                self._substate_manifold = build_substate_manifold(
+                    corpus.chunk_pointers,
+                    corpus.chunk_texts,
+                    corpus.chunk_vectors,
+                    params=params,
+                )
+                self._manifold_cache_key = cache_key
+            return self._substate_manifold
 
     def _ensure_csr_graph(self) -> CSRGraph:
         with self._lock:
@@ -749,7 +861,19 @@ class YawGraphEngine:
         )
         subgraph_header = ""
         passage_budget = budget
-        if include_subgraph and self.conn is not None:
+        if include_subgraph and self.retriever_mode == "manifold":
+            if self._last_evidence_route:
+                active_params = self._active_manifold_params()
+                route_cap = derive_manifold_telemetry(active_params).route_max_chars
+                max_route_chars = min(route_cap, budget // 4) if budget is not None else route_cap
+                subgraph_header = format_evidence_route(
+                    self._last_evidence_route,
+                    max_chars=max_route_chars,
+                    params=active_params,
+                )
+                if subgraph_header and budget is not None:
+                    passage_budget = max(0, budget - len(subgraph_header) - 2)
+        elif include_subgraph and self.conn is not None:
             max_subgraph = budget // 4 if budget is not None else None
             chunk_ids = [p.chunk_id for p, _, _ in hits]
             subgraph_header = format_subgraph_for_qa(
@@ -846,7 +970,7 @@ class YawGraphEngine:
         item_docs: Sequence[str] | None = None,
     ) -> list[str]:
         with self._lock:
-            ext_fp = extraction_fingerprint(program)
+            ext_fp, _ = self._active_indexing_fingerprint(program)
             if self._active_extraction_fingerprint != ext_fp or any(
                 p.chunk_id not in self._opt_indexed_cids for p, _ in self._opt_chunks_pool
             ):
@@ -980,10 +1104,13 @@ class YawGraphEngine:
             finally:
                 self._active_progress_callback = prev_cb
             self._csr_graph = None
+            self._substate_manifold = None
             self._csr_cache_key = None
+            self._manifold_cache_key = None
+            self._last_evidence_route = ()
             self._query_retrieval_memo.clear()
             self._last_memo_question = None
-            self._active_extraction_fingerprint = extraction_fingerprint(active_program)
+            self._active_extraction_fingerprint, _ = self._active_indexing_fingerprint(active_program)
             self._opt_indexed_cids = set(summary.chunk_ids)
             self._chunk_indexed_ext_fp = {cid: self._active_extraction_fingerprint for cid in summary.chunk_ids}
             self._graph_rlm_stats.update(summary.rlm_stats)
@@ -1040,6 +1167,50 @@ class YawGraphEngine:
             if allow_intent_path and str(query or "") != self._last_seed_query:
                 self._last_query_seeds = []
                 self._last_seed_query = str(query or "")
+            if self.retriever_mode == "manifold":
+                manifold = self._ensure_substate_manifold()
+                if not manifold.chunk_ids or top_k <= 0:
+                    self._last_evidence_route = ()
+                    return [], []
+                query_vec = self._encode_texts([query], instruction=PASSAGE_INSTRUCTION, stage="query_passage_embed")[0]
+                fts_hits = dict(search_chunks_fts(self.conn, query, top_k=self.fts_seed_pool_k))
+                vec_hits = dict(search_chunk_vectors_knn(self.conn, query_vec, top_k=self.passage_seed_pool_k))
+                pool_k = max(top_k * 4, 50)
+                res = run_substate_hmm(
+                    manifold,
+                    query,
+                    query_vec,
+                    top_k=pool_k,
+                    fts_chunk_scores=fts_hits,
+                    vec_chunk_scores=vec_hits,
+                    params=manifold.params,
+                )
+                self._last_evidence_route = res.route
+                if res.route:
+                    seen_route_cids: set[str] = set()
+                    seeds = []
+                    for h in res.route:
+                        if h.chunk_id in seen_route_cids:
+                            continue
+                        seen_route_cids.add(h.chunk_id)
+                        seeds.append((h.chunk_id, f"hop_{h.hop}", h.snippet[:120]))
+                elif res.ranked_chunks:
+                    top0_cid = res.ranked_chunks[0][0]
+                    top0_snip = ""
+                    if res.hop_posteriors and top0_cid in manifold.chunk_ids:
+                        c0_idx = manifold.chunk_ids.index(top0_cid)
+                        top0_snip = manifold.chunk_full_texts[c0_idx][:120]
+                    seeds = [(top0_cid, "hop_0", top0_snip)]
+                else:
+                    seeds = []
+                for seed_item in seeds:
+                    if seed_item not in self._last_query_seeds:
+                        self._last_query_seeds.append(seed_item)
+                if not res.ranked_chunks:
+                    return [], seeds
+                hydrated_hits = self._hydrate_maxp_passages(res.ranked_chunks, top_k)
+                return hydrated_hits, seeds
+
             graph = self._ensure_csr_graph()
             if len(graph.chunk_indices) == 0 or top_k <= 0:
                 return [], []
@@ -1501,7 +1672,7 @@ class YawGraphEngine:
         self._last_memo_question = None
         if self._opt_chunks_pool and (
             len(self._opt_indexed_cids) < len(self._opt_chunks_pool)
-            or self._active_extraction_fingerprint != extraction_fingerprint(compiled)
+            or self._active_extraction_fingerprint != self._active_indexing_fingerprint(compiled)[0]
         ):
             self.index_chunks(self._opt_chunks_pool, program=compiled)
         self._bind_program_hooks()
@@ -1623,5 +1794,6 @@ class YawGraphEngine:
 
 
 __all__ = [
+    "ManifoldCorpusData",
     "YawGraphEngine",
 ]

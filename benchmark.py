@@ -69,7 +69,7 @@ BASELINES: dict[str, dict[str, Any]] = json.loads(
 )["baselines"]
 
 QA_TOP_K = 5
-RETRIEVAL_TOP_K = 10
+RETRIEVAL_TOP_K = 20
 LINKING_TOP_K = 8
 FACT_CANDIDATE_POOL_K = 50
 FACT_FTS_POOL_K = 50
@@ -214,6 +214,7 @@ def run_yaw_benchmark(
     import dspy
 
     from yaw.daemon.graph.engine import YawGraphEngine
+    from yaw.daemon.graph.hmm import ManifoldHyperparams
     from yaw.daemon.graph.inference import (
         YawProgram,
         create_dspy_lm,
@@ -291,6 +292,8 @@ def run_yaw_benchmark(
             chunk_size=config.chunk_size,
             chunk_overlap=config.chunk_overlap,
             min_chunk_size=config.min_chunk_size,
+            retriever_mode=config.retriever_mode,
+            manifold_params=ManifoldHyperparams.from_overrides(config.manifold_overrides),
         ),
         state_root=config.state_dir,
         source_settings=SourceSettings(
@@ -392,12 +395,13 @@ def run_yaw_benchmark(
         retrieved_ids_list: list[list[str]] = []
 
         total_queries = len(queries)
+        eval_ret_k = max(RETRIEVAL_TOP_K, 20)
         for q_idx, query in enumerate(queries, start=1):
             t_q0 = perf_counter()
-            hits, kept_facts = yaw_engine.retrieve_with_seeds(query, top_k=RETRIEVAL_TOP_K)
+            hits, kept_facts = yaw_engine.retrieve_with_seeds(query, top_k=eval_ret_k)
             retrieval_elapsed = perf_counter() - t_q0
 
-            dpr_hits = yaw_engine.retrieve_dpr(query, top_k=RETRIEVAL_TOP_K)
+            dpr_hits = yaw_engine.retrieve_dpr(query, top_k=eval_ret_k)
 
             retrieved_passages = [text for _, _, text in hits]
             dpr_passages = [text for _, _, text in dpr_hits]
@@ -433,24 +437,26 @@ def run_yaw_benchmark(
             _, ret_per_query = ScriptRetrievalRecall().calculate_metric_scores(
                 gold_docs=gold_docs_norm,
                 retrieved_docs=ret_docs_norm,
-                k_list=[1, 2, 5, 10],
+                k_list=[1, 2, 5, 10, 20],
             )
             _, dpr_per_query = ScriptRetrievalRecall().calculate_metric_scores(
                 gold_docs=gold_docs_norm,
                 retrieved_docs=dpr_docs_norm,
-                k_list=[1, 2, 5, 10],
+                k_list=[1, 2, 5, 10, 20],
             )
             recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
             recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
             recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
             recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
+            recalls_20 = [round(float(r["Recall@20"]), 4) for r in ret_per_query]
             dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
             dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
             dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
             dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
+            dpr_recalls_20 = [round(float(r["Recall@20"]), 4) for r in dpr_per_query]
         else:
-            recalls_1 = recalls_2 = recalls_5 = recalls_10 = []
-            dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = []
+            recalls_1 = recalls_2 = recalls_5 = recalls_10 = recalls_20 = []
+            dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = dpr_recalls_20 = []
 
         qa_metrics = None
         em_list: list[float] = []
@@ -475,8 +481,8 @@ def run_yaw_benchmark(
                     "dpr_answer": "",
                     "gold_answers": gold_answers[q_idx],
                     "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
-                    "qa_evidence": all_retrieved_passages[q_idx],
-                    "dpr_evidence": all_dpr_passages[q_idx],
+                    "qa_evidence": all_retrieved_passages[q_idx][:QA_TOP_K],
+                    "dpr_evidence": all_dpr_passages[q_idx][:QA_TOP_K],
                     "graph_seeds": kept_facts_per_query[q_idx],
                     "recall": (
                         {
@@ -484,6 +490,7 @@ def run_yaw_benchmark(
                             "@2": recalls_2[q_idx],
                             "@5": recalls_5[q_idx],
                             "@10": recalls_10[q_idx],
+                            "@20": recalls_20[q_idx],
                         }
                         if gold_docs is not None
                         else None
@@ -494,6 +501,7 @@ def run_yaw_benchmark(
                             "@2": dpr_recalls_2[q_idx],
                             "@5": dpr_recalls_5[q_idx],
                             "@10": dpr_recalls_10[q_idx],
+                            "@20": dpr_recalls_20[q_idx],
                         }
                         if gold_docs is not None
                         else None
@@ -518,18 +526,21 @@ def run_yaw_benchmark(
                 "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
                 "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
                 "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
+                "Recall@20": round(float(np.mean(recalls_20)), 4) if recalls_20 else 0.0,
             }
             dpr_ret: dict[str, Any] = {
                 "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
                 "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
                 "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
                 "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
+                "Recall@20": round(float(np.mean(dpr_recalls_20)), 4) if dpr_recalls_20 else 0.0,
             }
             delta_vs_dpr: dict[str, Any] = {
                 "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
                 "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
                 "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
                 "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
+                "Recall@20": round(hipporag_ret["Recall@20"] - dpr_ret["Recall@20"], 4),
             }
         else:
             hipporag_ret = {}

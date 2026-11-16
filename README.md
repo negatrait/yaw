@@ -1,8 +1,10 @@
-# YAW: HippoRAG 2 Graph & Storage Engine
+# YAW
 
-YAW is a native HippoRAG 2 graph & storage engine backed by a single SQLite database (`yaw.db`), CocoIndex (`cocoindex>=1.0.0`) single-parse Rust Tree-sitter AST ingestion, and DSPy GBNF/RLM/GEPA inference. Read [FOUNDATIONAL](FOUNDATIONAL.md), then the [daemon epic](docs/epic-1-hipporag-daemon.md) and [Streamable HTTP epic](docs/epic-2-fastmcp-http.md). Reference papers are preserved locally under [HippoRAG 1 (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md) and [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md).
+YAW is a local-first retrieval and QA library built on a single SQLite database (`yaw.db`), `sqlite-vec` (`vec0` cosine KNN), contentless `FTS5` (`chunk_fts`), live declarative `CocoIndex` ingestion, zero-LLM hybrid `VectorSearch` (`recall`), and bare `DSPy` (`dspy.ReAct` QA + `dspy.GEPA` optimization). Upstream HippoRAG is a historical benchmark reference only; legacy HippoRAG OpenIE/PPR/W3C/OWL/SKOS/SHACL/GBNF/`dspy.RLM` machinery is actively being retired into a flat 14-file codebase under the [Clean-Slate Replacement Sprint](docs/reviews/bare-bones-replacement-sprint.md).
 
-## Available now
+Read [FOUNDATIONAL](FOUNDATIONAL.md), [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), and the [Clean-Slate Replacement Sprint](docs/reviews/bare-bones-replacement-sprint.md). Reference papers are preserved locally under [HippoRAG 1 (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md) and [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md).
+
+## Current Pre-Cutover Commands (Retiring in `CS-4`)
 
 Use Python `>=3.14` (`.python-version` `3.14.9`) and `uv`:
 
@@ -11,290 +13,69 @@ uv sync
 uv run preflight
 uv run preflight --full
 uv run typecheck
-uv run pytest -v
-uv run --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --source-dir outputs/datasets
-uv run yaw daemon status
-uv run yaw daemon run
-uv run yaw daemon start
-uv run yaw daemon stop
-uv run yaw graph build
-uv run yaw graph rebuild
-uv run yaw graph lint
-uv run yaw graph lint --turtle
-uv run yaw dspy optimize
-uv run --locked yaw dspy optimize --fresh
-uv run yaw dspy load-program .yaw/optimize_program.json
-uv run yaw dspy benchmark --gate benchmark_gate.json
-uv run yaw config get optimization.auto
-uv run yaw config set optimization.auto heavy
+uv run --locked pytest -v
+uv run --locked python scripts/download-datasets.py --dataset all --source-dir data/benchmarks
+uv run yaw daemon {run|start|stop|status}
+uv run yaw config get <key>
+uv run yaw config set <key> <value>
+uv run yaw dspy tune-manifold --trials 64
 uv run python benchmark.py --dataset sample --mode all
-uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25
+uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25 --mode retrieval
 uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
 uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
 uv run python scripts/verify_paper_parity_gate.py
 ```
 
-Dataset preparation now writes one JSON file per document under
-`outputs/datasets/<dataset>/documents/`, with evaluation rows and the manifest
-outside that scan root. `--source-dir` names the configured input JSON directory;
-the existing monolithic files are preserved as source inputs. To use explicit
-inputs, pass `--corpus <corpus.json> --questions <questions.json>` for one dataset.
-Use `--dataset all --source-dir <inputs>` to prepare all registered datasets and
-`--dataset enterprise_rag_bench --check` to validate that prepared bundle.
-Preparation copies the configured corpus in full and does not rewrite titles,
-answers or categories. Enterprise's deterministic 150/100 split is selected by
-the loader.
+Legacy `yaw graph ...`, `yaw dspy ...`, and `scripts/calibrate_candidates.py` commands remain pre-cutover only and are deleted in `CS-4b` ([Removal Inventory](docs/reviews/bare-bones-replacement-sprint.md#6-removal-inventory)).
 
-This development refactor requires fresh prepared bundles and indexes. After
-preparation, `uv run --locked yaw dspy optimize` resumes or initializes the
-canonical `.yaw/optimize_yaw.db` sandbox by default; pass `--fresh` to wipe prior
-`.yaw/optimize_*` state and start from scratch. Normal scans retain
-CocoIndex state, and complete snapshots include unchanged memoized documents.
-Production JSON key projection remains configurable. Unsafe source spans and
-malformed inputs fail explicitly rather than being repaired or silently skipped.
+## Target Clean-Slate CLI (`CS-3` / `CS-4`)
 
-`preflight` formats with Ruff, applies safe Ruff and ty fixes, then runs pytest
-with testmon and coverage.py through pytest-cov. It continues after failures and
-returns a failing exit status if any check fails. Full UTF-8 logs, JUnit XML,
-coverage JSON and a combined report are saved under `outputs/preflight/`;
-`latest.json` points to the newest report. Add `--verbose` to stream diagnostics.
-Default tests are incremental; `--full` runs the whole suite. Coverage describes
-the tests executed in that invocation. Every collected test runs, including live inference checks; configured models
-must already be resident.
-Ruff fixes and pytest `--testmon` are project defaults. ty's `--fix` has no
-persistent configuration setting; `uv run typecheck` supplies it automatically.
-See the [coverage plan](docs/coverage-plan.md) for remaining verification work.
+Once `CS-3` and `CS-4` land ([Epic 1 Decision 20](docs/epic-1-hipporag-daemon.md#decisions)), all operations unify onto the `FastMCP` Streamable HTTP daemon and bare `dspy` CLI:
 
-Indexes created before source-vector retention or `entity_mentions.llm_prob`
-require a rebuild from source
-before indexing with this version. The pipeline reports the missing schema
-explicitly. Restart long-running processes to load the implementation.
+```powershell
+uv run yaw daemon {run|start|stop|status} [--config PATH] [--json]
+uv run yaw recall <query> [--top-k 5] [--config PATH] [--json]
+uv run yaw qa <question> [--config PATH] [--json]
+uv run yaw optimize dspy [--dataset ...] [--max-queries N] [--train-queries K] [--fresh]
+uv run yaw optimize optuna [--dataset ...] [--trials 64] [--write-config]
+uv run yaw config {show|get [key]|set <key> <value>} [--config PATH] [--json]
+```
 
-NER, triples and semantic judges collect token logprobs on their existing calls.
-Source confidence pools those optional measurements with retained semantic
-similarity votes; missing logprobs do not remove scored traversal edges. Raw
-source measurements survive canonical merges and are withdrawn with their source.
+## Architecture & Model Stack
 
-Candidate discovery uses fixed `[graph]` `candidate_dense_threshold` and
-`candidate_lexical_threshold` cutoffs. `auto_merge_threshold` separately requires
-extreme cosine and difflib agreement on labels and definitions. The old
-`synonymy_threshold` and `synonymy_top_k` settings are rejected.
+- **Declarative Live Indexing (`yaw/pipeline.py`):** Continuous `CocoIndex` (`localfs.walk_dir(..., live=live)`) writes `chunks` (`vec0` cosine embeddings + line/AST metadata, zero raw chunk text) and `chunk_fts` (`USING fts5(title, body, content='', contentless_delete=1)`) in 64-chunk micro-batches with persistent LMDB memoization under `.yaw/coco_lmdb`.
+- **Zero-LLM Hybrid `VectorSearch` (`yaw/retrieval.py` -> `yaw recall`):** Read-only WAL retrieval (`PRAGMA data_version` snapshot reload) combining ABTT Marchenko–Pastur isotropic projection, CSLS `k=8` hubness penalty, squared-IDF bigram/BM25 lexical scoring, `spaCy` noun-phrase 2-hop bridging, coalitional branch reranking, and Submodular MMR with MaxP span deduplication and SHA-256 disk line hydration.
+- **Optuna `VectorSearch` Tuning (`yaw optimize optuna` / pre-cutover `yaw dspy tune-manifold`):** Single-study `optuna` `TPESampler` (`seed=42`, `multivariate=True`, `constant_liar=True`) tuning the 5 dimensionless `RetrievalParams` (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) across `Recall@{1, 2, 5, 10, 20}` objectives on disjoint slices (`query_offset >= 10`) and optionally writing `[retrieval]` in [`yaw.toml`](yaw.toml).
+- **Bare `dspy.ReAct` QA & `dspy.GEPA` (`yaw/qa.py`, `yaw/optimize.py`):** Unwrapped `dspy.ReAct` over 4 character-bounded read-only corpus tools (`search_passages`, `lexical_grep`, `expand_neighbors`, `read_chunk`), serialized under `Semaphore(1)` and verified against inline `[chunk_id=<int>]` tool provenance; QA-only `dspy.GEPA` optimization isolates telemetry in `.yaw/optimize_*` (resume by default; `--fresh` wipes `.yaw/optimize_*` while preserving `.yaw/coco_lmdb`).
+- **Streamable HTTP Transport (`yaw/mcp_server.py`, [Epic 2](docs/epic-2-fastmcp-http.md)):** `FastMCP("yaw")` on loopback `http://127.0.0.1:13306/mcp` with pre-dispatch `Host`/`Origin` `403` validation, `/healthz`, `/readyz`, and 3 read-only tools (`recall`, `qa`, `daemon_status`).
 
-To calibrate candidate volume for a corpus, use
-`uv run --locked python scripts/calibrate_candidates.py --db <yaw.db> --reference <reference.json>`.
-The reference contains `{"cases":[{"entity_ids":["..."],"candidate_count":33}]}`
-for complete fixed calibration pools. The command reads configured
-`graph.candidate_volume_ratio` (default `1.0`; optional `--volume-ratio` override),
-fits cutoffs within ±10% of target volume and prints the settings. Apply the
-printed cutoffs with `yaw config set graph.candidate_dense_threshold <value>`
-and `yaw config set graph.candidate_lexical_threshold <value>`. Calibration never
-changes the database or imposes runtime batch quotas. Current defaults target
-the optimizer corpus; new corpora need their own calibration. See the
-[candidate-search record](docs/reviews/synonym-candidate-search.md).
+### Active Local Inference Configuration (`http://127.0.0.1:8888/v1`, [`yaw.toml`](yaw.toml))
 
-Optimization uses the canonical `.yaw/optimize_yaw.db` sandbox and resumes by
-default so databases are never wiped accidentally (`--resume` and timestamped
-`*_optimize_<datestamp>*` sandboxes are retired). If `.yaw/optimize_yaw.db`
-exists, `uv run yaw dspy optimize` restores the saved dataset slice,
-optimization options, output path (`.yaw/optimize_program.json` plus
-`.yaw/optimize_program_audit.json`, `.yaw/optimize_program_eval.json`,
-`.yaw/optimize_program_pools.json`, and `.yaw/optimize_program_telemetry/`),
-seed program, and GEPA checkpoint; if `.yaw/optimize_yaw.db` does not exist yet,
-it initializes a new run. Pass `--fresh` to wipe `.yaw/optimize_yaw.db` and
-`.yaw/optimize_*` sidecars intentionally (while preserving shared
-`.yaw/coco_lmdb`, `.yaw/optimize_coco/`, and `.yaw/dspy_cache`). A custom
-database path can be selected with `--db-path <path>`. An active run retains its
-writer lock.
+- **Embeddings:** `embeddinggemma-2` (`distinct-titled` framing, 768-dim unit-norm vectors, `BoundedSemaphore(2)` shared across indexing and queries).
+- **QA & Reflection LLM:** `gemma-4-e4b` on local GPU `llama.cpp` (`--parallel 1`, `temperature = 1.0`).
 
-Resume validates ordered training/validation data and corpus contents, inference
-and indexing settings, implementation files, and package versions. Changed inputs
-require a fresh run. Legacy GEPA checkpoints without recorded identity are preserved
-and rejected because their scores cannot be verified. Legacy database entries
-without prompt provenance are recomputed; newly recorded matching extraction and
-graph results survive restarts. Hybrid runs retain the completed MIPRO seed before
-entering GEPA. Recovery uses the last saved checkpoint; unfinished work can repeat.
-GEPA 0.1.4 also reevaluates the seed validation set on startup; identical model
-requests can reuse DSPy's disk response cache. `--num-trials` is the
-total GEPA metric-call budget, including calls already recorded; increase it to
-continue an exhausted run.
+## Benchmarks & Baselines
 
-Candidate-stage results (embedding vectors, OpenIE records, synonym decisions,
-and SHACL repairs) are cached in `yaw.db`, shared across candidates and process
-restarts. These caches retain no resident result dictionaries and share a
-256 MiB compressed-payload budget with FIFO eviction. Keys cover stage inputs,
-prompt/schema/demos, model and sampling settings, embedding profile/endpoint,
-implementation and DSPy/NumPy versions; SHACL also keys the tool-visible graph
-and source content. Traces and their original OpenIE/synonym/SHACL token statistics
-are replayed on hits. Source passages in trace inputs/history are stored as
-content references and hydrated from the current source pool. Evicted,
-incompatible, corrupt, or unavailable-source entries are recomputed. This is
-application-level stage caching around native DSPy/GEPA.
+`benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate YAW against Standard DPR and two consolidated targets (see [evaluation ledger](docs/evaluation.md)):
 
-DSPy's native request/response disk cache is also enabled during evolution, with
-its memory cache disabled. A small public-interface adapter replays original
-token usage into YAW's tracker so GEPA scores reflect logical inference cost;
-When inspection history is enabled, DSPy records zero physical usage for cache hits. Request keys
-retain inference endpoints as well as model, messages, sampling and grammar
-settings. `cache=False` remains an explicit bypass. Legacy SDK cache entries with
-no recoverable usage are recomputed once rather than scored as free. No changes
-to GEPA's optimizer or program signatures are required.
+- **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Archived historical runs of upstream HippoRAG 2 on the older `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` stack only (stored in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
+- **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper scores (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
 
-GEPA reflection uses sandbox evidence selection followed by DSPy's native instruction
-writer. `inference.reflection_input_chars` defaults to **65,536 characters** and
-bounds the complete formatted request. The provider enforces token capacity and
-reports actual usage; YAW makes no tokenizer discovery requests. Evidence,
-proposals and SIMBA state checkpoint in `yaw.db`, including a pinned active request.
-See [DSPy practical improvements](docs/dspy-improvements.md).
+Across the `E1-M1` Pass-4 held-out `[0, 10)` shootout (`n=40` queries across `2wikimultihopqa`, `musique`, `hotpotqa`, `popqa`), pure-chunk hybrid `VectorSearch` scored macro `R@1/2/5/10/20 = 0.4333 / 0.6583 / 0.8146 / 0.8938 / 0.9854`, clearing `PAPER_BASELINES` `Recall@5` (`0.7828`) and outperforming legacy OpenIE + `ppr.py` (`R@5 = 0.7021`).
 
-During optimization, full DSPy LM/module inspection histories are disabled;
-GEPA traces and logical token accounting remain active. YAW keeps recent
-diagnostics (250 telemetry/embedding/definition records and 100 synonym/SHACL
-records), and candidate copies start without prior diagnostics. Reflection
-training keeps the same recent-example window that SIMBA consumes. This bounds
-diagnostic retention; the corpus and GEPA's own candidate/frontier state still
-require memory.
+## Quality Gates
 
-Embedding request limits are explicit under `[graph]`: `embed_batch_size` bounds
-items (up to 64), and `embed_batch_chars` bounds aggregate formatted characters
-(default 4096). Both apply to batches; a single oversized input is sent whole.
-Larger character budgets need testing against the inference server; provider
-overflow errors propagate. Query-prefix evolution preserves document-stage
-caches, while query vectors use the effective query prefix in their own keys.
-Persistent CocoIndex parsing also invalidates when parsing helpers change.
+```powershell
+uv run ty check
+uv run ruff check --fix
+uv run ruff format
+uv run --locked pytest
+git diff --check
+```
 
-Runtime reads the active context lengths of the configured extraction and QA
-models from the authenticated model endpoint and uses the smaller value. The
-embedding profile uses the endpoint's active context and reported checkpoint;
-changing that deployment invalidates its vector cache identity. Model metadata
-is a server report, not independent weight attestation. Model configuration can
-be constructed offline; runtime binding requires the endpoint to be available.
+`preflight` runs Ruff, `ty`, and `pytest` with `--testmon` and coverage tracking; see [coverage plan](docs/coverage-plan.md). Remaining upstream algorithm references:
 
-Unset `max_output_tokens` and `rlm_max_output_chars` derive from the active chat
-capacity: 8,192 tokens and 20,000 characters at 128K. Explicit values remain
-fixed, and an output-token budget exceeding the active context fails. The
-`reflection_input_chars` limit is independent. `[graph].max_context_chars` is
-optional; when omitted, selected source content is not cut to a character limit.
-Synonym packets retain their explicit pair and memory limits, and provider token
-overflow fails without splitting or retrying. Embedding inputs remain whole.
-`rlm_max_iters` and `rlm_max_llm_calls` bound SHACL and reflection loops.
-Changing a running process's configuration requires restarting that process.
-
-The dashboard's `scripts/watchdog.py --layout-iterations 1000` controls graph
-relaxation rounds (default 1,000). Fig. 2 shows only the largest connected
-one-hop neighborhood seeded by `skos:related` and `owl:differentFrom`, with
-labels on ten recent disambiguation pairs. Both assertion lists follow Fig. 2;
-the related list shows up to ten active canonical pairs by newest insertion
-rowid, since reassertion timestamps are not stored. Full-validation progress
-uses GEPA's validation score; candidate F1/recall means include minibatches.
-
-`benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate the native `yaw` engine (`YawGraphEngine` + `yaw.db` + `YawProgram`) against Standard DPR (`retrieve_dpr`) and two consolidated reference targets across the 7 HippoRAG 2 paper datasets (`popqa`, `lveval`, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`):
-
-Both runners load inference settings from `yaw.toml`; `--config <path>` selects
-another configuration. Benchmark model flags explicitly override those aliases.
-The configured endpoint, credentials, context/output limits, ingestion chunking
-and embedding batch limits reach the active clients. Reports identify configured
-profiles rather than claiming remotely verified checkpoints or devices. Parity
-reports are reused only for the same configured deployment.
-
-- **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Consolidated historical runs of upstream HippoRAG 2 on the exact same `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` local stack (archived in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
-- **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper results (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
-
-Upstream `hipporag` and `optuna` are permanently retired from `pyproject.toml`, `uv.lock`, and runtime/test code.
-
-The unified local model stack (`http://127.0.0.1:8888/v1`) uses:
-- **Embeddings (`--embedding-model`):** `embeddinggemma-300m-GGUF` on GPU `llamacpp` (`--embedding-task-mode` defaults to `distinct-titled` under `retrieval-prompts-v3`).
-- **Unified Chat, GBNF Worker, QA Reader & RLM Orchestrator (`--extraction-model`, `--qa-model`):** `gemma-4-e4b` (`Q4_K_M`, 32,768 context) on GPU `llamacpp` (`--parallel 1 --cache-ram 0`) with pure-JSON GBNF grammar enforcement (`_yaw_supports_gbnf=True`) for direct/worker predictors and unconstrained Python REPL execution (`_yaw_supports_gbnf=False`) inside DSPy's managed Deno/Pyodide WASM sandbox (`dspy[deno]`, `dspy.PythonInterpreter`) for `shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`. Historical Qwen benchmark targets remain unchanged.
-- **OOD Enterprise Prompt Evolution (`uv run yaw dspy optimize`):** Configured by default in [`yaw.toml`](yaw.toml) to train on the stratified 250-query (`150` train + `100` val) **EnterpriseRAG-Bench** (`enterprise_rag_bench`, `onyx-dot-app/EnterpriseRAG-Bench`) dataset across all 10 reasoning categories (`Basic`, `Semantic`, `Intra-Document Reasoning`, `Project Related`, `Constrained`, `Conflicting Info`, `Completeness`, `Miscellaneous`, `Info Not Found`, `High Level`). Preparation exports every document in the configured corpus, including its existing distractors. The loader owns stratification. Optimization uses canonical `"hybrid"` (`dspy.MIPROv2` warm-up + `dspy.GEPA` handoff with `candidate_selection_strategy="pareto"` and `use_merge=True` + always-on `dspy.SIMBA`, `auto = "heavy"`) and `compute_task_quality_score` (`yaw/daemon/graph/inference/parsers.py`, unweighted arithmetic mean $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ over available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
-
-On this machine the models and settings are already installed. For a fresh Lemonade installation, register/download the embedding checkpoint and save both `llamacpp` models and settings explicitly before running benchmarks. 
-
-## Measured versus planned
-
-Across the consolidated benchmark evaluations ([`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json) and [evaluation](docs/evaluation.md)):
-- **Native YAW vs. Target 1 (Monkeypatched Upstream HippoRAG 2 on `Qwen3-4B`):**
-  - `popqa` (25 queries): YAW `Recall@5 = 0.9600`, `F1 = 0.7867` (`+0.0448` F1 vs. upstream HippoRAG 2 `0.7419`; `2.3x` faster wall-clock).
-  - `lveval` (25 queries): YAW `Recall@5 = 0.9600`, `F1 = 0.5965` (`+0.0100` R@5, `+0.0215` F1 vs. upstream HippoRAG 2).
-  - `narrativeqa` (25 queries): YAW `Recall@5 = 0.8800`, `F1 = 0.4399` (`+0.0800` R@5 vs. upstream HippoRAG 2 `0.8000`).
-  - `2wikimultihopqa` (22 queries): YAW `Recall@5 = 0.9091`, `F1 = 0.6914` (`1.6x` faster indexing/eval).
-- **Native YAW vs. Target 2 (Published Paper 70B `Llama-3.3-70B` + `NV-Embed-v2`):**
-  - `popqa`: YAW `Recall@5 = 0.9600` vs. Paper `0.5170` (**`+44.30%`**), `F1 = 0.7867` vs. Paper `0.5620` (**`+22.47%`**).
-  - `lveval`: YAW `F1 = 0.5965` vs. Paper `0.1290` (**`+46.75%`**).
-  - `narrativeqa`: YAW `F1 = 0.4399` vs. Paper `0.2590` (**`+18.09%`**).
-  - `2wikimultihopqa`: YAW `Recall@5 = 0.9091` vs. Paper `0.9040` (**`+0.51%`**).
-
-161 offline and live-silicon integration regression tests pass (`uv run --locked pytest -q`). See [evaluation](docs/evaluation.md) for benchmark runs, closed-world SHACL validations, and live-silicon GEPA optimization results.
-
-The native HippoRAG 2 engine (`yaw/daemon/graph/engine.py`), persistent single-owner daemon runtime (`yaw/daemon/runtime.py`), single `yaw.db` SQLite storage (`sqlite-vec` + FTS5 + sparse entity-state HMM), native CocoIndex single-parse Rust Tree-sitter AST ingestion across 30+ formats with declarative $\pi_{\mathcal{W}, \mathcal{B}}$ key projection, title-aware `EmbeddingGemma` formatting, Dai & Callan MaxP passage aggregation, and DSPy GEPA prompt evolution with hot-reload program promotion are implemented. HMM retrieval quality and full-corpus parity remain acceptance gates. Epic 2 (FastMCP over Streamable HTTP) follows as the next planned phase.
-
-## Native W3C Semantic Graph & Knowledge Representation (`yaw.db`)
-
-YAW replaces upstream HippoRAG 2's flat, unvalidated 7-file Parquet/Pickle/JSON storage with an in-process, closed-world SQLite graph database ([`yaw/daemon/graph/storage/db.py`](yaw/daemon/graph/storage/db.py)) that natively operationalizes W3C Semantic Web recommendations (SKOS, RDF 1.1, OWL 2, SHACL) and the EDC (*Extract, Define, Canonicalize*, arXiv:2404.03868) framework with zero heavy external RDF library bloat (`rdflib`, `pySHACL`, and `spaCy` are retired):
-
-- **Concepts & Contextual Definitions (`skos:Concept`, `skos:definition`):**
-  Graph nodes are persisted in `entities(entity_id, name, definition)`. Following EDC, every extracted entity must have a contextual `skos:definition`. This provides lexical disambiguation for `EmbeddingGemma` (`title: {name} | text: {definition}`), separating homographs (e.g. *"ball"* as a dance vs. *"ball"* as a spherical toy) into distinct semantic nodes before candidate generation.
-- **Multi-Label Synonymy & SKOS S13 Constraint (`entity_labels`):**
-  Synonyms are mapped via `entity_labels(label_norm, entity_id, label_kind, raw_label, chunk_id)` supporting `skos:prefLabel`, `skos:altLabel`, and `skos:hiddenLabel`. YAW enforces W3C SKOS integrity constraint **S13** (pairwise disjointness among `prefLabel`, `altLabel`, and `hiddenLabel` for any given concept).
-- **Reversible Merges & Lineage Tracking (`entity_alt_labels`, `entity_redirects`, `entity_merge_lineage`):**
-  When synonym candidates are verified by LLM adjudication (`judge_semantics`), `merge_entities` aliases duplicate concepts into `entity_alt_labels` while preserving complete merge lineage and redirects. This ensures that incremental document removals (`delete_chunks`) via CocoIndex `SyncDelta` remain fully reversible without corrupting the graph.
-- **Typed Semantic Edges & Contrastive Semantics (`edges`, `edge_sources`):**
-  Edges model semantic relations explicitly:
-  - `passage`: Bipartite passage-to-entity links.
-  - `fact`: Directed assertion triples (`subj` $\to$ `obj`) enriched with contextual triple `skos:definition`. Predicates remain typed edge properties rather than graph concept hubs, avoiding predicate super-nodes.
-  - `skos:related`: Symmetric associative links used as positive sparse HMM entity transitions.
-  - `owl:differentFrom`: Symmetric contrastive non-identity links between distinct polysemous/homograph senses. These edges are strictly dominant over merging and are excluded from relevance transitions.
-- **Two-Channel Candidate Discovery & Source-Sense Preservation:**
-  `find_entity_candidates` combines blocked cosine thresholds with sparse character-trigram similarity and exact source-label matches. Immutable `entity_candidate_vectors` preserve member evidence after merges; labels and definitions identify provisional senses independently of admission scores. A separate calibrated `auto_merge_threshold` requires extreme cosine and difflib agreement on labels and definitions. Remaining pairs enter the merge, hierarchy and relation/distinctness judges.
-- **Closed-World SHACL Validation (`lint_graph_shacl`):**
-  Native SQLite checks enforce resource labels/definitions, SKOS label integrity, resource/literal endpoints, irreflexive statements, provenance, hierarchy/disjointness and confidence constraints. Validation runs during planning and before atomic publication; its cost must be measured against graph size.
-- **Autonomous DSPy RLM Self-Healing (`heal_shacl_violations`):**
-  The read-only `shacl_healer_rlm` delegates bounded report batches through `propose_repairs()`. Its structured worker receives typed repair fields, the actual report, graph profiles and frozen source passages; error-specific GBNF binds focus IDs, actions and complete nonempty coverage. Repairs are applied to the proposal and validated before declarative CocoIndex targets commit. Unresolved violations abort publication and optimization; raw source evidence remains unchanged. See the [native graph plan](docs/native-cocoindex-graph.md).
-- **Zero-Dependency W3C Turtle 1.1 Export (`serialize_graph_turtle`):**
-  `yaw graph lint --turtle` streams the entire closed-world graph directly to standard Turtle syntax with standard prefix namespaces (`rdf:`, `rdfs:`, `skos:`, `owl:`, `sh:`, `yaw:`).
-
-## Theoretical & Empirical Foundations (Scientific References)
-
-YAW is engineered directly from principles and algorithms established in the following peer-reviewed and preprint literature:
-
-### Information Retrieval & Language Model Architecture (arXiv & Peer-Reviewed)
-
-1. **HippoRAG: Neurobiologically Inspired Long-Term Memory for Large Language Models**
-   - *Bernal, et al. (2024)* — [arXiv:2405.14831](https://arxiv.org/abs/2405.14831) / [Local Copy](docs/arxiv-2405.14831v3-hipporag.md)
-   - *Key Foundations:* Hippocampal memory indexing theory, OpenIE knowledge graph construction, and Personalized PageRank (PPR) associative activation over passage-entity-fact graphs.
-2. **HippoRAG 2: From RAG to Memory via Personalized PageRank**
-   - *Bernal, et al. (2025)* — [arXiv:2502.14802](https://arxiv.org/abs/2502.14802) / [Local Copy](docs/arxiv-2502.14802v1-hipporag2.md)
-   - *Key Foundations:* Continuous online graph updating, Recognition Memory fact reranking with bidirectional phrase linking, and sparse CSR matrix PPR power iteration without external vector database dependencies.
-3. **EDC: Extract, Define, Canonicalize: An LLM-based Framework for Knowledge Graph Construction**
-   - *arXiv:2404.03868 (2024)* — [arXiv:2404.03868](https://arxiv.org/abs/2404.03868)
-   - *Key Foundations:* Augmenting triplet extraction with contextual entity and triple definitions (`skos:definition`), resolving homographs and polysemous senses prior to entity deduplication, disambiguation, and canonicalization.
-4. **Deconvolving Passage Retrieval with MaxP**
-   - *Dai & Callan (SIGIR 2019)* — [arXiv:1905.01988](https://arxiv.org/abs/1905.01988)
-   - *Key Foundations:* Max-Passage (MaxP) aggregation ($S(\text{passage}) = \max_{c \in \text{passage}} S(c)$), scoring multi-chunk passages and long documents by their maximal scoring sub-chunk without allowing redundant chunks to displace distinct documents from top-$K$ recall evaluation.
-5. **Dense Passage Retrieval for Open-Domain Question Answering (DPR)**
-   - *Karpukhin, et al. (EMNLP 2020)* — [arXiv:2004.04906](https://arxiv.org/abs/2004.04906)
-   - *Key Foundations:* Dense dual-encoder representation and retrieval baseline against which associative graph retrieval is calibrated and benchmarked.
-6. **DSPy: Compiling Declarative Language Model Calls into State-of-the-Art Pipelines**
-   - *Khattab, et al. (2023)* — [arXiv:2310.03714](https://arxiv.org/abs/2310.03714)
-   - *Key Foundations:* Declarative Signatures, Modules, and programmatic prompt compilation against objective metric evaluators with strict separation of concerns.
-7. **MIPROv2 & GEPA: Optimizing Instructions and Demonstrations for Multi-Stage Language Model Programs**
-   - *Opsahl-Ong, et al. (2024)* — [arXiv:2406.11695](https://arxiv.org/abs/2406.11695)
-   - *Key Foundations:* Multi-stage instruction proposal and few-shot demonstration search with reflective, evolutionary Pareto optimization (`candidate_selection_strategy="pareto"`, compile-time system-aware `use_merge=True`) over unweighted arithmetic mean task quality (`compute_task_quality_score`: $\text{score} = \frac{1}{|M|}\sum_{m \in M} m$ across available `Recall@1/2/5/10/20`, `EM`, and `F1`, preserving all 7 raw metrics in `objective_scores`).
-8. **Recursive Language Modeling for Long Context Reasoning (RLM)**
-   - *Zhang, et al. (2025)* — [arXiv:2502.06733](https://arxiv.org/abs/2502.06733)
-   - *Key Foundations:* Decomposing complex multi-step reasoning, self-healing graph validation, and semantic adjudication into programmatic REPL tool loops with sandboxed Python evaluation.
-
-### Knowledge Representation & Semantic Web Standards (W3C Recommendations)
-
-9. **W3C SKOS Simple Knowledge Organization System Reference**
-   - *Miles & Bechhofer (W3C Recommendation, 2009)* — [W3C SKOS Reference](https://www.w3.org/TR/skos-reference/)
-   - *Key Foundations:* Modeling knowledge graph nodes as `skos:Concept` instances; multi-label indexing with `skos:prefLabel`, `skos:altLabel`, and `skos:hiddenLabel`; enforcing SKOS integrity constraint **S13** label disjointness; associative semantic edge linking via symmetric `skos:related`; and lexical documentation via `skos:definition`.
-10. **W3C SHACL Shapes Constraint Language**
-    - *Knublauch & Kontokostas (W3C Recommendation, 2017)* — [W3C SHACL](https://www.w3.org/TR/shacl/)
-    - *Key Foundations:* Declarative closed-world structural validation. Implemented natively in pure SQLite SQL without external RDF libraries (`lint_graph_shacl`), enforcing 6 deterministic closed-world shapes (`ConceptShape/prefLabel`, `ConceptShape/S13-DisjointLabels`, `ConceptShape/definition`, `ConceptShape/ContrastiveDisjointness`, `FactStatementShape/endpoints`, `ProvenanceShape/edgeSources`).
-11. **W3C RDF 1.1 Turtle: Terse RDF Triple Language**
-    - *Prud'hommeaux & Carothers (W3C Recommendation, 2014)* — [W3C Turtle](https://www.w3.org/TR/turtle/)
-    - *Key Foundations:* Standardized text serialization of RDF graphs. Implemented natively in YAW (`serialize_graph_turtle`, `yaw graph lint --turtle`) to export the closed-world knowledge graph directly to standard Turtle syntax with zero external dependency bloat.
-12. **W3C OWL 2 Web Ontology Language Document Overview**
-    - *W3C OWL Working Group (W3C Recommendation, 2012)* — [W3C OWL 2 Overview](https://www.w3.org/TR/owl2-overview/)
-    - *Key Foundations:* Expressing contrastive non-identity between distinct polysemous/homograph senses using symmetric `owl:differentFrom` assertions, dominant over transitive merging and excluded from HMM relevance transitions.
-
-Upstream baseline: [pinned HippoRAG source](https://github.com/OSU-NLP-Group/HippoRAG/tree/d5c8329422e0a0b834a15874545cb6a74b4f9b26).
+1. **HippoRAG (`arXiv:2405.14831v3`):** [arXiv:2405.14831](https://arxiv.org/abs/2405.14831) / [Local Copy](docs/arxiv-2405.14831v3-hipporag.md)
+2. **HippoRAG 2 (`arXiv:2502.14802v1`):** [arXiv:2502.14802](https://arxiv.org/abs/2502.14802) / [Local Copy](docs/arxiv-2502.14802v1-hipporag2.md)
+3. **MaxP Passage Retrieval (Dai & Callan, SIGIR 2019):** [arXiv:1905.01988](https://arxiv.org/abs/1905.01988)
+4. **DSPy & GEPA (`arXiv:2310.03714`, `arXiv:2406.11695`):** Declarative `ReAct` and reflective Pareto optimization
