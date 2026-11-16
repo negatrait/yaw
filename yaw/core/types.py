@@ -66,13 +66,16 @@ def render_document_text(title: str, body: str) -> str:
 class ChunkPointer:
     """1-indexed line span pointer to an immutable markdown/text chunk on disk."""
 
-    chunk_id: str
+    chunk_id: int | str
     rel_posix_path: str
     start_line: int
     end_line: int
     title: str = ""
     ast_island_start: int = 0
     ast_island_end: int = 0
+    source_hash: str = ""
+    char_start: int = 0
+    char_end: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,6 +86,19 @@ class HydratedPassage:
     text: str
     score: float
     stale_on_disk: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class QAResult:
+    """Grounded answer produced by ReAct QA over hydrated corpus passages."""
+
+    answer: str
+    citations: tuple[HydratedPassage, ...]
+    termination_reason: str
+    turns: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(slots=True, frozen=True)
@@ -470,6 +486,69 @@ def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: 
     """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
     payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"
     return compute_mdhash_id(payload, prefix="chunk-")
+
+
+def compute_chunk_int_id(
+    rel_posix_path: str,
+    start_line: int,
+    end_line: int,
+    char_start: int = 0,
+    char_end: int = 0,
+    source_hash: str = "",
+) -> int:
+    """Compute a deterministic positive 63-bit integer key shared by vec0 and fts5."""
+    payload = f"{rel_posix_path}:{start_line}:{end_line}:{char_start}:{char_end}:{source_hash}"
+    val = int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+    return val if val > 0 else 1
+
+
+_TITLE_LINE_RE = re.compile(r"^(?:#{1,6}\s+|(?:wikipedia\s+)?title:\s*)(.+)$", re.IGNORECASE)
+_QUERY_PREFIXES: dict[str, str] = {
+    "search": "task: search result | query: ",
+    "titled": "task: search result | query: ",
+    "qa": "task: question answering | query: ",
+    "distinct": "task: question answering | query: ",
+    "distinct-titled": "task: question answering | query: ",
+    "fact": "task: fact checking | query: ",
+}
+_DOCUMENT_PREFIX = "title: none | text: "
+
+
+def format_query_for_embedding(query: str, task_mode: str = "distinct-titled") -> str:
+    """Format a query string using the active embedding task prefix."""
+    if not isinstance(query, str):
+        raise TypeError("Embedding query must be a string.")
+    if not query.strip():
+        raise ValueError("Embedding query must not be empty.")
+    prefix = _QUERY_PREFIXES.get(task_mode)
+    if prefix is None:
+        raise ValueError(f"Unsupported embedding task_mode: {task_mode!r}")
+    if query.startswith(tuple(_QUERY_PREFIXES.values())):
+        raise ValueError("Pass raw query text, not an already prefixed embedding input.")
+    return prefix + query
+
+
+def format_doc_for_embedding(text: str, title: str = "", task_mode: str = "distinct-titled") -> str:
+    """Format a passage string using title framing when enabled by embedding_task_mode."""
+    if not isinstance(text, str):
+        raise TypeError("Embedding document text must be a string.")
+    if task_mode not in _QUERY_PREFIXES:
+        raise ValueError(f"Unsupported embedding task_mode: {task_mode!r}")
+    if text.startswith(_DOCUMENT_PREFIX) or (text.startswith("title: ") and " | text: " in text):
+        raise ValueError("Pass raw document text, not an already prefixed embedding input.")
+    if task_mode in ("titled", "distinct-titled"):
+        if "\n" in text:
+            first_line, body = text.split("\n", 1)
+            if match := _TITLE_LINE_RE.match(first_line.strip()):
+                parsed_title = match.group(1).strip()
+                parsed_body = body.strip()
+                if parsed_title and parsed_body:
+                    return f"title: {parsed_title} | text: {parsed_body}"
+        if title and (clean_title := title.strip()):
+            body = text[len(clean_title) + 1 :].strip() if text.startswith(f"{clean_title}\n") else text.strip()
+            if body:
+                return f"title: {clean_title} | text: {body}"
+    return _DOCUMENT_PREFIX + text
 
 
 def inclusive_end_line(start_line: int, end_line: int, end_column: int) -> int:

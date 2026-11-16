@@ -7,10 +7,10 @@ import math
 import os
 import time
 import tomllib
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, fields, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from .types import YawRuntimeError
 
@@ -178,6 +178,41 @@ def _resolve_path(base_dir: Path, raw: str | Path, default_rel: str) -> Path:
 
 
 @dataclass(slots=True, frozen=True)
+class RetrievalParams:
+    """5 dimensionless parameters governing hybrid zero-LLM chunk retrieval."""
+
+    peclet: float = 0.3375533823900754
+    alpha_sprt: float = 0.07953934952508675
+    redundancy_curvature: float = 0.834659004285133
+    coalition_coupling: float = 0.3887505167779042
+    external_trust: float = 0.26842185514853145
+
+    def __post_init__(self) -> None:
+        bounds = {"peclet": (0.0, 1.0, False, True), "alpha_sprt": (0.0, 0.5, False, False)}
+        for f_name in self.__dataclass_fields__:
+            raw = getattr(self, f_name)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(f"{f_name} must be an int or float")
+            if not math.isfinite(val := float(raw)):
+                raise ValueError(f"{f_name} must be finite")
+            lo, hi, inc_lo, inc_hi = bounds.get(
+                f_name,
+                (0.0, 2.0 if f_name == "redundancy_curvature" else 1.0, True, True),
+            )
+            if not ((val >= lo if inc_lo else val > lo) and (val <= hi if inc_hi else val < hi)):
+                raise ValueError(f"{f_name} out of domain [{lo}, {hi}]: {val}")
+            object.__setattr__(self, f_name, val)
+
+    @classmethod
+    def from_overrides(cls, overrides: Mapping[str, Any] | Sequence[tuple[str, Any]] | None = None) -> Self:
+        """Build validated RetrievalParams from a mapping or key-value sequence."""
+        cleaned = dict(overrides.items() if isinstance(overrides, Mapping) else (overrides or ()))
+        if bad := [k for k in cleaned if k not in cls.__dataclass_fields__]:
+            raise ValueError(f"Unknown RetrievalParams field: {bad[0]!r}")
+        return replace(cls(), **cleaned)
+
+
+@dataclass(slots=True, frozen=True)
 class YawConfig:
     """Immutable daemon, ingestion, inference, and graph configuration loaded from yaw.toml."""
 
@@ -202,7 +237,9 @@ class YawConfig:
 
     # Inference settings
     base_url: str = "http://127.0.0.1:8888/v1"
-    api_key: str = field(default_factory=lambda: os.environ.get("UNSLOTH_STUDIO_AUTH_TOKEN", ""))
+    api_key: str = field(
+        default_factory=lambda: os.environ.get("UNSLOTH_STUDIO_AUTH_TOKEN") or os.environ.get("OPENAI_API_KEY") or ""
+    )
     provider: str = "openai"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_task_mode: str = "distinct-titled"
@@ -210,6 +247,7 @@ class YawConfig:
     qa_model: str = "gemma-4-e4b"
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
     max_output_tokens: int | None = None
+    react_max_iters: int = 6
     rlm_max_iters: int = 20
     rlm_max_llm_calls: int = 50
     rlm_max_output_chars: int | None = None
@@ -224,6 +262,7 @@ class YawConfig:
     linking_top_k: int = 8
     retrieval_top_k: int = 10
     damping: float = 0.5
+    retriever_mode: Literal["graph", "manifold"] = "graph"
 
     candidate_dense_threshold: float = 0.85
     candidate_lexical_threshold: float = 0.675
@@ -252,6 +291,8 @@ class YawConfig:
     optimize_sleep_seconds: float = 0.0
     optimize_max_bootstrapped_demos: int = 1
     optimize_max_labeled_demos: int = 1
+    retrieval: RetrievalParams = field(default_factory=RetrievalParams)
+    manifold_overrides: tuple[tuple[str, int | float], ...] = ()
 
     def __post_init__(self) -> None:
         ws = Path(self.workspace_root).resolve()
@@ -279,6 +320,7 @@ class YawConfig:
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
             raise YawRuntimeError("INVALID_INPUT", "max_output_tokens must be positive")
         for name in (
+            "react_max_iters",
             "rlm_max_iters",
             "rlm_max_llm_calls",
             "reflection_input_chars",
@@ -292,6 +334,8 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}")
+        if self.retriever_mode not in ("graph", "manifold"):
+            raise YawRuntimeError("INVALID_INPUT", f"Unsupported retriever_mode: {self.retriever_mode!r}")
         if self.optimize_auto not in ("light", "medium", "heavy"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}")
         object.__setattr__(
@@ -334,6 +378,7 @@ class YawConfig:
                 j_attr,
                 j_tuple if j_attr == "json_keys_blacklist" else (j_tuple or j_default),
             )
+        object.__setattr__(self, "manifold_overrides", _normalize_manifold_overrides(self.manifold_overrides))
 
     def resolve_inference_budgets(self, context_tokens: int) -> YawConfig:
         """Bind serving capacity and tool budgets; leave omitted generation limits to the endpoint."""
@@ -393,7 +438,8 @@ class YawConfig:
         safe_hash = re.sub(r"[^a-zA-Z0-9_.-]+", "_", slice_hash.strip().lower()).strip("_") or "default"
         ws = Path(self.workspace_root).resolve() if self.workspace_root else Path.cwd().resolve()
         root_dir = Path(index_root).resolve() if index_root is not None else (ws / "outputs" / "benchmarks" / "indexes")
-        sandbox_dir = root_dir / f"{safe_ds}_{safe_hash}"
+        suffix = "_manifold" if self.retriever_mode == "manifold" else ""
+        sandbox_dir = root_dir / f"{safe_ds}_{safe_hash}{suffix}"
 
         if fresh and sandbox_dir.exists():
             shutil.rmtree(sandbox_dir, ignore_errors=True)
@@ -439,6 +485,7 @@ class YawConfig:
             "candidate_volume_ratio": self.candidate_volume_ratio,
             "semantic_adjudication_batch_size": self.semantic_adjudication_batch_size,
             "damping": self.damping,
+            "retriever_mode": self.retriever_mode,
         }
         raw = json.dumps(payload, sort_keys=True).encode("utf-8")
         return "yaw-cfg-v1:" + hashlib.sha256(raw).hexdigest()[:16]
@@ -485,6 +532,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "rlm_max_iters": "inference",
     "rlm_max_llm_calls": "inference",
     "rlm_max_output_chars": "inference",
+    "react_max_iters": "inference",
     "reflection_input_chars": "inference",
     "enable_gbnf": "inference",
     "gbnf_max_entities": "inference",
@@ -492,6 +540,7 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "gbnf_max_facts": "inference",
     "gbnf_max_reasoning_chars": "inference",
     "linking_top_k": "graph",
+    "retriever_mode": "retrieval",
     "retrieval_top_k": "graph",
     "damping": "graph",
     "candidate_dense_threshold": "graph",
@@ -549,6 +598,45 @@ def _format_toml_scalar(val: Any) -> str:
     return json.dumps(str(val))
 
 
+def _normalize_manifold_overrides(
+    raw: Mapping[str, Any] | Sequence[tuple[str, Any]] | None,
+) -> tuple[tuple[str, int | float], ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)):
+        raise ValueError(
+            f"Manifold overrides must be a mapping or sequence of (key, value) pairs, got {type(raw).__name__}"
+        )
+    items = raw.items() if isinstance(raw, Mapping) else raw
+    normalized: dict[str, int | float] = {}
+    for pair in items:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError(f"Manifold override entry must be a (key, value) pair, got {pair!r}")
+        key, val = pair
+        if not isinstance(key, str) or not key.isidentifier():
+            raise ValueError(f"Manifold override key must be a valid identifier string, got {key!r}")
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"Manifold override {key!r} must be int or float (not bool), got {type(val).__name__}")
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValueError(f"Manifold override {key!r} must be finite, got {val!r}")
+        normalized[key] = val
+    return tuple(normalized.items())
+
+
+def _extract_toml_section_name(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped.startswith("[") or stripped.startswith("[["):
+        return None
+    close_idx = stripped.find("]")
+    if close_idx == -1:
+        return None
+    trailing = stripped[close_idx + 1 :].strip()
+    if trailing and not trailing.startswith("#"):
+        return None
+    section = stripped[1:close_idx].strip()
+    return section or None
+
+
 def load_config(
     path: Path | str | None = None,
     *,
@@ -575,11 +663,18 @@ def load_config(
             raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML in {toml_file}: {exc}") from exc
 
     valid_fields = {f.name for f in fields(YawConfig)}
+    retrieval_fields = frozenset(RetrievalParams.__dataclass_fields__)
+    retrieval_raw: dict[str, Any] = {}
     kwargs: dict[str, Any] = {}
-    for sec_name in ("paths", "ingestion", "inference", "graph", "runtime", "optimization"):
+    for sec_name in ("paths", "ingestion", "inference", "graph", "retrieval", "runtime", "optimization"):
         section = data.get(sec_name)
+        if sec_name == "retrieval" and section is not None and not isinstance(section, dict):
+            raise ValueError(f"[retrieval] section in {toml_file} must be a TOML table, got {type(section).__name__}")
         if isinstance(section, dict):
             for k, v in section.items():
+                if sec_name == "retrieval" and k in retrieval_fields:
+                    retrieval_raw[k] = v
+                    continue
                 if sec_name == "graph" and k in {"synonymy_threshold", "synonymy_top_k"}:
                     raise YawRuntimeError("INVALID_INPUT", f"Retired candidate setting: graph.{k}")
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
@@ -590,6 +685,17 @@ def load_config(
                         )
                     else:
                         kwargs[mapped_k] = tuple(v) if isinstance(v, list) else v
+
+    if retrieval_raw:
+        kwargs["retrieval"] = RetrievalParams.from_overrides(retrieval_raw)
+
+    if "manifold" in data:
+        manifold_raw = data["manifold"]
+        if not isinstance(manifold_raw, dict):
+            raise ValueError(
+                f"[manifold] section in {toml_file} must be a TOML table, got {type(manifold_raw).__name__}"
+            )
+        kwargs["manifold_overrides"] = _normalize_manifold_overrides(manifold_raw)
 
     ws_raw = kwargs.pop("workspace_root", None)
     kwargs["workspace_root"] = _resolve_path(base_dir, ws_raw, ".") if ws_raw and not workspace_override else base_dir
@@ -608,7 +714,9 @@ def get_config_value(
         out: dict[str, Any] = {}
         for f in fields(cfg):
             val = getattr(cfg, f.name)
-            if isinstance(val, Path):
+            if isinstance(val, RetrievalParams):
+                val = asdict(val)
+            elif isinstance(val, Path):
                 val = str(val)
             elif isinstance(val, tuple):
                 val = list(val)
@@ -616,6 +724,21 @@ def get_config_value(
         return out
 
     cleaned_key = key.strip()
+    if cleaned_key == "retrieval":
+        return asdict(cfg.retrieval)
+    if cleaned_key.startswith("retrieval."):
+        subkey = cleaned_key.split(".", 1)[1].strip()
+        if subkey in RetrievalParams.__dataclass_fields__:
+            return getattr(cfg.retrieval, subkey)
+    if cleaned_key == "manifold":
+        return dict(cfg.manifold_overrides)
+    if cleaned_key.startswith("manifold."):
+        subkey = cleaned_key.split(".", 1)[1].strip()
+        overrides_map = dict(cfg.manifold_overrides)
+        if subkey not in overrides_map:
+            raise KeyError(f"Unset manifold configuration key: {cleaned_key!r}")
+        return overrides_map[subkey]
+
     if hasattr(cfg, cleaned_key):
         val = getattr(cfg, cleaned_key)
         return str(val) if isinstance(val, Path) else list(val) if isinstance(val, tuple) else val
@@ -657,16 +780,31 @@ def set_config_value(
         section_name = section_name.strip()
         prop_name = prop_name.strip()
 
-    field_name = (
-        _OPTIMIZATION_KEY_ALIASES.get(prop_name, prop_name) if section_name in (None, "optimization") else prop_name
-    )
-    resolved_section = section_name or _FIELD_TO_SECTION.get(field_name)
-    if not resolved_section:
-        raise YawRuntimeError("INVALID_INPUT", f"Cannot determine section for key: {key!r}")
-    if field_name not in {field.name for field in fields(YawConfig)}:
-        raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
+    if section_name == "retrieval" and prop_name in RetrievalParams.__dataclass_fields__:
+        raw_parsed = _parse_toml_scalar(raw_value)
+        validated = RetrievalParams.from_overrides({prop_name: raw_parsed})
+        parsed_val = getattr(validated, prop_name)
+        resolved_section = "retrieval"
+        target_prop = prop_name
+    elif section_name == "manifold":
+        if not prop_name:
+            raise ValueError(f"Invalid manifold configuration key: {key!r}")
+        raw_parsed = _parse_toml_scalar(raw_value)
+        validated_key, parsed_val = _normalize_manifold_overrides([(prop_name, raw_parsed)])[0]
+        resolved_section = "manifold"
+        target_prop = validated_key
+    else:
+        field_name = (
+            _OPTIMIZATION_KEY_ALIASES.get(prop_name, prop_name) if section_name in (None, "optimization") else prop_name
+        )
+        resolved_section = section_name or _FIELD_TO_SECTION.get(field_name)
+        if not resolved_section:
+            raise YawRuntimeError("INVALID_INPUT", f"Cannot determine section for key: {key!r}")
+        if field_name not in {field.name for field in fields(YawConfig)}:
+            raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
+        parsed_val = _parse_toml_scalar(raw_value)
+        target_prop = prop_name.removeprefix("optimize_") if prop_name.startswith("optimize_") else prop_name
 
-    parsed_val = _parse_toml_scalar(raw_value)
     formatted_val = _format_toml_scalar(parsed_val)
 
     lines = toml_path.read_text(encoding="utf-8").splitlines()
@@ -674,22 +812,18 @@ def set_config_value(
     current_sec: str | None = None
     key_written = False
 
-    target_prop = prop_name
-    if prop_name.startswith("optimize_"):
-        target_prop = prop_name.removeprefix("optimize_")
-
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
+        sec_hdr = _extract_toml_section_name(line)
+        if sec_hdr is not None:
             if current_sec == resolved_section and not key_written:
                 new_lines.append(f"{target_prop} = {formatted_val}")
                 key_written = True
-            current_sec = stripped[1:-1].strip()
+            current_sec = sec_hdr
             new_lines.append(line)
             continue
 
         if current_sec == resolved_section:
-            parts = stripped.split("=", 1)
+            parts = line.strip().split("=", 1)
             if len(parts) == 2 and parts[0].strip() in (target_prop, prop_name):
                 new_lines.append(f"{target_prop} = {formatted_val}")
                 key_written = True
@@ -705,28 +839,134 @@ def set_config_value(
             new_lines.append(f"{target_prop} = {formatted_val}")
 
     updated_text = "\n".join(new_lines) + "\n"
-    tmp_path = toml_path.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        tmp_path.write_text(updated_text, encoding="utf-8")
-        # Validate that the modified file produces a valid YawConfig
-        load_config(tmp_path, workspace_override=workspace_override)
-        tmp_path.replace(toml_path)
-    finally:
-        with contextlib.suppress(OSError):
-            tmp_path.unlink(missing_ok=True)
+
+    def _write_validated(tmp: Path) -> None:
+        tmp.write_text(updated_text, encoding="utf-8", newline="\n")
+        load_config(tmp, workspace_override=workspace_override)
+
+    write_via_temp_atomic(toml_path, _write_validated)
 
     return f"{resolved_section}.{target_prop}", parsed_val
+
+
+def write_manifold_section(
+    overrides: Mapping[str, int | float] | Sequence[tuple[str, int | float]],
+    path: Path | str | None = None,
+    *,
+    workspace_override: Path | str | None = None,
+) -> Path:
+    """Atomically replace or append the [manifold] section in yaw.toml after validating via load_config."""
+    base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
+    toml_path = Path(path).resolve() if path else base_dir / "yaw.toml"
+    if not toml_path.exists():
+        raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_path}")
+
+    normalized = _normalize_manifold_overrides(overrides)
+    section_lines = ["[manifold]", *(f"{k} = {_format_toml_scalar(v)}" for k, v in normalized)]
+
+    existing_lines = toml_path.read_text(encoding="utf-8").splitlines()
+    out_lines: list[str] = []
+    in_manifold = False
+    replaced = False
+
+    for line in existing_lines:
+        sec_hdr = _extract_toml_section_name(line)
+        if sec_hdr is not None:
+            if in_manifold:
+                in_manifold = False
+            if sec_hdr == "manifold":
+                if not replaced:
+                    out_lines.extend(section_lines)
+                    out_lines.append("")
+                    replaced = True
+                in_manifold = True
+                continue
+        if not in_manifold:
+            out_lines.append(line)
+
+    if not replaced:
+        while out_lines and not out_lines[-1].strip():
+            out_lines.pop()
+        if out_lines:
+            out_lines.append("")
+        out_lines.extend(section_lines)
+
+    updated_text = "\n".join(out_lines).rstrip("\n") + "\n"
+
+    def _write_validated(tmp: Path) -> None:
+        tmp.write_text(updated_text, encoding="utf-8", newline="\n")
+        load_config(tmp, workspace_override=workspace_override)
+
+    write_via_temp_atomic(toml_path, _write_validated)
+    return toml_path
+
+
+def write_retrieval_section(
+    overrides: Mapping[str, int | float] | Sequence[tuple[str, int | float]],
+    path: Path | str | None = None,
+    *,
+    workspace_override: Path | str | None = None,
+) -> Path:
+    """Atomically replace or append the [retrieval] section in yaw.toml after validating RetrievalParams."""
+    base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
+    toml_path = Path(path).resolve() if path else base_dir / "yaw.toml"
+    if not toml_path.exists():
+        raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_path}")
+
+    validated = RetrievalParams.from_overrides(overrides)
+    section_lines = [
+        "[retrieval]",
+        *(f"{k} = {_format_toml_scalar(getattr(validated, k))}" for k in validated.__dataclass_fields__),
+    ]
+
+    existing_lines = toml_path.read_text(encoding="utf-8").splitlines()
+    out_lines: list[str] = []
+    in_section = False
+    replaced = False
+
+    for line in existing_lines:
+        sec_hdr = _extract_toml_section_name(line)
+        if sec_hdr is not None:
+            in_section = False
+            if sec_hdr == "retrieval":
+                if not replaced:
+                    out_lines.extend(section_lines)
+                    out_lines.append("")
+                    replaced = True
+                in_section = True
+                continue
+        if not in_section:
+            out_lines.append(line)
+
+    if not replaced:
+        while out_lines and not out_lines[-1].strip():
+            out_lines.pop()
+        if out_lines:
+            out_lines.append("")
+        out_lines.extend(section_lines)
+
+    updated_text = "\n".join(out_lines).rstrip("\n") + "\n"
+
+    def _write_validated(tmp: Path) -> None:
+        tmp.write_text(updated_text, encoding="utf-8", newline="\n")
+        load_config(tmp, workspace_override=workspace_override)
+
+    write_via_temp_atomic(toml_path, _write_validated)
+    return toml_path
 
 
 __all__ = [
     "DEFAULT_EXCLUDED_PATTERNS",
     "DEFAULT_INCLUDED_PATTERNS",
+    "RetrievalParams",
     "YawConfig",
     "get_config_value",
     "load_config",
     "parse_dataset_list",
     "resolve_coco_state_root",
     "set_config_value",
+    "write_manifold_section",
+    "write_retrieval_section",
     "write_text_atomic",
     "write_via_temp_atomic",
 ]
