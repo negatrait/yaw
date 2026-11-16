@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/hmm-graph-substate-manifold-research.md",
+                "file": ".agents/agents/implementer/agent.md",
                 "mode": "source",
-                "source": false
+                "source": true
               },
               "icon": "lucide-file",
-              "title": "hmm-graph-substate-manifold-research"
+              "title": "agent"
             }
           }
         ]
@@ -190,6 +190,9 @@
   },
   "active": "2f7347019df76f95",
   "lastOpenFiles": [
+    ".agents/agents/ontologist/agent.md",
+    ".agents/agents/implementer/agent.md",
+    ".agents/agents/critic/agent.md",
     "Untitled.md",
     "docs/hmm-graph-substate-manifold-research.md",
     ".agents/skills/owl/SKILL.md",
@@ -223,9 +226,6 @@
     "docs/epistemic-confidence-spec.md",
     "docs/native-cocoindex-graph.md",
     "docs/native-cocoindex-indexing.md",
-    ".agents/skills/dspy-rlm-module/reference.md",
-    ".agents/skills/engineering-real-tests/SKILL.md",
-    ".agents/skills/owl/03-OWL-CLASSES.md",
     ".yaw/kg_frames_20261101_172330/frame_00023_00047_00025_00037_00000_00000.png",
     "outputs/dashboard/pareto_frontier_progress.svg",
     "outputs/dashboard/knowledge_graph_extraction_dashboard.svg",
