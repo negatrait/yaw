@@ -337,6 +337,7 @@ class DaemonStatus:
     last_error: str | None = None
     last_sync_at: float | None = None
     pid: int | None = None
+    num_chunks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
