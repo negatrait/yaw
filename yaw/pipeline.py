@@ -11,7 +11,6 @@ import os
 import re
 import sqlite3
 import threading
-import weakref
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,14 +69,84 @@ _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EMBED_BATCH_SIZE = 64
-_MAX_EMBED_BATCH_CHARS = 16_384
+_EMBED_BATCH_SIZE = 1 # Breaks the pipeline at > 1!
+_MAX_EMBED_BATCH_CHARS = 8192
+_MAX_EMBED_IN_FLIGHT = 4
 
 
 def _validate_identifier(name: str) -> str:
     if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
         raise ValueError(f"Invalid SQLite identifier: {name!r}")
     return name
+
+
+class _DspyBatchEmbedder:
+    """Byte-budgeted, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
+
+    def __init__(self, cfg: YawConfig) -> None:
+        self._max_items = min(_EMBED_BATCH_SIZE, max(1, int(cfg.embed_batch_size)))
+        self._max_item_chars = max(4096, int(cfg.chunk_size) * 4)
+        self._max_batch_chars = max(self._max_item_chars, _MAX_EMBED_BATCH_CHARS)
+        self._embedder = dspy.Embedder(
+            f"{cfg.provider}/{cfg.embedding_model}",
+            api_base=cfg.base_url,
+            api_key=cfg.api_key or "yaw",
+            batch_size=self._max_items,
+            caching=False,
+        )
+        self._sem = threading.BoundedSemaphore(_MAX_EMBED_IN_FLIGHT)
+
+    def _pack_batches(self, texts: list[str]) -> list[list[str]]:
+        for idx, item in enumerate(texts):
+            if len(item) > self._max_item_chars:
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    f"Embedding input[{idx}] length {len(item)} chars exceeds limit {self._max_item_chars}",
+                )
+        # Pack sub-batches by both item count and character budget to prevent oversized API payloads.
+        batches: list[list[str]] = []
+        cur_batch: list[str] = []
+        cur_chars = 0
+        for item in texts:
+            if cur_batch and (len(cur_batch) >= self._max_items or cur_chars + len(item) > self._max_batch_chars):
+                batches.append(cur_batch)
+                cur_batch = []
+                cur_chars = 0
+            cur_batch.append(item)
+            cur_chars += len(item)
+        if cur_batch:
+            batches.append(cur_batch)
+        return batches
+
+    @staticmethod
+    def _normalize_batch(raw: Any) -> NDArray[np.float32]:
+        arr = np.asarray(raw, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        norms = np.maximum(np.linalg.norm(arr, axis=1, keepdims=True), 1e-12)
+        return (arr / norms).astype(np.float32, copy=False)
+
+    def __call__(self, texts: list[str]) -> NDArray[np.float32]:
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        parts: list[NDArray[np.float32]] = []
+        for batch in self._pack_batches(texts):
+            with self._sem:
+                raw = self._embedder(batch)
+            parts.append(self._normalize_batch(raw))
+        return np.vstack(parts) if len(parts) > 1 else parts[0]
+
+    async def acall(self, texts: list[str]) -> NDArray[np.float32]:
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        # Use DSPy's native async path directly on the CocoIndex loop; fall back to threadpool only for sync stubs.
+        acall_fn = getattr(self._embedder, "acall", None)
+        if not callable(acall_fn):
+            return await asyncio.to_thread(self, texts)
+        parts: list[NDArray[np.float32]] = []
+        for batch in self._pack_batches(texts):
+            parts.append(self._normalize_batch(await acall_fn(batch)))
+        return np.vstack(parts) if len(parts) > 1 else parts[0]
 
 
 class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
@@ -93,49 +162,51 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
         self._embed_fn = embed_fn
         self._dim = vector_dim
         self._memo_key = memo_key
-        self._lock = threading.Lock()
+        self._dim_lock = asyncio.Lock()
 
-    def _resolve_dim(self) -> int:
+    async def _invoke(self, texts: list[str]) -> NDArray[np.float32]:
+        raw = (
+            await self._embed_fn.acall(texts)
+            if isinstance(self._embed_fn, _DspyBatchEmbedder)
+            else await asyncio.to_thread(self._embed_fn, texts)
+        )
+        return np.asarray(raw, dtype=np.float32)
+
+    async def _resolve_dim(self) -> int:
         if self._dim is not None:
             return self._dim
-        with self._lock:
+        async with self._dim_lock:
             if self._dim is None:
-                probe = np.asarray(self._embed_fn(["dimension probe"]), dtype=np.float32)
+                probe = await self._invoke(["dimension probe"])
                 if probe.ndim != 2 or probe.shape[1] < 1:
                     raise ValueError(f"Invalid embedding dimension from probe shape {probe.shape}")
                 self._dim = int(probe.shape[1])
             return self._dim
 
     async def __coco_vector_schema__(self) -> coco_schema.VectorSchema:
-        dim = await asyncio.to_thread(self._resolve_dim)
+        dim = await self._resolve_dim()
         return coco_schema.VectorSchema(dtype=np.dtype(np.float32), size=dim)
 
     def __coco_memo_key__(self) -> object:
         return self._memo_key
 
-    @coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE)
+    # Bound in-flight CocoIndex batches natively so partial batches do not stall behind saturated worker threads.
+    @coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE, max_in_flight=_MAX_EMBED_IN_FLIGHT)
     async def _embed_batch(self, texts: list[str]) -> list[NDArray[np.float32]]:
         if not texts:
             return []
-
-        def _run() -> list[NDArray[np.float32]]:
-            arr = np.asarray(self._embed_fn(texts), dtype=np.float32)
-            if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
-                raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
-            if self._dim is None:
-                with self._lock:
-                    if self._dim is None:
-                        self._dim = int(arr.shape[1])
-            return [arr[i].astype("<f4", copy=False) for i in range(len(texts))]
-
-        return await asyncio.to_thread(_run)
+        arr = np.ascontiguousarray(await self._invoke(texts), dtype="<f4")
+        if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
+            raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
+        if self._dim is None:
+            self._dim = int(arr.shape[1])
+        return [arr[i] for i in range(len(texts))]
 
     async def embed(self, text: str) -> NDArray[np.float32]:
         return await type(self)._embed_batch(self, text)
 
 
 EMBEDDER = coco.ContextKey[_PipelineEmbedder]("yaw/pipeline/embedder", detect_change=True)
-_CONFIG_EMBED_FNS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,14 +277,18 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
     def _apply(self, _context_provider: coco.ContextProvider, actions: Sequence[_FtsRowAction], /) -> None:
         if not actions:
             return
+        deletes = [(act.chunk_id,) for act in actions]
+        inserts = [
+            (act.chunk_id, act.title, act.body) for act in actions if act.title is not None and act.body is not None
+        ]
+        # Batch FTS5 deletions and insertions with executemany inside one CocoIndex transaction.
         with self._conn_mgr.transaction() as conn:
-            for act in actions:
-                conn.execute(f'DELETE FROM "{self._table_name}" WHERE rowid = ?', (act.chunk_id,))
-                if act.title is not None and act.body is not None:
-                    conn.execute(
-                        f'INSERT INTO "{self._table_name}"(rowid, title, body) VALUES (?, ?, ?)',
-                        (act.chunk_id, act.title, act.body),
-                    )
+            conn.executemany(f'DELETE FROM "{self._table_name}" WHERE rowid = ?', deletes)
+            if inserts:
+                conn.executemany(
+                    f'INSERT INTO "{self._table_name}"(rowid, title, body) VALUES (?, ?, ?)',
+                    inserts,
+                )
 
     def reconcile(
         self,
@@ -299,68 +374,22 @@ _FTS_TABLES = coco.register_root_target_states_provider("yaw/pipeline/fts5", _Ft
 
 
 def open_managed_db(db_path: Path | str) -> sqlite.ManagedConnection:
-    """Open CocoIndex ManagedConnection with sqlite-vec loaded and WAL configured in autocommit."""
+    """Open CocoIndex ManagedConnection with sqlite-vec loaded and WAL configured."""
     target = Path(db_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     conn_mgr = sqlite.connect(target, timeout=30.0, load_vec=True)
+    # ManagedConnection uses autocommit internally; readonly() acquires its lock without BEGIN,
+    # which SQLite forbids for PRAGMA journal_mode and PRAGMA synchronous.
     with conn_mgr.readonly() as conn:
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
     return conn_mgr
 
 
 def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float32]]:
     """Build a byte-budgeted, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
-    max_items = min(_EMBED_BATCH_SIZE, max(1, int(cfg.embed_batch_size)))
-    max_item_chars = max(4096, int(cfg.chunk_size) * 4)
-    max_batch_chars = max(max_item_chars, _MAX_EMBED_BATCH_CHARS)
-    embedder = dspy.Embedder(
-        f"{cfg.provider}/{cfg.embedding_model}",
-        api_base=cfg.base_url,
-        api_key=cfg.api_key or "yaw",
-        batch_size=max_items,
-        caching=False,
-    )
-    sem = threading.BoundedSemaphore(2)
-
-    def _embed(texts: list[str]) -> NDArray[np.float32]:
-        if not texts:
-            return np.zeros((0, 0), dtype=np.float32)
-        for idx, item in enumerate(texts):
-            if len(item) > max_item_chars:
-                raise YawRuntimeError(
-                    "INVALID_INPUT",
-                    f"Embedding input[{idx}] length {len(item)} chars exceeds limit {max_item_chars}",
-                )
-
-        # Pack sub-batches by both item count and character budget to prevent oversized API payloads.
-        batches: list[list[str]] = []
-        cur_batch: list[str] = []
-        cur_chars = 0
-        for item in texts:
-            if cur_batch and (len(cur_batch) >= max_items or cur_chars + len(item) > max_batch_chars):
-                batches.append(cur_batch)
-                cur_batch = []
-                cur_chars = 0
-            cur_batch.append(item)
-            cur_chars += len(item)
-        if cur_batch:
-            batches.append(cur_batch)
-
-        parts: list[NDArray[np.float32]] = []
-        for batch in batches:
-            with sem:
-                raw = embedder(batch)
-            arr = np.asarray(raw, dtype=np.float32)
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            norms = np.maximum(np.linalg.norm(arr, axis=1, keepdims=True), 1e-12)
-            parts.append((arr / norms).astype(np.float32, copy=False))
-        return np.vstack(parts) if len(parts) > 1 else parts[0]
-
-    _CONFIG_EMBED_FNS.add(_embed)
-    return _embed
+    return _DspyBatchEmbedder(cfg)
 
 
 def _detect_existing_vec_dim(conn_mgr: sqlite.ManagedConnection) -> int | None:
@@ -536,15 +565,14 @@ def chunk_file_content(
     return tuple({c.chunk_id: c for c in out}.values())
 
 
-@coco.fn(memo=True, version=1)
+# Keyed strictly by content (title, body) so line shifts or file moves reuse CocoIndex LMDB memos.
+@coco.fn(memo=True, version=2)
 async def _compute_chunk_features(
-    chunk_id: int,
-    title: str,
-    body: str,
+    title_body: tuple[str, str],
     task_mode: str,
     embedder: _PipelineEmbedder,
 ) -> tuple[NDArray[np.float32], str, str]:
-    _ = chunk_id
+    title, body = title_body
     formatted = format_doc_for_embedding(body, title=title, task_mode=task_mode)
     vec = await embedder.embed(formatted)
 
@@ -556,15 +584,7 @@ async def _compute_chunk_features(
     return vec, tokens_json, entities_json
 
 
-async def _compute_piece_features(
-    piece: SourceChunk,
-    embedder: _PipelineEmbedder,
-    task_mode: str,
-) -> tuple[NDArray[np.float32], str, str]:
-    return await _compute_chunk_features(piece.chunk_id, piece.title, piece.body, task_mode, embedder)
-
-
-@coco.fn(memo=True, version=2)
+@coco.fn(memo=True, version=3)
 async def _process_file(
     file: FileLike[Any],
     chunks_target: sqlite.TableTarget[ChunkVecRow],
@@ -584,7 +604,7 @@ async def _process_file(
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
     )
-    feats = await coco.map(_compute_piece_features, pieces, embedder, task_mode)
+    feats = await coco.map(_compute_chunk_features, [(p.title, p.body) for p in pieces], task_mode, embedder)
     for piece, (vec, tokens_json, entities_json) in zip(pieces, feats, strict=True):
         vec_arr = np.asarray(vec, dtype=np.float32)
         chunks_target.declare_row(
@@ -754,12 +774,12 @@ def start_pipeline(
         raise exc
 
     base_memo: tuple[object, ...] = (cfg.provider, cfg.embedding_model, cfg.base_url, cfg.embedding_task_mode)
-    if embed_fn is None or embed_fn in _CONFIG_EMBED_FNS:
+    if isinstance(active_embed, _DspyBatchEmbedder):
         memo_key: object = (*base_memo, "dspy")
     else:
         custom_id = (
-            getattr(embed_fn, "__module__", ""),
-            getattr(embed_fn, "__qualname__", type(embed_fn).__qualname__),
+            getattr(active_embed, "__module__", ""),
+            getattr(active_embed, "__qualname__", type(active_embed).__qualname__),
         )
         memo_key = (*base_memo, "custom", custom_id)
     embedder = _PipelineEmbedder(active_embed, vector_dim=known_dim, memo_key=memo_key)
