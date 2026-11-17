@@ -43,6 +43,8 @@ uv run yaw config {show|get [key]|set <key> <value>} [--config PATH] [--json]
 
 ## Architecture & Model Stack
 
+The replacement CLI handles Ctrl-C, SIGTERM, and Windows Ctrl-Break during optimization. The first signal allows cleanup; repeat it to force exit if cleanup or a provider worker is stuck. Forced exit can lose unfinished work. Restart an existing process to load this behavior.
+
 - **Declarative Live Indexing (`yaw/pipeline.py`):** Continuous `CocoIndex` (`localfs.walk_dir(..., live=live)`) writes `chunks` (`vec0` cosine embeddings + line/AST metadata, zero raw chunk text) and `chunk_fts` (`USING fts5(title, body, content='', contentless_delete=1)`) in 64-chunk micro-batches with persistent LMDB memoization under `.yaw/coco_lmdb`.
 - **Zero-LLM Hybrid `VectorSearch` (`yaw/retrieval.py` -> `yaw recall`):** Read-only WAL retrieval (`PRAGMA data_version` snapshot reload) combining ABTT Marchenko–Pastur isotropic projection, CSLS `k=8` hubness penalty, squared-IDF bigram/BM25 lexical scoring, `spaCy` noun-phrase 2-hop bridging, coalitional branch reranking, and Submodular MMR with MaxP span deduplication and SHA-256 disk line hydration.
 - **Optuna `VectorSearch` Tuning (`yaw optimize optuna` / pre-cutover `yaw dspy optuna`):** Single-study `optuna` `TPESampler` (`seed=42`, `multivariate=True`, `constant_liar=True`) tuning the 5 dimensionless `RetrievalParams` (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) across `Recall@{1, 2, 5, 10, 20}` objectives on disjoint slices (`query_offset >= 10`) and optionally writing `[retrieval]` in [`yaw.toml`](yaw.toml).

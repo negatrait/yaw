@@ -388,8 +388,8 @@ def chunk_file_content(
     rel_path: str,
     raw_text: str,
     *,
-    chunk_size: int = 1200,
-    chunk_overlap: int = 120,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 150,
     min_chunk_size: int = 100,
 ) -> tuple[SourceChunk, ...]:
     """Split raw disk text into 1-indexed deterministic line/char chunks with source hashes."""

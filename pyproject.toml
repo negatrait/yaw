@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yaw"
 version = "0.1.0"
-description = "HippoRAG 2 -style GraphRAG on a local LLM"
+description = "Graphless RAG QA on a local LLM"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.scripts]
-yaw = "yaw.daemon.cli:cli_entrypoint"
+yaw = "yaw.cli:cli_entrypoint"
 watchdog = "scripts.watchdog:main"
 preflight = "scripts.preflight:main"
 typecheck = "scripts.preflight:typecheck"

@@ -195,6 +195,11 @@ reject new tool work (`SHUTTING_DOWN`), join/close `close_pipeline`, set
 `"stopped"`, and release `FileLock`. Wire `yaw daemon run|start|stop|status`
 (`yaw/cli.py`) into this runtime and server runner.
 
+The shared executable entrypoint also covers synchronous commands: SIGINT,
+SIGTERM, and Windows SIGBREAK initiate exception unwinding; a repeated signal
+forces process exit if cleanup or worker joins block. See the replacement
+sprint's [CLI contract](reviews/bare-bones-replacement-sprint.md#59-yawclipy-575-loc--yaw__main__py-8-loc).
+
 ---
 
 ## Sprint 2 (`E2-S2`): MCP Tools and Transport Acceptance

@@ -43,9 +43,9 @@ candidate_lexical_threshold = 0.675
 auto_merge_threshold = 0.98
 candidate_volume_ratio = 0.5
 semantic_adjudication_batch_size = 5
-embed_batch_size = 32
+embed_batch_size = 16
 # Aggregate formatted-input budget per embedding request; tune for the provider.
-embed_batch_chars = 4096
+embed_batch_chars = 2048
 
 [runtime]
 queue_maxsize = 32
@@ -65,15 +65,8 @@ max_bootstrapped_demos = 1
 max_labeled_demos = 1
 
 [retrieval]
-peclet = 0.3375533823900754
-alpha_sprt = 0.07953934952508675
-redundancy_curvature = 0.834659004285133
-coalition_coupling = 0.3887505167779042
-external_trust = 0.26842185514853145
-
-[manifold]
-peclet = 0.3375533823900754
-alpha_sprt = 0.07953934952508675
-redundancy_curvature = 0.834659004285133
-coalition_coupling = 0.3887505167779042
-external_trust = 0.26842185514853145
+peclet = 0.338
+alpha_sprt = 0.079
+redundancy_curvature = 0.835
+coalition_coupling = 0.389
+external_trust = 0.268

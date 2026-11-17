@@ -9,6 +9,7 @@ import json
 import os
 import re
 import runpy
+import signal
 import socket
 import subprocess
 import sys
@@ -800,6 +801,96 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         assert written.peclet == pytest.approx(optuna_res["best_params"]["peclet"])
     finally:
         srv.shutdown()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: bool) -> None:
+    requested, release = threading.Event(), threading.Event()
+
+    def stalled_chat(_turn: int, _payload: dict[str, Any]) -> tuple[int, str]:
+        requested.set()
+        assert release.wait(timeout=60)
+        return 200, _xml_tool_reply("Finish", [{"name": "finish", "args": {"answer": "Neil Armstrong"}}])
+
+    srv, _ = _start_openai_stub(stalled_chat)
+    toml_path = _write_toml(tmp_path, port=srv.server_port)
+    bundle = _prepare_sample_bundle(tmp_path)
+    cfg = load_config(toml_path).for_optimization(None)
+    assert cfg.status_path and cfg.lock_path
+    command = (
+        [sys.executable, "-m", "yaw"]
+        if force
+        else [sys.executable, "-c", "from yaw.cli import cli_entrypoint; cli_entrypoint()"]
+    )
+    proc = subprocess.Popen(
+        [
+            *command,
+            "optimize",
+            "dspy",
+            "--config",
+            str(toml_path),
+            "--dataset",
+            str(bundle),
+            "--max-queries",
+            "4",
+            "--train-queries",
+            "2",
+            "--query-offset",
+            "0",
+            "--max-metric-calls",
+            "6",
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+    sig = signal.SIGBREAK if os.name == "nt" else signal.SIGINT
+    interrupted = threading.Event()
+    errors: list[str] = []
+
+    def read_errors() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            errors.append(line)
+            if "Interrupt received; signal again to force exit." in line:
+                interrupted.set()
+
+    reader = threading.Thread(target=read_errors, daemon=True)
+    reader.start()
+    try:
+        assert requested.wait(timeout=40), "Optimizer never reached the loopback provider"
+        assert proc.poll() is None
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else sig)
+        assert interrupted.wait(timeout=5), "First signal was not dispatched"
+        if force:
+            assert proc.poll() is None, "Blocked provider should keep a worker alive"
+            proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else sig)
+        else:
+            release.set()
+        proc.wait(timeout=15)
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        stderr = "".join(errors)
+        assert proc.returncode == 128 + sig, stderr
+        assert "Traceback" not in stderr
+        if not force:
+            status = json.loads(cfg.status_path.read_text(encoding="utf-8"))
+            assert status["lifecycle"] == "stopped"
+            assert "KeyboardInterrupt" in status["last_error"]
+        with filelock.FileLock(str(cfg.lock_path), timeout=0):
+            pass
+    finally:
+        release.set()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        reader.join(timeout=5)
+        if proc.stderr is not None:
+            proc.stderr.close()
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Path) -> None:

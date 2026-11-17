@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Generator, Sequence
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 import filelock
@@ -54,6 +55,7 @@ from yaw.runtime import (
 )
 
 _kernel32: Any = None
+_console_handler: Any = None
 if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
@@ -571,5 +573,56 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def cli_entrypoint() -> None:
-    """Console script entrypoint raising SystemExit with CLI return code."""
-    raise SystemExit(main())
+    """Run the CLI with graceful interruption and a repeated-signal escape hatch."""
+    global _console_handler
+    interrupted_signal: int | None = None
+    console_signal: int | None = None
+
+    def interrupt(signum: int, _frame: FrameType | None) -> None:
+        nonlocal interrupted_signal
+        if interrupted_signal is not None:
+            os._exit(128 + signum)
+        interrupted_signal = signum
+        if console_signal is None:
+            os.write(2, b"Interrupt received; signal again to force exit.\n")
+        raise KeyboardInterrupt
+
+    signals = (signal.SIGINT, signal.SIGTERM)
+    if (sigbreak := getattr(signal, "SIGBREAK", None)) is not None:
+        signals += (sigbreak,)
+    previous = {sig: signal.signal(sig, interrupt) for sig in signals}
+    if os.name == "nt":
+        handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint32)
+
+        def console_interrupt(event: int) -> bool:
+            nonlocal console_signal
+            if event not in (0, 1):
+                return False
+            signum = signal.SIGINT if event == 0 else signal.SIGBREAK
+            if console_signal is not None or interrupted_signal is not None:
+                os._exit(128 + signum)
+            console_signal = signum
+            os.write(2, b"Interrupt received; signal again to force exit.\n")
+            # Let CPython receive the first console event and unwind when its wait returns.
+            return False
+
+        _console_handler = handler_type(console_interrupt)
+        _kernel32.SetConsoleCtrlHandler.argtypes = [handler_type, ctypes.c_int]
+        _kernel32.SetConsoleCtrlHandler.restype = ctypes.c_int
+        if not _kernel32.SetConsoleCtrlHandler(_console_handler, 1):
+            raise ctypes.WinError()
+    try:
+        code = main()
+    except KeyboardInterrupt:
+        code = 128 + (interrupted_signal or signal.SIGINT)
+        sys.stderr.write("Interrupted.\n")
+    finally:
+        # Keep the escape hatch installed while Python waits for worker threads on exit.
+        if interrupted_signal is None and console_signal is None:
+            if _console_handler is not None:
+                if not _kernel32.SetConsoleCtrlHandler(_console_handler, 0):
+                    raise ctypes.WinError()
+                _console_handler = None
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+    raise SystemExit(code)
