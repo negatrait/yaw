@@ -69,9 +69,10 @@ _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EMBED_BATCH_SIZE = 1 # Breaks the pipeline at > 1!
+_EMBED_BATCH_SIZE = 64
 _MAX_EMBED_BATCH_CHARS = 8192
 _MAX_EMBED_IN_FLIGHT = 4
+_MAX_INFLIGHT_COMPONENTS = 16
 
 
 def _validate_identifier(name: str) -> str:
@@ -95,6 +96,13 @@ class _DspyBatchEmbedder:
             caching=False,
         )
         self._sem = threading.BoundedSemaphore(_MAX_EMBED_IN_FLIGHT)
+        self._async_sem: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+    def _get_async_sem(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._async_sem is None or self._async_sem[0] is not loop:
+            self._async_sem = (loop, asyncio.Semaphore(_MAX_EMBED_IN_FLIGHT))
+        return self._async_sem[1]
 
     def _pack_batches(self, texts: list[str]) -> list[list[str]]:
         for idx, item in enumerate(texts):
@@ -132,7 +140,7 @@ class _DspyBatchEmbedder:
         parts: list[NDArray[np.float32]] = []
         for batch in self._pack_batches(texts):
             with self._sem:
-                raw = self._embedder(batch)
+                raw = self._embedder(batch, batch_size=len(batch))
             parts.append(self._normalize_batch(raw))
         return np.vstack(parts) if len(parts) > 1 else parts[0]
 
@@ -143,10 +151,34 @@ class _DspyBatchEmbedder:
         acall_fn = getattr(self._embedder, "acall", None)
         if not callable(acall_fn):
             return await asyncio.to_thread(self, texts)
+        sem = self._get_async_sem()
         parts: list[NDArray[np.float32]] = []
         for batch in self._pack_batches(texts):
-            parts.append(self._normalize_batch(await acall_fn(batch)))
+            async with sem:
+                raw = await acall_fn(batch, batch_size=len(batch))
+            parts.append(self._normalize_batch(raw))
         return np.vstack(parts) if len(parts) > 1 else parts[0]
+
+
+# Bound in-flight CocoIndex batches natively so partial batches do not stall behind saturated worker threads.
+# Module-level function keeps `texts` as the sole batched arg and `embedder` as the hashable batcher key.
+@coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE, max_in_flight=_MAX_EMBED_IN_FLIGHT)
+async def _embed_batch(texts: list[str], embedder: _PipelineEmbedder) -> list[NDArray[np.float32]]:
+    if not texts:
+        return []
+    try:
+        arr = np.ascontiguousarray(await embedder.invoke(texts), dtype="<f4")
+    except Exception as exc:
+        # Split failed multi-item batches so payload/token caps or one bad chunk never poison healthy peers.
+        if len(texts) > 1:
+            raise coco.RetryWithSmallerBatch() from exc
+        raise
+    if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
+        if len(texts) > 1:
+            raise coco.RetryWithSmallerBatch()
+        raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
+    embedder.record_dim(int(arr.shape[1]))
+    return [arr[i] for i in range(len(texts))]
 
 
 class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
@@ -164,7 +196,7 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
         self._memo_key = memo_key
         self._dim_lock = asyncio.Lock()
 
-    async def _invoke(self, texts: list[str]) -> NDArray[np.float32]:
+    async def invoke(self, texts: list[str]) -> NDArray[np.float32]:
         raw = (
             await self._embed_fn.acall(texts)
             if isinstance(self._embed_fn, _DspyBatchEmbedder)
@@ -172,12 +204,18 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
         )
         return np.asarray(raw, dtype=np.float32)
 
+    def record_dim(self, dim: int) -> None:
+        if self._dim is None:
+            self._dim = dim
+        elif self._dim != dim:
+            raise ValueError(f"Inconsistent embedding dimension: expected {self._dim}, got {dim}")
+
     async def _resolve_dim(self) -> int:
         if self._dim is not None:
             return self._dim
         async with self._dim_lock:
             if self._dim is None:
-                probe = await self._invoke(["dimension probe"])
+                probe = await self.invoke(["dimension probe"])
                 if probe.ndim != 2 or probe.shape[1] < 1:
                     raise ValueError(f"Invalid embedding dimension from probe shape {probe.shape}")
                 self._dim = int(probe.shape[1])
@@ -190,20 +228,8 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
     def __coco_memo_key__(self) -> object:
         return self._memo_key
 
-    # Bound in-flight CocoIndex batches natively so partial batches do not stall behind saturated worker threads.
-    @coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE, max_in_flight=_MAX_EMBED_IN_FLIGHT)
-    async def _embed_batch(self, texts: list[str]) -> list[NDArray[np.float32]]:
-        if not texts:
-            return []
-        arr = np.ascontiguousarray(await self._invoke(texts), dtype="<f4")
-        if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
-            raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
-        if self._dim is None:
-            self._dim = int(arr.shape[1])
-        return [arr[i] for i in range(len(texts))]
-
     async def embed(self, text: str) -> NDArray[np.float32]:
-        return await type(self)._embed_batch(self, text)
+        return await _embed_batch(text, self)
 
 
 EMBEDDER = coco.ContextKey[_PipelineEmbedder]("yaw/pipeline/embedder", detect_change=True)
@@ -574,13 +600,16 @@ async def _compute_chunk_features(
 ) -> tuple[NDArray[np.float32], str, str]:
     title, body = title_body
     formatted = format_doc_for_embedding(body, title=title, task_mode=task_mode)
-    vec = await embedder.embed(formatted)
 
     def _nlp_features() -> tuple[str, str]:
         terms, ents = extract_text_features(title, body)
         return json.dumps(terms, ensure_ascii=False), json.dumps(list(ents), ensure_ascii=False)
 
-    tokens_json, entities_json = await asyncio.to_thread(_nlp_features)
+    # Overlap async embedding HTTP I/O with CPU spaCy feature extraction.
+    vec, (tokens_json, entities_json) = await asyncio.gather(
+        embedder.embed(formatted),
+        asyncio.to_thread(_nlp_features),
+    )
     return vec, tokens_json, entities_json
 
 
@@ -713,6 +742,8 @@ async def _watch_pipeline(session: PipelineSession, stop_async: asyncio.Event) -
                 break
             if snap.stats.total.num_errors:
                 had_errors = snap.stats.total.num_errors
+                if snap.status.name == "READY":
+                    break
                 continue
             if snap.status.name == "READY":
                 session.ready_event.set()
@@ -801,7 +832,7 @@ def start_pipeline(
                 exception_handler=_on_component_error,
             )
             app = coco.App(
-                coco.AppConfig(name=resolved_app, environment=env, max_inflight_components=_EMBED_BATCH_SIZE),
+                coco.AppConfig(name=resolved_app, environment=env, max_inflight_components=_MAX_INFLIGHT_COMPONENTS),
                 _indexing_main,
                 tuple(cfg.included_patterns),
                 tuple(cfg.excluded_patterns),
