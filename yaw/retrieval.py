@@ -8,7 +8,7 @@ import math
 import re
 import sqlite3
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from graphlib import CycleError, TopologicalSorter
@@ -34,50 +34,10 @@ from yaw.core import (
 
 FTS_STOPWORDS: frozenset[str] = frozenset(
     {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
-        "did",
-        "do",
-        "does",
-        "for",
-        "from",
-        "had",
-        "has",
-        "have",
-        "how",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "their",
-        "then",
-        "there",
-        "these",
-        "they",
-        "this",
-        "to",
-        "was",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "who",
-        "whom",
-        "why",
-        "with",
+        "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from",
+        "had", "has", "have", "how", "in", "into", "is", "it", "its", "of", "on", "or", "that",
+        "the", "their", "then", "there", "these", "they", "this", "to", "was", "were", "what",
+        "when", "where", "which", "who", "whom", "why", "with",
     }
 )
 
@@ -89,6 +49,8 @@ _MAX_FTS_TERMS = 24
 _MAX_HYDRATE_SPAN = 5000
 _SPACY_LOCK = threading.Lock()
 type _LinksByBranch = list[list[tuple[int, int, int, float, str]]]
+type _FileCache = dict[Path, tuple[str, list[str]] | None]
+type _JsonCache = dict[tuple[Path, int, int], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,16 +120,19 @@ def get_spacy_nlp() -> Any:
         return _load_spacy_cached()
 
 
-def extract_terms(text: str, stops: set[str]) -> list[str]:
+def extract_terms(text: str, stops: Collection[str]) -> list[str]:
     """Extract lowercased non-stop unigrams and adjacent bigrams."""
     words = [w for m in _WORD_RE.finditer(text) if len(w := m.group(0).lower()) > 1 and w not in stops]
     return words + [f"{words[k]}__{words[k + 1]}" for k in range(len(words) - 1)]
 
 
-def extract_entities(doc: Any, stops: set[str], *, include_attr: bool = False) -> list[str]:
+def extract_entities(
+    doc: Any, stops: Collection[str], *, include_attr: bool = False, max_chars: int | None = None
+) -> list[str]:
     """Extract clean proper-noun spans, noun chunks, and optional sentence attr nouns."""
     spans: list[str] = []
-    toks = list(doc)
+    # Restrict tokens by char offset so callers can reuse one parsed Doc without re-running spaCy.
+    toks = [t for t in doc if t.idx < max_chars] if max_chars is not None else list(doc)
     idx = 0
     while idx < len(toks):
         end = idx + 1
@@ -182,15 +147,26 @@ def extract_entities(doc: Any, stops: set[str], *, include_attr: bool = False) -
             spans.append(doc[idx:end].text)
         idx = end
     if doc.has_annotation("DEP"):
-        spans.extend(nc.text for nc in doc.noun_chunks if nc.root.pos_ == "PROPN")
+        spans.extend(
+            nc.text for nc in doc.noun_chunks
+            if nc.root.pos_ == "PROPN" and (max_chars is None or nc.start_char < max_chars)
+        )
         if include_attr:
             for sent in list(doc.sents)[:2]:
+                if max_chars is not None and sent.start_char >= max_chars:
+                    break
                 for tok in sent:
+                    if max_chars is not None and tok.idx >= max_chars:
+                        break
                     if tok.pos_ == "NOUN" and not tok.is_stop and tok.dep_ == "attr":
                         spans.append(tok.text)
-                        spans.extend(c.text for c in tok.conjuncts if c.pos_ == "NOUN" and not c.is_stop)
+                        spans.extend(
+                            c.text for c in tok.conjuncts
+                            if c.pos_ == "NOUN" and not c.is_stop and (max_chars is None or c.idx < max_chars)
+                        )
+    fallback_text = doc.text[:max_chars] if max_chars is not None else doc.text
     dedup: dict[str, str] = {}
-    for raw in spans or _CAP_SPAN_RE.findall(doc.text):
+    for raw in spans or _CAP_SPAN_RE.findall(fallback_text):
         clean = raw.strip(" \t\n\r\"'()[]{}:;,.?!")
         if len(clean) >= 2 and extract_terms(clean, stops):
             dedup.setdefault(re.sub(r"\s+", " ", clean).lower(), clean)
@@ -200,11 +176,14 @@ def extract_entities(doc: Any, stops: set[str], *, include_attr: bool = False) -
 def extract_text_features(title: str, body: str) -> tuple[list[str], tuple[list[str], list[str]]]:
     """Extract deduplicated index terms and `(main_entities, attr_entities)` for one chunk."""
     nlp = get_spacy_nlp()
-    stops = set(nlp.Defaults.stop_words)
+    stops = nlp.Defaults.stop_words
     terms = list(dict.fromkeys(extract_terms(f"{title}\n{body}", stops)))
     doc_main = nlp(body)
-    doc_attr = nlp(body[:320]) if len(body) > 320 else doc_main
-    return terms, (extract_entities(doc_main, stops), extract_entities(doc_attr, stops, include_attr=True)[:8])
+    attr_limit = 320 if len(body) > 320 else None
+    return terms, (
+        extract_entities(doc_main, stops),
+        extract_entities(doc_main, stops, include_attr=True, max_chars=attr_limit)[:8],
+    )
 
 
 def open_readonly_db(db_path: Path | str, *, timeout: float = 5.0) -> sqlite3.Connection:
@@ -234,26 +213,36 @@ def _crop_text(text: str, max_chars: int | None) -> str:
     return text[: max(1, limit - len(marker))] + marker if limit > len(marker) else text[:limit]
 
 
-def hydrate_passage(
+def _hydrate_one(
     corpus_root: Path,
     ptr: ChunkPointer,
-    score: float = 0.0,
-    *,
-    max_chars: int | None = None,
-    include_island: bool = False,
-    full_span: bool = False,
+    score: float,
+    max_chars: int | None,
+    include_island: bool,
+    full_span: bool,
+    file_cache: _FileCache | None = None,
+    json_cache: _JsonCache | None = None,
 ) -> HydratedPassage:
-    """Hydrate 1-indexed source lines from disk with SHA-256 freshness verification."""
     limit = _validate_max_chars(max_chars)
     sl, el = int(ptr.start_line), int(ptr.end_line)
     if sl < 1 or el < sl or (el - sl + 1) > _MAX_HYDRATE_SPAN:
         raise ValueError(f"Invalid hydration line range [{sl}, {el}] for {ptr.rel_posix_path}")
     target = resolve_corpus_path(corpus_root, ptr.rel_posix_path)
-    if not target.is_file():
+
+    if file_cache is not None and target in file_cache:
+        loaded = file_cache[target]
+    else:
+        if target.is_file():
+            norm_text = target.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            loaded = (norm_text, norm_text.splitlines())
+        else:
+            loaded = None
+        if file_cache is not None:
+            file_cache[target] = loaded
+    if loaded is None:
         return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
 
-    text = target.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.splitlines()
+    text, lines = loaded
     if el > len(lines):
         return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
     raw_slice = "\n".join(lines[sl - 1 : el])
@@ -262,10 +251,16 @@ def hydrate_passage(
 
     suffix = Path(ptr.rel_posix_path).suffix.lower()
     if suffix in (".json", ".jsonl", ".ndjson"):
-        try:
-            parsed = json.loads(raw_slice)
-        except json.JSONDecodeError as exc:
-            raise YawRuntimeError("CONSISTENCY_ERROR", f"Corrupted JSON document at {target}: {exc}") from exc
+        cache_key = (target, sl, el)
+        if json_cache is not None and cache_key in json_cache:
+            parsed = json_cache[cache_key]
+        else:
+            try:
+                parsed = json.loads(raw_slice)
+            except json.JSONDecodeError as exc:
+                raise YawRuntimeError("CONSISTENCY_ERROR", f"Corrupted JSON document at {target}: {exc}") from exc
+            if json_cache is not None:
+                json_cache[cache_key] = parsed
         fallback = Path(ptr.rel_posix_path).stem
         item = parsed
         if isinstance(parsed, list):
@@ -298,6 +293,19 @@ def hydrate_passage(
     return HydratedPassage(ptr, rendered, float(score), stale_on_disk=False)
 
 
+def hydrate_passage(
+    corpus_root: Path,
+    ptr: ChunkPointer,
+    score: float = 0.0,
+    *,
+    max_chars: int | None = None,
+    include_island: bool = False,
+    full_span: bool = False,
+) -> HydratedPassage:
+    """Hydrate 1-indexed source lines from disk with SHA-256 freshness verification."""
+    return _hydrate_one(corpus_root, ptr, score, max_chars, include_island, full_span)
+
+
 def _l2_norm(arr: NDArray[np.float32], *, row_wise: bool = False) -> NDArray[np.float32]:
     data = np.asarray(arr, dtype=np.float32)
     if not data.size:
@@ -318,7 +326,8 @@ def _build_ast_siblings(ptrs: Sequence[ChunkPointer]) -> tuple[NDArray[np.int32]
     for idx, ptr in enumerate(ptrs):
         if ptr.ast_island_start > 0 and ptr.ast_island_end >= ptr.ast_island_start:
             by_file.setdefault(ptr.rel_posix_path, []).append((idx, ptr))
-    siblings = [np.empty((0,), np.int32)] * len(ptrs)
+    empty = np.empty((0,), np.int32)
+    siblings = [empty] * len(ptrs)
     for items in by_file.values():
         items.sort(key=lambda pair: (pair[1].start_line, pair[1].end_line, int(pair[1].chunk_id)))
         for idx, ptr in items:
@@ -330,10 +339,7 @@ def _build_ast_siblings(ptrs: Sequence[ChunkPointer]) -> tuple[NDArray[np.int32]
 
 
 def build_vector_search(
-    conn: sqlite3.Connection,
-    params: RetrievalParams | None = None,
-    *,
-    data_version: int = 0,
+    conn: sqlite3.Connection, params: RetrievalParams | None = None, *, data_version: int = 0
 ) -> VectorSearch:
     """Load `chunks` metadata/embeddings from SQLite and precompute ABTT isotropic & lexical structures."""
     hp = params or RetrievalParams()
@@ -346,26 +352,8 @@ def build_vector_search(
         empty_m = np.zeros((0, 0), np.float32)
         empty_i, empty_f, empty_r = np.zeros((0,), np.int32), np.zeros((0,), np.float32), np.zeros((0, 0), np.float32)
         return VectorSearch(
-            (),
-            {},
-            (),
-            (),
-            (),
-            empty_m,
-            empty_m,
-            empty_r,
-            0,
-            1.0,
-            empty_f,
-            {},
-            (),
-            empty_i,
-            empty_f,
-            (),
-            (),
-            (),
-            hp,
-            data_version,
+            (), {}, (), (), (), empty_m, empty_m, empty_r, 0, 1.0, empty_f, {}, (), empty_i, empty_f,
+            (), (), (), hp, data_version,
         )
 
     ptrs: list[ChunkPointer] = []
@@ -376,20 +364,14 @@ def build_vector_search(
         cid = int(row[0])
         ptrs.append(
             ChunkPointer(
-                chunk_id=cid,
-                rel_posix_path=str(row[2]),
-                start_line=int(row[4]),
-                end_line=int(row[5]),
-                title=str(row[10]),
-                ast_island_start=int(row[8]),
-                ast_island_end=int(row[9]),
-                source_hash=str(row[3]),
-                char_start=int(row[6]),
-                char_end=int(row[7]),
+                chunk_id=cid, rel_posix_path=str(row[2]), start_line=int(row[4]), end_line=int(row[5]),
+                title=str(row[10]), ast_island_start=int(row[8]), ast_island_end=int(row[9]),
+                source_hash=str(row[3]), char_start=int(row[6]), char_end=int(row[7]),
             )
         )
-        vecs_list.append(np.frombuffer(bytes(row[1]), dtype="<f4"))
-        doc_terms.append([str(t) for t in json.loads(str(row[11]))])
+        # Zero-copy view over SQLite BLOB buffer prior to batched vstack/L2 normalization.
+        vecs_list.append(np.frombuffer(row[1], dtype="<f4"))
+        doc_terms.append(list(dict.fromkeys(str(t) for t in json.loads(str(row[11])))))
         raw_ents = json.loads(str(row[12]))
         c_ents.append(([str(e) for e in raw_ents[0]], [str(e) for e in raw_ents[1][:8]]))
 
@@ -427,36 +409,14 @@ def build_vector_search(
     idf2[t_df > (0.25 * n_c if n_c >= 16 else n_c)] = 0.0
     t_sets = tuple(frozenset(v_idx[t] for t in tms if idf2[v_idx[t]] > 0.0) for tms in doc_terms)
     return VectorSearch(
-        tuple(ptrs),
-        {cid: i for i, cid in enumerate(c_ids)},
-        c_ids,
-        titles,
-        t_norms,
-        u_raw,
-        u_iso,
-        q_rogue,
-        abtt_d,
-        float(lam),
-        csls,
-        v_idx,
-        posts,
-        t_df,
-        idf2,
-        t_sets,
-        _build_ast_siblings(ptrs),
-        tuple(c_ents),
-        hp,
-        data_version,
+        tuple(ptrs), {cid: i for i, cid in enumerate(c_ids)}, c_ids, titles, t_norms, u_raw, u_iso, q_rogue,
+        abtt_d, float(lam), csls, v_idx, posts, t_df, idf2, t_sets, _build_ast_siblings(ptrs),
+        tuple(c_ents), hp, data_version,
     )
 
 
 def query_external_hints(
-    conn: sqlite3.Connection,
-    query_text: str,
-    query_vec: NDArray[np.float32],
-    *,
-    fts_k: int = 50,
-    vec_k: int = 200,
+    conn: sqlite3.Connection, query_text: str, query_vec: NDArray[np.float32], *, fts_k: int = 50, vec_k: int = 200
 ) -> tuple[dict[int, float], dict[int, float]]:
     """Query SQLite contentless FTS5 (`bm25`) and `vec0` KNN cosine hints."""
     fts_scores: dict[int, float] = {}
@@ -475,7 +435,8 @@ def query_external_hints(
     vec_scores: dict[int, float] = {}
     q_arr = np.asarray(query_vec, dtype=np.float32).reshape(-1)
     if vec_k > 0 and q_arr.size > 0:
-        blob = sqlite_vec.serialize_float32(q_arr.tolist())
+        # Encode contiguous little-endian float32 bytes directly for sqlite-vec without Python list boxing.
+        blob = np.ascontiguousarray(q_arr, dtype="<f4").tobytes()
         rows = conn.execute(
             "WITH knn AS MATERIALIZED (SELECT chunk_id, distance FROM chunks WHERE embedding MATCH ? AND k = ? "
             "ORDER BY distance) SELECT chunk_id, (1.0 - distance) FROM knn ORDER BY distance ASC, chunk_id ASC",
@@ -525,6 +486,16 @@ def _is_comp_q(doc: Any, ent_spans: Sequence[str]) -> bool:
         if (lem := tok.lemma_.lower()) not in _AUX_LEMMAS and tok.text.lower() not in ent_low:
             preds.add(lem)
     return len(preds) >= 2
+
+
+@lru_cache(maxsize=512)
+def _analyze_query_cached(nlp: Any, query_text: str) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+    # Cache deterministic query NLP features to avoid repeating spaCy parses in parameter sweeps.
+    stops = nlp.Defaults.stop_words
+    q_terms = tuple(extract_terms(query_text, stops))
+    q_doc = nlp(query_text)
+    q_ent_spans = tuple(extract_entities(q_doc, stops))
+    return q_terms, q_ent_spans, _is_comp_q(q_doc, q_ent_spans)
 
 
 def _build_routes(
@@ -586,17 +557,16 @@ def search_vectors(
     z_d = _robust_z(blend * (vs.u_chunk_raw @ q_raw) + hp.peclet * (u_iso @ q_iso - csls_w * csls))
 
     nlp = get_spacy_nlp()
-    stops = set(nlp.Defaults.stop_words)
+    stops = nlp.Defaults.stop_words
+    q_terms, q_ent_spans, comp_q = _analyze_query_cached(nlp, query_text)
     c_ids, titles, t_norms = vs.chunk_ids, vs.chunk_titles, vs.chunk_title_norms
     v_idx, idf2, t_sets = vs.vocab_index, vs.token_idf2, vs.chunk_tok_sets
-    lex_c, q_tids = _score_terms(vs, extract_terms(query_text, stops), 1.5)
+    lex_c, q_tids = _score_terms(vs, q_terms, 1.5)
     z_fts, z_vec = _scale_hints(n_c, fts_scores, vs.id_to_pos), _scale_hints(n_c, vec_scores, vs.id_to_pos)
     s0 = z_d + 2.2 * (1.0 - 0.5 * hp.peclet) * lex_c + hp.external_trust * (2.2 * (z_fts / 4.0) + 1.2 * (z_vec / 4.0))
     h0_post = softmax(np.asarray(s0, np.float64)).astype(np.float32)
 
-    q_doc = nlp(query_text)
-    q_ent_spans = extract_entities(q_doc, stops)
-    comp_q, z_gate = _is_comp_q(q_doc, q_ent_spans), np.maximum(0.1, (z_d + 2.0) / 4.0)
+    z_gate = np.maximum(0.1, (z_d + 2.0) / 4.0)
     ent_facets: list[tuple[str, NDArray[np.float32]]] = []
     for span in q_ent_spans if len(q_ent_spans) >= 2 else ():
         ef, _ = _score_terms(vs, extract_terms(span, stops), 1.6)
@@ -666,11 +636,21 @@ def search_vectors(
                     rare = [t for t in valid if int(vs.token_df[t]) <= rare_cap]
                     if not valid or not rare or all(t in q_tids for t in valid):
                         continue
-                    cand = set.intersection(*(set(map(int, vs.postings[t])) for t in rare))
-                    if 0 < len(cand) <= cand_cap:
-                        bg_tids, base_w = [ti for term, ti in tids if "__" in term], (1.15 if len(cand) <= 3 else 0.75)
-                        for dst in cand - {p_ci}:
-                            if single_peak and span not in attr_only and u_bonus[dst] <= 0.0:
+                    if len(rare) == 1 and int(vs.token_df[rare[0]]) > cand_cap:
+                        continue
+                    # Intersect sorted unique int32 posting arrays smallest-first without Python set/int boxing.
+                    rare.sort(key=lambda t: int(vs.token_df[t]))
+                    cand_arr = vs.postings[rare[0]]
+                    for t in rare[1:]:
+                        cand_arr = np.intersect1d(cand_arr, vs.postings[t], assume_unique=True)
+                        if cand_arr.size == 0:
+                            break
+                    if 0 < cand_arr.size <= cand_cap:
+                        bg_tids = [ti for term, ti in tids if "__" in term]
+                        base_w = 1.15 if cand_arr.size <= 3 else 0.75
+                        for dst_np in cand_arr:
+                            dst = int(dst_np)
+                            if dst == p_ci or (single_peak and span not in attr_only and u_bonus[dst] <= 0.0):
                                 continue
                             bg_hit = 0.25 if any(b in t_sets[dst] for b in bg_tids) else 0.0
                             if (sc := pw * (base_w + bg_hit + 0.50 * float(u_bonus[dst]))) > lex_loc[dst]:
@@ -723,26 +703,42 @@ def search_vectors(
     ef_mat = np.vstack([ef for _, ef in ent_facets]) if ent_facets else np.zeros((0, n_c), np.float32)
     base = s0_norm + w_hop * h_norm + coal_bonus + (w_f * ef_mat.sum(axis=0)).astype(np.float32)
     rem = np.asarray([i for i in np.argsort(-base, kind="mergesort")[: max(64, eff_k * 4)] if i != seed0], np.int32)
-    max_sims = (u_iso[rem] @ u_iso[seed0]).astype(np.float32)
     reranked: list[tuple[int, float]] = [(seed0, float(base[seed0]))]
-    used_t: set[str] = {t_norms[seed0]} if t_norms[seed0] else set()
-    hop_cov, e_cov, last = min(1.0, 0.5 * float(h_norm[seed0])), np.minimum(1.0, ef_mat[:, seed0]), float(base[seed0])
-    for _ in range(1, min(eff_k, 1 + rem.size)):
-        e_gain = (w_f * (1.0 - e_cov)) @ ef_mat[:, rem]
-        raw_sc = s0_norm[rem] + w_hop * (1.0 - 0.35 * hop_cov) * h_norm[rem] + coal_bonus[rem] + e_gain
-        red_pen = np.maximum(0.15, 1.0 - 0.65 * curv * np.maximum(0.0, max_sims - gate) / max(1e-6, 1.0 - gate))
-        if curv > 0.0 and used_t:
-            red_pen[[i for i, c in enumerate(rem) if t_norms[int(c)] in used_t]] *= 0.85
-        gains = raw_sc * red_pen
-        pick = int(np.argmax(gains))
-        best_idx = int(rem[pick])
-        last = min(last - 1e-6, float(gains[pick]))
-        reranked.append((best_idx, last))
-        if t_norms[best_idx]:
-            used_t.add(t_norms[best_idx])
-        hop_cov, e_cov = min(1.0, hop_cov + 0.5 * float(h_norm[best_idx])), np.minimum(1.0, e_cov + ef_mat[:, best_idx])
-        rem = np.delete(rem, pick)
-        max_sims = np.maximum(np.delete(max_sims, pick), u_iso[rem] @ u_iso[best_idx])
+    if (n_rem := int(rem.size)) > 0 and eff_k > 1:
+        # Pre-slice candidate arrays once and mask picked entries to avoid per-step np.delete copies.
+        u_rem = u_iso[rem]
+        s0_rem, h_rem, coal_rem, ef_rem = s0_norm[rem], h_norm[rem], coal_bonus[rem], ef_mat[:, rem]
+        rem_titles = [t_norms[int(c)] for c in rem]
+        max_sims = (u_rem @ u_iso[seed0]).astype(np.float32)
+        alive = np.ones((n_rem,), dtype=bool)
+        title_pen = np.ones((n_rem,), dtype=np.float32)
+        used_t: set[str] = set()
+        if curv > 0.0 and t_norms[seed0]:
+            t0 = t_norms[seed0]
+            used_t.add(t0)
+            for i, tc in enumerate(rem_titles):
+                if tc == t0:
+                    title_pen[i] = 0.85
+        hop_cov, e_cov = min(1.0, 0.5 * float(h_norm[seed0])), np.minimum(1.0, ef_mat[:, seed0])
+        last, denom_gate = float(base[seed0]), max(1e-6, 1.0 - gate)
+        for _ in range(1, min(eff_k, 1 + n_rem)):
+            e_gain = (w_f * (1.0 - e_cov)) @ ef_rem
+            raw_sc = s0_rem + w_hop * (1.0 - 0.35 * hop_cov) * h_rem + coal_rem + e_gain
+            red_pen = np.maximum(0.15, 1.0 - 0.65 * curv * np.maximum(0.0, max_sims - gate) / denom_gate)
+            gains = np.where(alive, raw_sc * (red_pen * title_pen), -np.inf)
+            pick = int(np.argmax(gains))
+            best_idx = int(rem[pick])
+            last = min(last - 1e-6, float(gains[pick]))
+            reranked.append((best_idx, last))
+            alive[pick] = False
+            if curv > 0.0 and (bt := rem_titles[pick]) and bt not in used_t:
+                used_t.add(bt)
+                for i, tc in enumerate(rem_titles):
+                    if tc == bt:
+                        title_pen[i] = 0.85
+            hop_cov = min(1.0, hop_cov + 0.5 * float(h_norm[best_idx]))
+            e_cov = np.minimum(1.0, e_cov + ef_rem[:, pick])
+            max_sims = np.maximum(max_sims, u_rem @ u_rem[pick])
 
     seed_info = [(s, lbl, float(s0[s])) for s, lbl in zip(seeds, labels, strict=True)]
     route, routes = _build_routes(vs, links_br, seed_info, route_gate)
@@ -768,6 +764,9 @@ def hydrate_ranked_passages(
         return ()
     out: list[HydratedPassage] = []
     seen_spans: set[tuple[str, int, int]] = set()
+    # Scope file/JSON caches strictly to this call so repeated chunks from one file read disk once.
+    file_cache: _FileCache = {}
+    json_cache: _JsonCache = {}
     for cid, score in ranked_chunks:
         if (pos := vs.id_to_pos.get(int(cid))) is None:
             continue
@@ -777,8 +776,8 @@ def hydrate_ranked_passages(
             continue
         seen_spans.add(span)
         out.append(
-            hydrate_passage(
-                corpus_root, ptr, float(score), max_chars=limit, include_island=include_island, full_span=full_span
+            _hydrate_one(
+                corpus_root, ptr, float(score), limit, include_island, full_span, file_cache, json_cache
             )
         )
         if len(out) >= top_k:
@@ -809,3 +808,4 @@ def format_evidence_route(route: Sequence[EvidenceHop], *, max_chars: int | None
             parts.append(line)
         used += len(parts[-1]) + (1 if len(parts) > 1 else 0)
     return "\n".join(parts)
+    

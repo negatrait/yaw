@@ -24,7 +24,7 @@ import sqlite_vec
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
-from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.ops.text import CustomLanguageConfig, RecursiveSplitter, detect_code_language
 from cocoindex.resources import schema as coco_schema
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from numpy.typing import NDArray
@@ -43,7 +43,6 @@ from yaw.retrieval import extract_text_features
 
 CORPUS_ROOT = coco.ContextKey[Path]("yaw/pipeline/corpus_root")
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/pipeline/sqlite_db")
-EMBED_FN = coco.ContextKey[Callable[[list[str]], NDArray[np.float32]]]("yaw/pipeline/embed_fn")
 
 _CHUNK_AUXILIARY_COLS: list[str] = [
     "rel_path",
@@ -58,12 +57,21 @@ _CHUNK_AUXILIARY_COLS: list[str] = [
     "tokens_json",
     "entities_json",
 ]
-_SPLITTER = RecursiveSplitter()
+# Configure hierarchical prose separators for non-Tree-sitter formats; AST languages use Tree-sitter.
+_SPLITTER = RecursiveSplitter(
+    custom_languages=[
+        CustomLanguageConfig(
+            language_name="prose",
+            separators_regex=[r"\n\n+", r"[.?!]+\s+", r"\n", r"\s+"],
+        )
+    ]
+)
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EMBED_BATCH_SIZE = 64
+_MAX_EMBED_BATCH_CHARS = 16_384
 
 
 def _validate_identifier(name: str) -> str:
@@ -303,12 +311,15 @@ def open_managed_db(db_path: Path | str) -> sqlite.ManagedConnection:
 
 
 def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float32]]:
-    """Build a bounded, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
+    """Build a byte-budgeted, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
+    max_items = min(_EMBED_BATCH_SIZE, max(1, int(cfg.embed_batch_size)))
+    max_item_chars = max(4096, int(cfg.chunk_size) * 4)
+    max_batch_chars = max(max_item_chars, _MAX_EMBED_BATCH_CHARS)
     embedder = dspy.Embedder(
         f"{cfg.provider}/{cfg.embedding_model}",
         api_base=cfg.base_url,
-        api_key=cfg.api_key,
-        batch_size=min(_EMBED_BATCH_SIZE, max(1, cfg.embed_batch_size)),
+        api_key=cfg.api_key or "yaw",
+        batch_size=max_items,
         caching=False,
     )
     sem = threading.BoundedSemaphore(2)
@@ -316,9 +327,29 @@ def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float
     def _embed(texts: list[str]) -> NDArray[np.float32]:
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
+        for idx, item in enumerate(texts):
+            if len(item) > max_item_chars:
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    f"Embedding input[{idx}] length {len(item)} chars exceeds limit {max_item_chars}",
+                )
+
+        # Pack sub-batches by both item count and character budget to prevent oversized API payloads.
+        batches: list[list[str]] = []
+        cur_batch: list[str] = []
+        cur_chars = 0
+        for item in texts:
+            if cur_batch and (len(cur_batch) >= max_items or cur_chars + len(item) > max_batch_chars):
+                batches.append(cur_batch)
+                cur_batch = []
+                cur_chars = 0
+            cur_batch.append(item)
+            cur_chars += len(item)
+        if cur_batch:
+            batches.append(cur_batch)
+
         parts: list[NDArray[np.float32]] = []
-        for idx in range(0, len(texts), _EMBED_BATCH_SIZE):
-            batch = texts[idx : idx + _EMBED_BATCH_SIZE]
+        for batch in batches:
             with sem:
                 raw = embedder(batch)
             arr = np.asarray(raw, dtype=np.float32)
@@ -384,6 +415,34 @@ def _line_slice_sha256(lines: Sequence[str], start_line: int, end_line: int) -> 
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _subsplit_by_bytes(text: str, max_bytes: int, overlap_chars: int) -> list[tuple[int, int, str]]:
+    """Enforce a hard UTF-8 byte cap on any oversized leaf node returned by RecursiveSplitter."""
+    if not text.strip():
+        return []
+    limit = max(4, int(max_bytes))
+    if len(text.encode("utf-8")) <= limit:
+        return [(0, len(text), text)]
+    out: list[tuple[int, int, str]] = []
+    n = len(text)
+    pos = 0
+    while pos < n:
+        end = min(n, pos + limit)
+        while end > pos and len(text[pos:end].encode("utf-8")) > limit:
+            byte_len = len(text[pos:end].encode("utf-8"))
+            shrink = max(1, (end - pos) * limit // byte_len)
+            end = pos + shrink if shrink < (end - pos) else end - 1
+        if end == pos:
+            end = pos + 1
+        piece = text[pos:end]
+        if piece.strip():
+            out.append((pos, end, piece))
+        if end >= n:
+            break
+        step = max(1, (end - pos) - min(max(0, overlap_chars), max(0, (end - pos) - 1)))
+        pos += step
+    return out
+
+
 def chunk_file_content(
     rel_path: str,
     raw_text: str,
@@ -403,47 +462,52 @@ def chunk_file_content(
     out: list[SourceChunk] = []
 
     if suffix in (".json", ".jsonl", ".ndjson"):
-        units: list[tuple[str, str, int, int, str]] = []
+        units: list[tuple[str, str, int, int, str, str]] = []
         if suffix in (".jsonl", ".ndjson"):
             for line_no, raw_line in enumerate(lines, start=1):
                 if raw_line.strip():
                     t, b = json_document_fields(json.loads(raw_line), fallback_title)
-                    units.append((t, b, line_no, line_no, _line_slice_sha256(lines, line_no, line_no)))
+                    units.append((t, b, line_no, line_no, _line_slice_sha256(lines, line_no, line_no), rel_path))
         else:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
                 t, b = json_document_fields(parsed, fallback_title)
-                units.append((t, b, 1, total_lines, _line_slice_sha256(lines, 1, total_lines)))
+                units.append((t, b, 1, total_lines, _line_slice_sha256(lines, 1, total_lines), rel_path))
             elif isinstance(parsed, list):
                 s_hash = _line_slice_sha256(lines, 1, total_lines)
-                for item in parsed:
+                for item_idx, item in enumerate(parsed):
                     t, b = json_document_fields(item, fallback_title)
-                    units.append((t, b, 1, total_lines, s_hash))
-        for t, b, sl, el, s_hash in units:
+                    # Disambiguate array items in chunk_id computation while preserving rel_path for hydration.
+                    id_key = rel_path if item_idx == 0 else f"{rel_path}#{item_idx}"
+                    units.append((t, b, 1, total_lines, s_hash, id_key))
+        for t, b, sl, el, s_hash, id_key in units:
             rendered = render_document_text(t, b)
             if not rendered.strip():
                 continue
-            if len(rendered) <= chunk_size:
-                cid = compute_chunk_int_id(rel_path, sl, el, 0, 0, s_hash)
+            if len(rendered.encode("utf-8")) <= chunk_size:
+                cid = compute_chunk_int_id(id_key, sl, el, 0, 0, s_hash)
                 out.append(SourceChunk(cid, rel_path, s_hash, sl, el, 0, 0, sl, el, t, rendered))
             else:
-                eff = max(min_chunk_size, chunk_size - len(t) - 1) if t else chunk_size
+                title_bytes = len(t.encode("utf-8")) + 1 if t else 0
+                eff = max(min_chunk_size, chunk_size - title_bytes) if title_bytes < chunk_size else chunk_size
                 parts = _SPLITTER.split(
                     b,
                     chunk_size=eff,
                     chunk_overlap=min(chunk_overlap, max(0, eff - 1)),
                     min_chunk_size=min(min_chunk_size, max(1, len(b.strip()))),
-                    language="markdown",
+                    language="prose",
                 )
                 for c in parts:
-                    cs, ce = c.start.char_offset, c.end.char_offset
-                    body_text = render_document_text(t, c.text)
-                    cid = compute_chunk_int_id(rel_path, sl, el, cs, ce, s_hash)
-                    out.append(SourceChunk(cid, rel_path, s_hash, sl, el, cs, ce, sl, el, t, body_text))
+                    base_cs = int(c.start.char_offset)
+                    for sub_cs, sub_ce, sub_text in _subsplit_by_bytes(c.text, eff, chunk_overlap):
+                        cs, ce = base_cs + sub_cs, base_cs + sub_ce
+                        body_text = render_document_text(t, sub_text)
+                        cid = compute_chunk_int_id(id_key, sl, el, cs, ce, s_hash)
+                        out.append(SourceChunk(cid, rel_path, s_hash, sl, el, cs, ce, sl, el, t, body_text))
         return tuple({c.chunk_id: c for c in out}.values())
 
-    lang = detect_code_language(filename=rel_path)
-    headings = _markdown_headings(lines) if lang in (None, "markdown") else []
+    lang = detect_code_language(filename=rel_path) or "prose"
+    headings = _markdown_headings(lines) if lang in ("prose", "markdown") else []
     split_chunks = _SPLITTER.split(
         text,
         chunk_size=chunk_size,
@@ -452,22 +516,23 @@ def chunk_file_content(
         language=lang,
     )
     same_span_counts: dict[tuple[int, int], int] = {}
-    raw_pieces = []
+    raw_pieces: list[tuple[int, int, int, int, str]] = []
     for c in split_chunks:
+        if not c.text.strip():
+            continue
         sl = max(1, int(c.start.line))
         el = min(total_lines, max(sl, inclusive_end_line(sl, int(c.end.line), int(c.end.column))))
-        same_span_counts[(sl, el)] = same_span_counts.get((sl, el), 0) + 1
-        raw_pieces.append((c, sl, el))
+        base_cs = int(c.start.char_offset)
+        for sub_cs, sub_ce, sub_text in _subsplit_by_bytes(c.text, chunk_size, chunk_overlap):
+            raw_pieces.append((sl, el, base_cs + sub_cs, base_cs + sub_ce, sub_text))
+            same_span_counts[(sl, el)] = same_span_counts.get((sl, el), 0) + 1
 
-    for c, sl, el in raw_pieces:
-        if same_span_counts[(sl, el)] > 1:
-            cs, ce = int(c.start.char_offset), int(c.end.char_offset)
-        else:
-            cs, ce = 0, 0
+    for sl, el, piece_cs, piece_ce, piece_text in raw_pieces:
+        cs, ce = (piece_cs, piece_ce) if same_span_counts[(sl, el)] > 1 else (0, 0)
         s_hash = _line_slice_sha256(lines, sl, el)
         title, ast_s, ast_e = _heading_bounds(headings, sl, total_lines, fallback_title)
         cid = compute_chunk_int_id(rel_path, sl, el, cs, ce, s_hash)
-        out.append(SourceChunk(cid, rel_path, s_hash, sl, el, cs, ce, ast_s, ast_e, title, c.text))
+        out.append(SourceChunk(cid, rel_path, s_hash, sl, el, cs, ce, ast_s, ast_e, title, piece_text))
     return tuple({c.chunk_id: c for c in out}.values())
 
 
@@ -499,7 +564,7 @@ async def _compute_piece_features(
     return await _compute_chunk_features(piece.chunk_id, piece.title, piece.body, task_mode, embedder)
 
 
-@coco.fn(memo=True, version=1)
+@coco.fn(memo=True, version=2)
 async def _process_file(
     file: FileLike[Any],
     chunks_target: sqlite.TableTarget[ChunkVecRow],
@@ -708,7 +773,6 @@ def start_pipeline(
             ctx = coco.ContextProvider()
             ctx.provide(CORPUS_ROOT, corpus_root)
             ctx.provide(SQLITE_DB, conn_mgr)
-            ctx.provide(EMBED_FN, active_embed)
             ctx.provide(EMBEDDER, embedder)
             env = coco.Environment(
                 settings=coco.Settings(db_path=state_dir),
