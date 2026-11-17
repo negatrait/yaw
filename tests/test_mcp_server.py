@@ -154,7 +154,7 @@ def test_mcp_server_containment_bind_validation_and_tool_inventory(tmp_path: Pat
     assert "manifold" not in low and "hmm" not in low and "hipporag" not in low
 
     tree = ast.parse(src, filename=str(mcp_path))
-    allowed_top = sys.stdlib_module_names | {"yaw", "fastmcp", "starlette", "uvicorn"}
+    allowed_top = sys.stdlib_module_names | {"yaw", "fastmcp", "pydantic", "starlette", "uvicorn"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -506,7 +506,12 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
                 st = (await client.call_tool("daemon_status", {})).data
                 assert st["lifecycle"] == "ready" and st["num_chunks"] >= 7
 
-                # 3. INVALID_INPUT cases (including bool/str/float top_k, >1024B query, extra args) + precedence
+                # 3. Long > 1024-byte query succeeds; native Pydantic strict validation + runtime INVALID_INPUT
+                long_q = "orbital booster " * 80
+                assert len(long_q.encode("utf-8")) > 1024
+                long_rec = (await client.call_tool("recall", {"query": long_q, "top_k": 2})).data
+                assert len(long_rec["results"]) == 2
+
                 for tool_name, bad_args in (
                     ("recall", {"query": "ok", "top_k": True}),
                     ("recall", {"query": "ok", "top_k": False}),
@@ -514,19 +519,20 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
                     ("recall", {"query": "ok", "top_k": 5.0}),
                     ("recall", {"query": "ok", "top_k": 0}),
                     ("recall", {"query": "ok", "top_k": 21}),
-                    ("recall", {"query": "   "}),
-                    ("recall", {"query": "z" * 1025}),
+                    ("recall", {"query": ""}),
                     ("recall", {"query": 123}),
                     ("recall", {"query": "ok", "extra": 1}),
-                    ("qa", {"question": "   "}),
+                    ("qa", {"question": ""}),
                     ("qa", {"question": 42}),
                     ("daemon_status", {"x": 1}),
                 ):
-                    with pytest.raises(ToolError) as exc_inv:
+                    with pytest.raises(ToolError):
                         await client.call_tool(tool_name, bad_args)
-                    assert str(exc_inv.value).startswith("[INVALID_INPUT]"), (
-                        f"Failed for {tool_name} {bad_args}: {exc_inv.value}"
-                    )
+
+                for tool_name, ws_args in (("recall", {"query": "   "}), ("qa", {"question": "   "})):
+                    with pytest.raises(ToolError) as exc_ws:
+                        await client.call_tool(tool_name, ws_args)
+                    assert str(exc_ws.value).startswith("[INVALID_INPUT]")
 
                 # Precedence: INVALID_INPUT wins over NOT_READY; valid input hits NOT_READY
                 rt.lifecycle = "starting"

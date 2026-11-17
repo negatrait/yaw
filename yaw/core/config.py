@@ -10,7 +10,7 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, Union, get_args, get_origin, get_type_hints
 
 from .types import YawRuntimeError
 
@@ -303,6 +303,23 @@ class YawConfig:
                 attr,
                 _resolve_path(ws, getattr(self, attr) or "", default_rel),
             )
+        for int_field in _INT_FIELDS:
+            raw_int = getattr(self, int_field)
+            if raw_int is None:
+                if int_field not in _OPTIONAL_INT_FIELDS and int_field not in (
+                    "optimize_max_bootstrapped_demos",
+                    "optimize_max_labeled_demos",
+                ):
+                    raise YawRuntimeError(
+                        "INVALID_INPUT",
+                        f"Configuration field {int_field!r} requires an integer, got None",
+                    )
+                continue
+            if isinstance(raw_int, bool) or not isinstance(raw_int, int):
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    f"Configuration field {int_field!r} requires an integer, got {raw_int!r}",
+                )
         if not all(
             math.isfinite(value) for value in (self.candidate_dense_threshold, self.candidate_lexical_threshold)
         ):
@@ -338,21 +355,34 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported retriever_mode: {self.retriever_mode!r}")
         if self.optimize_auto not in ("light", "medium", "heavy"):
             raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}")
-        object.__setattr__(
-            self,
-            "optimize_sleep_seconds",
-            max(0.0, float(self.optimize_sleep_seconds or 0.0)),
-        )
-        object.__setattr__(
-            self,
-            "optimize_max_bootstrapped_demos",
-            max(0, int(1 if self.optimize_max_bootstrapped_demos is None else self.optimize_max_bootstrapped_demos)),
-        )
-        object.__setattr__(
-            self,
-            "optimize_max_labeled_demos",
-            max(0, int(1 if self.optimize_max_labeled_demos is None else self.optimize_max_labeled_demos)),
-        )
+        raw_sleep = self.optimize_sleep_seconds
+        if raw_sleep is None:
+            sleep_seconds = 0.0
+        elif isinstance(raw_sleep, bool) or not isinstance(raw_sleep, (int, float)):
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                f"optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
+            )
+        else:
+            sleep_seconds = float(raw_sleep)
+            if not math.isfinite(sleep_seconds) or sleep_seconds < 0.0:
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    f"optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
+                )
+        object.__setattr__(self, "optimize_sleep_seconds", sleep_seconds)
+        for demo_field in ("optimize_max_bootstrapped_demos", "optimize_max_labeled_demos"):
+            raw_demo = getattr(self, demo_field)
+            if raw_demo is None:
+                demo_val = 1
+            elif isinstance(raw_demo, bool) or not isinstance(raw_demo, int) or raw_demo < 0:
+                raise YawRuntimeError(
+                    "INVALID_INPUT",
+                    f"{demo_field} must be a non-negative integer, got {raw_demo!r}",
+                )
+            else:
+                demo_val = raw_demo
+            object.__setattr__(self, demo_field, demo_val)
         raw_ds = self.optimize_datasets
         if isinstance(raw_ds, str):
             ds_tuple = tuple(p.strip() for p in raw_ds.split(",") if p.strip())
@@ -569,22 +599,112 @@ _FIELD_TO_SECTION: dict[str, str] = {
 }
 
 
-def _parse_toml_scalar(val_str: str) -> Any:
+def _yaw_config_field_kinds() -> tuple[
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+]:
+    hints = get_type_hints(YawConfig)
+    bool_fields: set[str] = set()
+    seq_fields: set[str] = set()
+    str_path_fields: set[str] = set()
+    opt_int_fields: set[str] = set()
+    int_fields: set[str] = set()
+    float_fields: set[str] = set()
+    for f in fields(YawConfig):
+        ann = hints.get(f.name, f.type)
+        origin = get_origin(ann)
+        args = get_args(ann)
+        if ann is bool:
+            bool_fields.add(f.name)
+        elif origin is tuple and args == (str, ...):
+            seq_fields.add(f.name)
+        elif ann in (str, Path) or origin is Literal or (origin is Union and any(a in (str, Path) for a in args)):
+            str_path_fields.add(f.name)
+        elif ann is int or (origin is Union and int in args and float not in args):
+            int_fields.add(f.name)
+            if origin is Union and type(None) in args:
+                opt_int_fields.add(f.name)
+        elif ann is float or (origin is Union and float in args):
+            float_fields.add(f.name)
+    return (
+        frozenset(bool_fields),
+        frozenset(seq_fields),
+        frozenset(str_path_fields),
+        frozenset(opt_int_fields),
+        frozenset(int_fields),
+        frozenset(float_fields),
+    )
+
+
+_BOOL_FIELDS, _SEQUENCE_FIELDS, _STRING_PATH_FIELDS, _OPTIONAL_INT_FIELDS, _INT_FIELDS, _FLOAT_FIELDS = (
+    _yaw_config_field_kinds()
+)
+
+
+def _strict_toml_value(val_str: str, cleaned: str) -> Any:
+    try:
+        parsed = tomllib.loads(f"v = {cleaned}")
+    except tomllib.TOMLDecodeError as exc:
+        raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value: {val_str!r}") from exc
+    if len(parsed) != 1:
+        raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value: {val_str!r}")
+    return parsed["v"]
+
+
+def _parse_config_scalar(val_str: str, field_name: str | None = None) -> Any:
     cleaned = val_str.strip()
-    if cleaned.lower() == "true":
-        return True
-    if cleaned.lower() == "false":
-        return False
-    if cleaned.startswith("[") and cleaned.endswith("]"):
-        with contextlib.suppress(json.JSONDecodeError):
-            return json.loads(cleaned)
-    with contextlib.suppress(ValueError):
-        return int(cleaned)
-    with contextlib.suppress(ValueError):
-        return float(cleaned)
-    if (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'")):
-        return cleaned[1:-1]
-    return cleaned
+    if field_name in _BOOL_FIELDS:
+        low = cleaned.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        raise YawRuntimeError("INVALID_INPUT", f"Invalid boolean value for {field_name}: {val_str!r}")
+
+    if field_name in _SEQUENCE_FIELDS:
+        if not cleaned:
+            return ""
+        if cleaned[0] in ("[", '"', "'"):
+            return _strict_toml_value(val_str, cleaned)
+        return cleaned
+
+    if field_name in _STRING_PATH_FIELDS:
+        if len(cleaned) >= 2 and (
+            (cleaned.startswith('"') and cleaned.endswith('"')) or (cleaned.startswith("'") and cleaned.endswith("'"))
+        ):
+            return _strict_toml_value(val_str, cleaned)
+        return cleaned
+
+    if field_name in _INT_FIELDS or field_name in _FLOAT_FIELDS or field_name is None:
+        if field_name in _OPTIONAL_INT_FIELDS and cleaned.lower() in ("none", "null"):
+            return None
+        try:
+            parsed = tomllib.loads(f"v = {cleaned}")
+        except tomllib.TOMLDecodeError as exc:
+            if field_name is None:
+                raise ValueError(f"Invalid numeric scalar value: {val_str!r}") from exc
+            raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value for {field_name}: {val_str!r}") from exc
+        if len(parsed) != 1:
+            if field_name is None:
+                raise ValueError(f"Invalid numeric scalar value: {val_str!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value for {field_name}: {val_str!r}")
+        val = parsed["v"]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            if field_name is None:
+                raise ValueError(f"Expected numeric value, got {type(val).__name__}")
+            raise YawRuntimeError("INVALID_INPUT", f"Expected numeric value for {field_name}, got {val!r}")
+        if field_name in _INT_FIELDS and not isinstance(val, int):
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                f"Configuration field {field_name!r} requires an integer, got {val!r}",
+            )
+        return val
+
+    raise YawRuntimeError("INVALID_INPUT", f"Unsupported scalar configuration field: {field_name!r}")
 
 
 def _format_toml_scalar(val: Any) -> str:
@@ -781,7 +901,7 @@ def set_config_value(
         prop_name = prop_name.strip()
 
     if section_name == "retrieval" and prop_name in RetrievalParams.__dataclass_fields__:
-        raw_parsed = _parse_toml_scalar(raw_value)
+        raw_parsed = _parse_config_scalar(raw_value, None)
         validated = RetrievalParams.from_overrides({prop_name: raw_parsed})
         parsed_val = getattr(validated, prop_name)
         resolved_section = "retrieval"
@@ -789,7 +909,7 @@ def set_config_value(
     elif section_name == "manifold":
         if not prop_name:
             raise ValueError(f"Invalid manifold configuration key: {key!r}")
-        raw_parsed = _parse_toml_scalar(raw_value)
+        raw_parsed = _parse_config_scalar(raw_value, None)
         validated_key, parsed_val = _normalize_manifold_overrides([(prop_name, raw_parsed)])[0]
         resolved_section = "manifold"
         target_prop = validated_key
@@ -802,10 +922,10 @@ def set_config_value(
             raise YawRuntimeError("INVALID_INPUT", f"Cannot determine section for key: {key!r}")
         if field_name not in {field.name for field in fields(YawConfig)}:
             raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
-        parsed_val = _parse_toml_scalar(raw_value)
+        parsed_val = _parse_config_scalar(raw_value, field_name)
         target_prop = prop_name.removeprefix("optimize_") if prop_name.startswith("optimize_") else prop_name
 
-    formatted_val = _format_toml_scalar(parsed_val)
+    formatted_val = None if parsed_val is None else _format_toml_scalar(parsed_val)
 
     lines = toml_path.read_text(encoding="utf-8").splitlines()
     new_lines: list[str] = []
@@ -815,7 +935,7 @@ def set_config_value(
     for line in lines:
         sec_hdr = _extract_toml_section_name(line)
         if sec_hdr is not None:
-            if current_sec == resolved_section and not key_written:
+            if formatted_val is not None and current_sec == resolved_section and not key_written:
                 new_lines.append(f"{target_prop} = {formatted_val}")
                 key_written = True
             current_sec = sec_hdr
@@ -825,13 +945,14 @@ def set_config_value(
         if current_sec == resolved_section:
             parts = line.strip().split("=", 1)
             if len(parts) == 2 and parts[0].strip() in (target_prop, prop_name):
-                new_lines.append(f"{target_prop} = {formatted_val}")
-                key_written = True
+                if formatted_val is not None:
+                    new_lines.append(f"{target_prop} = {formatted_val}")
+                    key_written = True
                 continue
 
         new_lines.append(line)
 
-    if not key_written:
+    if formatted_val is not None and not key_written:
         if current_sec == resolved_section:
             new_lines.append(f"{target_prop} = {formatted_val}")
         else:

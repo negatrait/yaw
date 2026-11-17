@@ -33,6 +33,9 @@ from yaw.runtime import (
     get_vector_search,
     recall,
     redact_secrets,
+    require_path,
+    resolve_program_path,
+    serialize_passage,
     signal_stop_event,
     start_runtime,
     wait_ready,
@@ -190,7 +193,7 @@ def test_empty_corpus_precedence_filelock_and_lifecycle(tmp_path: Path) -> None:
 
         # Validation precedence: INVALID_INPUT wins BEFORE NOT_READY and SHUTTING_DOWN
         rt.lifecycle = "starting"
-        bad_queries: list[Any] = ["", "   ", "x" * 1025, 123]
+        bad_queries: list[Any] = ["", "   ", 123]
         for bad_q in bad_queries:
             with pytest.raises(YawRuntimeError) as exc_inp:
                 recall(rt, bad_q)
@@ -266,6 +269,11 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
         paths = [h.pointer.rel_posix_path for h in hits]
         assert len(hits) == 2
         assert "multi.json" in paths and "booster_backup.md" in paths
+
+        # Queries > 1024 bytes succeed cleanly without artificial byte truncation
+        long_query = "orbital booster " * 80
+        assert len(long_query.encode("utf-8")) > 1024
+        assert len(recall(rt, long_query, top_k=2)) == 2
 
         # Write a new file while live CocoIndex watcher runs and verify PRAGMA data_version auto-swap
         (cfg.corpus_root / "live_new.md").write_text(
@@ -373,6 +381,19 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
 
         # Verify default queue_maxsize == 32 and program loading precedence
         assert YawConfig(workspace_root=tmp_path).queue_maxsize == 32
+        with pytest.raises(YawRuntimeError) as exc_req:
+            require_path(None, "db_path")
+        assert exc_req.value.code == "INVALID_INPUT"
+        assert require_path(cfg.db_path, "db_path") == cfg.db_path.resolve()
+        assert resolve_program_path(cfg) is None
+
+        recalled_for_ser = recall(rt, "Which valve controls booster separation?", top_k=1)
+        assert len(recalled_for_ser) == 1
+        ser = serialize_passage(1, recalled_for_ser[0])
+        assert ser["rank"] == 1
+        assert ser["chunk_id"] == int(recalled_for_ser[0].pointer.chunk_id)
+        assert ser["content_hash"].startswith("sha256:")
+        assert ser["source"]["start_line"] == int(recalled_for_ser[0].pointer.start_line)
 
         def _dummy_tool(query: str) -> str:
             return query
@@ -382,6 +403,7 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         opt_agent.react.signature = opt_agent.react.signature.with_instructions("CUSTOM_OPT_INSTR_MARKER")
         opt_prog_path = cfg.workspace_root / ".yaw" / "optimize_program.json"
         opt_agent.save(str(opt_prog_path), save_program=False)
+        assert resolve_program_path(cfg) == opt_prog_path
 
         qa_res_opt = ask(rt, "What instrument?")
         assert qa_res_opt.answer == "XylophoneZither"
@@ -392,6 +414,7 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         assert comp_agent.react.signature is not None
         comp_agent.react.signature = comp_agent.react.signature.with_instructions("CUSTOM_COMPILED_MARKER")
         comp_agent.save(str(cfg.compiled_program_path), save_program=False)
+        assert resolve_program_path(cfg) == cfg.compiled_program_path
 
         qa_res_comp = ask(rt, "What instrument?")
         assert qa_res_comp.answer == "XylophoneZither"
@@ -423,3 +446,40 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         if rt is not None:
             close_runtime(rt)
         srv.shutdown()
+
+
+def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_path: Path) -> None:
+    secret_tok = "tok-initial-live-secret999"
+    cfg = _make_cfg(tmp_path, api_key=secret_tok)
+    assert cfg.corpus_root is not None and cfg.status_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "boom.md").write_text("# Boom\nTrigger initial live embed failure.\n", encoding="utf-8")
+
+    def failing_embed(texts: list[str]) -> NDArray[np.float32]:
+        if any("Trigger initial live" in t for t in texts):
+            raise RuntimeError(f"embed backend failed with key={secret_tok}")
+        return _topic_embed(texts, dim=16)
+
+    rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=failing_embed, lm=create_lm(cfg))
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if rt.lifecycle == "error":
+                break
+            time.sleep(0.05)
+        assert rt.lifecycle == "error"
+        st = get_status(rt)
+        assert st.lifecycle == "error"
+        assert st.sync_state == "error"
+        assert st.provider_ready is False
+        assert st.last_error is not None
+        assert "RuntimeError" in st.last_error
+        assert secret_tok not in st.last_error
+        disk_text = cfg.status_path.read_text(encoding="utf-8")
+        assert '"lifecycle": "error"' in disk_text
+        assert secret_tok not in disk_text
+        with pytest.raises(YawRuntimeError) as exc_nr:
+            recall(rt, "anything")
+        assert exc_nr.value.code == "NOT_READY"
+    finally:
+        close_runtime(rt)

@@ -320,6 +320,21 @@ def test_regression_fixes() -> None:
     assert nq_ga == [["Here"]]
 
 
+def test_extract_gold_answers_json_and_malformed_fail_fast() -> None:
+    plain_sample = {
+        "question": "Who?",
+        "obj": "Alice",
+        "o_aliases": "Plain Alias String",
+        "possible_answers": '["Alias Two", "Alias Three"]',
+    }
+    answers = extract_gold_answers(plain_sample)
+    assert answers == ["Alice", "Alias Two", "Alias Three", "Plain Alias String"]
+
+    for field, bad_val in (("possible_answers", "[broken"), ("o_aliases", "{broken")):
+        with pytest.raises(ValueError):
+            extract_gold_answers({"question": "Who?", "obj": "Alice", field: bad_val})
+
+
 def test_imports_and_no_oop_metric_wrappers() -> None:
     src_path = Path(__file__).resolve().parent.parent / "yaw" / "datasets.py"
     text = src_path.read_text(encoding="utf-8")

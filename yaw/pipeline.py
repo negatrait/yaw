@@ -11,10 +11,11 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import AsyncGenerator, Callable, Collection, Sequence
+import weakref
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 import cocoindex as coco
 import dspy
@@ -24,6 +25,7 @@ from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.resources import schema as coco_schema
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from numpy.typing import NDArray
 
@@ -39,9 +41,9 @@ from yaw.core import (
 )
 from yaw.retrieval import extract_text_features
 
+CORPUS_ROOT = coco.ContextKey[Path]("yaw/pipeline/corpus_root")
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/pipeline/sqlite_db")
 EMBED_FN = coco.ContextKey[Callable[[list[str]], NDArray[np.float32]]]("yaw/pipeline/embed_fn")
-INDEXING_ERROR_SINK = coco.ContextKey[Callable[[BaseException], None]]("yaw/pipeline/indexing_error_sink")
 
 _CHUNK_AUXILIARY_COLS: list[str] = [
     "rel_path",
@@ -60,7 +62,72 @@ _SPLITTER = RecursiveSplitter()
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
 _SETEXT_RE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EMBED_BATCH_SIZE = 64
+
+
+def _validate_identifier(name: str) -> str:
+    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid SQLite identifier: {name!r}")
+    return name
+
+
+class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
+    """CocoIndex-native batching and VectorSchemaProvider adapter over a batch embed callable."""
+
+    def __init__(
+        self,
+        embed_fn: Callable[[list[str]], NDArray[np.float32]],
+        *,
+        vector_dim: int | None = None,
+        memo_key: object = None,
+    ) -> None:
+        self._embed_fn = embed_fn
+        self._dim = vector_dim
+        self._memo_key = memo_key
+        self._lock = threading.Lock()
+
+    def _resolve_dim(self) -> int:
+        if self._dim is not None:
+            return self._dim
+        with self._lock:
+            if self._dim is None:
+                probe = np.asarray(self._embed_fn(["dimension probe"]), dtype=np.float32)
+                if probe.ndim != 2 or probe.shape[1] < 1:
+                    raise ValueError(f"Invalid embedding dimension from probe shape {probe.shape}")
+                self._dim = int(probe.shape[1])
+            return self._dim
+
+    async def __coco_vector_schema__(self) -> coco_schema.VectorSchema:
+        dim = await asyncio.to_thread(self._resolve_dim)
+        return coco_schema.VectorSchema(dtype=np.dtype(np.float32), size=dim)
+
+    def __coco_memo_key__(self) -> object:
+        return self._memo_key
+
+    @coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE)
+    async def _embed_batch(self, texts: list[str]) -> list[NDArray[np.float32]]:
+        if not texts:
+            return []
+
+        def _run() -> list[NDArray[np.float32]]:
+            arr = np.asarray(self._embed_fn(texts), dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
+                raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
+            if self._dim is None:
+                with self._lock:
+                    if self._dim is None:
+                        self._dim = int(arr.shape[1])
+            return [arr[i].astype("<f4", copy=False) for i in range(len(texts))]
+
+        return await asyncio.to_thread(_run)
+
+    async def embed(self, text: str) -> NDArray[np.float32]:
+        return await type(self)._embed_batch(self, text)
+
+
+EMBEDDER = coco.ContextKey[_PipelineEmbedder]("yaw/pipeline/embedder", detect_change=True)
+_CONFIG_EMBED_FNS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,24 +192,20 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
 
     def __init__(self, conn_mgr: sqlite.ManagedConnection, table_name: str) -> None:
         self._conn_mgr = conn_mgr
-        self._table_name = table_name
+        self._table_name = _validate_identifier(table_name)
         self._sink = coco.TargetActionSink[_FtsRowAction].from_fn(self._apply)
 
-    def _apply(self, context_provider: coco.ContextProvider, actions: Sequence[_FtsRowAction], /) -> None:
+    def _apply(self, _context_provider: coco.ContextProvider, actions: Sequence[_FtsRowAction], /) -> None:
         if not actions:
             return
-        try:
-            with self._conn_mgr.transaction() as conn:
-                for act in actions:
-                    conn.execute(f'DELETE FROM "{self._table_name}" WHERE rowid = ?', (act.chunk_id,))
-                    if act.title is not None and act.body is not None:
-                        conn.execute(
-                            f'INSERT INTO "{self._table_name}"(rowid, title, body) VALUES (?, ?, ?)',
-                            (act.chunk_id, act.title, act.body),
-                        )
-        except BaseException as exc:
-            context_provider.get(INDEXING_ERROR_SINK)(exc)
-            raise
+        with self._conn_mgr.transaction() as conn:
+            for act in actions:
+                conn.execute(f'DELETE FROM "{self._table_name}" WHERE rowid = ?', (act.chunk_id,))
+                if act.title is not None and act.body is not None:
+                    conn.execute(
+                        f'INSERT INTO "{self._table_name}"(rowid, title, body) VALUES (?, ?, ?)',
+                        (act.chunk_id, act.title, act.body),
+                    )
 
     def reconcile(
         self,
@@ -174,24 +237,26 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
 
 
 def _fts_row_handler_factory(context_provider: coco.ContextProvider, action: _FtsTableAction) -> _FtsRowHandler:
-    return _FtsRowHandler(context_provider.get(SQLITE_DB), action.table_name)
+    conn_mgr = context_provider.get(action.key.db_key, sqlite.ManagedConnection)
+    return _FtsRowHandler(conn_mgr, _validate_identifier(action.table_name))
 
 
 def _apply_fts_tables(context_provider: coco.ContextProvider, actions: Sequence[_FtsTableAction], /) -> None:
-    try:
-        conn_mgr = context_provider.get(SQLITE_DB)
+    by_db: dict[str, list[_FtsTableAction]] = {}
+    for act in actions:
+        by_db.setdefault(act.key.db_key, []).append(act)
+    for db_key, db_actions in by_db.items():
+        conn_mgr = context_provider.get(db_key, sqlite.ManagedConnection)
         with conn_mgr.transaction() as conn:
-            for act in actions:
+            for act in db_actions:
+                table = _validate_identifier(act.table_name)
                 if act.action in ("delete", "replace"):
-                    conn.execute(f'DROP TABLE IF EXISTS "{act.table_name}"')
+                    conn.execute(f'DROP TABLE IF EXISTS "{table}"')
                 if act.action in ("insert", "upsert", "replace"):
                     conn.execute(
-                        f'CREATE VIRTUAL TABLE IF NOT EXISTS "{act.table_name}" '
+                        f'CREATE VIRTUAL TABLE IF NOT EXISTS "{table}" '
                         "USING fts5(title, body, content='', contentless_delete=1)"
                     )
-    except BaseException as exc:
-        context_provider.get(INDEXING_ERROR_SINK)(exc)
-        raise
 
 
 _FTS_TABLE_SINK = coco.TargetActionSink[_FtsTableAction].from_fn(
@@ -211,7 +276,7 @@ class _FtsTableHandler(coco.TargetHandler[str, str, _FtsRowHandler]):
     ) -> coco.TargetReconcileOutput[_FtsTableAction, str, _FtsRowHandler] | None:
         if not isinstance(key, tuple) or len(key) != 2:
             raise TypeError(f"Expected (db_key, table_name) key, got {key!r}")
-        t_key = _FtsTableKey(str(key[0]), str(key[1]))
+        t_key = _FtsTableKey(str(key[0]), _validate_identifier(str(key[1])))
         action = statediff.diff(statediff.TrackingRecordTransition(desired, prev_possible_records, prev_may_be_missing))
         invalid: Literal["destructive"] | None = "destructive" if action in ("delete", "replace") else None
         return coco.TargetReconcileOutput[_FtsTableAction, str, _FtsRowHandler](
@@ -263,6 +328,7 @@ def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float
             parts.append((arr / norms).astype(np.float32, copy=False))
         return np.vstack(parts) if len(parts) > 1 else parts[0]
 
+    _CONFIG_EMBED_FNS.add(_embed)
     return _embed
 
 
@@ -405,109 +471,80 @@ def chunk_file_content(
     return tuple({c.chunk_id: c for c in out}.values())
 
 
-@coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE)
-async def _embed_formatted_texts(
-    items: list[tuple[Callable[[list[str]], NDArray[np.float32]], str]],
-) -> list[bytes]:
-    by_fn: dict[int, tuple[Callable[[list[str]], NDArray[np.float32]], list[tuple[int, str]]]] = {}
-    for idx, (fn, text) in enumerate(items):
-        bucket = by_fn.get(id(fn))
-        if bucket is None:
-            by_fn[id(fn)] = (fn, [(idx, text)])
-        else:
-            bucket[1].append((idx, text))
-    out: dict[int, bytes] = {}
-
-    def _run() -> None:
-        for fn, pairs in by_fn.values():
-            arr = fn([text for _, text in pairs])
-            if arr.ndim != 2 or arr.shape[0] != len(pairs):
-                raise ValueError(f"Expected ({len(pairs)}, dim) embedding array, got {arr.shape}")
-            for row_i, (orig_i, _) in enumerate(pairs):
-                out[orig_i] = arr[row_i].astype("<f4", copy=False).tobytes()
-
-    await asyncio.to_thread(_run)
-    return [out[i] for i in range(len(items))]
-
-
 @coco.fn(memo=True, version=1)
 async def _compute_chunk_features(
     chunk_id: int,
     title: str,
     body: str,
     task_mode: str,
-) -> tuple[bytes, str, str]:
+    embedder: _PipelineEmbedder,
+) -> tuple[NDArray[np.float32], str, str]:
     _ = chunk_id
     formatted = format_doc_for_embedding(body, title=title, task_mode=task_mode)
-    embed_fn = coco.use_context(EMBED_FN)
-    vec_bytes = await _embed_formatted_texts((embed_fn, formatted))
+    vec = await embedder.embed(formatted)
 
     def _nlp_features() -> tuple[str, str]:
         terms, ents = extract_text_features(title, body)
         return json.dumps(terms, ensure_ascii=False), json.dumps(list(ents), ensure_ascii=False)
 
     tokens_json, entities_json = await asyncio.to_thread(_nlp_features)
-    return vec_bytes, tokens_json, entities_json
+    return vec, tokens_json, entities_json
+
+
+async def _compute_piece_features(
+    piece: SourceChunk,
+    embedder: _PipelineEmbedder,
+    task_mode: str,
+) -> tuple[NDArray[np.float32], str, str]:
+    return await _compute_chunk_features(piece.chunk_id, piece.title, piece.body, task_mode, embedder)
 
 
 @coco.fn(memo=True, version=1)
 async def _process_file(
     file: FileLike[Any],
-    corpus_root: Path,
     chunks_target: sqlite.TableTarget[ChunkVecRow],
     fts_target: coco.TargetStateProvider[tuple[str, str] | coco.NonExistenceType, None],
+    embedder: _PipelineEmbedder,
     chunk_size: int,
     chunk_overlap: int,
     min_chunk_size: int,
     task_mode: str,
 ) -> int:
-    try:
-        rel_path = Path(file.file_path.path).resolve().relative_to(corpus_root).as_posix()
-        raw_text = await file.read_text()
-        pieces = chunk_file_content(
-            rel_path,
-            raw_text,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            min_chunk_size=min_chunk_size,
-        )
-        count = 0
-        for start in range(0, len(pieces), _EMBED_BATCH_SIZE):
-            batch = pieces[start : start + _EMBED_BATCH_SIZE]
-            feats = await asyncio.gather(
-                *(_compute_chunk_features(c.chunk_id, c.title, c.body, task_mode) for c in batch)
+    rel_path = file.file_path.as_posix()
+    raw_text = await file.read_text()
+    pieces = chunk_file_content(
+        rel_path,
+        raw_text,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        min_chunk_size=min_chunk_size,
+    )
+    feats = await coco.map(_compute_piece_features, pieces, embedder, task_mode)
+    for piece, (vec, tokens_json, entities_json) in zip(pieces, feats, strict=True):
+        vec_arr = np.asarray(vec, dtype=np.float32)
+        chunks_target.declare_row(
+            row=ChunkVecRow(
+                chunk_id=piece.chunk_id,
+                embedding=vec_arr,
+                rel_path=piece.rel_path,
+                source_hash=piece.source_hash,
+                start_line=piece.start_line,
+                end_line=piece.end_line,
+                char_start=piece.char_start,
+                char_end=piece.char_end,
+                ast_island_start=piece.ast_island_start,
+                ast_island_end=piece.ast_island_end,
+                title=piece.title,
+                tokens_json=tokens_json,
+                entities_json=entities_json,
             )
-            for piece, (vec_bytes, tokens_json, entities_json) in zip(batch, feats, strict=True):
-                vec = np.frombuffer(vec_bytes, dtype="<f4").copy()
-                chunks_target.declare_row(
-                    row=ChunkVecRow(
-                        chunk_id=piece.chunk_id,
-                        embedding=vec,
-                        rel_path=piece.rel_path,
-                        source_hash=piece.source_hash,
-                        start_line=piece.start_line,
-                        end_line=piece.end_line,
-                        char_start=piece.char_start,
-                        char_end=piece.char_end,
-                        ast_island_start=piece.ast_island_start,
-                        ast_island_end=piece.ast_island_end,
-                        title=piece.title,
-                        tokens_json=tokens_json,
-                        entities_json=entities_json,
-                    )
-                )
-                coco.declare_target_state(fts_target.target_state((piece.chunk_id,), (piece.title, piece.body)))
-                count += 1
-        return count
-    except BaseException as exc:
-        coco.use_context(INDEXING_ERROR_SINK)(exc)
-        raise
+        )
+        coco.declare_target_state(fts_target.target_state((piece.chunk_id,), (piece.title, piece.body)))
+    return len(pieces)
 
 
 @coco.fn
 async def _indexing_main(
-    corpus_root: Path,
-    vector_dim: int,
     included_patterns: tuple[str, ...],
     excluded_patterns: tuple[str, ...],
     chunk_size: int,
@@ -516,46 +553,51 @@ async def _indexing_main(
     task_mode: str,
     live: bool,
 ) -> None:
-    try:
-        schema = await sqlite.TableSchema[ChunkVecRow].from_class(
-            ChunkVecRow,
-            primary_key=["chunk_id"],
-            column_overrides={
-                "embedding": sqlite.SqliteType(
-                    f"float[{vector_dim}] distance_metric=cosine",
-                    sqlite_vec.serialize_float32,
-                )
-            },
-        )
-        chunks_target = await sqlite.mount_table_target(
-            SQLITE_DB,
-            "chunks",
-            schema,
-            virtual_table_def=sqlite.Vec0TableDef(auxiliary_columns=list(_CHUNK_AUXILIARY_COLS)),
-        )
-        fts_target = await coco.mount_target(
-            _FTS_TABLES.target_state(_FtsTableKey(SQLITE_DB.key, "chunk_fts"), "chunk_fts")
-        )
-
-        async def _mount_file(file: localfs.File, /) -> int:
-            return await _process_file(
-                file, corpus_root, chunks_target, fts_target, chunk_size, chunk_overlap, min_chunk_size, task_mode
+    embedder = coco.use_context(EMBEDDER)
+    vector_schema = await embedder.__coco_vector_schema__()
+    vector_dim = vector_schema.size
+    schema = await sqlite.TableSchema[ChunkVecRow].from_class(
+        ChunkVecRow,
+        primary_key=["chunk_id"],
+        column_overrides={
+            "embedding": sqlite.SqliteType(
+                f"float[{vector_dim}] distance_metric=cosine",
+                sqlite_vec.serialize_float32,
             )
-
-        matcher = PatternFilePathMatcher(
-            included_patterns=list(included_patterns),
-            excluded_patterns=list(excluded_patterns),
-        )
-        files = localfs.walk_dir(corpus_root, recursive=True, path_matcher=matcher, live=live)
-        await coco.mount_each(_mount_file, files.items())
-    except BaseException as exc:
-        coco.use_context(INDEXING_ERROR_SINK)(exc)
-        raise
+        },
+    )
+    chunks_target = await sqlite.mount_table_target(
+        SQLITE_DB,
+        "chunks",
+        schema,
+        virtual_table_def=sqlite.Vec0TableDef(auxiliary_columns=list(_CHUNK_AUXILIARY_COLS)),
+    )
+    fts_target = await coco.mount_target(
+        _FTS_TABLES.target_state(_FtsTableKey(SQLITE_DB.key, "chunk_fts"), "chunk_fts")
+    )
+    matcher = PatternFilePathMatcher(
+        included_patterns=list(included_patterns),
+        excluded_patterns=list(excluded_patterns),
+    )
+    files = localfs.walk_dir(CORPUS_ROOT, recursive=True, path_matcher=matcher, live=live)
+    mount_handle = await coco.mount_each(
+        _process_file,
+        files.items(),
+        chunks_target,
+        fts_target,
+        embedder,
+        chunk_size,
+        chunk_overlap,
+        min_chunk_size,
+        task_mode,
+    )
+    if not live:
+        await mount_handle.ready()
 
 
 @dataclass(slots=True)
 class PipelineSession:
-    """Handle bundle owning a CocoIndex Environment, SQLite ManagedConnection, and live watcher."""
+    """Handle bundle owning a CocoIndex Environment, worker thread/loop, and SQLite connection."""
 
     db_path: Path
     state_dir: Path
@@ -565,50 +607,47 @@ class PipelineSession:
     conn_mgr: sqlite.ManagedConnection
     live: bool
     ready_event: threading.Event
-    loop: asyncio.AbstractEventLoop | None = None
-    thread: threading.Thread | None = None
-    watch_task: asyncio.Task[None] | None = None
+    thread: threading.Thread
+    loop: asyncio.AbstractEventLoop
+    stop_async: asyncio.Event
+    watch_handle: coco.UpdateHandle[Any] | None = None
     error: BaseException | None = None
 
 
-def _run_live_loop(session: PipelineSession) -> None:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    session.loop = loop
-
-    async def _watch() -> None:
-        handle = session.app.update(live=True)
-        snaps = handle.watch()
-        try:
-            async for snap in snaps:
-                if session.error is not None:
-                    session.ready_event.set()
-                    break
-                if snap.stats.total.num_errors:
-                    if session.error is None:
-                        session.error = YawRuntimeError(
-                            "CONSISTENCY_ERROR",
-                            f"CocoIndex live update reported {snap.stats.total.num_errors} component error(s).",
-                        )
-                    session.ready_event.set()
-                    break
-                if snap.status.name == "READY":
-                    session.ready_event.set()
-        finally:
-            if isinstance(snaps, AsyncGenerator):
-                await snaps.aclose()
-
-    task = loop.create_task(_watch())
-    session.watch_task = task
+async def _watch_pipeline(session: PipelineSession, stop_async: asyncio.Event) -> None:
+    handle = session.app.update(live=True)
+    session.watch_handle = handle
+    snaps: AsyncIterator[Any] | None = None
+    had_errors = 0
     try:
-        loop.run_until_complete(task)
+        snaps = handle.watch()
+        async for snap in snaps:
+            if session.error is not None:
+                session.ready_event.set()
+                stop_async.set()
+                break
+            if snap.stats.total.num_errors:
+                had_errors = snap.stats.total.num_errors
+                continue
+            if snap.status.name == "READY":
+                session.ready_event.set()
+        if had_errors and session.error is None:
+            session.error = YawRuntimeError(
+                "CONSISTENCY_ERROR",
+                f"CocoIndex live update reported {had_errors} component error(s).",
+            )
+            session.ready_event.set()
+            stop_async.set()
     except asyncio.CancelledError:
-        pass
+        return
     except BaseException as exc:
-        session.error = exc
+        if session.error is None:
+            session.error = exc
         session.ready_event.set()
+        stop_async.set()
     finally:
-        loop.close()
+        if isinstance(snaps, AsyncGenerator):
+            await snaps.aclose()
 
 
 def start_pipeline(
@@ -630,81 +669,127 @@ def start_pipeline(
     active_embed = embed_fn or make_dspy_embed_fn(cfg)
     conn_mgr = open_managed_db(db_path)
     try:
-        dim = vector_dim or _detect_existing_vec_dim(conn_mgr)
-        if dim is None:
-            probe = np.asarray(active_embed(["dimension probe"]), dtype=np.float32)
-            if probe.ndim != 2 or probe.shape[1] < 1:
-                raise ValueError(f"Invalid embedding dimension from probe shape {probe.shape}")
-            dim = int(probe.shape[1])
-
-        os.environ.setdefault("COCOINDEX_BANNER", "false")
-        ready_event = threading.Event()
-        err_lock = threading.Lock()
-        session_holder: list[PipelineSession] = []
-
-        def _record_error(exc: BaseException) -> None:
-            with err_lock:
-                if session_holder and session_holder[0].error is None:
-                    session_holder[0].error = exc
-                ready_event.set()
-
-        ctx = coco.ContextProvider()
-        ctx.provide(SQLITE_DB, conn_mgr)
-        ctx.provide(EMBED_FN, active_embed)
-        ctx.provide(INDEXING_ERROR_SINK, _record_error)
-        env = coco.Environment(settings=coco.Settings(db_path=state_dir), context_provider=ctx)
-        resolved_app = app_name or f"yaw_{hashlib.sha256(db_path.as_posix().encode('utf-8')).hexdigest()[:12]}"
-        app = coco.App(
-            coco.AppConfig(name=resolved_app, environment=env, max_inflight_components=4),
-            _indexing_main,
-            corpus_root,
-            dim,
-            tuple(cfg.included_patterns),
-            tuple(cfg.excluded_patterns),
-            cfg.chunk_size,
-            cfg.chunk_overlap,
-            cfg.min_chunk_size,
-            cfg.embedding_task_mode,
-            live,
-        )
+        known_dim = vector_dim or _detect_existing_vec_dim(conn_mgr)
     except Exception:
         conn_mgr.close()
         raise
 
-    session = PipelineSession(
-        db_path=db_path,
-        state_dir=state_dir,
-        corpus_root=corpus_root,
-        env=env,
-        app=app,
-        conn_mgr=conn_mgr,
-        live=live,
-        ready_event=ready_event,
+    os.environ.setdefault("COCOINDEX_BANNER", "false")
+    ready_event = threading.Event()
+    init_event = threading.Event()
+    err_lock = threading.Lock()
+    holder: dict[str, Any] = {}
+
+    def _on_component_error(exc: BaseException, _ctx: coco.ExceptionContext) -> None:
+        with err_lock:
+            session = holder.get("session")
+            if session is not None and session.error is None:
+                session.error = exc
+        ready_event.set()
+        raise exc
+
+    base_memo: tuple[object, ...] = (cfg.provider, cfg.embedding_model, cfg.base_url, cfg.embedding_task_mode)
+    if embed_fn is None or embed_fn in _CONFIG_EMBED_FNS:
+        memo_key: object = (*base_memo, "dspy")
+    else:
+        custom_id = (
+            getattr(embed_fn, "__module__", ""),
+            getattr(embed_fn, "__qualname__", type(embed_fn).__qualname__),
+        )
+        memo_key = (*base_memo, "custom", custom_id)
+    embedder = _PipelineEmbedder(active_embed, vector_dim=known_dim, memo_key=memo_key)
+    resolved_app = app_name or f"yaw_{hashlib.sha256(db_path.as_posix().encode('utf-8')).hexdigest()[:12]}"
+
+    async def _session_worker() -> None:
+        loop = asyncio.get_running_loop()
+        stop_async = asyncio.Event()
+        env: coco.Environment | None = None
+        try:
+            ctx = coco.ContextProvider()
+            ctx.provide(CORPUS_ROOT, corpus_root)
+            ctx.provide(SQLITE_DB, conn_mgr)
+            ctx.provide(EMBED_FN, active_embed)
+            ctx.provide(EMBEDDER, embedder)
+            env = coco.Environment(
+                settings=coco.Settings(db_path=state_dir),
+                context_provider=ctx,
+                event_loop=loop,
+                exception_handler=_on_component_error,
+            )
+            app = coco.App(
+                coco.AppConfig(name=resolved_app, environment=env, max_inflight_components=_EMBED_BATCH_SIZE),
+                _indexing_main,
+                tuple(cfg.included_patterns),
+                tuple(cfg.excluded_patterns),
+                cfg.chunk_size,
+                cfg.chunk_overlap,
+                cfg.min_chunk_size,
+                cfg.embedding_task_mode,
+                live,
+            )
+            session = PipelineSession(
+                db_path=db_path,
+                state_dir=state_dir,
+                corpus_root=corpus_root,
+                env=env,
+                app=app,
+                conn_mgr=conn_mgr,
+                live=live,
+                ready_event=ready_event,
+                thread=threading.current_thread(),
+                loop=loop,
+                stop_async=stop_async,
+            )
+            holder["session"] = session
+            init_event.set()
+        except BaseException as exc:
+            holder["init_error"] = exc
+            if env is not None:
+                env.close()
+            init_event.set()
+            return
+
+        if not live:
+            await stop_async.wait()
+            return
+
+        watch_task = asyncio.create_task(_watch_pipeline(session, stop_async))
+        stop_task = asyncio.create_task(stop_async.wait())
+        _, pending = await asyncio.wait({watch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        results = await asyncio.gather(watch_task, stop_task, return_exceptions=True)
+        for res in results:
+            if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
+                if session.error is None:
+                    session.error = res
+                session.ready_event.set()
+
+    thread = threading.Thread(
+        target=lambda: asyncio.run(_session_worker()),
+        daemon=True,
+        name="yaw-cocoindex-session",
     )
-    session_holder.append(session)
-    if live:
-        thread = threading.Thread(target=_run_live_loop, args=(session,), daemon=True, name="yaw-coco-live")
-        session.thread = thread
+    try:
         thread.start()
-    return session
+    except Exception:
+        conn_mgr.close()
+        raise
+    init_event.wait()
+    if (init_err := holder.get("init_error")) is not None:
+        thread.join(timeout=5.0)
+        conn_mgr.close()
+        raise init_err
+    return cast(PipelineSession, holder["session"])
 
 
 def update_pipeline_once(session: PipelineSession) -> None:
     """Execute one catch-up CocoIndex update synchronously (for non-live batch sessions)."""
     if session.error is not None:
         raise session.error
-
-    async def _run_once() -> int:
-        handle = session.app.update(live=False)
-        await handle.result()
-        stats = handle.stats()
-        return stats.total.num_errors if stats is not None else 0
-
-    num_errors = asyncio.run(_run_once())
+    session.app.update_blocking(live=False)
     if session.error is not None:
         raise session.error
-    if num_errors:
-        raise YawRuntimeError("CONSISTENCY_ERROR", f"CocoIndex update reported {num_errors} component error(s).")
     session.ready_event.set()
 
 
@@ -717,16 +802,20 @@ def wait_pipeline_ready(session: PipelineSession, timeout: float = 30.0) -> bool
 
 
 def close_pipeline(session: PipelineSession) -> None:
-    """Stop any live watcher loop cleanly and close CocoIndex Environment and SQLite handles."""
-    if session.loop is not None and session.watch_task is not None:
-        with contextlib.suppress(RuntimeError):
-            session.loop.call_soon_threadsafe(session.watch_task.cancel)
-    if session.thread is not None and session.thread.is_alive():
-        session.thread.join(timeout=5.0)
+    """Stop the CocoIndex worker thread/loop cleanly and close Environment and SQLite handles."""
     try:
-        session.env.close()
+        if not session.loop.is_closed() and session.loop.is_running():
+            with contextlib.suppress(RuntimeError):
+                session.loop.call_soon_threadsafe(session.stop_async.set)
+        if session.thread.is_alive() and session.thread is not threading.current_thread():
+            session.thread.join(timeout=10.0)
+            if session.thread.is_alive():
+                raise YawRuntimeError("SHUTTING_DOWN", "Timed out waiting for CocoIndex session thread to stop.")
     finally:
-        session.conn_mgr.close()
+        try:
+            session.env.close()
+        finally:
+            session.conn_mgr.close()
 
 
 def list_user_tables(conn: sqlite3.Connection) -> tuple[str, ...]:

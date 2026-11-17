@@ -26,6 +26,7 @@ from yaw.core import (
     ChunkPointer,
     HydratedPassage,
     RetrievalParams,
+    YawRuntimeError,
     json_document_fields,
     render_document_text,
     resolve_corpus_path,
@@ -201,9 +202,9 @@ def extract_text_features(title: str, body: str) -> tuple[list[str], tuple[list[
     nlp = get_spacy_nlp()
     stops = set(nlp.Defaults.stop_words)
     terms = list(dict.fromkeys(extract_terms(f"{title}\n{body}", stops)))
-    doc_main = nlp(body[:1600])
+    doc_main = nlp(body)
     doc_attr = nlp(body[:320]) if len(body) > 320 else doc_main
-    return terms, (extract_entities(doc_main, stops)[:16], extract_entities(doc_attr, stops, include_attr=True)[:8])
+    return terms, (extract_entities(doc_main, stops), extract_entities(doc_attr, stops, include_attr=True)[:8])
 
 
 def open_readonly_db(db_path: Path | str, *, timeout: float = 5.0) -> sqlite3.Connection:
@@ -217,16 +218,33 @@ def open_readonly_db(db_path: Path | str, *, timeout: float = 5.0) -> sqlite3.Co
     return conn
 
 
+def _validate_max_chars(max_chars: int | None) -> int | None:
+    if max_chars is None:
+        return None
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 0:
+        raise ValueError(f"max_chars must be a non-negative integer or None, got {max_chars!r}")
+    return max_chars
+
+
+def _crop_text(text: str, max_chars: int | None) -> str:
+    limit = _validate_max_chars(max_chars)
+    if limit is None or limit == 0 or len(text) <= limit:
+        return text
+    marker = "\n[... cropped ...]"
+    return text[: max(1, limit - len(marker))] + marker if limit > len(marker) else text[:limit]
+
+
 def hydrate_passage(
     corpus_root: Path,
     ptr: ChunkPointer,
     score: float = 0.0,
     *,
-    max_chars: int = 4000,
+    max_chars: int | None = None,
     include_island: bool = False,
     full_span: bool = False,
 ) -> HydratedPassage:
     """Hydrate 1-indexed source lines from disk with SHA-256 freshness verification."""
+    limit = _validate_max_chars(max_chars)
     sl, el = int(ptr.start_line), int(ptr.end_line)
     if sl < 1 or el < sl or (el - sl + 1) > _MAX_HYDRATE_SPAN:
         raise ValueError(f"Invalid hydration line range [{sl}, {el}] for {ptr.rel_posix_path}")
@@ -246,13 +264,13 @@ def hydrate_passage(
     if suffix in (".json", ".jsonl", ".ndjson"):
         try:
             parsed = json.loads(raw_slice)
-        except json.JSONDecodeError:
-            return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
+        except json.JSONDecodeError as exc:
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Corrupted JSON document at {target}: {exc}") from exc
         fallback = Path(ptr.rel_posix_path).stem
         item = parsed
         if isinstance(parsed, list):
             if not parsed:
-                return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
+                raise YawRuntimeError("CONSISTENCY_ERROR", f"Corrupted JSON document at {target}: empty JSON array")
             item = next((x for x in parsed if json_document_fields(x, fallback)[0] == ptr.title), parsed[0])
         title, body = json_document_fields(item, fallback)
         if not full_span and ptr.char_end > ptr.char_start:
@@ -275,11 +293,8 @@ def hydrate_passage(
         ):
             rendered = f"{ptr.title}\n{rendered}"
 
-    if max_chars > 0 and len(rendered) > max_chars:
-        marker = "\n[... cropped ...]"
-        rendered = (
-            rendered[: max(1, max_chars - len(marker))] + marker if max_chars > len(marker) else rendered[:max_chars]
-        )
+    if limit is not None and limit > 0:
+        rendered = _crop_text(rendered, limit)
     return HydratedPassage(ptr, rendered, float(score), stale_on_disk=False)
 
 
@@ -376,7 +391,7 @@ def build_vector_search(
         vecs_list.append(np.frombuffer(bytes(row[1]), dtype="<f4"))
         doc_terms.append([str(t) for t in json.loads(str(row[11]))])
         raw_ents = json.loads(str(row[12]))
-        c_ents.append(([str(e) for e in raw_ents[0][:16]], [str(e) for e in raw_ents[1][:8]]))
+        c_ents.append(([str(e) for e in raw_ents[0]], [str(e) for e in raw_ents[1][:8]]))
 
     c_ids = tuple(int(p.chunk_id) for p in ptrs)
     titles = tuple(p.title for p in ptrs)
@@ -535,9 +550,7 @@ def _build_routes(
         graph, prev_br[bi] = cand_g, d_ci
         seen_br[bi].add(d_ci)
         ptr = vs.pointers[d_ci]
-        snip = (vs.chunk_titles[d_ci] or f"{ptr.rel_posix_path}:{ptr.start_line}-{ptr.end_line}").replace("\n", " ")[
-            :180
-        ]
+        snip = (vs.chunk_titles[d_ci] or f"{ptr.rel_posix_path}:{ptr.start_line}-{ptr.end_line}").replace("\n", " ")
         routes_br[bi].append(EvidenceHop(hop, vs.chunk_ids[d_ci], vs.chunk_titles[d_ci], snip, score, bridge, bi))
     active = tuple(tuple(br) for br in routes_br if len(br) >= 2)
     flat = sorted((h for b in active for h in b), key=lambda h: (-h.hop, h.score, -h.branch))
@@ -745,11 +758,12 @@ def hydrate_ranked_passages(
     corpus_root: Path,
     *,
     top_k: int = 5,
-    max_chars: int = 4000,
+    max_chars: int | None = None,
     include_island: bool = False,
     full_span: bool = False,
 ) -> tuple[HydratedPassage, ...]:
     """Apply MaxP deduplication by `(rel_posix_path, start_line, end_line)` and hydrate top `top_k` passages."""
+    limit = _validate_max_chars(max_chars)
     if top_k <= 0 or not ranked_chunks:
         return ()
     out: list[HydratedPassage] = []
@@ -764,7 +778,7 @@ def hydrate_ranked_passages(
         seen_spans.add(span)
         out.append(
             hydrate_passage(
-                corpus_root, ptr, float(score), max_chars=max_chars, include_island=include_island, full_span=full_span
+                corpus_root, ptr, float(score), max_chars=limit, include_island=include_island, full_span=full_span
             )
         )
         if len(out) >= top_k:
@@ -772,11 +786,12 @@ def hydrate_ranked_passages(
     return tuple(out)
 
 
-def format_evidence_route(route: Sequence[EvidenceHop], *, max_chars: int = 600) -> str:
-    """Format an acyclic multi-hop EvidenceHop trajectory within a character budget."""
-    budget = int(max_chars)
-    if not route or budget <= 0:
+def format_evidence_route(route: Sequence[EvidenceHop], *, max_chars: int | None = None) -> str:
+    """Format an acyclic multi-hop EvidenceHop trajectory, optionally bounded by `max_chars`."""
+    limit = _validate_max_chars(max_chars)
+    if not route:
         return ""
+    budget = limit if limit is not None and limit > 0 else None
     parts: list[str] = []
     seen: set[tuple[int, int]] = set()
     used = 0
@@ -786,8 +801,11 @@ def format_evidence_route(route: Sequence[EvidenceHop], *, max_chars: int = 600)
         seen.add((hop.chunk_id, hop.hop))
         head = f"[H{hop.hop}{' B' + str(hop.branch) if hop.branch else ''}] {hop.title + ': ' if hop.title else ''}"
         line = f"{head}{hop.snippet}{' (' + hop.bridge + ')' if hop.bridge else ''}".strip()
-        if parts and used + 1 + len(line) > budget:
-            break
-        parts.append(line[:budget] if not parts else line)
+        if budget is not None:
+            if parts and used + 1 + len(line) > budget:
+                break
+            parts.append(line[:budget] if not parts else line)
+        else:
+            parts.append(line)
         used += len(parts[-1]) + (1 if len(parts) > 1 else 0)
     return "\n".join(parts)

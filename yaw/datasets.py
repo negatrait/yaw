@@ -346,10 +346,10 @@ def extract_gold_answers(sample: Mapping[str, Any]) -> list[str]:
         for field in ("possible_answers", "o_aliases"):
             value = sample.get(field, [])
             if isinstance(value, str):
-                try:
+                if value.lstrip().startswith(("[", "{")):
                     parsed = json.loads(value)
                     gold_answer.extend(parsed if isinstance(parsed, list) else ([parsed] if parsed else []))
-                except json.JSONDecodeError, TypeError:
+                else:
                     gold_answer.append(value)
             elif isinstance(value, list):
                 gold_answer.extend(value)

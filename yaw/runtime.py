@@ -28,6 +28,7 @@ from yaw.core import (
     YawRuntimeError,
     configure_logging,
     format_query_for_embedding,
+    get_logger,
     write_text_atomic,
 )
 from yaw.pipeline import (
@@ -48,7 +49,6 @@ from yaw.retrieval import (
     search_vectors,
 )
 
-_MAX_QUERY_BYTES = 1024
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
 _URL_USERINFO_RE = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
@@ -217,9 +217,10 @@ def _empty_vector_search(params: RetrievalParams) -> VectorSearch:
     )
 
 
-def _require_path(path: Path | None, field_name: str) -> Path:
+def require_path(path: Path | None, label: str) -> Path:
+    """Resolve a required configuration path or raise INVALID_INPUT when omitted."""
     if path is None:
-        raise YawRuntimeError("INVALID_INPUT", f"YawConfig.{field_name} must not be None.")
+        raise YawRuntimeError("INVALID_INPUT", f"YawConfig.{label} must not be None.")
     return Path(path).resolve()
 
 
@@ -238,7 +239,7 @@ def get_vector_search(rt: YawRuntime, conn: sqlite3.Connection | None = None) ->
         if rt.index_data_version >= 0 and cur_ver == rt.index_data_version:
             return rt.vector_search
 
-    db_path = _require_path(rt.config.db_path, "db_path")
+    db_path = require_path(rt.config.db_path, "db_path")
     with contextlib.nullcontext(conn) if conn is not None else contextlib.closing(open_readonly_db(db_path)) as ro_conn:
         if ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             return rt.vector_search
@@ -267,8 +268,8 @@ def start_runtime(
     lm: dspy.LM | None = None,
 ) -> YawRuntime:
     """Acquire exclusive yaw.db.lock, start CocoIndex pipeline, and optionally block until ready."""
-    lock_path = _require_path(cfg.lock_path, "lock_path")
-    db_path = _require_path(cfg.db_path, "db_path")
+    lock_path = require_path(cfg.lock_path, "lock_path")
+    db_path = require_path(cfg.db_path, "db_path")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     file_lock = filelock.FileLock(str(lock_path), timeout=0)
     try:
@@ -319,8 +320,15 @@ def start_runtime(
                     return
                 rt.pipeline.ready_event.wait()
                 if not rt.stop_event.is_set() and rt.lifecycle == "starting":
-                    with contextlib.suppress(BaseException):
+                    try:
                         wait_ready(rt, timeout=0.0)
+                    except Exception as exc:
+                        msg = redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key)
+                        with rt.state_lock:
+                            rt.last_error = msg
+                            rt.lifecycle = "error"
+                        rt.pipeline.ready_event.set()
+                        get_status(rt)
 
             rt._ready_thread = threading.Thread(target=_await_initial_ready, name="yaw-ready-waiter", daemon=True)
             rt._ready_thread.start()
@@ -377,8 +385,6 @@ def _validate_text_input(raw: str, label: str) -> str:
     cleaned = raw.strip()
     if not cleaned:
         raise YawRuntimeError("INVALID_INPUT", f"{label} must not be empty.")
-    if len(cleaned.encode("utf-8")) > _MAX_QUERY_BYTES:
-        raise YawRuntimeError("INVALID_INPUT", f"{label} exceeds {_MAX_QUERY_BYTES} UTF-8 bytes.")
     return cleaned
 
 
@@ -415,8 +421,8 @@ def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassa
         raise YawRuntimeError("INVALID_INPUT", "top_k must be an integer between 1 and 20.")
     _ensure_ready(rt)
 
-    db_path = _require_path(rt.config.db_path, "db_path")
-    corpus_root = _require_path(rt.config.corpus_root, "corpus_root")
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "recall"), contextlib.closing(open_readonly_db(db_path)) as conn:
         vs = get_vector_search(rt, conn)
         if vs.size == 0:
@@ -437,11 +443,32 @@ def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassa
         return hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=top_k)
 
 
-def _resolve_program_path(cfg: YawConfig) -> Path | None:
+def resolve_program_path(cfg: YawConfig) -> Path | None:
+    """Resolve an existing compiled DSPy program path, falling back to `.yaw/optimize_program.json`."""
     if cfg.compiled_program_path is not None and Path(cfg.compiled_program_path).is_file():
         return Path(cfg.compiled_program_path)
     fallback = Path(cfg.workspace_root) / ".yaw" / "optimize_program.json"
     return fallback if fallback.is_file() else None
+
+
+def serialize_passage(rank: int, hp: HydratedPassage) -> dict[str, Any]:
+    """Serialize a hydrated passage into the canonical JSON payload shared by MCP and CLI."""
+    ptr = hp.pointer
+    digest = hashlib.sha256(hp.text.encode("utf-8")).hexdigest()
+    return {
+        "rank": rank,
+        "chunk_id": int(ptr.chunk_id),
+        "text": hp.text,
+        "score": float(hp.score),
+        "stale_on_disk": bool(hp.stale_on_disk),
+        "content_hash": f"sha256:{digest}",
+        "source": {
+            "rel_posix_path": ptr.rel_posix_path,
+            "start_line": int(ptr.start_line),
+            "end_line": int(ptr.end_line),
+            "title": ptr.title,
+        },
+    }
 
 
 def ask(rt: YawRuntime, question: str) -> QAResult:
@@ -449,15 +476,15 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
     q = _validate_text_input(question, "Question")
     _ensure_ready(rt)
 
-    db_path = _require_path(rt.config.db_path, "db_path")
-    corpus_root = _require_path(rt.config.corpus_root, "corpus_root")
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "qa"), contextlib.closing(open_readonly_db(db_path)) as conn:
         vs = get_vector_search(rt, conn)
         if vs.size == 0:
             raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
         tools = make_qa_tools(vs, corpus_root, rt.embed_fn, conn, task_mode=rt.config.embedding_task_mode)
         agent = build_qa_agent(tools, max_iters=rt.config.react_max_iters)
-        if (prog_path := _resolve_program_path(rt.config)) is not None:
+        if (prog_path := resolve_program_path(rt.config)) is not None:
             agent.load(str(prog_path))
         try:
             result = ask_question(
@@ -490,6 +517,8 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
     pipe_err = rt.pipeline.error
     if pipe_err is not None:
         raw_err = f"{type(pipe_err).__name__}: {pipe_err}"
+    elif (pipe_num_errors := getattr(rt.pipeline, "num_errors", 0)) and pipe_num_errors > 0 and not raw_err:
+        raw_err = f"Pipeline reported {pipe_num_errors} component error(s)."
     redacted_err = redact_secrets(raw_err, rt.config.api_key) if raw_err else None
     sync_state = "error" if redacted_err else ("syncing" if lc == "starting" else "idle")
     status = DaemonStatus(
@@ -504,8 +533,10 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
         num_chunks=num_chunks,
     )
     if rt.config.status_path is not None:
-        with contextlib.suppress(OSError):
+        try:
             write_text_atomic(rt.config.status_path, json.dumps(status.to_dict(), indent=2))
+        except OSError as exc:
+            get_logger("yaw.runtime").error("Failed to persist status.json: %s", exc)
     return status
 
 

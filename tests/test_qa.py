@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import dspy
 import numpy as np
@@ -232,8 +232,12 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
             vs, cfg.corpus_root, tracked_embed, conn
         )
 
-        # Blank queries do not invoke embedder and return standard no-match message
-        assert search_passages("   ") == "No matching passages."
+        # Blank/non-string queries and invalid top_k fail fast without invoking embedder
+        for bad_q in ("", "   "):
+            with pytest.raises(ValueError, match="query"):
+                search_passages(bad_q)
+            with pytest.raises(ValueError, match="query"):
+                lexical_grep(bad_q)
         assert len(embed_calls) == 0
 
         # MaxP pooling must pass pool_k >= 50 so multi.json (7 chunks) does not starve booster_backup.md
@@ -243,43 +247,65 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         assert "booster_backup.md" in booster_out
         assert len(_CID_IN_PROMPT_RE.findall(booster_out)) == 2
 
-        # Clamp top_k <= 1 and check 1,200 char cropping on WapakonetaArchiveAlpha long chunk
-        alpha_search = search_passages("WapakonetaArchiveAlpha", top_k=0)
-        assert len(_CID_IN_PROMPT_RE.findall(alpha_search)) == 1
-        assert "[... cropped ...]" in alpha_search
-        assert len(alpha_search) <= 1350
+        # Reject invalid top_k and return uncropped passage for valid top_k
+        for bad_k in (0, -1, True):
+            with pytest.raises(ValueError, match="top_k"):
+                search_passages("WapakonetaArchiveAlpha", top_k=bad_k)
+            with pytest.raises(ValueError, match="top_k"):
+                lexical_grep("WapakonetaArchiveAlpha", top_k=bad_k)
 
-        # lexical_grep must invoke ZERO embed calls and clamp top_k to 1..10
+        alpha_search = search_passages("WapakonetaArchiveAlpha", top_k=1)
+        assert len(_CID_IN_PROMPT_RE.findall(alpha_search)) == 1
+        assert "[... cropped ...]" not in alpha_search
+        assert "Sentence 20:" in alpha_search
+
+        # lexical_grep must invoke ZERO embed calls, respect large top_k without clamping, and return uncropped text
         calls_before_grep = len(embed_calls)
-        assert lexical_grep("   ") == "No matching passages."
+        assert lexical_grep("DefinitelyAbsentTokenZeta999", top_k=5) == "No matching passages."
         grep_hit = lexical_grep("XylophoneZither", top_k=5)
         assert len(embed_calls) == calls_before_grep
         assert "bridge.md" in grep_hit and "XylophoneZither" in grep_hit
 
         grep_long = lexical_grep("WapakonetaArchiveAlpha", top_k=99)
         assert len(embed_calls) == calls_before_grep
-        assert "[... cropped ...]" in grep_long
-        assert len(_CID_IN_PROMPT_RE.findall(grep_long)) <= 10
+        assert "[... cropped ...]" not in grep_long
+        assert "Sentence 20:" in grep_long
+        assert len(_CID_IN_PROMPT_RE.findall(grep_long)) >= 1
 
         # Identify chunk 1 and chunk 2 of bridge.md to verify expand_neighbors and read_chunk
         bridge_cids = [int(p.chunk_id) for p in vs.pointers if p.rel_posix_path == "bridge.md"]
         assert len(bridge_cids) >= 2
         long_cid = int(_CID_IN_PROMPT_RE.findall(grep_long)[0])
 
-        assert expand_neighbors(999999) == "[INVALID chunk_id=999999]"
-        assert expand_neighbors(True) == "[INVALID chunk_id=True]"  # type: ignore[arg-type]
+        with pytest.raises(KeyError, match="999999"):
+            expand_neighbors(999999)
+        with pytest.raises(TypeError, match="chunk_id"):
+            expand_neighbors(cast(Any, True))
+        for bad_k in (0, True):
+            with pytest.raises(ValueError, match="top_k"):
+                expand_neighbors(long_cid, top_k=bad_k)
         nbr_out = expand_neighbors(long_cid, top_k=3)
+        assert "[... cropped ...]" not in nbr_out
         nbr_cids = [int(x) for x in _CID_IN_PROMPT_RE.findall(nbr_out)]
         assert long_cid not in nbr_cids
         assert any(cid in nbr_cids for cid in bridge_cids if cid != long_cid)
 
-        # read_chunk respects score=1.000 header, invalid ID, and AST island expansion capped at 2,400 chars
-        assert read_chunk(-1) == "[INVALID chunk_id=-1]"
+        # read_chunk respects score=1.000 header, raises on invalid IDs, and returns full uncropped AST island
+        with pytest.raises(KeyError, match="-1"):
+            read_chunk(-1)
+        with pytest.raises(KeyError, match="999999"):
+            read_chunk(999999)
+        with pytest.raises(TypeError, match="chunk_id"):
+            read_chunk(cast(Any, True))
         chunk_plain = read_chunk(long_cid, include_siblings=False)
         assert f"[chunk_id={long_cid}]" in chunk_plain and "score=1.000:" in chunk_plain
         chunk_island = read_chunk(long_cid, include_siblings=True)
-        assert "[... cropped ...]" in chunk_island
-        assert 2200 <= len(chunk_island) <= 2550
+        assert "[... cropped ...]" not in chunk_island
+        assert "Sentence 1:" in chunk_island
+        assert "Sentence 20:" in chunk_island
+        assert "XylophoneZither" in chunk_island
+        assert "Music note 27" in chunk_island
+        assert len(chunk_island) > 2500
 
     # Solo 1-chunk VectorSearch returns No matching passages on expand_neighbors
     solo_cfg = _index_qa_corpus(tmp_path / "solo", single_doc=True)
@@ -289,6 +315,29 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         assert s_vs.size == 1
         solo_tools = make_qa_tools(s_vs, solo_cfg.corpus_root, tracked_embed, s_conn)
         assert solo_tools[2](int(s_vs.chunk_ids[0])) == "No matching passages."
+        with pytest.raises(ValueError, match="top_k"):
+            solo_tools[2](int(s_vs.chunk_ids[0]), top_k=0)
+
+    # Verify top_k > 10 is honored without clamping to 10 across search_passages, lexical_grep, and expand_neighbors
+    many_cfg = _make_cfg(tmp_path / "many")
+    assert many_cfg.corpus_root is not None and many_cfg.db_path is not None
+    many_cfg.corpus_root.mkdir(parents=True)
+    for i in range(13):
+        (many_cfg.corpus_root / f"doc_{i:02d}.md").write_text(
+            f"# ManyDoc {i}\nSharedManyToken document body number {i}.\n",
+            encoding="utf-8",
+        )
+    many_sess = start_pipeline(many_cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    try:
+        update_pipeline_once(many_sess)
+    finally:
+        close_pipeline(many_sess)
+    with open_readonly_db(many_cfg.db_path) as m_conn:
+        m_vs = build_vector_search(m_conn)
+        m_search, m_grep, m_expand, _ = make_qa_tools(m_vs, many_cfg.corpus_root, tracked_embed, m_conn)
+        assert len(_CID_IN_PROMPT_RE.findall(m_search("SharedManyToken", top_k=12))) == 12
+        assert len(_CID_IN_PROMPT_RE.findall(m_grep("SharedManyToken", top_k=12))) == 12
+        assert len(_CID_IN_PROMPT_RE.findall(m_expand(int(m_vs.chunk_ids[0]), top_k=12))) == 12
 
 
 def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None:
@@ -612,6 +661,39 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
             assert exc_stale.value.code == "CONSISTENCY_ERROR"
         finally:
             srv_stale.shutdown()
+
+        # Verify dspy.ReAct catches tool argument errors natively and records is_error=True in history.messages
+        def invalid_tool_then_submit(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Invoke tools with invalid args",
+                    [
+                        {"name": "read_chunk", "args": {"chunk_id": 999999}},
+                        {"name": "search_passages", "args": {"query": "", "top_k": 0}},
+                    ],
+                )
+            return 200, _xml_tool_reply(
+                "Submit after observing native tool errors",
+                [{"name": "submit", "args": {"answer": "Insufficient references in corpus"}}],
+            )
+
+        srv_react_err, _, _ = _start_loopback_chat_server(invalid_tool_then_submit)
+        try:
+            with dspy.context(lm=_make_loopback_lm(srv_react_err)):
+                pred_err = agent(question="Test native tool errors")
+            tool_results = [
+                res
+                for msg in pred_err.history.messages
+                if isinstance(msg, dict) and (tc := msg.get("tool_calls")) is not None
+                for res in (getattr(getattr(tc, "tool_call_results", None), "tool_call_results", None) or ())
+            ]
+            err_results = [r for r in tool_results if getattr(r, "is_error", False)]
+            assert len(err_results) == 2
+            assert all("[INVALID" not in str(getattr(r, "value", "")) for r in err_results)
+            assert any("Unknown chunk_id: 999999" in str(getattr(r, "value", "")) for r in err_results)
+            assert any("non-empty string" in str(getattr(r, "value", "")) for r in err_results)
+        finally:
+            srv_react_err.shutdown()
 
         # HTTP 500 server error must propagate unmasked (LMServerError), NOT be wrapped or swallowed
         srv_500, _, _ = _start_loopback_chat_server(lambda _i, _p: (500, "backend exploded"))

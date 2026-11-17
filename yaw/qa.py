@@ -55,23 +55,25 @@ def _format_passages(passages: Sequence[HydratedPassage]) -> str:
     return "\n\n".join(_format_passage(hp) for hp in passages) if passages else _NO_MATCHES
 
 
-def _clamp_top_k(raw: Any, default: int) -> int:
-    if isinstance(raw, bool):
-        return default
-    try:
-        return max(1, min(10, int(raw)))
-    except TypeError, ValueError:
-        return default
+def _require_query(query: str) -> str:
+    if not isinstance(query, str) or not (cleaned := query.strip()):
+        raise ValueError("query must be a non-empty string.")
+    return cleaned
 
 
-def _resolve_chunk_pos(vs: VectorSearch, chunk_id: Any) -> int | None:
-    if isinstance(chunk_id, bool):
-        return None
-    try:
-        cid = int(chunk_id)
-    except TypeError, ValueError:
-        return None
-    return vs.id_to_pos.get(cid)
+def _require_top_k(top_k: int) -> int:
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise ValueError(f"top_k must be a positive integer, got {top_k!r}.")
+    return top_k
+
+
+def _require_chunk_pos(vs: VectorSearch, chunk_id: int) -> int:
+    if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
+        raise TypeError(f"chunk_id must be an integer, got {chunk_id!r}.")
+    idx = vs.id_to_pos.get(chunk_id)
+    if idx is None:
+        raise KeyError(f"Unknown chunk_id: {chunk_id}")
+    return idx
 
 
 def make_qa_tools(
@@ -87,10 +89,10 @@ def make_qa_tools(
 
     def search_passages(query: str, top_k: int = 8) -> str:
         """Search corpus passages using hybrid vector and lexical ranking."""
-        q = query.strip() if isinstance(query, str) else ""
-        if not q or vs.size == 0:
+        q = _require_query(query)
+        k = _require_top_k(top_k)
+        if vs.size == 0:
             return _NO_MATCHES
-        k = _clamp_top_k(top_k, 8)
         raw_emb = np.asarray(embed_fn([format_query_for_embedding(q, task_mode)]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         fts_scores, vec_scores = query_external_hints(conn, q, q_vec)
@@ -103,26 +105,24 @@ def make_qa_tools(
             vec_scores=vec_scores,
             params=vs.params,
         )
-        return _format_passages(hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=k, max_chars=1200))
+        return _format_passages(hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=k))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
         """Run zero-embedder FTS5 keyword grep over indexed passages."""
-        q = query.strip() if isinstance(query, str) else ""
-        if not q or vs.size == 0:
+        q = _require_query(query)
+        k = _require_top_k(top_k)
+        if vs.size == 0:
             return _NO_MATCHES
-        k = _clamp_top_k(top_k, 10)
         fts_scores, _ = query_external_hints(conn, q, np.zeros((0,), dtype=np.float32), fts_k=max(k * 2, 20), vec_k=0)
         ranked = sorted(fts_scores.items(), key=lambda item: (-item[1], item[0]))
-        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k, max_chars=1200))
+        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
         """Expand isotropic, shared-entity, and AST-sibling neighbor passages for chunk_id."""
-        idx = _resolve_chunk_pos(vs, chunk_id)
-        if idx is None:
-            return f"[INVALID chunk_id={chunk_id}]"
+        idx = _require_chunk_pos(vs, chunk_id)
+        k = _require_top_k(top_k)
         if vs.size <= 1:
             return _NO_MATCHES
-        k = _clamp_top_k(top_k, 6)
         sims = vs.u_chunk_iso @ vs.u_chunk_iso[idx]
         src_ents = {e.lower() for e in vs.chunk_entities[idx][0]}
         sibs = {int(s) for s in vs.ast_siblings[idx]}
@@ -138,19 +138,16 @@ def make_qa_tools(
         ]
         scored.sort(key=lambda item: (-item[1], item[0]))
         return _format_passages(
-            hydrate_ranked_passages(vs, scored[: max(k * 4, 50)], corpus_root, top_k=k, max_chars=1200),
+            hydrate_ranked_passages(vs, scored[: max(k * 4, 50)], corpus_root, top_k=k),
         )
 
     def read_chunk(chunk_id: int, include_siblings: bool = False) -> str:
         """Read a passage by chunk_id, optionally expanding its enclosing AST section."""
-        idx = _resolve_chunk_pos(vs, chunk_id)
-        if idx is None:
-            return f"[INVALID chunk_id={chunk_id}]"
+        idx = _require_chunk_pos(vs, chunk_id)
         hp = hydrate_passage(
             corpus_root,
             vs.pointers[idx],
             score=1.0,
-            max_chars=2400,
             include_island=bool(include_siblings),
         )
         return _format_passage(hp)
@@ -240,7 +237,7 @@ def ask_question(
 
     citations: list[HydratedPassage] = []
     for cid in chosen_ids:
-        hp = hydrate_passage(corpus_root, vs.pointers[vs.id_to_pos[cid]], score=seen_scores[cid][0], max_chars=4000)
+        hp = hydrate_passage(corpus_root, vs.pointers[vs.id_to_pos[cid]], score=seen_scores[cid][0])
         if hp.stale_on_disk:
             raise YawRuntimeError("CONSISTENCY_ERROR", f"Cited chunk {cid} is stale or missing on disk.")
         citations.append(hp)

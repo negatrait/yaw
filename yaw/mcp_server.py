@@ -4,29 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
 import ipaddress
 import os
 import threading
 from collections.abc import AsyncGenerator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware import Middleware
+from pydantic import Field
 from starlette.middleware import Middleware as StarletteMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from yaw.core import DaemonStatus, HydratedPassage, YawConfig, YawRuntimeError
+from yaw.core import DaemonStatus, YawConfig, YawRuntimeError
 from yaw.runtime import (
     YawRuntime,
     close_runtime,
     get_status,
     redact_secrets,
+    serialize_passage,
     start_runtime,
 )
 from yaw.runtime import (
@@ -120,53 +120,6 @@ class _LoopbackGuardMiddleware:
         await self.app(scope, receive, send)
 
 
-class _ToolInputMiddleware(Middleware):
-    """Reject Pydantic coercions (bool/str/float) before FastMCP validates tool parameters."""
-
-    async def on_call_tool(self, context: Any, call_next: Any) -> Any:
-        raw_args = context.message.arguments
-        if raw_args is not None and not isinstance(raw_args, dict):
-            raise ToolError("[INVALID_INPUT] Tool arguments must be a JSON object.")
-        args = dict(raw_args or {})
-        name = context.message.name
-        if name == "recall":
-            if extra := set(args) - {"query", "top_k"}:
-                raise ToolError(f"[INVALID_INPUT] Unexpected argument(s) for recall: {', '.join(sorted(extra))}")
-            if "query" not in args or not isinstance(args["query"], str):
-                raise ToolError("[INVALID_INPUT] Query must be a string.")
-            if "top_k" in args:
-                tk = args["top_k"]
-                if isinstance(tk, bool) or not isinstance(tk, int) or not (1 <= tk <= 20):
-                    raise ToolError("[INVALID_INPUT] top_k must be an integer between 1 and 20.")
-        elif name == "qa":
-            if extra := set(args) - {"question"}:
-                raise ToolError(f"[INVALID_INPUT] Unexpected argument(s) for qa: {', '.join(sorted(extra))}")
-            if "question" not in args or not isinstance(args["question"], str):
-                raise ToolError("[INVALID_INPUT] Question must be a string.")
-        elif name == "daemon_status" and args:
-            raise ToolError("[INVALID_INPUT] daemon_status takes no arguments.")
-        return await call_next(context)
-
-
-def _serialize_passage(rank: int, hp: HydratedPassage) -> dict[str, Any]:
-    ptr = hp.pointer
-    digest = hashlib.sha256(hp.text.encode("utf-8")).hexdigest()
-    return {
-        "rank": rank,
-        "chunk_id": int(ptr.chunk_id),
-        "text": hp.text,
-        "score": float(hp.score),
-        "stale_on_disk": bool(hp.stale_on_disk),
-        "content_hash": f"sha256:{digest}",
-        "source": {
-            "rel_posix_path": ptr.rel_posix_path,
-            "start_line": int(ptr.start_line),
-            "end_line": int(ptr.end_line),
-            "title": ptr.title,
-        },
-    }
-
-
 def _to_tool_error(exc: YawRuntimeError, api_key: str) -> ToolError:
     return ToolError(f"[{exc.code}] {redact_secrets(exc.message, api_key)}")
 
@@ -229,7 +182,7 @@ def create_mcp_app(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_ensure_executor(holder["rt"]), functools.partial(fn, *args, **kwargs))
 
-    mcp = FastMCP("yaw", strict_input_validation=True, middleware=[_ToolInputMiddleware()], lifespan=_lifespan)
+    mcp = FastMCP("yaw", strict_input_validation=True, lifespan=_lifespan)
 
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_request: Request) -> JSONResponse:
@@ -248,13 +201,12 @@ def create_mcp_app(
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     )
-    async def recall(query: str, top_k: int = 5) -> dict[str, Any]:
+    async def recall(
+        query: Annotated[str, Field(min_length=1)],
+        top_k: Annotated[int, Field(ge=1, le=20)] = 5,
+    ) -> dict[str, Any]:
         """Retrieve ranked disk-hydrated corpus passages using zero-LLM VectorSearch."""
         if (active := holder["rt"]) is None:
-            if not isinstance(query, str) or not query.strip() or len(query.strip().encode("utf-8")) > 1024:
-                raise ToolError("[INVALID_INPUT] Query must be a non-empty string <= 1024 UTF-8 bytes.")
-            if isinstance(top_k, bool) or not isinstance(top_k, int) or not (1 <= top_k <= 20):
-                raise ToolError("[INVALID_INPUT] top_k must be an integer between 1 and 20.")
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:
             passages = await _run_offloaded(runtime_recall, active, query, top_k=top_k)
@@ -263,17 +215,15 @@ def create_mcp_app(
         return {
             "query": query.strip(),
             "top_k": top_k,
-            "results": [_serialize_passage(idx, hp) for idx, hp in enumerate(passages, start=1)],
+            "results": [serialize_passage(idx, hp) for idx, hp in enumerate(passages, start=1)],
         }
 
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
     )
-    async def qa(question: str) -> dict[str, Any]:
+    async def qa(question: Annotated[str, Field(min_length=1)]) -> dict[str, Any]:
         """Answer a multi-hop question using bare ReAct grounded in retrieved corpus passages."""
         if (active := holder["rt"]) is None:
-            if not isinstance(question, str) or not question.strip() or len(question.strip().encode("utf-8")) > 1024:
-                raise ToolError("[INVALID_INPUT] Question must be a non-empty string <= 1024 UTF-8 bytes.")
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:
             res = await _run_offloaded(runtime_ask, active, question)
@@ -284,7 +234,7 @@ def create_mcp_app(
             "answer": res.answer,
             "termination_reason": res.termination_reason,
             "turns": int(res.turns),
-            "citations": [_serialize_passage(idx, hp) for idx, hp in enumerate(res.citations, start=1)],
+            "citations": [serialize_passage(idx, hp) for idx, hp in enumerate(res.citations, start=1)],
         }
 
     @mcp.tool(
