@@ -552,7 +552,7 @@ NER owns resources, and the current healer reads frozen evidence through
     - Replaced hard baseline gates with continuous Geometric Mean of Goods divided by Geometric Mean of Bads ($\text{GM}_{\text{good}} / \text{GM}_{\text{bad}}$), rewarding Recall@1/2/5/10/20, EM, F1, and SHACL conformance while penalizing latency, token counts, and RLM healing iterations.
   - **Dynamic Active Trace Component Selector (`_ActiveTraceComponentSelector`):**
     - Inspects sampled minibatch trajectories during GEPA reflection to select exclusively from predictors active in the execution trace (`qa_cot.predict`, `query_intent`, `fact_filter`), eliminating `No valid predictions found for any module` errors.
-  - **Production Promotion & Hot-Reload (`yaw load-program`):**
+  - **Production Promotion & Hot-Reload (`yaw load`):**
     - Validates compiled DSPy program JSON, copies to `compiled_program_path` (`.yaw/compiled_program.json`), and signals running daemons via IPC signal files or stages for the next startup.
 
 - **Live Silicon Benchmark & Prompt Evolution Results (`http://localhost:13305/api/v1`):**
@@ -568,7 +568,7 @@ NER owns resources, and the current healer reads frozen evidence through
        - Full valset score: $0.7488 \to 0.7592$ (**75.9%**).
      - Candidate accepted into Pareto frontier and saved to `.yaw/compiled_program_optimize_20261018_082953.json` with proposer telemetry and graph RLM audit trail.
   3. **Daemon Production Promotion:**
-     - Promoted via `uv run yaw load-program .yaw/compiled_program_optimize_20261018_082953.json` to `.yaw/compiled_program.json`.
+     - Promoted via `uv run yaw load .yaw/compiled_program_optimize_20261018_082953.json` to `.yaw/compiled_program.json`.
      - Confirmed `YawProgram.from_config(config)` loads the optimized program and evolved instructions on initialization.
 
 - **Verification Status:**

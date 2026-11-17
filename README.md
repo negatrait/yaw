@@ -18,7 +18,7 @@ uv run --locked python scripts/download-datasets.py --dataset all --source-dir d
 uv run yaw daemon {run|start|stop|status}
 uv run yaw config get <key>
 uv run yaw config set <key> <value>
-uv run yaw dspy tune-manifold --trials 64
+uv run yaw dspy optuna --trials 64
 uv run python benchmark.py --dataset sample --mode all
 uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25 --mode retrieval
 uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
@@ -45,7 +45,7 @@ uv run yaw config {show|get [key]|set <key> <value>} [--config PATH] [--json]
 
 - **Declarative Live Indexing (`yaw/pipeline.py`):** Continuous `CocoIndex` (`localfs.walk_dir(..., live=live)`) writes `chunks` (`vec0` cosine embeddings + line/AST metadata, zero raw chunk text) and `chunk_fts` (`USING fts5(title, body, content='', contentless_delete=1)`) in 64-chunk micro-batches with persistent LMDB memoization under `.yaw/coco_lmdb`.
 - **Zero-LLM Hybrid `VectorSearch` (`yaw/retrieval.py` -> `yaw recall`):** Read-only WAL retrieval (`PRAGMA data_version` snapshot reload) combining ABTT Marchenko–Pastur isotropic projection, CSLS `k=8` hubness penalty, squared-IDF bigram/BM25 lexical scoring, `spaCy` noun-phrase 2-hop bridging, coalitional branch reranking, and Submodular MMR with MaxP span deduplication and SHA-256 disk line hydration.
-- **Optuna `VectorSearch` Tuning (`yaw optimize optuna` / pre-cutover `yaw dspy tune-manifold`):** Single-study `optuna` `TPESampler` (`seed=42`, `multivariate=True`, `constant_liar=True`) tuning the 5 dimensionless `RetrievalParams` (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) across `Recall@{1, 2, 5, 10, 20}` objectives on disjoint slices (`query_offset >= 10`) and optionally writing `[retrieval]` in [`yaw.toml`](yaw.toml).
+- **Optuna `VectorSearch` Tuning (`yaw optimize optuna` / pre-cutover `yaw dspy optuna`):** Single-study `optuna` `TPESampler` (`seed=42`, `multivariate=True`, `constant_liar=True`) tuning the 5 dimensionless `RetrievalParams` (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) across `Recall@{1, 2, 5, 10, 20}` objectives on disjoint slices (`query_offset >= 10`) and optionally writing `[retrieval]` in [`yaw.toml`](yaw.toml).
 - **Bare `dspy.ReAct` QA & `dspy.GEPA` (`yaw/qa.py`, `yaw/optimize.py`):** Unwrapped `dspy.ReAct` over 4 character-bounded read-only corpus tools (`search_passages`, `lexical_grep`, `expand_neighbors`, `read_chunk`), serialized under `Semaphore(1)` and verified against inline `[chunk_id=<int>]` tool provenance; QA-only `dspy.GEPA` optimization isolates telemetry in `.yaw/optimize_*` (resume by default; `--fresh` wipes `.yaw/optimize_*` while preserving `.yaw/coco_lmdb`).
 - **Streamable HTTP Transport (`yaw/mcp_server.py`, [Epic 2](docs/epic-2-fastmcp-http.md)):** `FastMCP("yaw")` on loopback `http://127.0.0.1:13306/mcp` with pre-dispatch `Host`/`Origin` `403` validation, `/healthz`, `/readyz`, and 3 read-only tools (`recall`, `qa`, `daemon_status`).
 

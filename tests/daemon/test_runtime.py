@@ -1297,7 +1297,7 @@ def test_cli_config_get_and_set(tmp_path: Path) -> None:
 
 
 def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provider) -> None:
-    """Verify `yaw dspy load-program <file>` stages offline and hot-reloads live daemon in-memory."""
+    """Verify `yaw dspy load <file>` stages offline and hot-reloads live daemon in-memory."""
     cfg, toml_path = _make_test_config(tmp_path)
     prog, emb, _, _ = _make_program_and_embedder(provider[0])
 
@@ -1309,7 +1309,7 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provid
     # 1. Offline promotion (daemon stopped)
     buf = io.StringIO()
     with redirect_stdout(buf):
-        rc = main(["dspy", "load-program", str(cand1), "--config", str(toml_path)])
+        rc = main(["dspy", "load", str(cand1), "--config", str(toml_path)])
     assert rc == 0
     load_out = json.loads(buf.getvalue())
     assert load_out["reloaded"] is False
@@ -1332,7 +1332,7 @@ def test_cli_dspy_load_program_hot_reload_live_and_staged(tmp_path: Path, provid
         # 3. Live hot-reload via CLI while daemon is running
         buf2 = io.StringIO()
         with redirect_stdout(buf2):
-            rc2 = main(["dspy", "load-program", str(cand2), "--config", str(toml_path)])
+            rc2 = main(["dspy", "load", str(cand2), "--config", str(toml_path)])
         assert rc2 == 0
         load_out2 = json.loads(buf2.getvalue())
         assert load_out2["reloaded"] is True

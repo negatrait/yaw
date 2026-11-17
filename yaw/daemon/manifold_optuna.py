@@ -260,7 +260,7 @@ def _select_candidate(
     if src == "defaults" or not _minimal_overrides(params):
         src = "baseline_fallback"
         sys.stderr.write(
-            "[tune-manifold] WARNING: baseline_fallback — no trial cleared all horizons; retaining defaults.\n"
+            "[optuna] WARNING: baseline_fallback — no trial cleared all horizons; retaining defaults.\n"
         )
         sys.stderr.flush()
     return src, params, tm, vm
@@ -442,7 +442,7 @@ def tune_manifold(
     baseline_train = _eval_split(prepared, default_mans, _DEFAULT_HP, "train")
     baseline_val = _eval_split(prepared, default_mans, _DEFAULT_HP, "val")
     sys.stderr.write(
-        f"[tune-manifold] baseline train={baseline_train['combined']:.4f} "
+        f"[optuna] baseline train={baseline_train['combined']:.4f} "
         f"val={baseline_val['combined']:.4f} (datasets={len(prepared)})\n"
     )
     sys.stderr.flush()
@@ -476,7 +476,7 @@ def tune_manifold(
             trial.set_user_attr("overrides", _minimal_overrides(params))
             r_str = "/".join(f"{train_m[f'r{k}']:.3f}" for k in _EVAL_KS)
             sys.stderr.write(
-                f"[tune-manifold] trial={trial.number} train_r1..20={r_str} "
+                f"[optuna] trial={trial.number} train_r1..20={r_str} "
                 f"val={val_m['combined']:.4f} feasible={all(v <= 0.0 for v in constraints.values())}\n"
             )
             sys.stderr.flush()

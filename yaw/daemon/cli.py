@@ -3,7 +3,7 @@
 Grammar:
   yaw daemon {start|stop|status|run} [--config <path>]
   yaw graph {build|rebuild|lint} [--config <path>] [--turtle]
-  yaw dspy {optimize|load-program|benchmark|tune-manifold} [--flags]
+  yaw dspy {optimize|load|benchmark|optuna} [--flags]
   yaw config {get|set} [--flags]
 """
 
@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_help = "Path to yaw.toml configuration file (default: ./yaw.toml)"
     common = ap(add_help=False, allow_abbrev=False)
     common.add_argument("--config", "-c", dest="config", type=str, default=argparse.SUPPRESS, help=cfg_help)
-    parser = ap(prog="yaw", description="YAW: Native HippoRAG 2 & CocoIndex v1 persistent daemon.", allow_abbrev=False)
+    parser = ap(prog="yaw", description="YAW: Graph Search over Vector + Full text index & persistent daemon.", allow_abbrev=False)
     parser.add_argument("--config", "-c", dest="config", type=str, default=None, help=cfg_help)
     dom_subs = parser.add_subparsers(dest="domain", help="Domain to operate on")
 
@@ -137,12 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         ),
         (
-            "dspy",
-            "DSPy prompt optimization, benchmark, and program management",
-            "DSPy action",
+            "optimize",
+            "Prompt optimization, hyperparametetr search, benchmark, and program management",
+            "Optimize action",
             (
                 (
-                    "optimize",
+                    "dspy",
                     "Compile and evolve DSPy prompts in an isolated sandbox and save candidate JSON",
                     (
                         (
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
                     ),
                 ),
                 (
-                    "load-program",
+                    "load",
                     "Promote a compiled DSPy program JSON into production and hot-reload in-memory",
                     (
                         (
@@ -320,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
                 (
                     "benchmark",
-                    "Run HippoRAG 2 + DPR benchmark evaluation and optional parity gate",
+                    "Run Graph + DPR benchmark evaluation and optional parity gate",
                     (
                         (
                             "--dataset",
@@ -419,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
                     ),
                 ),
                 (
-                    "tune-manifold",
+                    "optuna",
                     "Run persistent single-study Optuna TPESampler tuning over SubStateManifold hyperparameters",
                     (
                         (
@@ -1285,14 +1285,14 @@ def main(
                 return handle_graph_lint(
                     config, as_turtle=bool(getattr(args, "turtle", False)), db_path=getattr(args, "db_path", None)
                 )
-        elif domain == "dspy":
-            if action == "optimize":
+        elif domain == "optimize":
+            if action == "dspy":
                 return handle_dspy_optimize(config, args, program=program, embedder=embedder)
-            if action == "load-program":
+            if action == "load":
                 return handle_dspy_load_program(config, args.file)
             if action == "benchmark":
                 return handle_dspy_benchmark(config, args, program=program, embedder=embedder)
-            if action == "tune-manifold":
+            if action == "optuna":
                 return handle_dspy_tune_manifold(config, args, config_path=cfg_path, program=program, embedder=embedder)
         elif domain == "config":
             if action == "get":

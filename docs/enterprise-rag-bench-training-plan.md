@@ -54,7 +54,7 @@ flowchart TD
     end
 
     subgraph DualTargetGate ["4. Promotion & Dual-Target Verification Gate"]
-        ARTIFACT --> LOAD["yaw dspy load-program .yaw/compiled_program_enterprise.json"]
+        ARTIFACT --> LOAD["yaw dspy load .yaw/compiled_program_enterprise.json"]
         LOAD --> GATE["scripts/verify_paper_parity_gate.py:<br/>1. Beat/Match MONKEYPATCHED_HIPPORAG_BASELINES (Local Stack)<br/>2. Drive Toward Published PAPER_BASELINES (SOTA 70B Stack)"]
     end
 ```
@@ -196,7 +196,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 4. **Live Disk Sandbox Invariant During `optimize()`**: The sandbox corpus files remain on disk throughout `evolve_prompts(...)` so 1-indexed line hydration never encounters missing files.
 
 ### 4.2 Explicit Non-Goals (Anti-Invention Contract)
-- **Zero Custom Optimization Scripts**: Do **NOT** create `scripts/optimize_dspy_pipeline.py`. Use the existing [`yaw dspy optimize`](../yaw/daemon/cli.py#L126-L185) and [`yaw dspy load-program`](../yaw/daemon/cli.py#L186-L195) CLI commands.
+- **Zero Custom Optimization Scripts**: Do **NOT** create `scripts/optimize_dspy_pipeline.py`. Use the existing [`yaw dspy optimize`](../yaw/daemon/cli.py#L126-L185) and [`yaw dspy load`](../yaw/daemon/cli.py#L186-L195) CLI commands.
 - **Zero Legacy Compatibility Shims**: Do **NOT** keep `legacy_chat.py`, `legacy_embedding.py`, or `--engine hipporag` as deprecated aliases; delete them completely.
 - **Zero Schema Migrations or New Config Flags**: The database schema and configuration files remain unchanged.
 
@@ -243,7 +243,7 @@ when adopting this breaking layout; no migration or legacy-layout discovery exis
 3. **CLI Optimization & Hot-Reload Promotion**:
    ```powershell
    uv run --locked yaw dspy optimize --dataset enterprise_rag_bench --max-queries 162 --train-queries 135 --mode gepa --auto light --output .yaw/compiled_program_enterprise.json
-   uv run --locked yaw dspy load-program .yaw/compiled_program_enterprise.json
+   uv run --locked yaw dspy load .yaw/compiled_program_enterprise.json
    ```
 4. **Dual-Target Parity Gate Evaluation**:
    ```powershell

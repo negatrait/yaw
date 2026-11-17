@@ -48,7 +48,7 @@ def test_cli_dspy_tune_manifold_persists_optuna_and_applies_toml(
     capsys: pytest.CaptureFixture[str],
     benchmark_inference_server: tuple[str, list[object]],
 ) -> None:
-    """End-to-end tune-manifold builds SQLite index, persists 5-horizon Optuna study, and saves yaw.toml."""
+    """End-to-end optuna builds SQLite index, persists 5-horizon Optuna study, and saves yaw.toml."""
     base_url, _ = benchmark_inference_server
 
     docs = [
@@ -135,7 +135,7 @@ def test_cli_dspy_tune_manifold_persists_optuna_and_applies_toml(
         main(
             [
                 "dspy",
-                "tune-manifold",
+                "optuna",
                 "--config",
                 str(config_path),
                 "--query-offset",
@@ -161,7 +161,7 @@ def test_cli_dspy_tune_manifold_persists_optuna_and_applies_toml(
     exit_code = main(
         [
             "dspy",
-            "tune-manifold",
+            "optuna",
             "--config",
             str(config_path),
             "--dataset",
@@ -190,7 +190,7 @@ def test_cli_dspy_tune_manifold_persists_optuna_and_applies_toml(
     assert exit_code == 0
     captured_first = capsys.readouterr()
     payload = json.loads(captured_first.out)
-    assert "[tune-manifold]" in captured_first.err
+    assert "[optuna]" in captured_first.err
 
     assert payload["applied"] is True
     assert payload["applied_config_path"] == str(config_path.resolve())
