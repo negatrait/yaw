@@ -17,7 +17,7 @@ chunk_size = 1000
 chunk_overlap = 150
 min_chunk_size = 100
 # Maximum separate chunk inputs per native CocoIndex/DSPy embedding batch.
-embed_batch_size = 4
+embed_batch_size = 5
 poll_interval_seconds = 10.0
 
 [inference]

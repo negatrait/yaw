@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "AGENTS.md",
+                "file": "docs/reviews/mdl-dag-sprint.md",
                 "mode": "source",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "AGENTS"
+              "title": "mdl-dag-sprint"
             }
           }
         ]
@@ -190,8 +190,21 @@
   },
   "active": "2f7347019df76f95",
   "lastOpenFiles": [
+    "AGENTS.md",
+    "FOUNDATIONAL.md",
+    "docs/reviews/mdl-dag-sprint.md",
+    "docs/reviews/minimum-hop-subspace-resolution-dag.md",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_14/iter_0_prog_0.json",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_14",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_13/iter_0_prog_0.json",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_13",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_12/iter_0_prog_0.json",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_12",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_11/iter_0_prog_0.json",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_11",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_10/iter_0_prog_0.json",
+    ".yaw/gepa_logs/generated_best_outputs_valset/task_10",
     ".agents/agents/critic/agent.md",
-    "outputs/probe_coco_ast.py",
     ".yaw/dspy_corpus/enterprise_rag_bench_e85136c482ee9ef2.md",
     ".yaw/dspy_corpus/enterprise_rag_bench_889864180a0fcc3e.md",
     ".yaw/dspy_corpus/enterprise_rag_bench_213fa0b46d887214.md",
@@ -213,19 +226,6 @@
     ".yaw/dspy_corpus/enterprise_rag_bench_d5d8776d645742f9.md",
     ".yaw/dspy_corpus/enterprise_rag_bench_0c64bb926f82cb01.md",
     ".yaw/dspy_corpus/enterprise_rag_bench_4987397dffdd1f7e.md",
-    ".yaw/dspy_corpus/enterprise_rag_bench_bcb936a35cc216a3.md",
-    ".yaw/dspy_corpus/enterprise_rag_bench_f8e5fd0dce16ae71.md",
-    ".yaw/dspy_corpus/enterprise_rag_bench_8224baba6ab60d70.md",
-    ".yaw/dspy_corpus/enterprise_rag_bench_a88123ef8736acec.md",
-    "outputs/datasets/enterprise_rag_bench/bundle.lock",
-    ".yaw/optimize_yaw.db-shm",
-    ".yaw/optimize_yaw.db-wal",
-    ".yaw/optimize_yaw.db",
-    ".yaw/dspy_corpus",
-    ".yaw/dspy_status.json",
-    ".yaw/optimize_yaw.db.lock",
-    ".yaw/optuna_index.db",
-    ".yaw/optuna_index.db-wal",
     ".yaw/kg_frames_20261101_172330/frame_00023_00047_00025_00037_00000_00000.png",
     "outputs/dashboard/pareto_frontier_progress.svg",
     "outputs/dashboard/knowledge_graph_extraction_dashboard.svg",

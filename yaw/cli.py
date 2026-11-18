@@ -36,7 +36,7 @@ from yaw.core import (
 from yaw.mcp_server import serve_http
 from yaw.optimize import optimize_dspy, optimize_optuna
 from yaw.pipeline import make_dspy_embed_fn
-from yaw.qa import ask_question, build_qa_agent, make_qa_tools
+from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
 from yaw.retrieval import (
     VectorSearch,
     build_vector_search,
@@ -45,7 +45,6 @@ from yaw.retrieval import (
     search_vectors,
 )
 from yaw.runtime import (
-    create_lm,
     redact_secrets,
     require_path,
     resolve_program_path,
@@ -374,10 +373,9 @@ def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
         if vs.size == 0:
             raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
         tools = make_qa_tools(vs, corpus_root, make_dspy_embed_fn(cfg), conn, task_mode=cfg.embedding_task_mode)
-        agent = build_qa_agent(tools, max_iters=cfg.react_max_iters)
-        if (prog_path := resolve_program_path(cfg)) is not None:
-            agent.load(str(prog_path))
-        with dspy.context(lm=create_lm(cfg)):
+        lm = create_lm(cfg)
+        agent = build_qa_agent(tools, max_iters=cfg.react_max_iters, artifact_path=resolve_program_path(cfg))
+        with dspy.context(lm=lm):
             res = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)
     return {
         "question": q,

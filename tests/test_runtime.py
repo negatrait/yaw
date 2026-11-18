@@ -143,7 +143,8 @@ def test_fastmcp_gate_and_runtime_module_isolation(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
     lm = create_lm(cfg)
     assert type(lm) is dspy.LM
-    assert lm.model == f"{cfg.provider}/{cfg.qa_model}"
+    assert lm.model == f"yaw-openai/{cfg.qa_model}"
+    assert lm.supports_function_calling
     assert lm.model_type == "chat"
     assert lm.cache is False
     assert lm.kwargs.get("temperature") == 1.0

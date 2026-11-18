@@ -60,8 +60,20 @@ def _topic_embed_vec(text: str, *, dim: int = 16) -> np.ndarray:
     return base / max(float(np.linalg.norm(base)), 1e-12)
 
 
-def _xml_tool_reply(thought: str, calls: list[dict[str, Any]]) -> str:
-    return f"<next_thought>{thought}</next_thought>\n<tool_calls>{json.dumps({'tool_calls': calls})}</tool_calls>"
+def _tool_reply(thought: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": thought,
+        "tool_calls": [
+            {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {"name": call["name"], "arguments": json.dumps(call["args"])},
+            }
+            for i, call in enumerate(calls)
+        ],
+    }
 
 
 def _start_openai_stub(chat_responder: Any = None) -> tuple[ThreadingHTTPServer, dict[str, int]]:
@@ -110,7 +122,13 @@ def _start_openai_stub(chat_responder: Any = None) -> tuple[ThreadingHTTPServer,
                     "created": 1,
                     "model": payload.get("model", "gemma-4-e4b"),
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": content
+                            if isinstance(content, dict)
+                            else {"role": "assistant", "content": content},
+                            "finish_reason": "tool_calls" if isinstance(content, dict) else "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
@@ -579,15 +597,15 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
 
     seen_messages: list[str] = []
 
-    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
         msgs = payload.get("messages", [])
         blob = json.dumps(msgs)
         seen_messages.append(blob)
         has_tool_obs = any(m.get("role") == "tool" for m in msgs)
         cids = [int(m.group(1)) for m in _CID_IN_TEXT_RE.finditer(blob)]
         if not has_tool_obs or not cids:
-            return 200, _xml_tool_reply("Search corpus", [{"name": "search_passages", "args": {"query": "Apollo 11"}}])
-        return 200, _xml_tool_reply(
+            return 200, _tool_reply("Search corpus", [{"name": "search_passages", "args": {"query": "Apollo 11"}}])
+        return 200, _tool_reply(
             "Submit grounded answer",
             [{"name": "submit", "args": {"answer": f"Neil Armstrong [chunk_id={cids[0]}]"}}],
         )
@@ -673,25 +691,25 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
             titles = conn.execute("SELECT title FROM chunks").fetchall()
             assert titles and all(row[0] == "" for row in titles)
 
-    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
         msgs = payload.get("messages", [])
         sys_text = str(msgs[0].get("content", "")) if msgs else ""
         blob = json.dumps(msgs)
         seen_chat_blobs.append(blob)
         if "improved_instruction" in sys_text:
-            return 200, _xml_tool_reply(
+            return 200, _tool_reply(
                 "Submit concise instruction",
                 [{"name": "submit", "args": {"improved_instruction": "Use search_passages concisely."}}],
             )
         has_tool_obs = any(m.get("role") == "tool" for m in msgs)
         cids = [int(m.group(1)) for m in _CID_IN_TEXT_RE.finditer(blob)]
         if not has_tool_obs or not cids:
-            return 200, _xml_tool_reply(
+            return 200, _tool_reply(
                 "Search passages", [{"name": "search_passages", "args": {"query": "Apollo 11", "top_k": 3}}]
             )
         cid = cids[0]
         ans = f"Neil Armstrong [chunk_id={cid}]" if "Apollo" in blob else f"XylophoneZither [chunk_id={cid}]"
-        return 200, _xml_tool_reply("Submit answer", [{"name": "submit", "args": {"answer": ans}}])
+        return 200, _tool_reply("Submit answer", [{"name": "submit", "args": {"answer": ans}}])
 
     srv, _ = _start_openai_stub(chat_responder)
     try:
@@ -810,10 +828,10 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
 def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: bool) -> None:
     requested, release = threading.Event(), threading.Event()
 
-    def stalled_chat(_turn: int, _payload: dict[str, Any]) -> tuple[int, str]:
+    def stalled_chat(_turn: int, _payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
         requested.set()
         assert release.wait(timeout=60)
-        return 200, _xml_tool_reply("Finish", [{"name": "finish", "args": {"answer": "Neil Armstrong"}}])
+        return 200, _tool_reply("Finish", [{"name": "finish", "args": {"answer": "Neil Armstrong"}}])
 
     srv, _ = _start_openai_stub(stalled_chat)
     toml_path = _write_toml(tmp_path, port=srv.server_port)

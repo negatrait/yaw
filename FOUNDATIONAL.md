@@ -2,120 +2,58 @@
 
 ## 1. Purpose
 
-YAW is a native HippoRAG 2-style retrieval engine built around a single SQLite database.
+`yaw` is a local, zero-LLM-index multi-hop retrieval engine and context compiler built on SQLite (`sqlite-vec` + contentless `FTS5`).
 
-The project exists to reproduce or exceed HippoRAG 2 retrieval quality with a smaller, inspectable, locally operable architecture. YAW owns its ingestion, storage, retrieval, graph traversal, inference orchestration, and source hydration.
+- **Tier 0 — Primary Librarian Surface (`recall`, `neighbors`):** Compiles large, messy, ambiguous corpora into a minimal, cycle-free **Evidence DAG** at query time with **zero generative LLM dependency**—returning verified disk spans, topological bridge edges, calibrated completeness (`explained_r2`), and missing-evidence diagnostics (`stalled_anchors`, `near_miss_terms`).
+- **Tier 1 — Benchmark QA Harness (`qa`, `optimize dspy`):** Optional local SLM reader (`dspy.ReAct` + `dspy.GEPA`) used strictly for academic end-to-end EM/F1 benchmarking (`PopQA`, `MuSiQue`, `HotpotQA`, `2WikiMultiHopQA`) and optional sub-agent synthesis.
 
-YAW is not a wrapper around HippoRAG. Upstream HippoRAG is a behavioral and benchmark reference only.
+Upstream `HippoRAG 2` and `Youtu-GraphRAG` are external benchmark baselines only (`0` `hipporag` imports anywhere in `yaw/`, `scripts/`, or `tests/`).
 
-## 2. Success Criteria
+## 2. Non-Goals & Retired Stack
 
-YAW succeeds only when it demonstrates all of the following:
+`yaw` does **not** provide backward-compatibility shims, multi-backend storage abstractions, imperative SQLite bypass writers, speculative configuration knobs, or fallback retrieval paths.
 
-1. **Retrieval quality**
-   - Tier 1 benchmark parity during Epic 1 development.
-   - Tier 2 full-corpus parity or better before Epic 1 acceptance.
-2. **Native implementation**
-   - No `hipporag` imports in production code, benchmarks, scripts, or tests.
-   - No hidden delegation to an upstream HippoRAG runtime.
-3. **Architectural containment**
-   - Each domain owns its implementation and internal dependencies.
-   - Shared code is limited to genuinely domain-neutral primitives in `yaw.core`.
-   - Cross-domain imports are rejected by automated tests.
-4. **Operational simplicity**
-   - One runtime.
-   - One authoritative database.
-   - One database writer.
-   - Explicit failures instead of silent degradation.
-5. **Traceable evidence**
-   - Evaluation records distinguish setup success from retrieval and inference correctness.
-   - Acceptance claims are supported by reproducible benchmark outputs.
-   - Architectural and schema cutovers are complete only when all runtime lifecycles, callers, and telemetry consumers (`scripts/watchdog.py`) are wired to the active schema and verified end-to-end.
+The following remain permanently retired unless a controlled holdout benchmark proves material Recall@K, latency, and memory gains justifying the dependency weight:
+`rdflib`, OWL 2 RL, `pySHACL`, LLM OpenIE triple/ontology extraction, GBNF grammars, `skos:ConceptScheme`, `dspy.RLM`, `spacy` (`en-core-web-sm`), and `optuna` retrieval sweeps.
 
-Passing unit tests alone does not establish benchmark parity or system acceptance.
+## 3. Package Boundaries
 
-## 3. Non-Goals
-
-YAW does not aim to provide:
-
-- Backward compatibility with abandoned internal APIs.
-- A compatibility layer for HippoRAG.
-- A general-purpose ontology platform.
-- Multiple interchangeable storage backends.
-- Distributed ingestion or storage.
-- Silent fallbacks between retrieval or inference paths.
-- Abstractions created only for possible future use.
-
-The following technologies remain retired unless controlled benchmarks demonstrate a material improvement:
-
-- `rdflib`
-- OWL 2 RL
-- `pySHACL`
-- spaCy-based ontology processing
-
-A benchmark improvement must justify the additional dependency, complexity, runtime cost, and maintenance burden.
-
-## 4. System Model
-
-YAW consists of five conceptual capabilities:
-
-1. **Ingestion**
-   - Observes corpus changes through OS event-driven CocoIndex (`localfs.walk_dir(..., live=True)`).
-   - Streams ingestion and candidate indexing in dataset-agnostic, bounded micro-batches (`64` chunks per `app.update()` cycle) so heap/VRAM usage stays flat and `yaw.db` publishes incremental graph state every 64 chunks. Never encode benchmark presets or train/val splits in production ingestion.
-   - Persists CocoIndex LMDB memoization state (`coco.Settings(db_path=...)`) in a shared, content-addressed cache across runs—never tied to transient per-run database filenames.
-2. **Storage**
-   - Incremental publication reuses unchanged validated contributions and evidence-keyed adjudications. Its input checkpoint commits with the graph; unresolved SHACL violations abort publication. For fixed evidence, 64+64 and 128 chunks must yield the same canonical graph with comparable cumulative compute, as specified in [native graph publication](docs/native-cocoindex-graph.md). Existing graph-wide staging is an unfinished cutover, not accepted target behavior.
-   - Persists source metadata, text, graph data, vectors, and lexical indexes in `yaw.db`.
-   - Declares every SQLite table and `sqlite-vec` `vec0` index through typed CocoIndex targets (`TableSchema.from_class`), with one writer and no competing imperative `upsert_*` sinks.
-3. **Retrieval & Ontology**
-   - Produces lexical, vector, and graph-derived evidence using sparse CSR entity-state HMM inference with separate passage emissions, as defined in [H1](docs/reviews/hmm-retrieval.md). The user approved this retrieval target on 2026-11-13; historical PPR measurements do not establish HMM quality.
-   - Maintains closed-world W3C concept/entity semantics, source-supported facts and relations, and revisable canonical identities across documents and ingestion batches. Legitimate semantic islands are allowed; incomplete documents are not reported as semantically complete.
-   - Removes `skos:ConceptScheme` and all scheme clustering, storage, inference, embeddings and retrieval/QA/telemetry consumers from the current implementation target. Reintroduction requires a separate experiment proving held-out Recall@N, EM or F1 improvement against the scheme-free baseline with acceptable compute, memory and other quality metrics.
-4. **Inference**
-   - NER alone discovers and defines resources: particular `owl:NamedIndividual` instances and general `skos:Concept` categories. Resource labels require lexical content (letters); pure numbers, codes, dates, and scalar measurements remain literals (`rdfs:Literal`).
-   - Triple extraction selects existing NER resources as subjects/resource objects and discovers literal objects while expressing passage-supported `rdf:Statement` facts. Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.
-   - Three-layer parity: GBNF grammar, extraction parsers, and SQLite SHACL shapes enforce identical resource and statement contracts. Every parser-accepted record must normalize, bind, and publish without dropped statements.
-   - Uses native DSPy interfaces (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`) and treats model services as external dependencies.
-   - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`). The configured Unsloth deployment admits two `embeddinggemma-2` requests through the single native DSPy embedding adapter and one `gemma-4-e4b` generation request; query and indexing embedding calls share the adapter limit.
-   - Enforces sampling temperatures $\ge 0.3$ (defaulting to $0.35$ for extraction and QA, up to $0.7$–$0.8$ for reflection) on small local models to avoid looping; temperatures below $0.3$ are prohibited.
-5. **Runtime**
-   - Coordinates ingestion, retrieval, inference, and source hydration in `yaw/daemon/runtime.py`.
-   - Exposes one application-level API used by transports and evaluation.
-
-Transport adapters do not contain application logic.
-
-## 5. Repository Boundaries
-
-The implementation is contained within:
+All production code lives inside a flat 14-file boundary:
 
 ```text
-
 yaw/
-
-├── core/
-└── daemon/
-    ├── ingestion/
-    └── graph/
-        ├── storage/
-        └── inference/
-
+├── core/        # __init__.py, config.py, logger.py, types.py (Python stdlib only; 0 ML/DB imports)
+└── *.py         # __init__, __main__, cli, datasets, mcp_server, optimize, pipeline, qa, retrieval, runtime
 ```
 
-## 6. Failure Policy
+- Modules never import another module's `_private` symbols.
+- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic.
+- `cli.py` lazy-imports `optimize.py` and `datasets.py` inside optimization subcommands so Tier-0 commands run standalone outside a git checkout.
 
-Until YAW is feature complete, every failure is a hard failure.
+## 4. System Invariants
 
-- DSPy's native retry policy is the only retry mechanism for transient model-service errors.
-- When those retries are exhausted, or a model service is unavailable, the operation aborts with the original error. Nothing is skipped, defaulted or degraded.
-- Graph publication failures abort immediately: during optimization, publication errors escape evaluation wrappers (`FatalGraphPublicationError` subclasses `BaseException`) and abort the optimizer with the original exception rather than looping or repeatedly retrying failed indexing.
-- Fallbacks, degraded modes and recovery paths are out of scope until the core pipeline is complete. Each is then introduced as an explicit, scoped decision, with tests that exercise the failure it handles.
+1. **Declarative Ingestion & Ingest Gate (`yaw/pipeline.py`):**
+   - Sole writer to `.yaw/yaw.db` via event-driven CocoIndex (`localfs.walk_dir(..., live=True)`), dataset-agnostic `64`-chunk micro-batches per `app.update()`, and a persistent content-addressed CocoIndex LMDB memo cache. Never encode dataset splits or benchmark presets in production code.
+   - `tree-sitter-language-pack` supplies AST/Markdown `(ast_island_start, ast_island_end, title)` and structural symbol/link anchors (`json_document_fields` unwraps benchmark JSON documents).
+   - A 64-bit SimHash + conditional `zlib(zdict)` novelty gate (`novelty_q8 < 51`) reuses prototype embeddings without invoking the neural embedder on boilerplate/log clones. Disk embeddings remain chunk-local (never coupled to corpus-wide whitening).
+   - Mounts dual contentless `FTS5` indexes plus `fts5vocab(..., 'row')` views: `chunk_fts` (`unicode61` prose/phrases) and `anchor_fts` (`unicode61 tokenchars '_-./:@$'` exact paths/CVEs/identifiers).
+2. **Pointer-Only Disk Hydration:**
+   - `yaw.db` stores 1-indexed `(rel_posix_path, start_line, end_line)`, SHA-256 `source_hash`, `mtime_ns`, and `novelty_q8`—never authoritative copies of corpus text.
+   - Passages hydrate from disk at query time: hash mismatches return `stale_on_disk = True` with `text = ""`; mid-read file mutations raise `CONSISTENCY_ERROR`.
+3. **Stage-1 `RaBitQ` & MDL DAG Solver (`yaw/retrieval.py`):**
+   - `VectorSearch` holds **no** full-corpus `(N, D)` `float32` array or JSON token/entity dicts in RAM—only `~100B/chunk` Stage-1 `RaBitQ` codes, Marchenko–Pastur shrinkage whitening $(\mu, V_{\text{spike}}, \Delta w, D_{\text{eff}})$, `csls_rk`, and `next_in_file`.
+   - Exact Stage-2 vectors are read from `chunks` strictly for bidirectional wavefront survivors (`<= 192`). All `FTS5` queries specify `ORDER BY bm25(...) ASC LIMIT ?`.
+   - Candidate chains are scored via orthogonal bridge-subspace projection (`qr`) and assembled into a cycle-free DAG via parameter-free Shannon/MDL `scipy.optimize.nnls` bit accounting + `zlib` path novelty.
+4. **Runtime Concurrency & Lazy LLM Admission (`yaw/runtime.py`):**
+   - Tier-0 reads (`recall`, `neighbors`) run under `BoundedSemaphore(32)` over `?mode=ro` SQLite connections and succeed when no generative LLM endpoint is configured or reachable.
+   - Tier-1 `dspy.LM` initializes lazily on first `qa` call under `Semaphore(1)` (`temperature=1.0` student / `0.7` GEPA reflection; embeddings batched at `max_batch_size = 64`).
 
-At this stage a fallback hides defects and corrupts benchmark evidence. A visible failure is more useful than a run that completes.
+## 5. Failure Policy & Acceptance Criteria
 
-## 7. Further Context
+- **Fail-Fast Semantics:** Transient model-service retries use `dspy.LM(num_retries=...)` exclusively. Exhausted retries, SQLite operational errors, or invariant violations abort immediately with the original exception or typed `YawRuntimeError("[CODE]", ...)`—zero silent catch-and-continue or degraded fallback loops.
+- **Evidence-Gated Acceptance:** Unit tests prove mechanics, not retrieval quality. Cutovers are complete only when all callers, CLI/MCP surfaces, and telemetry (`scripts/watchdog.py`) are wired end-to-end and backed by reproducible benchmark artifacts (`Recall@K`, Reject-mode calibration, RAM/latency envelopes, and Tier-1 EM/F1).
 
-- [HippoRAG (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md)
-- [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md)
-- [Epic 1: Native `yaw.db` Engine & CocoIndex Daemon](docs/epic-1-hipporag-daemon.md) — Core engine & clean-slate 7-dataset slice-based paper parity decision gate
-- [Epic 2: FastMCP Streamable HTTP Adapter](docs/epic-2-fastmcp-http.md) — Feature completion (Streamable HTTP transport, daemon lifespan, 5 MCP tools, source freshness citations)
-- [Epic 3: Performance, Symbolic Pruning & Full-Corpus Scale](docs/epic-3-performance.md) — Post-Epic 2 W3C/OWL/SKOS/PROV-O symbolic distractor pruning, novel DSPy retrieval/QA experiments, demoscene execution speed, radical codebase reduction, and full-corpus multi-day holdout benchmarks
+## 6. Governing Specs
+
+- Active migration ledgers: `docs/reviews/` (currently `docs/reviews/mdl-dag-sprint.md`)
+- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where older epic text references pre-cutover OpenIE/SHACL/PPR details, §§1–5 above take precedence)*.

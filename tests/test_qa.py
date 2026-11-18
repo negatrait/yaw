@@ -23,7 +23,7 @@ from numpy.typing import NDArray
 
 from yaw.core import EmbedFn, YawConfig, YawRuntimeError
 from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
-from yaw.qa import QASignature, build_qa_agent, make_qa_tools
+from yaw.qa import QASignature, build_qa_agent, create_lm, make_qa_tools
 from yaw.qa import ask_question as run_qa
 from yaw.retrieval import build_vector_search, open_readonly_db
 
@@ -146,7 +146,13 @@ def _start_loopback_chat_server(
                     "created": 1,
                     "model": payload.get("model", "gemma-4-e4b"),
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": content
+                            if isinstance(content, dict)
+                            else {"role": "assistant", "content": content},
+                            "finish_reason": "tool_calls" if isinstance(content, dict) else "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
@@ -219,6 +225,120 @@ def test_qa_module_isolation_and_zero_wrappers() -> None:
     assert agent.max_iters == 6
     assert set(agent.tools) == {"_dummy_tool", "submit"}
     assert EmbedFn is not None
+
+
+def test_local_alias_uses_native_tools_and_saved_lm_cannot_override_deployment(tmp_path: Path) -> None:
+    calls_seen: list[str] = []
+
+    def search_passages(query: str) -> str:
+        """Find evidence in the test corpus."""
+        calls_seen.append(query)
+        return "NATIVE-TOOLS-OK"
+
+    def responder(turn: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        assert {tool["function"]["name"] for tool in payload["tools"]} == {"search_passages", "submit"}
+        assert "max_tokens" not in payload and "max_completion_tokens" not in payload
+        if turn == 0:
+            name, args = "search_passages", {"query": "protocol evidence"}
+        else:
+            assert any(
+                msg.get("role") == "tool" and "NATIVE-TOOLS-OK" in str(msg.get("content"))
+                for msg in payload["messages"]
+            )
+            name, args = "submit", {"answer": "NATIVE-TOOLS-OK"}
+        return 200, {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"native_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        }
+
+    saved = tmp_path / "compiled.json"
+    old = build_qa_agent([search_passages])
+    old.set_lm(dspy.LM("openai/obsolete-alias", api_base="http://127.0.0.1:1/v1", max_tokens=11))
+    old.save(str(saved))
+    srv, requests, _ = _start_loopback_chat_server(responder)
+    try:
+        cfg = YawConfig(workspace_root=tmp_path, base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        lm = create_lm(cfg)
+        assert lm.supports_function_calling
+        agent = build_qa_agent([search_passages], artifact_path=saved)
+        assert agent.react.lm is None
+        with dspy.context(lm=lm):
+            prediction = agent(question="Find protocol evidence.")
+        assert prediction.answer == "NATIVE-TOOLS-OK"
+        assert prediction.termination_reason == "submit"
+        assert calls_seen == ["protocol evidence"]
+        assert len(requests) == 2
+        assert all(request["model"] == cfg.qa_model for request in requests)
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("max_iters", [1, 2])
+def test_native_react_requires_a_tool_instead_of_allowing_prose_completion(tmp_path: Path, max_iters: int) -> None:
+    executed: list[str] = []
+
+    def read_evidence() -> str:
+        """Read evidence needed to answer the question."""
+        executed.append("read")
+        return "The evidence token is NATIVE-TOOLS-OK."
+
+    def responder(turn: int, payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
+        choice = payload.get("tool_choice", "auto")
+        if choice == "auto":
+            # Valid native Chat response, but not a valid ReAct action.
+            return 200, "I have gathered sufficient information to answer the question."
+        has_evidence = any(message["role"] == "tool" for message in payload["messages"])
+        if choice == "required" and not has_evidence:
+            name, args = "read_evidence", {}
+        else:
+            name, args = "submit", {"answer": "NATIVE-TOOLS-OK"}
+        return 200, {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"required_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        }
+
+    srv, requests, _ = _start_loopback_chat_server(responder)
+    try:
+        cfg = YawConfig(workspace_root=tmp_path, base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        lm = create_lm(cfg)
+        agent = build_qa_agent([read_evidence], max_iters=max_iters)
+        # A saved, older program may carry the permissive default explicitly.
+        agent.react.update_config(tool_choice="auto")
+        path = tmp_path / "permissive.json"
+        agent.save(str(path))
+        agent = build_qa_agent([read_evidence], max_iters=max_iters, artifact_path=path)
+        with dspy.context(lm=lm):
+            prediction = agent(question="Read the evidence and report its token.")
+        assert prediction.termination_reason == ("submit" if max_iters == 2 else "forced_submit")
+        assert prediction.answer == "NATIVE-TOOLS-OK"
+        assert executed == ["read"]
+        assert len(requests) == 2
+        assert requests[0]["tool_choice"] == "required"
+        assert requests[1]["tool_choice"] == (
+            "required" if max_iters == 2 else {"type": "function", "function": {"name": "submit"}}
+        )
+    finally:
+        srv.shutdown()
 
 
 def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:

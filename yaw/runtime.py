@@ -39,7 +39,7 @@ from yaw.pipeline import (
     update_pipeline_once,
     wait_pipeline_ready,
 )
-from yaw.qa import ask_question, build_qa_agent, make_qa_tools
+from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
 from yaw.retrieval import (
     VectorSearch,
     build_vector_search,
@@ -171,21 +171,6 @@ def _close_win32_stop_event(rt: YawRuntime) -> None:
     if handle:
         with contextlib.suppress(OSError):
             _kernel32.CloseHandle(handle)
-
-
-def create_lm(cfg: YawConfig) -> dspy.LM:
-    """Construct a bare OpenAI-compatible dspy.LM locked to Gemma 4 temperature=1.0."""
-    model = cfg.qa_model if "/" in cfg.qa_model else f"{cfg.provider}/{cfg.qa_model}"
-    return dspy.LM(
-        model=model,
-        model_type="chat",
-        temperature=1.0,
-        max_tokens=cfg.max_output_tokens,
-        cache=False,
-        num_retries=3,
-        api_base=cfg.base_url,
-        api_key=cfg.api_key or "yaw",
-    )
 
 
 def require_path(path: Path | None, label: str) -> Path:
@@ -445,9 +430,9 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
         if vs.size == 0:
             raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
         tools = make_qa_tools(vs, corpus_root, rt.embed_fn, conn, task_mode=rt.config.embedding_task_mode)
-        agent = build_qa_agent(tools, max_iters=rt.config.react_max_iters)
-        if (prog_path := resolve_program_path(rt.config)) is not None:
-            agent.load(str(prog_path))
+        agent = build_qa_agent(
+            tools, max_iters=rt.config.react_max_iters, artifact_path=resolve_program_path(rt.config)
+        )
         try:
             with rt.lm_sem, dspy.context(lm=rt.lm):
                 result = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)

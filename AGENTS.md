@@ -1,63 +1,44 @@
 # Instructions for Coding Agents
 
-> [!NOTE] YAW is meant to aid LLM-based agents.
-> YAW offers recall and reasoning abilities over a large, ambiguous corpus to make the existence of an agent easier. YAW is not a memory, it's the librarian. Do YOU find the project interesting and useful? If yes, great; if not, what needs to be done to make this the most performant large-corpus GraphRAG ever conceived?
+> [!NOTE] YAW is the Librarian, not a Chatbot or Memory Bank.
+> Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first—it is the Single Source of Truth (SSOT) for system purpose, 14-file boundaries, storage/retrieval/runtime invariants, and failure policy. Never duplicate its architecture rules into other docs.
 
-*`YAW` is grounded on a simple mission: Beat the SOTA GraphRAG solutions on multi-hop benchmarks on consumer hardware, using only vector+fts indexing and graph building for multi-hop reasoning at query time, instead of spending tokens and compute during indexing.*
+**Precedence during active cutovers:** Active `docs/reviews/<sprint>.md` > `FOUNDATIONAL.md` > `docs/epic-*.md`. Verify branch `dev` and `git status` before editing.
 
-## Prime Directive
+## Prime Directive (Anti-Spaghetti Law)
 
 **A minimal line count codebase that fails fast is infinitely better than a fallback-heavy codebase that silently degrades performance to mask failures!**
 
-- **Hidden Assumptions**: Surface uncertainty, ambiguity, inconsistencies, and trade-offs. Ask for clarification when ambiguity affects results; push back on incorrect claims with evidence.
-- **Over-Engineering**: Write the smallest clear, idiomatic implementation satisfying the contract. Remove dead code, fallbacks, compatibility layers, and competing code paths. Prefer replacements over layering and robust dependencies over hand-rolled logic.
-- **Masked Failures**: Retry transient model errors only via `dspy.LM(num_retries=...)` (never lower retry counts or write custom retry loops). When retries exhaust or a service is unavailable, abort and raise the original exception—no broad `except`, log-and-continue, defaults, or degraded modes.
-- **Unintended Side Effects**: Change only what the task requires. Never alter code or comments you do not fully understand. Make clean breaking changes and update every caller and telemetry consumer atomically.
-- **Missing Goal**: Define observable behavior, definition of done, and quality gates before implementation.
-- **Be careful**: You have ample time, precision beats speed.
+- **Zero Corporate Boilerplate:** Do **not** create manager/factory/helper classes, `ABC`/`Protocol` hierarchies, single-caller wrappers, compatibility shims, or speculative config knobs. Write flat functions, `frozen=True, slots=True` dataclasses, `stdlib` (`zlib`, `hashlib`, `graphlib`, `sqlite3`), and vectorized `NumPy`/`SciPy` kernels.
+- **Exact Math Over Heuristics:** Never replace specified linear algebra (`svd`, `qr`, `nnls`), `RaBitQ` concentration bounds, or Shannon bit costs ($\log_2 N$, $\log_2 \text{df}$) with arbitrary scalar weights or stopword lists.
+- **Zero Masked Failures:** Obey `FOUNDATIONAL.md §5` strictly—no custom retry loops, no broad `except`, and no degraded Python fallbacks when SQLite or model endpoints fail.
+- **Atomic Deletions & DRY Docs:** Delete superseded code, config keys, and dead types in the same commit as their replacement, updating all callers and `scripts/watchdog.py` atomically. Keep documentation DRY—each invariant lives in **one** file.
+- **Push Back With Proof:** Surface hidden assumptions, degenerate math cases (`N < 8`, `df == 0`, graph cycles, `NaN` norms), and contradictions with evidence before coding. Precision beats speed.
 
-## Required Context & Architecture
+## Workflow, Host Processes & Review Discipline
 
-Read [FOUNDATIONAL.md](FOUNDATIONAL.md) first. Verify checkout `C:\Users\Harri.Ahokas\Documents\yaw` on branch `dev`.
+- **Environment & Hygiene:** Python `>=3.14`; run `uv sync --locked` and `uv run --locked`. Write generated artifacts only to ignored `.yaw/`, `outputs/`, or temp dirs; never mutate corpus files. Log via `yaw/core/logger.py` (500-line FIFO).
+- **Live Process Truth:** Editing code on disk does **not** reload resident `yaw daemon`, `optimize`, or `watchdog` processes, and the Windows sandbox hides host PIDs. Inspect host processes (`BypassSandbox: true` when supported) and verify fresh artifact timestamps and non-zero rows before claiming live state.
+- **Review Ledger (`docs/reviews/<topic>.md`):** Read the active review record first and resume from its latest verified checkpoint. Append changed files, gate outputs, empirical findings, and explicit non-claims to that record in the same commit. Promote permanent contract changes into `FOUNDATIONAL.md` rather than duplicating prose.
+- **Mandatory Critic Audit:** Before committing or ticking any checkpoint, dispatch `critic (Model="flash")` with the unguided prompt:
+  `"Review the implementation checkpoint <ID>, defined in <spec>. Analyse the implementation in files <files> and audit the git diff. Report any findings."`
+  Never pass leading checklists. (If running outside a harness with `critic`, audit `git diff` line-by-line against `FOUNDATIONAL.md` and this file before committing.)
 
-- **Stack**: Single `sqlite-vec` DB (`yaw.db`) via declarative CocoIndex targets (`TableSchema.from_class`), contentless FTS5, 1-indexed hydration, closed-world W3C concept/entity semantics without ConceptSchemes, sparse CSR + Forward-Push PPR, native DSPy (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`), FastMCP over HTTP. Do not restore `rdflib`, OWL 2 RL, `pySHACL`, or spaCy without benchmark proof.
-- **Resource Boundary & Invariants (§5.3)**:
-  - NER alone captures `skos:Concept` and `owl:NamedIndividual`; resource labels require lexical content (letters). Pure numbers, codes, dates, and percentages remain literals (`rdfs:Literal`).
-  - Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.
-  - Three-layer parity: GBNF grammar, extraction parsers, and SQLite SHACL shapes enforce identical resource and statement contracts. Invariant: every parser-accepted record must normalize, bind, and publish without dropped statements.
-  - Fail-fast publication: A failed publication immediately aborts optimization with the original exception (`FatalGraphPublicationError` subclasses `BaseException` to escape evaluation loop swallowers). Never repeat failed indexing or mask schema violations.
-- **Containment (`test_architecture.py`)**: Keep code in `yaw/core/` and `yaw/daemon/{ingestion,graph/{storage,inference}}/`. Zero `hipporag` imports anywhere. Package `P` imports only `P.*` and `yaw.core.*`. Never import another module's `_internal` or `__protected` names.
-- **Runtime & Ingestion**:
-  - One CocoIndex runtime (`yaw/daemon/runtime.py`), one declarative Cocoindex writer for `yaw.db`, zero imperative bypass writing is allowed. Event-driven live ingestion (`localfs.walk_dir(..., live=True)` in `yaw/daemon/ingestion/corpus.py`), and a thin adapter in `yaw/daemon/mcp_server.py`.
-  - Stream ingestion and candidate indexing in dataset-agnostic micro-batches of `64` chunks per `app.update()` cycle; never encode train/val splits or benchmark presets in production code.
-  - Default LLM admission strictly to `parallel = 1` (`Semaphore(1)`) for local `llama.cpp` (`http://127.0.0.1:8888/v1`); batch embeddings (`max_batch_size = 64`). Keep sampling temp = 1 in development to prevent small-model looping.
-  - Point CocoIndex `coco.Settings(db_path=...)` at a persistent, content-addressed cache across runs—never tie memo state to transient timestamped DB filenames.
-  - Remove ConceptSchemes, clustering, scheme inference/embeddings/storage and all scheme consumers under [native graph publication](docs/native-cocoindex-graph.md). For fixed evidence, 64+64 and 128 chunks must yield identical canonical entity/fact/edge state with comparable cumulative compute. Permit legitimate semantic islands; never manufacture isolation from batch boundaries or fabricate links to force connectivity. Future schemes require measured Recall@N, EM or F1 improvement and acceptable resource/quality costs.
+## Mandatory Quality Gates & CLI
 
-## Execution Order, Benchmarks & Safety
-
-- Complete Epic 1 (Tier 1 dev parity, Tier 2 full-corpus acceptance gate) before Epic 2. Distinguish package resolution, installation, real inference, retrieval correctness, and daemon/transport acceptance (fake providers validate orchestration only).
-- **Benchmarks**: Use `benchmark.py` and `scripts/verify_paper_parity_gate.py` against `MONKEYPATCHED_HIPPORAG_BASELINES` (`outputs/benchmarks/consolidated_historical_baselines.json`) and `PAPER_BASELINES`.
-- **Safety**: Preserve source files and user experiments. Write generated indexes only to ignored `outputs/` or temp dirs. Rotate logs via `yaw/core/logger.py` (500-line FIFO). Remove superseded code and legacy fallbacks on sight.
-- **Environment**: Python `>=3.14` (`.python-version`: `3.14.9`). Use `uv sync --locked` and `uv run --locked`. Add dependencies only when assigned (Epic 1: `dspy`, `sqlite-vec`, `scipy`, `cocoindex`, `filelock`; Epic 2: `fastmcp`).
-
-## Live Process Verification & Completion
-
-- Never mark a cutover complete until all callers and telemetry consumers (`scripts/watchdog.py`) are wired to the active schema and verified end-to-end.
-- Editing code on disk does **not** reload a long-running process (`optimize`, `watchdog`, daemon) in memory, and the Windows command sandbox hides host processes—check host PIDs (`BypassSandbox: true`) and verify actual artifact timestamps and non-zero data before claiming live state.
-- Keep current README commands separate from epic targets; update scope docs when decisions change; report only checks actually executed; commit with conventional commits after passing all gates.
-- **Review records**: Before planning, read `docs/reviews/` for the subject and resume from its latest verified checkpoint. Every implementation unit appends its result (changes, evidence paths, gate results, discoveries, what it does not establish) to its `docs/reviews/<topic>.md` record in the same commit. Promote contract decisions into the governing spec; tick checkpoints only with evidence.
-- **Mandatory Critic Audit**: Before committing any completed unit of work or ticking a checkpoint, dispatch `critic (Model="flash")` using the unguided dispatch pattern: `"Review the implementation checkpoint <ID>, defined in <spec>. Analyse the implementation in files <files> and audit the git diff. Report any findings."` Never spoon-feed checklists, confirmation questions, or leading scenarios.
-
-## Mandatory Quality Gates & Commands
+Run **all** gates before every commit (`-o addopts=""` bypasses `--testmon` so SQLite/schema/config changes are never skipped):
 
 ```bash
 uv run ty check
 uv run ruff check --fix
 uv run ruff format
-uv run pytest
+uv run pytest -o addopts=""
 git diff --check
 ```
 
-- `uv run yaw dspy optimize`: launch or resume GEPA optimization in `.yaw/optimize_yaw.db` (pass `--fresh` to wipe prior `optimize_*` state and start from scratch).
-- `$env:YAW_ARTIFACT_DIR = "<directory>"; uv run watchdog --watch 300`: launch the DSPy optimization watchdog outputting to the dashboard directory.
+- `uv run yaw daemon {start|stop|status|run}`: Streamable HTTP FastMCP + live ingestion daemon.
+- `uv run yaw recall "<query>" --top-k 5 [--json]`: standalone read-only Tier-0 MDL DAG recall.
+- `uv run yaw qa "<question>" [--json]`: Tier-1 `dspy.ReAct` benchmark QA.
+- `uv run yaw optimize dspy [--fresh]`: launch or resume `dspy.GEPA` QA prompt compilation.
+- `uv run yaw config {show|get|set}`: inspect or update `yaw.toml` atomically (secrets redacted).
+- `$env:YAW_ARTIFACT_DIR = "<dir>"; uv run watchdog --watch 300`: optimization telemetry watchdog.

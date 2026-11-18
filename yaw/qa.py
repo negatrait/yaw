@@ -8,9 +8,17 @@ from typing import Any
 
 import dspy
 import numpy as np
+from dspy.lm15 import (
+    AccessPolicy,
+    EndpointSupport,
+    ModelSupport,
+    OpenAIChatCompat,
+    ProviderDefinition,
+    register_provider,
+)
 from dspy.utils.exceptions import AdapterParseError
 
-from .core import EmbedFn, HydratedPassage, QAResult, YawRuntimeError, format_query_for_embedding
+from .core import EmbedFn, HydratedPassage, QAResult, YawConfig, YawRuntimeError, format_query_for_embedding
 from .retrieval import VectorSearch, hydrate_passage, hydrate_ranked_passages, lexical_search, search_vectors
 
 _MAX_TOP_K = 25
@@ -28,6 +36,37 @@ class QASignature(dspy.Signature):
 
     question: str = dspy.InputField(desc="User question to answer from indexed corpus.")
     answer: str = dspy.OutputField(desc="Grounded answer citing [chunk_id=<int>] or refusal.")
+
+
+def create_lm(cfg: YawConfig, *, temperature: float = 1.0) -> dspy.LM:
+    """Declare the required native tool protocol for the configured compatible endpoint."""
+    model = cfg.qa_model if "/" in cfg.qa_model else f"{cfg.provider}/{cfg.qa_model}"
+    if model.startswith("openai/"):
+        register_provider(
+            ProviderDefinition.chat(
+                AccessPolicy(
+                    provider="yaw-openai",
+                    base_url=cfg.base_url,
+                    supports=EndpointSupport(complete=True),
+                    auth_modes=("bearer",),
+                ),
+                compat=OpenAIChatCompat(max_tokens_field="max_tokens"),
+            ),
+            supports=ModelSupport(function_calling=True),
+            replace=True,
+        )
+        model = "yaw-openai/" + model.removeprefix("openai/")
+    return dspy.LM(
+        model,
+        model_type="chat",
+        engine="lm15",
+        temperature=temperature,
+        max_tokens=cfg.max_output_tokens,
+        cache=False,
+        num_retries=3,
+        api_base=cfg.base_url,
+        api_key=cfg.api_key or "yaw",
+    )
 
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:
@@ -180,6 +219,8 @@ def build_qa_agent(
     agent = dspy.ReAct(QASignature, tools=list(tools), max_iters=max_iters)
     if artifact_path is not None and artifact_path.is_file():
         agent.load(str(artifact_path))
+        agent.set_lm(None)
+    agent.react.update_config(tool_choice="required")
     return agent
 
 

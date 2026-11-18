@@ -47,7 +47,7 @@ from yaw.datasets import (
     resolve_dataset_name,
 )
 from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
-from yaw.qa import build_qa_agent, iter_tool_observations, make_qa_tools
+from yaw.qa import build_qa_agent, create_lm, iter_tool_observations, make_qa_tools
 from yaw.retrieval import build_vector_search, hydrate_ranked_passages, open_readonly_db, search_vectors
 
 _NORM_ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.UNICODE)
@@ -386,19 +386,6 @@ def _index_staged_slices(
         close_pipeline(session)
 
 
-def _make_lm(cfg: YawConfig, *, temperature: float) -> dspy.LM:
-    return dspy.LM(
-        cfg.qa_model if "/" in cfg.qa_model else f"{cfg.provider}/{cfg.qa_model}",
-        model_type="chat",
-        api_base=cfg.base_url,
-        api_key=cfg.api_key or "yaw",
-        temperature=temperature,
-        max_tokens=cfg.max_output_tokens,
-        num_retries=3,
-        cache=False,
-    )
-
-
 def optimize_optuna(
     cfg: YawConfig,
     *,
@@ -641,8 +628,8 @@ def _compile_dspy(
         trainset.extend(examples[:split_at])
         valset.extend(examples[split_at:])
 
-    s_lm = student_lm or _make_lm(opt_cfg, temperature=1.0)
-    r_lm = reflection_lm or _make_lm(opt_cfg, temperature=0.7)
+    s_lm = student_lm or create_lm(opt_cfg, temperature=1.0)
+    r_lm = reflection_lm or create_lm(opt_cfg, temperature=0.7)
     proposer = instruction_proposer or make_react_instruction_proposer(r_lm)
 
     gepa_kwargs: dict[str, Any] = {
@@ -732,7 +719,7 @@ def evaluate_optimization(
         extra_wipe=(eval_out,),
     )
 
-    active_lm = lm or _make_lm(eval_cfg, temperature=1.0)
+    active_lm = lm or create_lm(eval_cfg, temperature=1.0)
     conn = open_readonly_db(eval_db)
     try:
         vs = build_vector_search(conn)
