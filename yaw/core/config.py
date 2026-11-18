@@ -269,8 +269,8 @@ class YawConfig:
     auto_merge_threshold: float = 0.98
     candidate_volume_ratio: float = 0.5
     semantic_adjudication_batch_size: int = 5
-    embed_batch_size: int = 32
-    embed_batch_chars: int = 4096
+    embed_batch_size: int = 64
+    embed_max_in_flight: int = 2
     max_context_chars: int | None = None
     max_ast_expansion_hops: int = 1
     ast_context_hops: int = 1
@@ -332,6 +332,9 @@ class YawConfig:
             raise YawRuntimeError("INVALID_INPUT", "YawConfig(): queue_maxsize must be >= 1")
         if self.chunk_size < 1:
             raise YawRuntimeError("INVALID_INPUT", "YawConfig(): chunk_size must be >= 1")
+        for name in ("embed_batch_size", "embed_max_in_flight"):
+            if getattr(self, name) < 1:
+                raise YawRuntimeError("INVALID_INPUT", f"YawConfig(): {name} must be >= 1")
         if self.context_window_tokens < 2:
             raise YawRuntimeError("INVALID_INPUT", "YawConfig(): context_window_tokens must be >= 2")
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
@@ -582,8 +585,8 @@ _FIELD_TO_SECTION: dict[str, str] = {
     "auto_merge_threshold": "graph",
     "candidate_volume_ratio": "graph",
     "semantic_adjudication_batch_size": "graph",
-    "embed_batch_size": "graph",
-    "embed_batch_chars": "graph",
+    "embed_batch_size": "ingestion",
+    "embed_max_in_flight": "inference",
     "max_context_chars": "graph",
     "max_ast_expansion_hops": "graph",
     "ast_context_hops": "graph",
@@ -811,6 +814,16 @@ def load_config(
                     continue
                 if sec_name == "graph" and k in {"synonymy_threshold", "synonymy_top_k"}:
                     raise YawRuntimeError("INVALID_INPUT", f"load_config(): Retired candidate setting: graph.{k}")
+                if k == "embed_batch_chars":
+                    raise YawRuntimeError(
+                        "INVALID_INPUT",
+                        "load_config(): embed_batch_chars is retired; use ingestion.embed_batch_size "
+                        "and inference.embed_max_in_flight",
+                    )
+                if k in {"embed_batch_size", "embed_max_in_flight"} and sec_name != _FIELD_TO_SECTION[k]:
+                    raise YawRuntimeError(
+                        "INVALID_INPUT", f"load_config(): {k} belongs in [{_FIELD_TO_SECTION[k]}], not [{sec_name}]"
+                    )
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":

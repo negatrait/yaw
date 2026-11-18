@@ -12,7 +12,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,11 +23,14 @@ from typing import Any
 import numpy as np
 import pytest
 import sqlite_vec
+from cocoindex.ops.code import CodeSource
+from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from numpy.typing import NDArray
 
 import yaw.pipeline as yaw_pipeline
-from yaw.core import YawConfig, format_query_for_embedding
+from yaw.core import ChunkPointer, YawConfig, YawRuntimeError, format_query_for_embedding, load_config
 from yaw.pipeline import (
+    chunk_file_content,
     close_pipeline,
     list_user_tables,
     make_dspy_embed_fn,
@@ -32,6 +38,7 @@ from yaw.pipeline import (
     update_pipeline_once,
     wait_pipeline_ready,
 )
+from yaw.retrieval import hydrate_passage
 
 
 def _hash_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
@@ -281,7 +288,7 @@ def test_loopback_dspy_embedder_pipeline(tmp_path: Path) -> None:
         session = start_pipeline(cfg, embed_fn=embed_fn, vector_dim=10, live=False)
         try:
             update_pipeline_once(session)
-            assert any(s.startswith("title: Photonic Core | text: ") for s in seen_inputs)
+            assert any(s.startswith("title: none | text: # Photonic Core\n") for s in seen_inputs)
             with _open_ro(cfg.db_path) as conn:
                 blob = conn.execute("SELECT embedding FROM chunks").fetchone()[0]
                 vec = np.frombuffer(blob, dtype=np.float32)
@@ -616,6 +623,256 @@ def _loopback_embed_server(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5.0)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_embedding_requests_obey_configured_batch_size(tmp_path: Path, asynchronous: bool) -> None:
+    requests: list[list[str]] = []
+
+    def receive(_model: str, texts: list[str]) -> NDArray[np.float32]:
+        requests.append(texts)
+        return _hash_embed(texts, dim=8)
+
+    # Same shape as optimizer query pre-embedding: distinct inputs, not document chunks.
+    texts = [format_query_for_embedding(f"Question {i}: " + "routing " * 35) for i in range(16)]
+    with _loopback_embed_server(receive) as port:
+        cfg = replace(
+            _make_http_cfg(tmp_path, port=port, embedding_model="budget-model"),
+            chunk_size=1000,
+            embed_batch_size=3,
+        )
+        embed = make_dspy_embed_fn(cfg)
+        vectors = asyncio.run(asyncio.to_thread(embed, texts)) if asynchronous else embed(texts)
+
+    assert [text for batch in requests for text in batch] == texts
+    assert all(len(batch) <= cfg.embed_batch_size for batch in requests)
+    assert np.allclose(vectors, _hash_embed(texts, dim=8))
+
+
+@pytest.mark.parametrize("suffix", ["txt", "md", "json", "py"])
+def test_document_chunks_obey_byte_budget(suffix: str) -> None:
+    text = "# Heading\n" + 'Long prose, café 漢字 🧠 and code: {"key": "value"}. ' * 350
+    chunks = chunk_file_content(f"sample.{suffix}", text, chunk_size=1000, chunk_overlap=150)
+    assert len(chunks) > 1
+    assert all(0 < len(chunk.body.encode("utf-8")) <= 1000 for chunk in chunks)
+
+
+@pytest.mark.parametrize("suffix", ["md", "json"])
+def test_native_ast_is_the_only_chunk_boundary_authority(tmp_path: Path, suffix: str) -> None:
+    body = "Résumé 漢字 🧠 with a literal \\n and quoted evidence. " * 90
+    text = (
+        f"# Incident\n\n{body}\n\n```sh\n# not a title\nshow counters\n```\n\n## Recovery\nDone.\n"
+        if suffix == "md"
+        else json.dumps({"title": "Incident", "text": body}, ensure_ascii=False, indent=2)
+    )
+    name = f"source.{suffix}"
+    (tmp_path / name).write_text(text, encoding="utf-8")
+    native = RecursiveSplitter().split(
+        CodeSource(text, language=detect_code_language(filename=name)),
+        chunk_size=1000,
+        chunk_overlap=150,
+        min_chunk_size=100,
+    )
+    chunks = chunk_file_content(name, text)
+    assert [chunk.body for chunk in chunks] == [chunk.text for chunk in native if chunk.text.strip()]
+    assert all(chunk.title == "" for chunk in chunks)
+    for chunk in chunks:
+        assert text[chunk.char_start : chunk.char_end] == chunk.body
+        pointer = ChunkPointer(
+            chunk_id=chunk.chunk_id,
+            rel_path=name,
+            source_hash=chunk.source_hash,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+            char_start=chunk.char_start,
+            char_end=chunk.char_end,
+        )
+        hydrated = hydrate_passage(pointer, tmp_path)
+        assert not hydrated.stale_on_disk
+        assert hydrated.text == chunk.body
+
+
+def test_indivisible_native_chunk_fails_instead_of_manual_resplitting() -> None:
+    with pytest.raises(ValueError, match="native chunk is 5000 bytes, exceeding chunk_size=1000"):
+        chunk_file_content("unbroken.txt", "x" * 5000)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_batching_preserves_long_queries_and_ignores_chunk_size(tmp_path: Path, asynchronous: bool) -> None:
+    requests: list[list[str]] = []
+
+    def receive(_model: str, texts: list[str]) -> NDArray[np.float32]:
+        requests.append(texts)
+        return _hash_embed(texts, dim=8)
+
+    texts = ["a" * 350, "b" * 350, format_query_for_embedding("long query " * 500), "tail"]
+    with _loopback_embed_server(receive) as port:
+        base = replace(
+            _make_http_cfg(tmp_path, port=port, embedding_model="budget-model"),
+            embed_batch_size=2,
+        )
+        for chunk_size in (100, 5000):
+            requests.clear()
+            embed = make_dspy_embed_fn(replace(base, chunk_size=chunk_size))
+            vectors = asyncio.run(asyncio.to_thread(embed, texts)) if asynchronous else embed(texts)
+            assert requests == [texts[:2], texts[2:]]
+            assert np.allclose(vectors, _hash_embed(texts, dim=8))
+
+
+@pytest.mark.parametrize("field", ["embed_batch_size", "embed_max_in_flight"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_invalid_embedding_budget_fails_at_configuration(tmp_path: Path, field: str, value: int) -> None:
+    with pytest.raises(YawRuntimeError, match=field):
+        replace(_make_cfg(tmp_path), **{field: value})
+
+
+def test_retired_character_budget_fails_explicitly(tmp_path: Path) -> None:
+    config = tmp_path / "yaw.toml"
+    config.write_text("[graph]\nembed_batch_chars = 2048\n", encoding="utf-8")
+    with pytest.raises(YawRuntimeError, match="embed_batch_chars is retired"):
+        load_config(config)
+
+
+def test_embedding_settings_have_one_authoritative_section(tmp_path: Path) -> None:
+    config = tmp_path / "yaw.toml"
+    config.write_text("[ingestion]\nembed_batch_size = 3\n[inference]\nembed_max_in_flight = 1\n", encoding="utf-8")
+    cfg = load_config(config)
+    assert cfg.embed_batch_size == 3
+    assert cfg.embed_max_in_flight == 1
+    for key in ("embed_batch_size", "embed_max_in_flight"):
+        config.write_text(f"[graph]\n{key} = 4\n", encoding="utf-8")
+        with pytest.raises(YawRuntimeError, match="belongs in"):
+            load_config(config)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 70])
+def test_native_pipeline_batch_size_is_configured(tmp_path: Path, batch_size: int) -> None:
+    requests: list[list[str]] = []
+
+    def receive(_model: str, texts: list[str]) -> NDArray[np.float32]:
+        requests.append(texts)
+        return _hash_embed(texts, dim=8)
+
+    with _loopback_embed_server(receive) as port:
+        cfg = replace(
+            _make_http_cfg(tmp_path, port=port, embedding_model="batch-model"),
+            chunk_size=1000,
+            embed_batch_size=batch_size,
+        )
+        assert cfg.corpus_root is not None and cfg.db_path is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "long.txt").write_text("\n\n".join(f"Paragraph {i}: " + "routing " * 90 for i in range(80)))
+        pieces = chunk_file_content(
+            "long.txt",
+            (cfg.corpus_root / "long.txt").read_text(),
+            chunk_size=cfg.chunk_size,
+            chunk_overlap=cfg.chunk_overlap,
+            min_chunk_size=cfg.min_chunk_size,
+        )
+        session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), vector_dim=8, live=False)
+        try:
+            update_pipeline_once(session)
+            with _open_ro(cfg.db_path) as conn:
+                assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == len(pieces)
+        finally:
+            close_pipeline(session)
+    assert sum(map(len, requests)) == len(pieces)
+    assert max(map(len, requests)) <= batch_size
+    assert all(len(text.encode("utf-8")) <= 1100 for batch in requests for text in batch)
+    if batch_size > 1:
+        assert max(map(len, requests)) > 1
+    if batch_size > 64:
+        assert max(map(len, requests)) > 64
+
+
+def test_batch_size_changes_only_http_grouping_not_chunks(tmp_path: Path) -> None:
+    requests: list[list[str]] = []
+
+    def receive(_model: str, texts: list[str]) -> NDArray[np.float32]:
+        requests.append(list(texts))
+        return _hash_embed(texts, dim=8)
+
+    payloads: list[Counter[str]] = []
+    snapshots: list[list[Any]] = []
+    with _loopback_embed_server(receive) as port:
+        for batch_size in (1, 16):
+            requests.clear()
+            cfg = replace(
+                _make_http_cfg(tmp_path / str(batch_size), port=port, embedding_model="grouping-model"),
+                chunk_size=1000,
+                embed_batch_size=batch_size,
+            )
+            assert cfg.corpus_root is not None and cfg.db_path is not None
+            cfg.corpus_root.mkdir(parents=True)
+            for title in ("Interviewer workload", "Proxy timer skew"):
+                body = "\n\n".join(
+                    f"Section {i}: " + "Distinct evidence with café, 漢字 and 🧠. " * 20 for i in range(24)
+                )
+                (cfg.corpus_root / f"{title}.md").write_text(f"# {title}\n\n{body}", encoding="utf-8")
+            session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), vector_dim=8, live=False)
+            try:
+                update_pipeline_once(session)
+                with _open_ro(cfg.db_path) as conn:
+                    snapshots.append(conn.execute("SELECT * FROM chunks ORDER BY chunk_id").fetchall())
+            finally:
+                close_pipeline(session)
+            payloads.append(Counter(text for batch in requests for text in batch))
+            assert max(map(len, requests)) <= batch_size
+            if batch_size == 16:
+                assert max(map(len, requests)) > 1
+    # Exact on-wire text (including title/prefix), IDs, spans, features and vectors.
+    assert sum(payloads[0].values()) > 16
+    assert payloads[0] == payloads[1]
+    assert snapshots[0] == snapshots[1]
+
+
+@pytest.mark.parametrize("max_in_flight", [1, 2])
+def test_http_concurrency_is_shared_by_queries_and_ingestion(tmp_path: Path, max_in_flight: int) -> None:
+    lock = threading.Lock()
+    saturated = threading.Event()
+    release = threading.Event()
+    active = peak = 0
+
+    def receive(_model: str, texts: list[str]) -> NDArray[np.float32]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active >= max_in_flight:
+                saturated.set()
+        try:
+            assert release.wait(timeout=10)
+            return _hash_embed(texts, dim=8)
+        finally:
+            with lock:
+                active -= 1
+
+    with _loopback_embed_server(receive) as port:
+        cfg = replace(
+            _make_http_cfg(tmp_path, port=port, embedding_model="concurrency-model"),
+            embed_batch_size=2,
+            embed_max_in_flight=max_in_flight,
+        )
+        assert cfg.corpus_root is not None
+        cfg.corpus_root.mkdir(parents=True)
+        for i in range(8):
+            (cfg.corpus_root / f"note{i}.txt").write_text(f"Routing example {i}.\n", encoding="utf-8")
+        embed = make_dspy_embed_fn(cfg)
+        session = start_pipeline(cfg, embed_fn=embed, vector_dim=8, live=False)
+        try:
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = [pool.submit(update_pipeline_once, session)]
+                futures.extend(pool.submit(embed, [format_query_for_embedding(f"Question {i}")]) for i in range(4))
+                try:
+                    assert saturated.wait(timeout=10)
+                finally:
+                    release.set()
+                for future in futures:
+                    future.result(timeout=20)
+        finally:
+            release.set()
+            close_pipeline(session)
+    assert peak == max_in_flight
 
 
 def test_model_change_invalidates_memo_cache(tmp_path: Path) -> None:

@@ -3,6 +3,8 @@
 > [!NOTE] YAW is meant to aid LLM-based agents.
 > YAW offers recall and reasoning abilities over a large, ambiguous corpus to make the existence of an agent easier. YAW is not a memory, it's the librarian. Do YOU find the project interesting and useful? If yes, great; if not, what needs to be done to make this the most performant large-corpus GraphRAG ever conceived?
 
+*`YAW` is grounded on a simple mission: Beat the SOTA GraphRAG solutions on multi-hop benchmarks on consumer hardware, using only vector+fts indexing and graph building for multi-hop reasoning at query time, instead of spending tokens and compute during indexing.*
+
 ## Prime Directive
 
 **A minimal line count codebase that fails fast is infinitely better than a fallback-heavy codebase that silently degrades performance to mask failures!**

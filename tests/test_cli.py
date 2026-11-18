@@ -657,6 +657,22 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
     bundle_14 = _prepare_sample_bundle(tmp_path, dataset_name="sample14", total_questions=14)
     seen_chat_blobs: list[str] = []
 
+    def assert_plaintext_staging(stage: str, database: str) -> None:
+        source = json.loads((tmp_path / "_raw_src_sample" / "corpus.json").read_text(encoding="utf-8"))
+        expected = {
+            "sample_"
+            + hashlib.sha256(f"sample\0{row['idx']}".encode()).hexdigest()[:16]
+            + ".txt": f"{row['title']}\n{row['text']}"
+            for row in source
+        }
+        files = list((tmp_path / ".yaw" / stage).iterdir())
+        assert files and all(path.suffix == ".txt" for path in files)
+        for path in files:
+            assert path.read_bytes() == expected[path.name].encode("utf-8")
+        with open_readonly_db(tmp_path / ".yaw" / database) as conn:
+            titles = conn.execute("SELECT title FROM chunks").fetchall()
+            assert titles and all(row[0] == "" for row in titles)
+
     def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
         msgs = payload.get("messages", [])
         sys_text = str(msgs[0].get("content", "")) if msgs else ""
@@ -723,6 +739,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         dspy_res = json.loads(capsys.readouterr().out)
         program = Path(dspy_res["program_path"])
         assert program.is_file()
+        assert_plaintext_staging("dspy_corpus", "optimize_yaw.db")
         assert json.loads(program.with_name("dspy_gepa_audit.json").read_text(encoding="utf-8")) == dspy_res
 
         # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml
@@ -782,6 +799,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         )
         optuna_res = json.loads(capsys.readouterr().out)
         assert optuna_res["total_trials"] == 2
+        assert_plaintext_staging("optuna_corpus", "optuna_index.db")
         assert (tmp_path / ".yaw" / "optuna_study.db").is_file()
         assert set(optuna_res["best_params"]) == {"hybrid_alpha", "ppr_alpha", "seed_top_k"}
     finally:

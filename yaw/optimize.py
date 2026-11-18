@@ -40,6 +40,7 @@ from yaw.datasets import (
     build_benchmark_slice,
     doc_matches_gold,
     document_identity,
+    document_text,
     load_dataset_bundle,
     load_dataset_files,
     resolve_dataset_bundle,
@@ -334,18 +335,9 @@ def _stage_slice_documents(
         for did in doc_ids:
             if (row := by_id.get(did)) is None:
                 continue
-            raw_title = " ".join(str(row.get(title_key, "")).split())
-            heading = raw_title.lstrip("#").strip()
-            body = str(row.get(body_key) if body_key in row else row.get("text", row.get("content", "")))
-            # Stage plain Markdown so CocoIndex chunks directly without serde JSON escaping or parsing.
-            if heading and len(heading) <= 200 and not body.startswith((f"{raw_title}\n", f"# {heading}\n")):
-                rendered = f"# {heading}\n\n{body}\n" if body.strip() else f"# {heading}\n"
-            elif raw_title and not body.startswith(raw_title):
-                rendered = f"{raw_title}\n\n{body}\n" if body.strip() else f"{raw_title}\n"
-            else:
-                rendered = f"{body}\n"
+            rendered = document_text(row, title_key, body_key)
             digest = hashlib.sha256(f"{canonical}\0{did}".encode()).hexdigest()[:16]
-            target = (stage_dir / f"{canonical}_{digest}.md").resolve()
+            target = (stage_dir / f"{canonical}_{digest}.txt").resolve()
             desired.add(target)
             if not target.exists() or target.read_bytes() != rendered.encode("utf-8"):
                 write_text_atomic(target, rendered, newline="")

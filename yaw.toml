@@ -12,9 +12,12 @@ compiled_program_path = ".yaw/compiled_program.json"
 [ingestion]
 # included_patterns = ["*.md", "*.txt", "*.json"]
 # excluded_patterns = [".*", "*/.*", "__pycache__/*"]
+# Maximum document chunk body size in UTF-8 bytes; not a token count.
 chunk_size = 1000
 chunk_overlap = 150
 min_chunk_size = 100
+# Maximum separate chunk inputs per native CocoIndex/DSPy embedding batch.
+embed_batch_size = 4
 poll_interval_seconds = 10.0
 
 [inference]
@@ -22,6 +25,8 @@ base_url = "http://127.0.0.1:8888/v1"
 provider = "openai"
 embedding_model = "embeddinggemma-2"
 embedding_task_mode = "distinct-titled"
+# Shared embedding HTTP concurrency across ingestion and queries.
+embed_max_in_flight = 2
 extraction_model = "gemma-4-e4b"
 qa_model = "gemma-4-e4b"
 # Runtime reads active model capacity from the configured endpoint.
@@ -43,9 +48,6 @@ candidate_lexical_threshold = 0.675
 auto_merge_threshold = 0.98
 candidate_volume_ratio = 0.5
 semantic_adjudication_batch_size = 5
-embed_batch_size = 16
-# Aggregate formatted-input budget per embedding request; tune for the provider.
-embed_batch_chars = 2048
 
 [runtime]
 queue_maxsize = 32

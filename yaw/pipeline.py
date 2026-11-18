@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import bisect
 import contextlib
 import hashlib
 import json
@@ -23,7 +22,8 @@ import sqlite_vec
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
-from cocoindex.ops.text import CustomLanguageConfig, RecursiveSplitter, detect_code_language
+from cocoindex.ops.code import CodeSource
+from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.resources import schema as coco_schema
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from numpy.typing import NDArray
@@ -54,23 +54,9 @@ _CHUNK_AUXILIARY_COLS: list[str] = [
     "tokens_json",
     "entities_json",
 ]
-# Configure hierarchical prose separators for non-Tree-sitter formats; AST languages use Tree-sitter.
-_SPLITTER = RecursiveSplitter(
-    custom_languages=[
-        CustomLanguageConfig(
-            language_name="prose",
-            separators_regex=[r"\n\n+", r"[.?!]+\s+", r"\n", r"\s+"],
-        )
-    ]
-)
-_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s+(.*?))?(?:\s+#+\s*)?$")
-_MAX_HEADING_CHARS = 200
+_SPLITTER = RecursiveSplitter()
 _VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EMBED_BATCH_SIZE = 64
-_MAX_EMBED_BATCH_CHARS = 8192
-_MAX_EMBED_IN_FLIGHT = 4
-_MAX_INFLIGHT_COMPONENTS = 16
 
 
 def _validate_identifier(name: str) -> str:
@@ -80,48 +66,17 @@ def _validate_identifier(name: str) -> str:
 
 
 class _DspyBatchEmbedder:
-    """Byte-budgeted, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
+    """Native DSPy batching with one shared HTTP admission gate for indexing and queries."""
 
     def __init__(self, cfg: YawConfig) -> None:
-        self._max_items = min(_EMBED_BATCH_SIZE, max(1, int(cfg.embed_batch_size)))
-        self._max_item_chars = max(4096, int(cfg.chunk_size) * 4)
-        self._max_batch_chars = max(self._max_item_chars, _MAX_EMBED_BATCH_CHARS)
         kwargs: dict[str, Any] = {"api_base": cfg.base_url, "api_key": cfg.api_key or "yaw"}
         self._embedder = dspy.Embedder(
             f"{cfg.provider}/{cfg.embedding_model}",
-            batch_size=self._max_items,
+            batch_size=cfg.embed_batch_size,
             caching=False,
             **kwargs,
         )
-        self._sem = threading.BoundedSemaphore(_MAX_EMBED_IN_FLIGHT)
-        self._async_sem: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
-
-    def _get_async_sem(self) -> asyncio.Semaphore:
-        loop = asyncio.get_running_loop()
-        if self._async_sem is None or self._async_sem[0] is not loop:
-            self._async_sem = (loop, asyncio.Semaphore(_MAX_EMBED_IN_FLIGHT))
-        return self._async_sem[1]
-
-    def _pack_batches(self, texts: list[str]) -> list[list[str]]:
-        for idx, item in enumerate(texts):
-            if len(item) > self._max_item_chars:
-                raise YawRuntimeError(
-                    "INVALID_INPUT",
-                    f"Embedding input[{idx}] length {len(item)} chars exceeds limit {self._max_item_chars}",
-                )
-        batches: list[list[str]] = []
-        cur_batch: list[str] = []
-        cur_chars = 0
-        for item in texts:
-            if cur_batch and (len(cur_batch) >= self._max_items or cur_chars + len(item) > self._max_batch_chars):
-                batches.append(cur_batch)
-                cur_batch = []
-                cur_chars = 0
-            cur_batch.append(item)
-            cur_chars += len(item)
-        if cur_batch:
-            batches.append(cur_batch)
-        return batches
+        self._sem = threading.BoundedSemaphore(cfg.embed_max_in_flight)
 
     @staticmethod
     def _normalize_batch(raw: Any) -> NDArray[np.float32]:
@@ -134,26 +89,9 @@ class _DspyBatchEmbedder:
     def __call__(self, texts: list[str]) -> NDArray[np.float32]:
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
-        parts: list[NDArray[np.float32]] = []
-        for batch in self._pack_batches(texts):
-            with self._sem:
-                raw = self._embedder(batch, batch_size=len(batch))
-            parts.append(self._normalize_batch(raw))
-        return np.vstack(parts) if len(parts) > 1 else parts[0]
-
-    async def acall(self, texts: list[str]) -> NDArray[np.float32]:
-        if not texts:
-            return np.zeros((0, 0), dtype=np.float32)
-        acall_fn = getattr(self._embedder, "acall", None)
-        if not callable(acall_fn):
-            return await asyncio.to_thread(self, texts)
-        sem = self._get_async_sem()
-        parts: list[NDArray[np.float32]] = []
-        for batch in self._pack_batches(texts):
-            async with sem:
-                raw = await acall_fn(batch, batch_size=len(batch))
-            parts.append(self._normalize_batch(raw))
-        return np.vstack(parts) if len(parts) > 1 else parts[0]
+        with self._sem:
+            raw = self._embedder(texts)
+        return self._normalize_batch(raw)
 
 
 class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
@@ -165,18 +103,21 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
         *,
         vector_dim: int | None = None,
         memo_key: object = None,
+        batch_size: int,
+        max_in_flight: int,
     ) -> None:
         self._embed_fn = embed_fn
         self._dim = vector_dim
         self._memo_key = memo_key
         self._dim_lock = asyncio.Lock()
+        self.embed = coco.fn.as_async(
+            batching=True,
+            max_batch_size=batch_size,
+            max_in_flight=max_in_flight,
+        )(self._embed_batch)
 
     async def invoke(self, texts: list[str]) -> NDArray[np.float32]:
-        raw = (
-            await self._embed_fn.acall(texts)
-            if isinstance(self._embed_fn, _DspyBatchEmbedder)
-            else await asyncio.to_thread(self._embed_fn, texts)
-        )
+        raw = await asyncio.to_thread(self._embed_fn, texts)
         return np.asarray(raw, dtype=np.float32)
 
     def record_dim(self, dim: int) -> None:
@@ -203,8 +144,7 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
     def __coco_memo_key__(self) -> object:
         return self._memo_key
 
-    @coco.fn.as_async(batching=True, max_batch_size=_EMBED_BATCH_SIZE, max_in_flight=_MAX_EMBED_IN_FLIGHT)
-    async def embed(self, texts: list[str]) -> list[NDArray[np.float32]]:
+    async def _embed_batch(self, texts: list[str]) -> list[NDArray[np.float32]]:
         if not texts:
             return []
         arr = np.ascontiguousarray(await self.invoke(texts), dtype="<f4")
@@ -395,7 +335,7 @@ def open_managed_db(db_path: Path | str) -> sqlite.ManagedConnection:
 
 
 def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float32]]:
-    """Build a byte-budgeted, unit-L2-normalizing batch embedder backed by bare dspy.Embedder."""
+    """Build a native DSPy batch embedder preserving each input unchanged."""
     return _DspyBatchEmbedder(cfg)
 
 
@@ -408,66 +348,6 @@ def _detect_existing_vec_dim(conn_mgr: sqlite.ManagedConnection) -> int | None:
     return int(m.group(1)) if m is not None else None
 
 
-def _markdown_headings(lines: list[str]) -> list[tuple[int, str]]:
-    """Extract fenced-code-safe Markdown ATX headings (`#`..`######`) within a bounded title length."""
-    headings: list[tuple[int, str]] = []
-    in_fence: tuple[str, int] | None = None
-    for line_no, raw in enumerate(lines, start=1):
-        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", raw)
-        if fence is not None:
-            if in_fence is None:
-                in_fence = (fence[1][0], len(fence[1]))
-            elif fence[1][0] == in_fence[0] and len(fence[1]) >= in_fence[1] and not fence[2].strip():
-                in_fence = None
-            continue
-        if in_fence is not None:
-            continue
-        if (m_atx := _ATX_HEADING_RE.match(raw)) is not None:
-            heading = " ".join((m_atx.group(1) or "").split())
-            if 0 < len(heading) <= _MAX_HEADING_CHARS:
-                headings.append((line_no, heading))
-    return headings
-
-
-def _heading_bounds(headings: Sequence[tuple[int, str]], line_no: int, total_lines: int) -> tuple[str, int, int]:
-    """Return `(known_title, section_start, section_end)`; `known_title` is `''` when untitled."""
-    if not headings:
-        return "", 1, max(1, total_lines)
-    idx = bisect.bisect_right([h[0] for h in headings], line_no) - 1
-    if idx < 0:
-        return "", 1, max(1, headings[0][0] - 1)
-    end = headings[idx + 1][0] - 1 if idx + 1 < len(headings) else max(1, total_lines)
-    return headings[idx][1], headings[idx][0], end
-
-
-def _subsplit_by_bytes(text: str, max_bytes: int, overlap_chars: int) -> list[tuple[int, int, str]]:
-    """Enforce a hard UTF-8 byte cap on any oversized leaf node returned by RecursiveSplitter."""
-    if not text.strip():
-        return []
-    limit = max(4, int(max_bytes))
-    if len(text.encode("utf-8")) <= limit:
-        return [(0, len(text), text)]
-    out: list[tuple[int, int, str]] = []
-    n = len(text)
-    pos = 0
-    while pos < n:
-        end = min(n, pos + limit)
-        while end > pos and len(text[pos:end].encode("utf-8")) > limit:
-            byte_len = len(text[pos:end].encode("utf-8"))
-            shrink = max(1, (end - pos) * limit // byte_len)
-            end = pos + shrink if shrink < (end - pos) else end - 1
-        if end == pos:
-            end = pos + 1
-        piece = text[pos:end]
-        if piece.strip():
-            out.append((pos, end, piece))
-        if end >= n:
-            break
-        step = max(1, (end - pos) - min(max(0, overlap_chars), max(0, (end - pos) - 1)))
-        pos += step
-    return out
-
-
 def chunk_file_content(
     rel_path: str,
     raw_text: str,
@@ -476,49 +356,31 @@ def chunk_file_content(
     chunk_overlap: int = 150,
     min_chunk_size: int = 100,
 ) -> tuple[SourceChunk, ...]:
-    """Chunk disk text directly with CocoIndex's RecursiveSplitter without serde JSON parsing."""
+    """Use one native CocoIndex parse and preserve its exact source spans."""
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         return ()
     lines = text.splitlines()
-    total_lines = max(1, len(lines))
-    suffix = Path(rel_path).suffix.lower()
-    lang = detect_code_language(filename=rel_path) or ("json" if suffix == ".ndjson" else "prose")
-    headings = _markdown_headings(lines) if lang == "markdown" else []
-    split_chunks = _SPLITTER.split(
-        text,
-        chunk_size=chunk_size,
-        chunk_overlap=min(chunk_overlap, max(0, chunk_size - 1)),
-        min_chunk_size=min(min_chunk_size, max(1, len(text.strip()))),
-        language=lang,
-    )
-    same_span_counts: dict[tuple[int, int], int] = {}
-    raw_pieces: list[tuple[int, int, int, int, str]] = []
-    for c in split_chunks:
-        if not c.text.strip():
-            continue
-        sl = max(1, int(c.start.line))
-        el = min(total_lines, max(sl, inclusive_end_line(sl, int(c.end.line), int(c.end.column))))
-        base_cs = int(c.start.char_offset)
-        for sub_cs, sub_ce, sub_text in _subsplit_by_bytes(c.text, chunk_size, chunk_overlap):
-            raw_pieces.append((sl, el, base_cs + sub_cs, base_cs + sub_ce, sub_text))
-            same_span_counts[(sl, el)] = same_span_counts.get((sl, el), 0) + 1
-
+    language = detect_code_language(filename=rel_path)
+    source = CodeSource(text, language=language)
+    chunks = _SPLITTER.split(source, chunk_size=chunk_size, chunk_overlap=chunk_overlap, min_chunk_size=min_chunk_size)
     out: list[SourceChunk] = []
-    for sl, el, piece_cs, piece_ce, piece_text in raw_pieces:
-        line_slice = "\n".join(lines[sl - 1 : el])
-        use_char_span = same_span_counts[(sl, el)] > 1 or len(line_slice.encode("utf-8")) > chunk_size * 2
-        cs, ce = (piece_cs, piece_ce) if use_char_span else (0, 0)
-        s_hash = hashlib.sha256(line_slice.encode("utf-8")).hexdigest()
-        title, ast_s, ast_e = _heading_bounds(headings, sl, total_lines)
-        body = piece_text
-        if title and sl == ast_s and "\n" in piece_text:
-            first_line, rest = piece_text.split("\n", 1)
-            if _ATX_HEADING_RE.match(first_line) and rest.strip():
-                body = rest.lstrip("\n")
-        cid = compute_chunk_int_id(rel_path, sl, el, cs, ce, s_hash)
-        out.append(SourceChunk(cid, rel_path, s_hash, sl, el, cs, ce, ast_s, ast_e, title, body))
-    return tuple({c.chunk_id: c for c in out}.values())
+    for chunk in chunks:
+        if not chunk.text.strip():
+            continue
+        size = len(chunk.text.encode("utf-8"))
+        if size > chunk_size:
+            raise ValueError(
+                f"{rel_path}:{chunk.start.line}: native chunk is {size} bytes, exceeding chunk_size={chunk_size}"
+            )
+        sl = int(chunk.start.line)
+        el = inclusive_end_line(sl, int(chunk.end.line), int(chunk.end.column))
+        cs, ce = int(chunk.start.char_offset), int(chunk.end.char_offset)
+        source_hash = hashlib.sha256("\n".join(lines[sl - 1 : el]).encode("utf-8")).hexdigest()
+        cid = compute_chunk_int_id(rel_path, sl, el, cs, ce, source_hash)
+        # Empty until native AST title/scope metadata is exposed uniformly.
+        out.append(SourceChunk(cid, rel_path, source_hash, sl, el, cs, ce, 1, len(lines), "", chunk.text))
+    return tuple(out)
 
 
 # Keyed strictly by content (title, body) so line shifts or file moves reuse CocoIndex LMDB memos.
@@ -542,7 +404,7 @@ async def _compute_chunk_features(
     return vec, tokens_json, entities_json
 
 
-@coco.fn(memo=True, version=4)
+@coco.fn(memo=True, version=5)
 async def _process_file(
     file: FileLike[Any],
     chunks_target: sqlite.TableTarget[ChunkVecRow],
@@ -742,7 +604,13 @@ def start_pipeline(
             getattr(active_embed, "__qualname__", type(active_embed).__qualname__),
         )
         memo_key = (*base_memo, "custom", custom_id)
-    embedder = _PipelineEmbedder(active_embed, vector_dim=known_dim, memo_key=memo_key)
+    embedder = _PipelineEmbedder(
+        active_embed,
+        vector_dim=known_dim,
+        memo_key=memo_key,
+        batch_size=cfg.embed_batch_size,
+        max_in_flight=cfg.embed_max_in_flight,
+    )
     resolved_app = app_name or f"yaw_{hashlib.sha256(db_path.as_posix().encode('utf-8')).hexdigest()[:12]}"
 
     async def _session_worker() -> None:
@@ -761,7 +629,7 @@ def start_pipeline(
                 exception_handler=_on_component_error,
             )
             app = coco.App(
-                coco.AppConfig(name=resolved_app, environment=env, max_inflight_components=_MAX_INFLIGHT_COMPONENTS),
+                coco.AppConfig(name=resolved_app, environment=env),
                 _indexing_main,
                 tuple(cfg.included_patterns),
                 tuple(cfg.excluded_patterns),
