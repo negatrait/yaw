@@ -11,7 +11,6 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +19,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
+import dspy
 import filelock
 
 from yaw.core import (
@@ -42,7 +42,6 @@ from yaw.retrieval import (
     build_vector_search,
     hydrate_ranked_passages,
     open_readonly_db,
-    query_external_hints,
     search_vectors,
 )
 from yaw.runtime import (
@@ -348,7 +347,7 @@ def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, 
     with contextlib.closing(open_readonly_db(db_path)) as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             raise YawRuntimeError("EMPTY_INDEX", f"Index table 'chunks' not initialized in {db_path}")
-        yield conn, build_vector_search(conn, cfg.retrieval), corpus_root
+        yield conn, build_vector_search(conn), corpus_root
 
 
 def _cmd_recall(cfg: YawConfig, query: str, top_k: int) -> dict[str, Any]:
@@ -362,17 +361,8 @@ def _cmd_recall(cfg: YawConfig, query: str, top_k: int) -> dict[str, Any]:
             passages: tuple[HydratedPassage, ...] = ()
         else:
             q_vec = make_dspy_embed_fn(cfg)([format_query_for_embedding(q, cfg.embedding_task_mode)])[0]
-            fts_scores, vec_scores = query_external_hints(conn, q, q_vec)
-            trace = search_vectors(
-                vs,
-                q_vec,
-                q,
-                top_k=max(top_k * 4, 50),
-                fts_scores=fts_scores,
-                vec_scores=vec_scores,
-                params=vs.params,
-            )
-            passages = hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=top_k)
+            ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(top_k * 4, 50))
+            passages = hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
     return {"query": q, "top_k": top_k, "results": [serialize_passage(i, hp) for i, hp in enumerate(passages, 1)]}
 
 
@@ -387,13 +377,13 @@ def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
         agent = build_qa_agent(tools, max_iters=cfg.react_max_iters)
         if (prog_path := resolve_program_path(cfg)) is not None:
             agent.load(str(prog_path))
-        res = ask_question(agent, q, corpus_root=corpus_root, vs=vs, lm=create_lm(cfg), lm_sem=threading.Semaphore(1))
+        with dspy.context(lm=create_lm(cfg)):
+            res = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)
     return {
         "question": q,
         "answer": res.answer,
-        "termination_reason": res.termination_reason,
         "turns": int(res.turns),
-        "citations": [serialize_passage(i, hp) for i, hp in enumerate(res.citations, start=1)],
+        "citations": [serialize_passage(i, hp) for i, hp in enumerate(res.passages, start=1)],
     }
 
 
@@ -448,26 +438,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_dspy = sub_opt.add_parser("dspy", parents=[common], help="Compile bare ReAct QA instructions with GEPA")
     p_dspy.add_argument("--dataset", nargs="+", default=None, dest="datasets")
     p_dspy.add_argument("--max-queries", type=int, default=None)
-    p_dspy.add_argument("--train-queries", type=int, default=None)
     p_dspy.add_argument("--query-offset", type=int, default=None)
     p_dspy.add_argument("--auto", choices=("light", "medium", "heavy"), default=None)
     p_dspy.add_argument("--max-metric-calls", type=int, default=None)
-    p_dspy.add_argument("--output", default=None, dest="output_path")
-    p_dspy.add_argument("--db-path", default=None, dest="db_path")
+    p_dspy.add_argument("--threads", type=int, default=None)
     p_dspy.add_argument("--fresh", action="store_true", default=False)
 
     p_optuna = sub_opt.add_parser("optuna", parents=[common], help="Tune retrieval hyperparameters with Optuna")
     p_optuna.add_argument("--dataset", nargs="+", default=None, dest="datasets")
     p_optuna.add_argument("--query-offset", type=int, default=10)
     p_optuna.add_argument("--max-queries", type=int, default=20)
-    p_optuna.add_argument("--train-queries", type=int, default=12)
-    p_optuna.add_argument("--index-queries", type=int, default=20)
     p_optuna.add_argument("--trials", type=int, default=64)
-    p_optuna.add_argument("--study-db", default=".yaw/optimize_optuna.db")
     p_optuna.add_argument("--fresh", action="store_true", default=False)
-    p_optuna.add_argument("--write-config", action="store_true", default=False)
-    p_optuna.add_argument("--allow-eval-overlap", action="store_true", default=False)
-    p_optuna.add_argument("--output", default=None, dest="output_path")
 
     p_cfg = sub.add_parser("config", parents=[common], help="Inspect or update yaw.toml settings")
     sub_cfg = p_cfg.add_subparsers(dest="config_cmd", required=True)
@@ -528,31 +510,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.optimize_cmd == "dspy":
                         payload = optimize_dspy(
                             cfg,
-                            datasets=args.datasets,
+                            datasets=",".join(args.datasets) if args.datasets else None,
                             max_queries=args.max_queries,
-                            train_queries=args.train_queries,
                             query_offset=args.query_offset,
                             auto=args.auto,
                             max_metric_calls=args.max_metric_calls,
-                            output_path=args.output_path,
-                            db_path=args.db_path,
+                            threads=args.threads,
                             fresh=args.fresh,
                         )
                     else:
                         payload = optimize_optuna(
                             cfg,
-                            datasets=args.datasets,
+                            datasets=",".join(args.datasets) if args.datasets else None,
                             query_offset=args.query_offset,
                             max_queries=args.max_queries,
-                            train_queries=args.train_queries,
-                            index_queries=args.index_queries,
                             trials=args.trials,
-                            study_db=args.study_db,
                             fresh=args.fresh,
-                            write_config=args.write_config,
-                            allow_eval_overlap=args.allow_eval_overlap,
-                            output_path=args.output_path,
-                            toml_path=config_path,
                         )
                     text = json.dumps(payload, indent=2)
         _emit(payload, json_out=json_out, text=text)

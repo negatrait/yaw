@@ -305,7 +305,7 @@ def test_cli_containment_main_loc_zero_wrappers_and_clean_vocabulary() -> None:
                 base_txt = ast.unparse(base)
                 assert not any(w in base_txt for w in ("Module", "BaseLM", "Adapter"))
 
-    allowed_roots = {"filelock", "yaw"}
+    allowed_roots = {"dspy", "filelock", "yaw"}
     allowed_yaw = {
         "yaw.core",
         "yaw.datasets",
@@ -316,7 +316,7 @@ def test_cli_containment_main_loc_zero_wrappers_and_clean_vocabulary() -> None:
         "yaw.mcp_server",
         "yaw.optimize",
     }
-    forbidden_pkgs = ("yaw.daemon", "dspy", "cocoindex", "optuna", "fastmcp", "starlette", "uvicorn", "numpy")
+    forbidden_pkgs = ("yaw.daemon", "cocoindex", "optuna", "fastmcp", "starlette", "uvicorn", "numpy")
     stdlib_names = sys.stdlib_module_names
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -605,7 +605,7 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
         _index_corpus(cfg)
 
         with contextlib.closing(open_readonly_db(cfg.db_path)) as conn:
-            vs = build_vector_search(conn, cfg.retrieval)
+            vs = build_vector_search(conn)
 
             def _dummy_tool(query: str) -> str:
                 return query
@@ -615,14 +615,14 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
             opt_agent = build_qa_agent(tools, max_iters=cfg.react_max_iters)
             assert opt_agent.react.signature is not None
             opt_agent.react.signature = opt_agent.react.signature.with_instructions("CLI_OPT_PROG_MARKER")
-            opt_prog = cfg.workspace_root / ".yaw" / "optimize_program.json"
+            opt_prog = cfg.workspace_root / ".yaw" / "qa_program.json"
             opt_prog.parent.mkdir(parents=True, exist_ok=True)
             opt_agent.save(str(opt_prog), save_program=False)
 
             assert main(["qa", "Who commanded Apollo 11?", "--config", str(toml_path), "--json"]) == 0
             qa_out = json.loads(capsys.readouterr().out)
             assert "Neil Armstrong" in qa_out["answer"]
-            assert qa_out["termination_reason"] == "submit"
+            assert qa_out["turns"] >= 1
             assert qa_out["turns"] >= 1
             assert len(qa_out["citations"]) == 1
             assert qa_out["citations"][0]["chunk_id"] in vs.id_to_pos
@@ -662,13 +662,10 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         sys_text = str(msgs[0].get("content", "")) if msgs else ""
         blob = json.dumps(msgs)
         seen_chat_blobs.append(blob)
-        if "component_name" in blob or "list_examples" in sys_text:
-            tool_msgs = [str(m.get("content", "")) for m in msgs if m.get("role") == "tool"]
-            if not tool_msgs:
-                return 200, _xml_tool_reply("List examples", [{"name": "list_examples", "args": {}}])
+        if "improved_instruction" in sys_text:
             return 200, _xml_tool_reply(
                 "Submit concise instruction",
-                [{"name": "submit", "args": {"new_instruction": "CLI_GEPA_INSTR: Use search_passages concisely."}}],
+                [{"name": "submit", "args": {"improved_instruction": "Use search_passages concisely."}}],
             )
         has_tool_obs = any(m.get("role") == "tool" for m in msgs)
         cids = [int(m.group(1)) for m in _CID_IN_TEXT_RE.finditer(blob)]
@@ -713,8 +710,6 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
                     str(bundle),
                     "--max-queries",
                     "4",
-                    "--train-queries",
-                    "2",
                     "--query-offset",
                     "0",
                     "--max-metric-calls",
@@ -726,10 +721,9 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
             == 0
         )
         dspy_res = json.loads(capsys.readouterr().out)
-        assert {"program_path", "eval_path", "audit_path", "best_score", "trials"} <= set(dspy_res)
-        assert Path(dspy_res["program_path"]).is_file()
-        assert Path(dspy_res["eval_path"]).is_file()
-        assert Path(dspy_res["audit_path"]).is_file()
+        program = Path(dspy_res["program_path"])
+        assert program.is_file()
+        assert json.loads(program.with_name("dspy_gepa_audit.json").read_text(encoding="utf-8")) == dspy_res
 
         # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml
         seen_chat_blobs.clear()
@@ -751,8 +745,6 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
                     str(bundle_14),
                     "--max-queries",
                     "4",
-                    "--train-queries",
-                    "2",
                     "--max-metric-calls",
                     "4",
                     "--fresh",
@@ -762,8 +754,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
             == 0
         )
         offset_res = json.loads(capsys.readouterr().out)
-        offset_eval = json.loads(Path(offset_res["eval_path"]).read_text(encoding="utf-8"))
-        assert offset_eval["query_offset"] == 10
+        assert offset_res["train_size"] + offset_res["val_size"] == 4
         joined_chats = "\n".join(seen_chat_blobs)
         assert "OffsetCheck question 10" in joined_chats
         assert "OffsetCheck question 6" not in joined_chats
@@ -781,24 +772,18 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
                     "0",
                     "--max-queries",
                     "6",
-                    "--train-queries",
-                    "4",
-                    "--index-queries",
-                    "6",
                     "--trials",
                     "2",
                     "--fresh",
-                    "--write-config",
                     "--json",
                 ]
             )
             == 0
         )
         optuna_res = json.loads(capsys.readouterr().out)
-        assert optuna_res["trials"] == 2
-        assert Path(optuna_res["study_db"]).is_file()
-        written = load_config(toml_path).retrieval
-        assert written.peclet == pytest.approx(optuna_res["best_params"]["peclet"])
+        assert optuna_res["total_trials"] == 2
+        assert (tmp_path / ".yaw" / "optuna_study.db").is_file()
+        assert set(optuna_res["best_params"]) == {"hybrid_alpha", "ppr_alpha", "seed_top_k"}
     finally:
         srv.shutdown()
 
@@ -816,7 +801,7 @@ def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: 
     toml_path = _write_toml(tmp_path, port=srv.server_port)
     bundle = _prepare_sample_bundle(tmp_path)
     cfg = load_config(toml_path).for_optimization(None)
-    assert cfg.status_path and cfg.lock_path
+    assert cfg.db_path and cfg.lock_path
     command = (
         [sys.executable, "-m", "yaw"]
         if force
@@ -833,8 +818,6 @@ def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: 
             str(bundle),
             "--max-queries",
             "4",
-            "--train-queries",
-            "2",
             "--query-offset",
             "0",
             "--max-metric-calls",
@@ -876,9 +859,8 @@ def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: 
         assert proc.returncode == 128 + sig, stderr
         assert "Traceback" not in stderr
         if not force:
-            status = json.loads(cfg.status_path.read_text(encoding="utf-8"))
-            assert status["lifecycle"] == "stopped"
-            assert "KeyboardInterrupt" in status["last_error"]
+            status = json.loads(cfg.db_path.with_name("dspy_status.json").read_text(encoding="utf-8"))
+            assert status == {"state": "interrupted", "pid": None}
         with filelock.FileLock(str(cfg.lock_path), timeout=0):
             pass
     finally:

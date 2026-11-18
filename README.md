@@ -4,50 +4,34 @@ YAW is a local-first retrieval and QA library built on a single SQLite database 
 
 Read [FOUNDATIONAL](FOUNDATIONAL.md), [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), and the [Clean-Slate Replacement Sprint](docs/reviews/bare-bones-replacement-sprint.md). Reference papers are preserved locally under [HippoRAG 1 (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md) and [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md).
 
-## Current Pre-Cutover Commands (Retiring in `CS-4`)
+## Setup
 
 Use Python `>=3.14` (`.python-version` `3.14.9`) and `uv`:
 
 ```powershell
 uv sync
-uv run preflight
-uv run preflight --full
-uv run typecheck
-uv run --locked pytest -v
-uv run --locked python scripts/download-datasets.py --dataset all --source-dir data/benchmarks
-uv run yaw daemon {run|start|stop|status}
-uv run yaw config get <key>
-uv run yaw config set <key> <value>
-uv run yaw dspy optuna --trials 64
-uv run python benchmark.py --dataset sample --mode all
-uv run python benchmark.py --dataset 2wikimultihopqa --max-queries 25 --mode retrieval
-uv run python benchmark.py --dataset hotpotqa --max-queries 25 --mode retrieval
-uv run python benchmark.py --dataset musique --max-queries 25 --mode retrieval
-uv run python scripts/verify_paper_parity_gate.py
 ```
 
-Legacy `yaw graph ...`, `yaw dspy ...`, and `scripts/calibrate_candidates.py` commands remain pre-cutover only and are deleted in `CS-4b` ([Removal Inventory](docs/reviews/bare-bones-replacement-sprint.md#6-removal-inventory)).
+Benchmark, dataset download, and watchdog scripts still require the retired graph daemon. Their migration is tracked as CS-4c in the [replacement sprint](docs/reviews/bare-bones-replacement-sprint.md).
 
-## Target Clean-Slate CLI (`CS-3` / `CS-4`)
-
-Once `CS-3` and `CS-4` land ([Epic 1 Decision 20](docs/epic-1-hipporag-daemon.md#decisions)), all operations unify onto the `FastMCP` Streamable HTTP daemon and bare `dspy` CLI:
+## Active CLI
 
 ```powershell
 uv run yaw daemon {run|start|stop|status} [--config PATH] [--json]
 uv run yaw recall <query> [--top-k 5] [--config PATH] [--json]
 uv run yaw qa <question> [--config PATH] [--json]
-uv run yaw optimize dspy [--dataset ...] [--max-queries N] [--train-queries K] [--fresh]
-uv run yaw optimize optuna [--dataset ...] [--trials 64] [--write-config]
+uv run yaw optimize dspy [--dataset ...] [--max-queries N] [--query-offset M] [--threads N] [--fresh]
+uv run yaw optimize optuna [--dataset ...] [--query-offset M] [--trials 64] [--fresh]
 uv run yaw config {show|get [key]|set <key> <value>} [--config PATH] [--json]
 ```
 
 ## Architecture & Model Stack
 
-The replacement CLI handles Ctrl-C, SIGTERM, and Windows Ctrl-Break during optimization. The first signal allows cleanup; repeat it to force exit if cleanup or a provider worker is stuck. Forced exit can lose unfinished work. Restart an existing process to load this behavior.
+The replacement CLI handles Ctrl-C, SIGTERM, and Windows Ctrl-Break during optimization. The first signal allows cleanup. Repeat it to force exit if cleanup or a provider worker is stuck. Forced exit can lose unfinished work. Restart an existing process to load this behavior.
 
 - **Declarative Live Indexing (`yaw/pipeline.py`):** Continuous `CocoIndex` (`localfs.walk_dir(..., live=live)`) writes `chunks` (`vec0` cosine embeddings + line/AST metadata, zero raw chunk text) and `chunk_fts` (`USING fts5(title, body, content='', contentless_delete=1)`) in 64-chunk micro-batches with persistent LMDB memoization under `.yaw/coco_lmdb`.
 - **Zero-LLM Hybrid `VectorSearch` (`yaw/retrieval.py` -> `yaw recall`):** Read-only WAL retrieval (`PRAGMA data_version` snapshot reload) combining ABTT Marchenko–Pastur isotropic projection, CSLS `k=8` hubness penalty, squared-IDF bigram/BM25 lexical scoring, `spaCy` noun-phrase 2-hop bridging, coalitional branch reranking, and Submodular MMR with MaxP span deduplication and SHA-256 disk line hydration.
-- **Optuna `VectorSearch` Tuning (`yaw optimize optuna` / pre-cutover `yaw dspy optuna`):** Single-study `optuna` `TPESampler` (`seed=42`, `multivariate=True`, `constant_liar=True`) tuning the 5 dimensionless `RetrievalParams` (`peclet`, `alpha_sprt`, `redundancy_curvature`, `coalition_coupling`, `external_trust`) across `Recall@{1, 2, 5, 10, 20}` objectives on disjoint slices (`query_offset >= 10`) and optionally writing `[retrieval]` in [`yaw.toml`](yaw.toml).
+- **Optuna tuning:** `yaw optimize optuna` tunes `hybrid_alpha`, `ppr_alpha`, and `seed_top_k` for a weighted combination of Recall@5 and nDCG@5. It saves the study and writes `optuna_best_params.json`.
 - **Bare `dspy.ReAct` QA & `dspy.GEPA` (`yaw/qa.py`, `yaw/optimize.py`):** Unwrapped `dspy.ReAct` over 4 character-bounded read-only corpus tools (`search_passages`, `lexical_grep`, `expand_neighbors`, `read_chunk`), serialized under `Semaphore(1)` and verified against inline `[chunk_id=<int>]` tool provenance; QA-only `dspy.GEPA` optimization isolates telemetry in `.yaw/optimize_*` (resume by default; `--fresh` wipes `.yaw/optimize_*` while preserving `.yaw/coco_lmdb`).
 - **Streamable HTTP Transport (`yaw/mcp_server.py`, [Epic 2](docs/epic-2-fastmcp-http.md)):** `FastMCP("yaw")` on loopback `http://127.0.0.1:13306/mcp` with pre-dispatch `Host`/`Origin` `403` validation, `/healthz`, `/readyz`, and 3 read-only tools (`recall`, `qa`, `daemon_status`).
 

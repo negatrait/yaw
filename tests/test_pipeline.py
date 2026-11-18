@@ -362,7 +362,7 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
     for exported in (
         "CORPUS_ROOT",
         "SQLITE_DB",
-        "EMBED_FN",
+        "EMBEDDER",
         "PipelineSession",
         "open_managed_db",
         "make_dspy_embed_fn",

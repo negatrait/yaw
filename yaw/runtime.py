@@ -21,9 +21,9 @@ import numpy as np
 
 from yaw.core import (
     DaemonStatus,
+    EmbedFn,
     HydratedPassage,
     QAResult,
-    RetrievalParams,
     YawConfig,
     YawRuntimeError,
     configure_logging,
@@ -39,13 +39,12 @@ from yaw.pipeline import (
     update_pipeline_once,
     wait_pipeline_ready,
 )
-from yaw.qa import EmbedFn, ask_question, build_qa_agent, make_qa_tools
+from yaw.qa import ask_question, build_qa_agent, make_qa_tools
 from yaw.retrieval import (
     VectorSearch,
     build_vector_search,
     hydrate_ranked_passages,
     open_readonly_db,
-    query_external_hints,
     search_vectors,
 )
 
@@ -189,38 +188,10 @@ def create_lm(cfg: YawConfig) -> dspy.LM:
     )
 
 
-def _empty_vector_search(params: RetrievalParams) -> VectorSearch:
-    empty_m = np.zeros((0, 0), np.float32)
-    empty_i = np.zeros((0,), np.int32)
-    empty_f = np.zeros((0,), np.float32)
-    return VectorSearch(
-        (),
-        {},
-        (),
-        (),
-        (),
-        empty_m,
-        empty_m,
-        empty_m,
-        0,
-        1.0,
-        empty_f,
-        {},
-        (),
-        empty_i,
-        empty_f,
-        (),
-        (),
-        (),
-        params,
-        0,
-    )
-
-
 def require_path(path: Path | None, label: str) -> Path:
     """Resolve a required configuration path or raise INVALID_INPUT when omitted."""
     if path is None:
-        raise YawRuntimeError("INVALID_INPUT", f"YawConfig.{label} must not be None.")
+        raise YawRuntimeError("INVALID_INPUT", f"require_path(): YawConfig.{label} must not be None.")
     return Path(path).resolve()
 
 
@@ -243,7 +214,7 @@ def get_vector_search(rt: YawRuntime, conn: sqlite3.Connection | None = None) ->
     with contextlib.nullcontext(conn) if conn is not None else contextlib.closing(open_readonly_db(db_path)) as ro_conn:
         if ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             return rt.vector_search
-        new_vs = build_vector_search(ro_conn, rt.config.retrieval, data_version=cur_ver)
+        new_vs = build_vector_search(ro_conn)
 
     updated = False
     with rt.index_lock:
@@ -298,7 +269,7 @@ def start_runtime(
             lm_sem=threading.Semaphore(1),
             query_sem=threading.BoundedSemaphore(cfg.queue_maxsize),
             index_lock=threading.RLock(),
-            vector_search=_empty_vector_search(cfg.retrieval),
+            vector_search=build_vector_search(probe_conn),
             index_data_version=-1,
             lifecycle="starting",
             last_error=None,
@@ -381,10 +352,10 @@ def wait_ready(rt: YawRuntime, timeout: float = 30.0) -> bool:
 
 def _validate_text_input(raw: str, label: str) -> str:
     if not isinstance(raw, str):
-        raise YawRuntimeError("INVALID_INPUT", f"{label} must be a string.")
+        raise YawRuntimeError("INVALID_INPUT", f"_validate_text_input(): {label} must be a string.")
     cleaned = raw.strip()
     if not cleaned:
-        raise YawRuntimeError("INVALID_INPUT", f"{label} must not be empty.")
+        raise YawRuntimeError("INVALID_INPUT", f"_validate_text_input(): {label} must not be empty.")
     return cleaned
 
 
@@ -418,7 +389,7 @@ def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassa
     """Execute zero-LLM hybrid VectorSearch retrieval with MaxP disk hydration."""
     q = _validate_text_input(query, "Query")
     if isinstance(top_k, bool) or not isinstance(top_k, int) or not (1 <= top_k <= 20):
-        raise YawRuntimeError("INVALID_INPUT", "top_k must be an integer between 1 and 20.")
+        raise YawRuntimeError("INVALID_INPUT", "recall(): top_k must be an integer between 1 and 20.")
     _ensure_ready(rt)
 
     db_path = require_path(rt.config.db_path, "db_path")
@@ -430,24 +401,15 @@ def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassa
         formatted = format_query_for_embedding(q, rt.config.embedding_task_mode)
         raw_emb = np.asarray(rt.embed_fn([formatted]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-        fts_scores, vec_scores = query_external_hints(conn, q, q_vec)
-        trace = search_vectors(
-            vs,
-            q_vec,
-            q,
-            top_k=max(top_k * 4, 50),
-            fts_scores=fts_scores,
-            vec_scores=vec_scores,
-            params=vs.params,
-        )
-        return hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=top_k)
+        ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(top_k * 4, 50))
+        return hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
 
 
 def resolve_program_path(cfg: YawConfig) -> Path | None:
-    """Resolve an existing compiled DSPy program path, falling back to `.yaw/optimize_program.json`."""
+    """Resolve the configured compiled program or the optimizer's artifact."""
     if cfg.compiled_program_path is not None and Path(cfg.compiled_program_path).is_file():
         return Path(cfg.compiled_program_path)
-    fallback = Path(cfg.workspace_root) / ".yaw" / "optimize_program.json"
+    fallback = require_path(cfg.for_optimization().db_path, "optimization db_path").parent / "qa_program.json"
     return fallback if fallback.is_file() else None
 
 
@@ -487,14 +449,8 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
         if (prog_path := resolve_program_path(rt.config)) is not None:
             agent.load(str(prog_path))
         try:
-            result = ask_question(
-                agent,
-                q,
-                corpus_root=corpus_root,
-                vs=vs,
-                lm=rt.lm,
-                lm_sem=rt.lm_sem,
-            )
+            with rt.lm_sem, dspy.context(lm=rt.lm):
+                result = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)
         except YawRuntimeError as exc:
             if exc.code in ("MODEL_ERROR", "CONSISTENCY_ERROR"):
                 with rt.state_lock:

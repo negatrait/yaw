@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from yaw.core import SHACLViolation, StructuredTriple, YawConfig, YawRuntimeError, load_config
+from yaw.core import DaemonStatus, YawConfig, YawRuntimeError, load_config
 from yaw.core.logger import FIFOLineRotatingHandler, SuppressThirdPartyInfoFilter
 
 
@@ -34,24 +34,10 @@ def test_invalid_toml_settings_fail_before_runtime_start(tmp_path, section, key,
     assert error.value.code == "INVALID_INPUT"
 
 
-def test_native_data_contract_aliases_and_json():
-    triple = StructuredTriple("Ada", "A mathematician", "wrote", "Note G", "An algorithm", "Ada wrote Note G.")
-    assert (triple.subject, triple.predicate, triple.object) == triple.as_tuple() == ("Ada", "wrote", "Note G")
-    assert json.loads(json.dumps(triple.to_dict())) == {
-        "subj": "Ada",
-        "subj_def": "A mathematician",
-        "pred": "wrote",
-        "obj": "Note G",
-        "obj_def": "An algorithm",
-        "spo_def": "Ada wrote Note G.",
-    }
-    violation = SHACLViolation("ConceptShape", "Ada", "skos:definition", "Missing definition")
-    assert violation.to_dict() == {
-        "shape": "ConceptShape",
-        "focus_node": "Ada",
-        "result_path": "skos:definition",
-        "message": "Missing definition",
-    }
+def test_daemon_status_json_keeps_lifecycle_and_chunk_count():
+    status = DaemonStatus(lifecycle="ready", provider_ready=True, num_chunks=3)
+    payload = json.loads(json.dumps(status.to_dict()))
+    assert (payload["lifecycle"], payload["provider_ready"], payload["num_chunks"]) == ("ready", True, 3)
 
 
 def test_empty_and_unwritable_fifo_paths_preserve_the_log_buffer(tmp_path):
@@ -100,7 +86,7 @@ def test_third_party_info_is_filtered_but_warnings_and_yaw_logs_remain():
 
 
 def test_all_leaf_facades_advertise_and_resolve_their_public_exports():
-    for name in ("yaw.core", "yaw.daemon.graph.inference", "yaw.daemon.graph.storage", "yaw.daemon.ingestion"):
+    for name in ("yaw.core",):
         module = importlib.import_module(name)
         names = dir(module)
         assert names

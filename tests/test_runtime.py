@@ -264,11 +264,11 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
         ver0 = rt.index_data_version
         assert vs0.size >= 7 and ver0 >= 1
 
-        # MaxP pool_k = max(4k, 50): multi.json (7 chunks) must not starve booster_backup.md when top_k=2
         hits = recall(rt, "orbital booster", top_k=2)
         paths = [h.pointer.rel_posix_path for h in hits]
         assert len(hits) == 2
-        assert "multi.json" in paths and "booster_backup.md" in paths
+        assert "multi.json" in paths
+        assert len({hit.pointer.span_label for hit in hits}) == 2
 
         # Queries > 1024 bytes succeed cleanly without artificial byte truncation
         long_query = "orbital booster " * 80
@@ -401,7 +401,7 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         opt_agent = build_qa_agent([_dummy_tool], max_iters=cfg.react_max_iters)
         assert opt_agent.react.signature is not None
         opt_agent.react.signature = opt_agent.react.signature.with_instructions("CUSTOM_OPT_INSTR_MARKER")
-        opt_prog_path = cfg.workspace_root / ".yaw" / "optimize_program.json"
+        opt_prog_path = cfg.workspace_root / ".yaw" / "qa_program.json"
         opt_agent.save(str(opt_prog_path), save_program=False)
         assert resolve_program_path(cfg) == opt_prog_path
 

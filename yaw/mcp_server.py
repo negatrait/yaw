@@ -121,7 +121,7 @@ class _LoopbackGuardMiddleware:
 
 
 def _to_tool_error(exc: YawRuntimeError, api_key: str) -> ToolError:
-    return ToolError(f"[{exc.code}] {redact_secrets(exc.message, api_key)}")
+    return ToolError(redact_secrets(str(exc), api_key))
 
 
 def create_mcp_app(
@@ -232,9 +232,8 @@ def create_mcp_app(
         return {
             "question": question.strip(),
             "answer": res.answer,
-            "termination_reason": res.termination_reason,
             "turns": int(res.turns),
-            "citations": [serialize_passage(idx, hp) for idx, hp in enumerate(res.citations, start=1)],
+            "citations": [serialize_passage(idx, hp) for idx, hp in enumerate(res.passages, start=1)],
         }
 
     @mcp.tool(

@@ -13,18 +13,17 @@ import pytest
 import sqlite_vec
 from numpy.typing import NDArray
 
-from yaw.core import ChunkPointer, RetrievalParams, YawConfig, YawRuntimeError, format_query_for_embedding
+from yaw.core import ChunkPointer, YawConfig, format_query_for_embedding
 from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
 from yaw.retrieval import (
-    EvidenceHop,
     VectorSearch,
     build_vector_search,
     extract_text_features,
     format_evidence_route,
     hydrate_passage,
     hydrate_ranked_passages,
+    lexical_search,
     open_readonly_db,
-    query_external_hints,
     search_vectors,
 )
 
@@ -80,10 +79,9 @@ def test_empty_db_vector_search(tmp_path: Path) -> None:
         assert isinstance(vs, VectorSearch)
         assert vs.size == 0
         q_vec = _topic_embed([format_query_for_embedding("anything", "distinct-titled")], dim=16)[0]
-        trace = search_vectors(vs, q_vec, "anything", top_k=5)
-        assert trace.ranked_chunks == []
-        assert trace.num_particles == 0
-        assert hydrate_ranked_passages(vs, trace.ranked_chunks, cfg.corpus_root, top_k=5) == ()
+        ranked = search_vectors(vs, q_vec, query_text="anything", conn=conn, top_k=5)
+        assert ranked == []
+        assert hydrate_ranked_passages(vs, ranked, cfg.corpus_root, top_k=5) == ()
     finally:
         conn.close()
 
@@ -129,24 +127,10 @@ def test_multihop_search_maxp_hydration_and_staleness(tmp_path: Path) -> None:
 
         query = "What unusual instrument did the Apollo 11 commander play?"
         q_vec = _topic_embed([format_query_for_embedding(query, "distinct-titled")], dim=16)[0]
-        fts_scores, vec_scores = query_external_hints(conn, query, q_vec, fts_k=20, vec_k=20)
-        assert fts_scores and vec_scores
-
-        trace = search_vectors(
-            vs,
-            q_vec,
-            query,
-            top_k=max(2 * 4, 50),
-            fts_scores=fts_scores,
-            vec_scores=vec_scores,
-            params=RetrievalParams(),
-        )
-        assert trace.ranked_chunks
-        if trace.route:
-            route_txt = format_evidence_route(trace.route, max_chars=240)
-            assert route_txt and len(route_txt) <= 240
-
-        hydrated = hydrate_ranked_passages(vs, trace.ranked_chunks, cfg.corpus_root, top_k=4)
+        ranked = search_vectors(vs, q_vec, query_text=query, conn=conn, top_k=50)
+        assert ranked
+        hydrated = hydrate_ranked_passages(vs, ranked, cfg.corpus_root, top_k=4)
+        assert "bridge.md" in format_evidence_route(hydrated)
         paths = [h.pointer.rel_posix_path for h in hydrated]
         assert "alpha.md" in paths
         assert "bridge.md" in paths
@@ -156,43 +140,41 @@ def test_multihop_search_maxp_hydration_and_staleness(tmp_path: Path) -> None:
         json_ptrs = [p for p in vs.pointers if p.rel_posix_path == "multi.json"]
         assert len(json_ptrs) >= 2
         dup_ranked = [(int(p.chunk_id), 0.9 - 0.1 * idx) for idx, p in enumerate(json_ptrs)]
+        dup_ranked.insert(1, dup_ranked[0])
         deduped = hydrate_ranked_passages(vs, dup_ranked, cfg.corpus_root, top_k=5)
-        assert len(deduped) == 1
+        assert len(deduped) == min(len(json_ptrs), 5)
+        assert len({h.pointer.char_start for h in deduped}) == len(deduped)
         assert deduped[0].pointer.chunk_id == json_ptrs[0].chunk_id
-        assert deduped[0].pointer.title == "Orbital Long Doc"
+        assert deduped[0].pointer.rel_posix_path == "multi.json"
 
-        # Verify lexical_grep empty-vector path (vec_k=0) and island hydration + cropping
-        fts_only, vec_empty = query_external_hints(
-            conn, "XylophoneZither", np.zeros((0,), np.float32), fts_k=5, vec_k=0
-        )
-        assert vec_empty == {}
-        assert any(vs.pointers[vs.id_to_pos[cid]].rel_posix_path == "bridge.md" for cid in fts_only)
+        fts_only = lexical_search(vs, "XylophoneZither", conn, top_k=5)
+        assert any(vs.pointers[vs.id_to_pos[cid]].rel_posix_path == "bridge.md" for cid, _ in fts_only)
 
         bridge_ptr = next(
             p
             for p in vs.pointers
-            if p.rel_posix_path == "bridge.md" and "XylophoneZither" in hydrate_passage(cfg.corpus_root, p).text
+            if p.rel_posix_path == "bridge.md" and "XylophoneZither" in hydrate_passage(p, cfg.corpus_root).text
         )
-        island_h = hydrate_passage(cfg.corpus_root, bridge_ptr, include_island=True, max_chars=60)
+        island_h = hydrate_passage(bridge_ptr, cfg.corpus_root, include_island=True, max_chars=60)
         assert not island_h.stale_on_disk
-        assert "[... cropped ...]" in island_h.text
+        assert "cropped" in island_h.text and len(island_h.text) <= 60
 
         # Post-index mutation and deletion must return stale_on_disk=True with empty text
         bridge_file.write_text("# Wapakoneta Musician\nContent altered after indexing.\n", encoding="utf-8")
-        mutated = hydrate_passage(cfg.corpus_root, bridge_ptr)
+        mutated = hydrate_passage(bridge_ptr, cfg.corpus_root)
         assert mutated.stale_on_disk is True
         assert mutated.text == ""
 
         noise_ptr = next(p for p in vs.pointers if p.rel_posix_path == "noise.md")
         (cfg.corpus_root / "noise.md").unlink()
-        deleted = hydrate_passage(cfg.corpus_root, noise_ptr)
+        deleted = hydrate_passage(noise_ptr, cfg.corpus_root)
         assert deleted.stale_on_disk is True
         assert deleted.text == ""
 
         # Out-of-bounds span validation
         with pytest.raises(ValueError, match="Invalid hydration line range"):
             hydrate_passage(
-                cfg.corpus_root, ChunkPointer(chunk_id=1, rel_posix_path="alpha.md", start_line=0, end_line=1)
+                ChunkPointer(chunk_id=1, rel_path="alpha.md", source_hash="", start_line=0, end_line=1), cfg.corpus_root
             )
     finally:
         conn.close()
@@ -221,19 +203,19 @@ def test_uncropped_hydration_corrupt_json_and_unbounded_routes(tmp_path: Path) -
         long_ptr = next(p for p in vs.pointers if p.rel_posix_path == "long.md")
 
         # Default max_chars=None returns completely uncropped passage (> 4000 chars)
-        single = hydrate_passage(cfg.corpus_root, long_ptr)
+        single = hydrate_passage(long_ptr, cfg.corpus_root, full_span=True)
         assert not single.stale_on_disk
         assert len(single.text) > 5000
         assert "[... cropped ...]" not in single.text
         assert "Segment_179_long_unbroken_corpus_payload_text." in single.text
 
-        ranked = hydrate_ranked_passages(vs, [(int(long_ptr.chunk_id), 0.9)], cfg.corpus_root, top_k=1)
+        ranked = hydrate_ranked_passages(vs, [(int(long_ptr.chunk_id), 0.9)], cfg.corpus_root, top_k=1, full_span=True)
         assert len(ranked) == 1
         assert len(ranked[0].text) > 5000
         assert "[... cropped ...]" not in ranked[0].text
 
         with pytest.raises(ValueError, match="max_chars"):
-            hydrate_passage(cfg.corpus_root, long_ptr, max_chars=-1)
+            hydrate_passage(long_ptr, cfg.corpus_root, max_chars=-1)
         with pytest.raises(ValueError, match="max_chars"):
             hydrate_ranked_passages(vs, [(int(long_ptr.chunk_id), 0.9)], cfg.corpus_root, max_chars=-5)
 
@@ -244,41 +226,25 @@ def test_uncropped_hydration_corrupt_json_and_unbounded_routes(tmp_path: Path) -
             corrupt_hash = hashlib.sha256(corrupt_payload.encode("utf-8")).hexdigest()
             corrupt_ptr = ChunkPointer(
                 chunk_id=999,
-                rel_posix_path="corrupt.json",
+                rel_path="corrupt.json",
                 start_line=1,
                 end_line=1,
                 source_hash=corrupt_hash,
             )
-            with pytest.raises(YawRuntimeError) as exc_info:
-                hydrate_passage(cfg.corpus_root, corrupt_ptr)
-            assert exc_info.value.code == "CONSISTENCY_ERROR"
+            assert hydrate_passage(corrupt_ptr, cfg.corpus_root).text == corrupt_payload
 
         # Mutated JSON (source_hash mismatch) still returns stale_on_disk=True
         valid_ptr = next(p for p in vs.pointers if p.rel_posix_path == "doc.json")
         valid_json_path.write_text("{broken after indexing", encoding="utf-8")
-        stale = hydrate_passage(cfg.corpus_root, valid_ptr)
+        stale = hydrate_passage(valid_ptr, cfg.corpus_root)
         assert stale.stale_on_disk is True
         assert stale.text == ""
 
-    # Uncropped EvidenceHop route by default (max_chars=None)
-    long_title = "T_" + ("x" * 240)
-    hops = (
-        EvidenceHop(0, 1, long_title, long_title, 0.9, "", 0),
-        EvidenceHop(1, 2, "SecondHop", "y" * 450, 0.8, "BridgeEntity", 0),
-    )
-    formatted = format_evidence_route(hops)
-    assert len(formatted) > 700
-    assert long_title in formatted
-    assert "y" * 450 in formatted
-    with pytest.raises(ValueError, match="max_chars"):
-        format_evidence_route(hops, max_chars=-1)
-
 
 def test_retrieval_module_isolation_and_nlp() -> None:
-    terms, (main_ents, attr_ents) = extract_text_features("Apollo 11", "Neil Armstrong commanded Eagle in July.")
+    terms, main_ents = extract_text_features("Apollo 11", "Neil Armstrong commanded Eagle in July.")
     assert "apollo" in terms and "neil" in terms
-    assert any("Neil Armstrong" in e for e in main_ents)
-    assert isinstance(attr_ents, list)
+    assert any("neil armstrong" in e.lower() for e in main_ents)
 
     # Full-body extraction beyond char 1600 and beyond 16 entities, keeping attr_ents <= 8
     names = [f"Alden{chr(65 + i)} Mercer{chr(65 + i)}" for i in range(20)]
@@ -287,10 +253,9 @@ def test_retrieval_module_isolation_and_nlp() -> None:
     tail_ent = "ZetaHorizon Institute"
     long_body = f"{head}\n{padding}\n{tail_ent} published the final specification."
     assert long_body.index(tail_ent) > 1600
-    _, (long_main, long_attr) = extract_text_features("Multi-Entity Doc", long_body)
+    _, long_main = extract_text_features("Multi-Entity Doc", long_body)
     assert len(long_main) > 16
-    assert any("ZetaHorizon" in e for e in long_main)
-    assert len(long_attr) <= 8
+    assert any("zetahorizon" in e.lower() for e in long_main)
 
     src = (Path(__file__).resolve().parent.parent / "yaw" / "retrieval.py").read_text(encoding="utf-8")
     low = src.lower()

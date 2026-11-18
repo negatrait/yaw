@@ -1,79 +1,78 @@
-"""Bare dspy.ReAct multi-hop QA tools, agent builder, and grounded answer verification."""
-
 from __future__ import annotations
 
 import re
 import sqlite3
-import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import dspy
 import numpy as np
-from dspy.utils.exceptions import AdapterParseError, ContextWindowExceededError
-from numpy.typing import NDArray
+from dspy.utils.exceptions import AdapterParseError
 
-from yaw.core import HydratedPassage, QAResult, YawRuntimeError, format_query_for_embedding
-from yaw.retrieval import (
-    VectorSearch,
-    hydrate_passage,
-    hydrate_ranked_passages,
-    query_external_hints,
-    search_vectors,
-)
+from .core import EmbedFn, HydratedPassage, QAResult, YawRuntimeError, format_query_for_embedding
+from .retrieval import VectorSearch, hydrate_passage, hydrate_ranked_passages, lexical_search, search_vectors
 
-_NO_MATCHES = "No matching passages."
-_OBS_SCORE_RE = re.compile(r"\[chunk_id=(\d+)\]\s+\([^\n]+:\d+-\d+\)\s+score=([-+]?\d+(?:\.\d+)?):")
+_MAX_TOP_K = 25
+_NO_MATCHES = "No matching passages found."
+_NO_ISLAND = (1, 1)  # ChunkPointer default: the chunk carries no AST island.
+_PASSAGE_HEAD_RE = re.compile(r"^\[chunk_id=(\d+)\]\s+\([^)\n]+\)\s+score=([-+]?\d+(?:\.\d+)?):$", re.MULTILINE)
 _CHUNK_ID_RE = re.compile(r"\[chunk_id=(\d+)\]")
+_QUERY_DESC = {"query": "Non-empty search query.", "top_k": f"Max passages to return (1..{_MAX_TOP_K})."}
+_CHUNK_DESC = "Chunk ID from a prior [chunk_id=<int>] header."
 
 
-class EmbedFn(Protocol):
-    """Callable encoding text strings into unit-L2-normalized float32 embeddings."""
+class QASignature(dspy.Signature):
+    """Answer strictly from retrieved corpus passages using inline [chunk_id=<int>] citations,
+    or reply 'Insufficient references in corpus' when evidence is lacking."""
 
-    def __call__(self, texts: list[str], /) -> NDArray[np.float32]: ...
-
-
-class AnswerQuestion(dspy.Signature):
-    """Deduce a definitive closed-world answer grounded in tool-retrieved corpus passages.
-    Use search_passages, lexical_grep, expand_neighbors, and read_chunk to verify multi-hop facts.
-    Cite supporting passage IDs inline as [chunk_id=<int>], or reply 'Insufficient references in corpus'.
-    """
-
-    question: str = dspy.InputField(desc="Question to answer")
-    answer: str = dspy.OutputField(desc="Definitive grounded answer citing [chunk_id=<int>] or refusal")
+    question: str = dspy.InputField(desc="User question to answer from indexed corpus.")
+    answer: str = dspy.OutputField(desc="Grounded answer citing [chunk_id=<int>] or refusal.")
 
 
-def _format_passage(hp: HydratedPassage) -> str:
-    ptr = hp.pointer
-    body = f"[STALE ON DISK] {ptr.rel_posix_path}" if hp.stale_on_disk else hp.text
-    head = f"[chunk_id={ptr.chunk_id}] ({ptr.rel_posix_path}:{ptr.start_line}-{ptr.end_line}) score={hp.score:.3f}:"
-    return f"{head}\n{body}"
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
+
+
+def _valid_int(val: Any, lo: int = 1, hi: int | None = None) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val >= lo and (hi is None or val <= hi)
 
 
 def _format_passages(passages: Sequence[HydratedPassage]) -> str:
-    return "\n\n".join(_format_passage(hp) for hp in passages) if passages else _NO_MATCHES
+    if not passages:
+        return _NO_MATCHES
+    return "\n\n".join(
+        f"[chunk_id={p.pointer.chunk_id}] ({p.pointer.rel_posix_path}:{p.pointer.start_line}-{p.pointer.end_line})"
+        f" score={p.score:.3f}:\n{f'[STALE ON DISK] {p.pointer.rel_posix_path}' if p.stale_on_disk else p.text}"
+        for p in passages
+    )
 
 
 def _require_query(query: str) -> str:
-    if not isinstance(query, str) or not (cleaned := query.strip()):
+    if not isinstance(query, str) or not (q := query.strip()):
         raise ValueError("query must be a non-empty string.")
-    return cleaned
+    return q
 
 
 def _require_top_k(top_k: int) -> int:
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
-        raise ValueError(f"top_k must be a positive integer, got {top_k!r}.")
+    if not _valid_int(top_k, 1, _MAX_TOP_K):
+        raise ValueError(f"top_k must be an integer between 1 and {_MAX_TOP_K}.")
     return top_k
 
 
 def _require_chunk_pos(vs: VectorSearch, chunk_id: int) -> int:
     if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
-        raise TypeError(f"chunk_id must be an integer, got {chunk_id!r}.")
-    idx = vs.id_to_pos.get(chunk_id)
-    if idx is None:
-        raise KeyError(f"Unknown chunk_id: {chunk_id}")
-    return idx
+        raise ValueError("chunk_id must be an integer.")
+    if (pos := vs.id_to_pos.get(chunk_id)) is None:
+        raise ValueError(f"Unknown chunk_id={chunk_id}.")
+    return pos
+
+
+def _hydrate_ids(
+    vs: VectorSearch, ranked: Sequence[tuple[int, float]], corpus_root: Path
+) -> tuple[HydratedPassage, ...]:
+    """Hydrate exactly the requested chunk ids from disk, in order and without span deduplication."""
+    return tuple(hydrate_passage(vs.pointers[vs.id_to_pos[cid]], corpus_root, score=score) for cid, score in ranked)
 
 
 def make_qa_tools(
@@ -83,163 +82,144 @@ def make_qa_tools(
     conn: sqlite3.Connection,
     *,
     task_mode: str = "distinct-titled",
-) -> list[Callable[..., Any]]:
-    """Build the 4 read-only passage exploration tools bound to an immutable VectorSearch."""
-    format_query_for_embedding("probe", task_mode)
+) -> list[dspy.Tool]:
+    """Build closure-bound retrieval tools with explicit DSPy schemas for dspy.ReAct."""
 
     def search_passages(query: str, top_k: int = 8) -> str:
         """Search corpus passages using hybrid vector and lexical ranking."""
-        q = _require_query(query)
-        k = _require_top_k(top_k)
+        q, k = _require_query(query), _require_top_k(top_k)
         if vs.size == 0:
             return _NO_MATCHES
         raw_emb = np.asarray(embed_fn([format_query_for_embedding(q, task_mode)]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-        fts_scores, vec_scores = query_external_hints(conn, q, q_vec)
-        trace = search_vectors(
-            vs,
-            q_vec,
-            q,
-            top_k=max(k * 4, 50),
-            fts_scores=fts_scores,
-            vec_scores=vec_scores,
-            params=vs.params,
-        )
-        return _format_passages(hydrate_ranked_passages(vs, trace.ranked_chunks, corpus_root, top_k=k))
+        ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(k * 4, 50))
+        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
         """Run zero-embedder FTS5 keyword grep over indexed passages."""
-        q = _require_query(query)
-        k = _require_top_k(top_k)
+        q, k = _require_query(query), _require_top_k(top_k)
         if vs.size == 0:
             return _NO_MATCHES
-        fts_scores, _ = query_external_hints(conn, q, np.zeros((0,), dtype=np.float32), fts_k=max(k * 2, 20), vec_k=0)
-        ranked = sorted(fts_scores.items(), key=lambda item: (-item[1], item[0]))
+        # Over-fetch pool_k = max(k * 4, 50) to prevent sub-chunk starvation during MaxP span dedup.
+        ranked = lexical_search(vs, q, conn, top_k=max(k * 4, 50))
         return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
-        """Expand isotropic, shared-entity, and AST-sibling neighbor passages for chunk_id."""
-        idx = _require_chunk_pos(vs, chunk_id)
-        k = _require_top_k(top_k)
+        """Expand isotropic, shared-entity, and same-AST-island neighbor passages for chunk_id."""
+        idx, k = _require_chunk_pos(vs, chunk_id), _require_top_k(top_k)
         if vs.size <= 1:
             return _NO_MATCHES
-        sims = vs.u_chunk_iso @ vs.u_chunk_iso[idx]
-        src_ents = {e.lower() for e in vs.chunk_entities[idx][0]}
-        sibs = {int(s) for s in vs.ast_siblings[idx]}
-        scored = [
-            (
-                vs.chunk_ids[j],
-                float(sims[j])
-                + 0.35 * len(src_ents & {e.lower() for e in vs.chunk_entities[j][0]})
-                + (0.50 if j in sibs else 0.0),
-            )
-            for j in range(vs.size)
-            if j != idx
-        ]
-        scored.sort(key=lambda item: (-item[1], item[0]))
-        return _format_passages(
-            hydrate_ranked_passages(vs, scored[: max(k * 4, 50)], corpus_root, top_k=k),
-        )
+        # Embeddings are unit-normalized, so the dot product is the cosine; entity_to_chunk is (entities x chunks).
+        scores = (vs.embeddings @ vs.embeddings[idx]).astype(np.float64)
+        if (shared := vs.entity_to_chunk[:, idx].nonzero()[0]).size:
+            overlap = np.asarray(vs.entity_to_chunk[shared].astype(bool).sum(axis=0)).ravel()
+            scores += 0.35 * overlap
+        ptr = vs.pointers[idx]
+        island = (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end)
+        if (ptr.ast_island_start, ptr.ast_island_end) != _NO_ISLAND:
+            siblings = [
+                j
+                for j, p in enumerate(vs.pointers)
+                if (p.rel_posix_path, p.ast_island_start, p.ast_island_end) == island
+            ]
+            scores[siblings] += 0.50
+        scores[idx] = -np.inf
+        pool_k = min(max(k * 4, 50), vs.size - 1)
+        cutoff = float(np.partition(scores, -pool_k)[-pool_k])
+        ranked = sorted(
+            ((vs.chunk_ids[int(j)], float(scores[int(j)])) for j in np.flatnonzero(scores >= cutoff) if int(j) != idx),
+            key=lambda item: (-item[1], item[0]),
+        )[:pool_k]
+        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
-    def read_chunk(chunk_id: int, include_siblings: bool = False) -> str:
-        """Read a passage by chunk_id, optionally expanding its enclosing AST section."""
-        idx = _require_chunk_pos(vs, chunk_id)
-        hp = hydrate_passage(
-            corpus_root,
-            vs.pointers[idx],
-            score=1.0,
-            include_island=bool(include_siblings),
-        )
-        return _format_passage(hp)
+    def read_chunk(chunk_id: int) -> str:
+        """Read the exact hydrated passage for a single chunk_id."""
+        _require_chunk_pos(vs, chunk_id)
+        return _format_passages(_hydrate_ids(vs, [(chunk_id, 1.0)], corpus_root))
 
-    return [search_passages, lexical_grep, expand_neighbors, read_chunk]
+    return [
+        dspy.Tool(search_passages, arg_desc=_QUERY_DESC),
+        dspy.Tool(lexical_grep, arg_desc=_QUERY_DESC),
+        dspy.Tool(expand_neighbors, arg_desc={"chunk_id": _CHUNK_DESC, "top_k": _QUERY_DESC["top_k"]}),
+        dspy.Tool(read_chunk, arg_desc={"chunk_id": _CHUNK_DESC}),
+    ]
 
 
-def build_qa_agent(tools: list[Callable[..., Any]], max_iters: int = 6) -> dspy.ReAct:
-    """Return a bare dspy.ReAct agent configured with AnswerQuestion and exploration tools."""
-    return dspy.ReAct(AnswerQuestion, tools=tools, max_iters=max_iters)
+def iter_tool_observations(history_msgs: Sequence[Any]) -> Iterator[str]:
+    """Yield successful text results from live or serialized DSPy ToolCalls."""
+    for msg in history_msgs:
+        if (tc := _field(msg, "tool_calls")) is None:
+            continue
+        calls = _field(tc, "tool_calls") or ()
+        tcr = _field(tc, "tool_call_results")
+        results = tcr if isinstance(tcr, list | tuple) else (_field(tcr, "tool_call_results") or ())
+        by_id = {cid: _field(c, "name", "") for c in calls if (cid := _field(c, "id")) is not None}
+        for i, res in enumerate(results):
+            pos_name = _field(calls[i], "name", "") if i < len(calls) else ""
+            name = _field(res, "name") or by_id.get(_field(res, "tool_call_id")) or pos_name
+            if name == "submit" or _field(res, "is_error") or not isinstance(val := _field(res, "value"), str):
+                continue
+            yield val
 
 
 def _extract_seen_chunks(history_msgs: Sequence[Any]) -> dict[int, tuple[float, int]]:
-    """Extract {chunk_id: (best_score, first_order)} strictly from non-submit tool outputs."""
     seen: dict[int, tuple[float, int]] = {}
-    order = 0
-    for msg in history_msgs:
-        if not isinstance(msg, Mapping) or (tc := msg.get("tool_calls")) is None:
-            continue
-        calls = getattr(tc, "tool_calls", None) or ()
-        results = getattr(getattr(tc, "tool_call_results", None), "tool_call_results", None) or ()
-        for call, res in zip(calls, results, strict=False):
-            call_name = call.get("name", "") if isinstance(call, Mapping) else getattr(call, "name", "")
-            if call_name == "submit":
-                continue
-            is_error = bool(res.get("is_error")) if isinstance(res, Mapping) else bool(getattr(res, "is_error", False))
-            val = res.get("value") if isinstance(res, Mapping) else getattr(res, "value", None)
-            if is_error or not isinstance(val, str):
-                continue
-            scores_here = {int(m.group(1)): float(m.group(2)) for m in _OBS_SCORE_RE.finditer(val)}
-            for match in _CHUNK_ID_RE.finditer(val):
-                cid = int(match.group(1))
-                score = scores_here.get(cid, 0.0)
-                if cid not in seen:
-                    seen[cid] = (score, order)
-                    order += 1
-                elif score > seen[cid][0]:
-                    seen[cid] = (score, seen[cid][1])
+    for value in iter_tool_observations(history_msgs):
+        for m in _PASSAGE_HEAD_RE.finditer(value):
+            cid, score = int(m.group(1)), float(m.group(2))
+            prev = seen.get(cid, (score, len(seen)))
+            seen[cid] = (max(score, prev[0]), prev[1])
     return seen
 
 
+def build_qa_agent(
+    tools: Sequence[dspy.Tool | Callable[..., Any]], *, max_iters: int = 6, artifact_path: Path | None = None
+) -> dspy.ReAct:
+    if not _valid_int(max_iters):
+        raise YawRuntimeError("INVALID_INPUT", "max_iters must be >= 1.")
+    agent = dspy.ReAct(QASignature, tools=list(tools), max_iters=max_iters)
+    if artifact_path is not None and artifact_path.is_file():
+        agent.load(str(artifact_path))
+    return agent
+
+
 def ask_question(
-    agent: dspy.ReAct,
-    question: str,
-    *,
-    corpus_root: Path,
-    vs: VectorSearch,
-    lm: dspy.LM,
-    lm_sem: threading.Semaphore,
-    max_citations: int = 5,
+    question: str, *, vs: VectorSearch, corpus_root: Path, agent: dspy.Module, max_citations: int = 5
 ) -> QAResult:
-    """Execute bounded ReAct QA under lm_sem and verify cited chunks against disk."""
     if not isinstance(question, str) or not (q := question.strip()):
-        raise YawRuntimeError("INVALID_INPUT", "Question must be a non-empty string.")
-    if isinstance(max_citations, bool) or not isinstance(max_citations, int) or max_citations < 1:
-        raise YawRuntimeError("INVALID_INPUT", "max_citations must be a positive integer.")
+        raise YawRuntimeError("INVALID_INPUT", "question must be a non-empty string.")
+    if not _valid_int(max_citations):
+        raise YawRuntimeError("INVALID_INPUT", "max_citations must be >= 1.")
     if vs.size == 0:
-        raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
+        raise YawRuntimeError("EMPTY_INDEX", "Index contains 0 chunks.")
 
-    with lm_sem, dspy.context(lm=lm):
-        try:
-            pred = agent(question=q)
-        except (AdapterParseError, ContextWindowExceededError, ValueError) as exc:
-            raise YawRuntimeError("MODEL_ERROR", f"ReAct QA failed: {exc}") from exc
+    try:
+        pred = agent(question=q)
+    except AdapterParseError as exc:
+        raise YawRuntimeError("MODEL_ERROR", "QA model returned an invalid tool response.") from exc
+    if not isinstance(raw_ans := _field(pred, "answer"), str) or not (answer := raw_ans.strip()):
+        raise YawRuntimeError("MODEL_ERROR", "QA agent produced an empty answer.")
 
-    term = str(getattr(pred, "termination_reason", "") or "")
-    if term not in ("submit", "forced_submit"):
-        raise YawRuntimeError("MODEL_ERROR", f"Unexpected ReAct termination_reason: {term!r}")
-    raw_answer = getattr(pred, "answer", None)
-    if not isinstance(raw_answer, str) or not (answer := raw_answer.strip()):
-        raise YawRuntimeError("MODEL_ERROR", "ReAct produced an empty answer.")
-    history_msgs = getattr(getattr(pred, "history", None), "messages", ()) or ()
-    if not history_msgs:
-        raise YawRuntimeError("MODEL_ERROR", "ReAct returned an empty interaction history.")
-
+    # Verify inline [chunk_id] citations against tool-seen IDs and disk SHA-256 hashes.
+    history_msgs = _field(_field(pred, "history"), "messages") or ()
     seen_scores = _extract_seen_chunks(history_msgs)
     inline_ids = list(dict.fromkeys(int(m.group(1)) for m in _CHUNK_ID_RE.finditer(answer)))
     for cid in inline_ids:
         if cid not in seen_scores or cid not in vs.id_to_pos:
             raise YawRuntimeError("MODEL_ERROR", f"Answer cites ungrounded chunk_id={cid}.")
 
-    if inline_ids:
-        chosen_ids = inline_ids[:max_citations]
-    else:
-        ordered_seen = sorted(seen_scores.items(), key=lambda item: (-item[1][0], item[1][1]))
-        chosen_ids = [cid for cid, _ in ordered_seen if cid in vs.id_to_pos][:max_citations]
+    chosen_ids = (
+        inline_ids
+        or [cid for cid, _ in sorted(seen_scores.items(), key=lambda x: (-x[1][0], x[1][1])) if cid in vs.id_to_pos]
+    )[:max_citations]
+    citations = _hydrate_ids(vs, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root)
+    if any(hp.stale_on_disk for hp in citations):
+        raise YawRuntimeError("CONSISTENCY_ERROR", "Cited passage failed disk SHA-256 verification.")
 
-    citations: list[HydratedPassage] = []
-    for cid in chosen_ids:
-        hp = hydrate_passage(corpus_root, vs.pointers[vs.id_to_pos[cid]], score=seen_scores[cid][0])
-        if hp.stale_on_disk:
-            raise YawRuntimeError("CONSISTENCY_ERROR", f"Cited chunk {cid} is stale or missing on disk.")
-        citations.append(hp)
-
-    return QAResult(answer=answer, citations=tuple(citations), termination_reason=term, turns=len(history_msgs))
+    return QAResult(
+        question=q,
+        answer=answer,
+        citations=tuple(hp.pointer.span_label for hp in citations),
+        passages=citations,
+        turns=len(history_msgs),
+    )

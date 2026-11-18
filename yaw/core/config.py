@@ -323,19 +323,19 @@ class YawConfig:
         if not all(
             math.isfinite(value) for value in (self.candidate_dense_threshold, self.candidate_lexical_threshold)
         ):
-            raise YawRuntimeError("INVALID_INPUT", "Candidate admission thresholds must be finite")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): Candidate admission thresholds must be finite")
         if not 0 < self.auto_merge_threshold <= 1:
-            raise YawRuntimeError("INVALID_INPUT", "auto_merge_threshold must be in (0, 1]")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): auto_merge_threshold must be in (0, 1]")
         if not 0 < self.candidate_volume_ratio < float("inf"):
-            raise YawRuntimeError("INVALID_INPUT", "candidate_volume_ratio must be finite and positive")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): candidate_volume_ratio must be finite and positive")
         if self.queue_maxsize < 1:
-            raise YawRuntimeError("INVALID_INPUT", "queue_maxsize must be >= 1")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): queue_maxsize must be >= 1")
         if self.chunk_size < 1:
-            raise YawRuntimeError("INVALID_INPUT", "chunk_size must be >= 1")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): chunk_size must be >= 1")
         if self.context_window_tokens < 2:
-            raise YawRuntimeError("INVALID_INPUT", "context_window_tokens must be >= 2")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): context_window_tokens must be >= 2")
         if self.max_output_tokens is not None and self.max_output_tokens < 1:
-            raise YawRuntimeError("INVALID_INPUT", "max_output_tokens must be positive")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): max_output_tokens must be positive")
         for name in (
             "react_max_iters",
             "rlm_max_iters",
@@ -344,31 +344,31 @@ class YawConfig:
         ):
             value = getattr(self, name)
             if value is None or value < 1:
-                raise YawRuntimeError("INVALID_INPUT", f"{name} must be positive")
+                raise YawRuntimeError("INVALID_INPUT", f"YawConfig(): {name} must be positive")
         if self.rlm_max_output_chars is not None and self.rlm_max_output_chars < 1:
-            raise YawRuntimeError("INVALID_INPUT", "rlm_max_output_chars must be positive")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): rlm_max_output_chars must be positive")
         if self.max_context_chars is not None and self.max_context_chars < 1:
-            raise YawRuntimeError("INVALID_INPUT", "max_context_chars must be positive")
+            raise YawRuntimeError("INVALID_INPUT", "YawConfig(): max_context_chars must be positive")
         if self.optimize_mode not in ("miprov2", "gepa", "hybrid"):
-            raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_mode: {self.optimize_mode!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"YawConfig(): Unsupported optimize_mode: {self.optimize_mode!r}")
         if self.retriever_mode not in ("graph", "manifold"):
-            raise YawRuntimeError("INVALID_INPUT", f"Unsupported retriever_mode: {self.retriever_mode!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"YawConfig(): Unsupported retriever_mode: {self.retriever_mode!r}")
         if self.optimize_auto not in ("light", "medium", "heavy"):
-            raise YawRuntimeError("INVALID_INPUT", f"Unsupported optimize_auto: {self.optimize_auto!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"YawConfig(): Unsupported optimize_auto: {self.optimize_auto!r}")
         raw_sleep = self.optimize_sleep_seconds
         if raw_sleep is None:
             sleep_seconds = 0.0
         elif isinstance(raw_sleep, bool) or not isinstance(raw_sleep, (int, float)):
             raise YawRuntimeError(
                 "INVALID_INPUT",
-                f"optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
+                f"YawConfig(): optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
             )
         else:
             sleep_seconds = float(raw_sleep)
             if not math.isfinite(sleep_seconds) or sleep_seconds < 0.0:
                 raise YawRuntimeError(
                     "INVALID_INPUT",
-                    f"optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
+                    f"YawConfig(): optimize_sleep_seconds must be a non-negative finite number, got {raw_sleep!r}",
                 )
         object.__setattr__(self, "optimize_sleep_seconds", sleep_seconds)
         for demo_field in ("optimize_max_bootstrapped_demos", "optimize_max_labeled_demos"):
@@ -378,7 +378,7 @@ class YawConfig:
             elif isinstance(raw_demo, bool) or not isinstance(raw_demo, int) or raw_demo < 0:
                 raise YawRuntimeError(
                     "INVALID_INPUT",
-                    f"{demo_field} must be a non-negative integer, got {raw_demo!r}",
+                    f"YawConfig(): {demo_field} must be a non-negative integer, got {raw_demo!r}",
                 )
             else:
                 demo_val = raw_demo
@@ -413,14 +413,16 @@ class YawConfig:
     def resolve_inference_budgets(self, context_tokens: int) -> YawConfig:
         """Bind serving capacity and tool budgets; leave omitted generation limits to the endpoint."""
         if context_tokens < 2:
-            raise YawRuntimeError("INVALID_INPUT", "context_window_tokens must be >= 2")
+            raise YawRuntimeError("INVALID_INPUT", "resolve_inference_budgets(): context_window_tokens must be >= 2")
         rlm_chars = (
             self.rlm_max_output_chars
             if self.rlm_max_output_chars is not None
             else scale_context_budget(10000, context_tokens)
         )
         if self.max_output_tokens is not None and self.max_output_tokens >= context_tokens:
-            raise YawRuntimeError("INVALID_INPUT", "Require 0 < max_output_tokens < context_window_tokens")
+            raise YawRuntimeError(
+                "INVALID_INPUT", "resolve_inference_budgets(): Require 0 < max_output_tokens < context_window_tokens"
+            )
         return replace(self, context_window_tokens=context_tokens, rlm_max_output_chars=rlm_chars)
 
     def for_optimization(
@@ -434,7 +436,9 @@ class YawConfig:
         if db_override is not None:
             raw_path = str(db_override).strip()
             if not raw_path:
-                raise YawRuntimeError("INVALID_INPUT", "Optimization database path cannot be empty.")
+                raise YawRuntimeError(
+                    "INVALID_INPUT", "for_optimization(): Optimization database path cannot be empty."
+                )
             opt_db = _resolve_path(self.workspace_root, raw_path, raw_path)
             base_dir = opt_db.parent
         else:
@@ -649,9 +653,9 @@ def _strict_toml_value(val_str: str, cleaned: str) -> Any:
     try:
         parsed = tomllib.loads(f"v = {cleaned}")
     except tomllib.TOMLDecodeError as exc:
-        raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value: {val_str!r}") from exc
+        raise YawRuntimeError("INVALID_INPUT", f"_strict_toml_value(): Invalid TOML scalar value: {val_str!r}") from exc
     if len(parsed) != 1:
-        raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value: {val_str!r}")
+        raise YawRuntimeError("INVALID_INPUT", f"_strict_toml_value(): Invalid TOML scalar value: {val_str!r}")
     return parsed["v"]
 
 
@@ -663,7 +667,9 @@ def _parse_config_scalar(val_str: str, field_name: str | None = None) -> Any:
             return True
         if low == "false":
             return False
-        raise YawRuntimeError("INVALID_INPUT", f"Invalid boolean value for {field_name}: {val_str!r}")
+        raise YawRuntimeError(
+            "INVALID_INPUT", f"_parse_config_scalar(): Invalid boolean value for {field_name}: {val_str!r}"
+        )
 
     if field_name in _SEQUENCE_FIELDS:
         if not cleaned:
@@ -687,24 +693,32 @@ def _parse_config_scalar(val_str: str, field_name: str | None = None) -> Any:
         except tomllib.TOMLDecodeError as exc:
             if field_name is None:
                 raise ValueError(f"Invalid numeric scalar value: {val_str!r}") from exc
-            raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value for {field_name}: {val_str!r}") from exc
+            raise YawRuntimeError(
+                "INVALID_INPUT", f"_parse_config_scalar(): Invalid TOML scalar value for {field_name}: {val_str!r}"
+            ) from exc
         if len(parsed) != 1:
             if field_name is None:
                 raise ValueError(f"Invalid numeric scalar value: {val_str!r}")
-            raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML scalar value for {field_name}: {val_str!r}")
+            raise YawRuntimeError(
+                "INVALID_INPUT", f"_parse_config_scalar(): Invalid TOML scalar value for {field_name}: {val_str!r}"
+            )
         val = parsed["v"]
         if isinstance(val, bool) or not isinstance(val, (int, float)):
             if field_name is None:
-                raise ValueError(f"Expected numeric value, got {type(val).__name__}")
-            raise YawRuntimeError("INVALID_INPUT", f"Expected numeric value for {field_name}, got {val!r}")
+                raise ValueError(f"_parse_config_scalar(): Expected numeric value, got {type(val).__name__}")
+            raise YawRuntimeError(
+                "INVALID_INPUT", f"_parse_config_scalar(): Expected numeric value for {field_name}, got {val!r}"
+            )
         if field_name in _INT_FIELDS and not isinstance(val, int):
             raise YawRuntimeError(
                 "INVALID_INPUT",
-                f"Configuration field {field_name!r} requires an integer, got {val!r}",
+                f"_parse_config_scalar(): Configuration field {field_name!r} requires an integer, got {val!r}",
             )
         return val
 
-    raise YawRuntimeError("INVALID_INPUT", f"Unsupported scalar configuration field: {field_name!r}")
+    raise YawRuntimeError(
+        "INVALID_INPUT", f"_parse_config_scalar(): Unsupported scalar configuration field: {field_name!r}"
+    )
 
 
 def _format_toml_scalar(val: Any) -> str:
@@ -769,7 +783,7 @@ def load_config(
     if path is not None:
         toml_file = Path(path).resolve()
         if not toml_file.exists():
-            raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_file}")
+            raise YawRuntimeError("INVALID_INPUT", f"load_config(): Configuration file not found: {toml_file}")
         if workspace_override is None:
             base_dir = toml_file.parent
     elif (base_dir / "yaw.toml").exists():
@@ -780,7 +794,7 @@ def load_config(
         try:
             data = tomllib.loads(toml_file.read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as exc:
-            raise YawRuntimeError("INVALID_INPUT", f"Invalid TOML in {toml_file}: {exc}") from exc
+            raise YawRuntimeError("INVALID_INPUT", f"load_config(): Invalid TOML in {toml_file}: {exc}") from exc
 
     valid_fields = {f.name for f in fields(YawConfig)}
     retrieval_fields = frozenset(RetrievalParams.__dataclass_fields__)
@@ -796,7 +810,7 @@ def load_config(
                     retrieval_raw[k] = v
                     continue
                 if sec_name == "graph" and k in {"synonymy_threshold", "synonymy_top_k"}:
-                    raise YawRuntimeError("INVALID_INPUT", f"Retired candidate setting: graph.{k}")
+                    raise YawRuntimeError("INVALID_INPUT", f"load_config(): Retired candidate setting: graph.{k}")
                 mapped_k = _OPTIMIZATION_KEY_ALIASES.get(k, k) if sec_name == "optimization" else k
                 if mapped_k in valid_fields:
                     if mapped_k == "optimize_datasets":
@@ -875,7 +889,7 @@ def get_config_value(
             val = getattr(cfg, sub_mapped)
             return str(val) if isinstance(val, Path) else list(val) if isinstance(val, tuple) else val
 
-    raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
+    raise YawRuntimeError("INVALID_INPUT", f"get_config_value(): Unknown configuration key: {key!r}")
 
 
 def set_config_value(
@@ -889,7 +903,7 @@ def set_config_value(
     base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
     toml_path = Path(path).resolve() if path else base_dir / "yaw.toml"
     if not toml_path.exists():
-        raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_path}")
+        raise YawRuntimeError("INVALID_INPUT", f"set_config_value(): Configuration file not found: {toml_path}")
 
     cleaned_key = key.strip()
     section_name: str | None = None
@@ -919,9 +933,9 @@ def set_config_value(
         )
         resolved_section = section_name or _FIELD_TO_SECTION.get(field_name)
         if not resolved_section:
-            raise YawRuntimeError("INVALID_INPUT", f"Cannot determine section for key: {key!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"set_config_value(): Cannot determine section for key: {key!r}")
         if field_name not in {field.name for field in fields(YawConfig)}:
-            raise YawRuntimeError("INVALID_INPUT", f"Unknown configuration key: {key!r}")
+            raise YawRuntimeError("INVALID_INPUT", f"set_config_value(): Unknown configuration key: {key!r}")
         parsed_val = _parse_config_scalar(raw_value, field_name)
         target_prop = prop_name.removeprefix("optimize_") if prop_name.startswith("optimize_") else prop_name
 
@@ -980,7 +994,7 @@ def write_manifold_section(
     base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
     toml_path = Path(path).resolve() if path else base_dir / "yaw.toml"
     if not toml_path.exists():
-        raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_path}")
+        raise YawRuntimeError("INVALID_INPUT", f"write_manifold_section(): Configuration file not found: {toml_path}")
 
     normalized = _normalize_manifold_overrides(overrides)
     section_lines = ["[manifold]", *(f"{k} = {_format_toml_scalar(v)}" for k, v in normalized)]
@@ -1032,7 +1046,7 @@ def write_retrieval_section(
     base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
     toml_path = Path(path).resolve() if path else base_dir / "yaw.toml"
     if not toml_path.exists():
-        raise YawRuntimeError("INVALID_INPUT", f"Configuration file not found: {toml_path}")
+        raise YawRuntimeError("INVALID_INPUT", f"write_retrieval_section(): Configuration file not found: {toml_path}")
 
     validated = RetrievalParams.from_overrides(overrides)
     section_lines = [
