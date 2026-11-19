@@ -1,377 +1,812 @@
-# Sprint Spec: Parameter-Free MDL Evidence-DAG & Stage-1 RaBitQ Cutover (`mdl-dag-sprint`)
+# Sprint Spec: Post-`CS-6` FTS5-Trigram Watershed, Stage-1 `mmap` RaBitQ & Coverage-Lattice Gibbs (`mdl-dag-sprint`)
 
-## 0. Agent Execution Rules (Anti-Spaghetti Override)
+## 0. Sequencing & Hard Constraints
 
-You are executing a clean-slate algorithmic replacement governed by `AGENTS.md` ("A minimal line count codebase that fails fast is infinitely better than a fallback-heavy codebase that silently degrades performance to mask failures").
+1. **Entry Gate:** Execute strictly after `docs/reviews/bare-bones-replacement-sprint.md` (`CS-6`) is green.
+2. **Zero New Modules & Preserved `CS-6` Schema/MCP Contracts:**
+   - Keep the exact 14-file boundary (`yaw/*.py`, `yaw/core/*.py`).
+   - Preserve `list_user_tables(conn) == ("chunk_fts", "chunks")` (`CS-6 G1`); attach `fts5vocab` strictly in `temp` (`CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunk_vocab USING fts5vocab(main, 'chunk_fts', 'row')`).
+   - Preserve exact `3` read-only MCP tools (`recall`, `qa`, `daemon_status`), adding optional `exclude_chunk_ids: list[int] = []` and `trace` diagnostics on `recall`.
+3. **Zero Stopwords, Zero Title Heuristics, Zero Free Hyperparameters:**
+   - Do **not** reintroduce `_STOP` lists, `_CJK_RE` spacing hacks, `title` heuristics (`title == ""` must achieve full accuracy), CSLS clone-penalizing offsets, MP eigenvalue crushing, or arbitrary scalar weights.
+   - All scales derive strictly from corpus size $N$, covariance participation ratio $D_{\text{eff}} = (\sum \lambda_i)^2 / \sum \lambda_i^2$, and `temp.chunk_vocab` document frequencies:
+     - $d_{\text{bridge}} = \lceil\sqrt{N}\rceil$, $d_{\text{query}} = \max(8, \lfloor N / 2 \rfloor)$, $f_{\max} = \min(6, \max(2, \lfloor \frac{1}{2}\log_2 N \rfloor))$, $|C_T| \le 3\lceil\sqrt{N}\rceil$.
+     - Watershed stem boundary: $\text{df}(g_k) + 1 \le 2(d_{\text{peak}} + 1)$.
+     - Laplace surprisal: $I(s) = -\ln\frac{\text{df}(s)+1}{N+2}$; spherical null surprisal: $-\ln \frac{1}{2}I_{1-c^2}(\frac{d-1}{2}, \frac{1}{2})$; Laplace stop prior: $\rho_{\text{stop}}(i) = \frac{1}{1 + d_{\text{out}}(i)}$ ($\tau \equiv 1.0$).
+     - `RaBitQ` extreme-value Branch-and-Bound quantile: $z_N = \sqrt{2\ln N}$.
+4. **Read-Only Query Purity & Lazy Tier-1 LM:** `recall` runs over `?mode=ro` (`PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;`) with `0` SQLite writes, and `start_runtime` initializes `dspy.LM` lazily inside `ask()` so Tier-0 `recall` works when no LLM server is running.
 
-**Hard Constraints — Violations Fail Review Automatically:**
-1. **Zero New Modules:** Keep the exact flat package layout (`yaw/*.py` and `yaw/core/*.py`). Do **not** create `yaw/daemon/...`, `yaw/manifold.py`, `yaw/dag.py`, or helper subpackages.
-2. **Zero Legacy Shims or Feature Flags:** Do **not** add `retriever_mode`, `use_mdl_dag`, `legacy_ppr`, or `try ... except sqlite3.OperationalError: pass` fallbacks. Delete superseded functions, dataclasses, and dependencies outright.
-3. **Do Not Approximate the Math With Heuristics:** Implement the four reference kernels in §2 (`ingest_gate`, `fit_manifold`/`whiten_normalize`, `rabitq_encode`/`rabitq_query`, `cut_chain_atom`/`select_mdl_dag`) using exact linear algebra (`np.linalg.svd`, `np.linalg.qr`, `np.bitwise_count`, `scipy.optimize.nnls`, `graphlib.TopologicalSorter`, `zlib.compressobj`). Replacing `nnls` or QR bridge projection with ad-hoc scalar weighted sums is forbidden.
-4. **Hard LOC Ceilings:**
-   - `yaw/retrieval.py` <= **430 LOC** (currently ~370 LOC).
-   - `yaw/pipeline.py` <= **430 LOC** (currently ~390 LOC).
-   - Net repository LOC across `yaw/` **must decrease** by the end of `MDL-3`.
-5. **Quality Gates After Every Checkpoint (`MDL-1`, `MDL-2`, `MDL-3`):**
-   ```bash
-   uv run ty check
-   uv run ruff check --fix
-   uv run ruff format
-   uv run pytest -o addopts=""
-   git diff --check
+---
+
+## 1. File-by-File Implementation & Complete Code
+
+### 1.1 `pyproject.toml` & `yaw/pipeline.py` (`MDL-1`)
+1. Remove `spacy`, `en-core-web-sm` (`[tool.uv.sources]`), and `optuna` from `pyproject.toml`.
+2. In `yaw/pipeline.py:_apply_fts_tables`, switch `chunk_fts` from default `unicode61` to `tokenize='trigram'`:
+   ```sql
+   CREATE VIRTUAL TABLE IF NOT EXISTS "chunk_fts"
+   USING fts5(title, body, content='', contentless_delete=1, tokenize='trigram')
    ```
-   (`-o addopts=""` bypasses `--testmon` in `pyproject.toml` so SQLite/schema/asset changes are never silently skipped.)
+   *(Because `trigram` changes the FTS5 B-tree layout, bump schema version / rebuild `.yaw/yaw.db` cleanly on cutover.)*
 
----
-
-## 1. Evidence Ledger: Why Current `dev` Must Be Replaced
-
-1. **Title & AST-Island Starvation (`yaw/pipeline.py`):** `chunk_file_content` hardcodes `SourceChunk(..., 1, len(lines), "", chunk.text)`. Every chunk embeds as `"title: none | text: ..."` in `format_doc_for_embedding`, `chunk_fts` receives empty `title` values, `json_document_fields` in `yaw/core/types.py` is never called, and `expand_neighbors` in `yaw/qa.py` adds `+0.50` to *every* chunk in the same file because `(1, len(lines)) != (1, 1)`.
-2. **Broken FTS5 Ranking & Silent Fallback (`yaw/retrieval.py`):** `_bm25_scores` executes `SELECT rowid, -bm25(chunk_fts, 2.0, 1.0) FROM chunk_fts WHERE chunk_fts MATCH ? LIMIT ?` **without `ORDER BY bm25(chunk_fts)`**, returning arbitrary lowest-`rowid` matches on corpora with `>256` hits, followed by `except sqlite3.OperationalError: pass`.
-3. **Unbounded Python Heap & Index-Time NLP Tax (`yaw/pipeline.py`, `yaw/retrieval.py`):** `build_vector_search` loads all `N x D` `float32` vectors (`3,072B/chunk`) plus `json.loads(tokens_json)` and `json.loads(entities_json)` (`spacy` `en_core_web_sm`) into Python RAM on every `PRAGMA data_version` change.
-4. **Split-Brain Hyperparameters (`yaw/core/config.py`, `yaw/optimize.py`, `yaw/retrieval.py`):** `YawConfig.retrieval` defines 5 unused `RetrievalParams` (`peclet`, `alpha_sprt`, ...); `search_vectors` runs entity-PPR (`hybrid_alpha`, `ppr_alpha`, `seed_top_k`); `optimize_optuna` writes `.yaw/optuna_best_params.json`, which nothing loads.
-5. **Eager LLM & Catalog Coupling (`yaw/runtime.py`, `yaw/cli.py`):** `start_runtime` eagerly instantiates `create_lm(cfg)` even when only zero-LLM `recall` is used, and `yaw/cli.py` eagerly imports `yaw.optimize` at module import time.
-
----
-
-## 2. Verified Reference Kernels (Implement Directly; Do Not Improvise)
-
-All four kernels below handle degenerate `pytest` fixtures (`N = 1..7`, arbitrary `D`) and scale to `N = 10^6` without `NaN`s or `CycleError`s.
-
-### 2.1 Conditional `zlib(zdict)` Ingest Gate (`stdlib` `hashlib` + `zlib`, `~25µs`/chunk)
-Approximates conditional Kolmogorov complexity $\eta_{\text{corpus}}(u) = |\texttt{zlib}(u \mid \text{zdict}=\text{proto})| / |\texttt{zlib}(u)|$ to skip redundant neural embedding calls on log/boilerplate clones while preserving full `FTS5` indexing.
+### 1.2 `yaw/core/types.py` Contracts (`MDL-1`)
+Ensure `EvidenceHop` and `SearchTrace` are present and exported in `yaw/core/__init__.py`:
 
 ```python
-import hashlib
-import re
-import zlib
-
-_VOLATILE_RE = re.compile(
-    r"\b(?:0x[0-9a-fA-F]+|[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[\w.:+-]*|\d+)\b"
-)
-_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
+@dataclass(frozen=True, slots=True)
+class EvidenceHop:
+    src_chunk_id: int
+    dst_chunk_id: int
+    anchor: str
+    weight: float
 
 
-def zlen_bytes(data: bytes, zdict: bytes = b"") -> int:
-    if not data:
-        return 1
-    comp = zlib.compressobj(6, zdict=zdict[-32768:]) if zdict else zlib.compressobj(6)
-    return max(1, len(comp.compress(data) + comp.flush()))
-
-
-def simhash64(text: str) -> int:
-    masked = _VOLATILE_RE.sub("#", text.lower())
-    acc = [0] * 64
-    tokens = _WORD_RE.findall(masked) or [masked[:64]]
-    for tok in tokens:
-        h = int.from_bytes(hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest(), "little")
-        for bit in range(64):
-            acc[bit] += 1 if ((h >> bit) & 1) else -1
-    out = 0
-    for bit, val in enumerate(acc):
-        if val > 0:
-            out |= 1 << bit
-    return out - (1 << 64) if out >= (1 << 63) else out  # signed int64 for SQLite INTEGER
-
-
-def corpus_novelty_q8(body_bytes: bytes, proto_bytes: bytes | None) -> int:
-    if not proto_bytes:
-        return 255
-    ratio = min(1.0, zlen_bytes(body_bytes, proto_bytes) / float(zlen_bytes(body_bytes)))
-    return max(1, min(255, int(round(ratio * 255.0))))
+@dataclass(frozen=True, slots=True)
+class SearchTrace:
+    hops: tuple[EvidenceHop, ...] = ()
+    route_completeness: float = 0.0
+    log_bayes_factor: float = 0.0
+    unexplained_facets: tuple[str, ...] = ()
+    dead_end_bridges: tuple[str, ...] = ()
 ```
 
-### 2.2 Parameter-Free Marchenko–Pastur Shrinkage Whitening (`NumPy`)
-Computes mean $\mu$, low-rank spike attenuator $(V_{\text{spike}}, \Delta w)$ for eigenvalues exceeding the Marchenko–Pastur upper bulk edge $\lambda_+ = \sigma^2(1 + \sqrt{D/N_s})^2$, and participation-ratio intrinsic dimension $D_{\text{eff}} = (\sum \tilde{\lambda}_i)^2 / \sum \tilde{\lambda}_i^2$.
+### 1.3 Complete `yaw/retrieval.py` (`MDL-2`)
 
 ```python
+"""Trigram-Watershed, Zero-Copy Stage-1 RaBitQ & Coverage-Lattice Gibbs Retrieval."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import sqlite3
+from typing import Any
+
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import betainc
+
+from yaw.core.types import ChunkPointer, EvidenceHop, HydratedPassage, SearchTrace, YawRuntimeError
+
+_NO_ISLAND = (1, 1)
+_CJK_CH_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 
 
-def fit_manifold(
-    raw_vecs: NDArray[np.float32], max_samples: int = 4096, seed: int = 0x594157
-) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], float]:
-    n, d = raw_vecs.shape
-    if n < 8:
-        return (
-            np.zeros(d, dtype=np.float32),
-            np.zeros((d, 0), dtype=np.float32),
-            np.zeros(0, dtype=np.float32),
-            float(min(d, 64)),
-        )
-    sample = (
-        raw_vecs[np.random.default_rng(seed).choice(n, size=max_samples, replace=False)]
-        if n > max_samples
-        else raw_vecs
-    ).astype(np.float32, copy=False)
-    ns = sample.shape[0]
-    mu = sample.mean(axis=0, dtype=np.float64).astype(np.float32)
-    xc = (sample - mu) / np.sqrt(float(ns - 1))
-    _, s, vt = np.linalg.svd(xc, full_matrices=False)
-    lam = np.maximum(s.astype(np.float64) ** 2, 1e-12)
-    sigma2 = float(np.median(lam))
-    lam_plus = sigma2 * ((1.0 + np.sqrt(d / float(ns))) ** 2)
-    spikes = lam > lam_plus
-    w = np.where(spikes, np.sqrt(lam_plus / lam), 1.0)
-    lam_w = lam * (w**2)
-    d_eff = float(np.clip((lam_w.sum() ** 2) / max(1e-12, float(np.sum(lam_w**2))), 8.0, float(d)))
-    return mu, vt[spikes].T.astype(np.float32, copy=True), (w[spikes] - 1.0).astype(np.float32, copy=True), d_eff
+@dataclass(frozen=True, slots=True)
+class VectorSearch:
+    """~100B/chunk Stage-1 RaBitQ view (mmap-backed when on disk; ZERO float32[N, D] arrays in RAM)."""
+
+    chunk_ids: tuple[int, ...]
+    id_to_pos: dict[int, int]
+    pointers: tuple[ChunkPointer, ...]
+    dim: int
+    mu: NDArray[np.float32]
+    d_eff: float
+    rot: NDArray[np.float32]
+    rabitq_bits: NDArray[np.uint64]
+    rabitq_s: NDArray[np.float16]
+    rabitq_ones: NDArray[np.uint16]
+    corpus_root: Path | None = None
+
+    @property
+    def size(self) -> int:
+        return len(self.chunk_ids)
 
 
-def whiten_normalize(
-    vecs: NDArray[np.float32],
-    mu: NDArray[np.float32],
-    v_spike: NDArray[np.float32],
-    delta_w: NDArray[np.float32],
-) -> NDArray[np.float32]:
+def extract_text_features(title: str, body: str) -> tuple[str, str]:
+    """Compatibility stub until tokens_json/entities_json auxiliary columns are dropped."""
+    del title, body
+    return "{}", "[]"
+
+
+def _alnum_grams(s: str) -> list[str]:
+    return [s[i : i + 3] for i in range(len(s) - 2) if s[i : i + 3].isalnum()] if len(s) >= 3 else []
+
+
+def _center_normalize(vecs: NDArray[np.float32], mu: NDArray[np.float32]) -> NDArray[np.float32]:
     single = vecs.ndim == 1
     x = (vecs[None, :] if single else vecs).astype(np.float32) - mu
-    if v_spike.shape[1] > 0:
-        x = x + ((x @ v_spike) * delta_w[None, :]) @ v_spike.T
     x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
     return x[0] if single else x
-```
-
-### 2.3 Stage-1 `RaBitQ` (`100B`/chunk in RAM: `bits_u64` + `s_o` + `ones_count`)
-Unbiased inner-product estimator $\hat{y}_o = \langle \bar{x}, P^\top q \rangle / s_o$ with concentration error bound $\epsilon_o = \frac{\sqrt{1 - s_o^2}}{s_o}\frac{t}{\sqrt{D - 1}}$ via 4-bit-plane SIMD `np.bitwise_count` (`numpy>=2.5.4`).
-
-```python
-def make_orthogonal_rotation(dim: int, seed: int = 0x594157) -> NDArray[np.float32]:
-    q, r = np.linalg.qr(np.random.default_rng(seed + dim).standard_normal((dim, dim)).astype(np.float32))
-    q *= np.sign(np.diag(r))
-    return q.astype(np.float32, copy=False)
 
 
-def rabitq_encode(
-    unit_vecs: NDArray[np.float32], rot: NDArray[np.float32]
-) -> tuple[NDArray[np.uint64], NDArray[np.float16], NDArray[np.uint16]]:
-    x = unit_vecs @ rot
-    s_o = np.maximum((np.sum(np.abs(x), axis=1) / np.sqrt(x.shape[1])).astype(np.float16), np.float16(1e-4))
-    bits_u8 = np.packbits(x >= 0.0, axis=1, bitorder="little")
-    if rem := (bits_u8.shape[1] % 8):
-        bits_u8 = np.pad(bits_u8, ((0, 0), (0, 8 - rem)))
-    bits_u64 = np.ascontiguousarray(bits_u8).view(np.uint64)
-    ones = np.bitwise_count(bits_u64).sum(axis=1, dtype=np.uint16)
-    return bits_u64, s_o, ones
+def _null_nats(cos_val: NDArray[Any] | float, d_eff: float) -> NDArray[np.float64]:
+    c = np.asarray(cos_val, dtype=np.float64)
+    pos = c > 0.0
+    x = np.where(pos, np.maximum(1e-15, 1.0 - np.minimum(c * c, 0.999999)), 1.0)
+    p = 0.5 * betainc(0.5 * max(2.0, d_eff - 1.0), 0.5, x)
+    return np.where(pos, -np.log(np.maximum(p, 1e-300)), 0.0)
 
 
-def rabitq_query(
-    bits_u64: NDArray[np.uint64],
-    s_o: NDArray[np.float16],
-    ones: NDArray[np.uint16],
-    q_unit: NDArray[np.float32],
-    rot: NDArray[np.float32],
-    dim: int,
-    t_bound: float = 2.8,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    q_rot = q_unit @ rot
-    q_min, q_max = float(q_rot.min()), float(q_rot.max())
-    span = max(q_max - q_min, 1e-8)
-    q_u4 = np.clip(np.round((q_rot - q_min) * (15.0 / span)), 0, 15).astype(np.uint8)
-    dot_b_q = np.zeros(bits_u64.shape[0], dtype=np.int32)
-    for plane in range(4):
-        p_u8 = np.packbits((q_u4 >> plane) & 1, bitorder="little")
-        if rem := (len(p_u8) % 8):
-            p_u8 = np.pad(p_u8, (0, 8 - rem))
-        p_u64 = p_u8.view(np.uint64)
-        dot_b_q += np.bitwise_count(bits_u64 & p_u64[None, :]).sum(axis=1, dtype=np.int32) << plane
-    sum_b_q = q_min * ones.astype(np.float32) + (span / 15.0) * dot_b_q.astype(np.float32)
-    xbar_dot_q = (2.0 * sum_b_q - float(q_rot.sum())) / np.sqrt(float(dim))
-    s_f32 = s_o.astype(np.float32)
-    est = (xbar_dot_q / s_f32).astype(np.float32)
-    eps = ((np.sqrt(np.maximum(0.0, 1.0 - s_f32 * s_f32)) / s_f32) * (t_bound / np.sqrt(max(1, dim - 1)))).astype(
-        np.float32
-    )
-    return est, eps
-```
-
-### 2.4 Hilbert-Space Cut Operator & Parameter-Free MDL `nnls` DAG Selector (`SciPy` + `stdlib`)
-Projects internal existentially-bound bridge vectors $Q_B$ out of chain sums, fits $\hat{q}$ in the non-negative cone (`scipy.optimize.nnls`), gates text clones via `zlib(zdict=path_bytes)`, prices unlinked jumps at $\log_2 N$ bits and anchor hops at $\log_2\max(2, \text{df}(e)-1)$ bits, and enforces strict DAG acyclicity before `TopologicalSorter`.
-
-```python
-from graphlib import TopologicalSorter
-from scipy.optimize import nnls
+def _db_file_path(conn: sqlite3.Connection) -> Path | None:
+    for _, name, file_p in conn.execute("PRAGMA database_list").fetchall():
+        if name == "main" and file_p:
+            return Path(file_p).resolve()
+    return None
 
 
-def cut_chain_atom(chunk_vecs: list[NDArray[np.float32]], bridge_vecs: list[NDArray[np.float32]]) -> NDArray[np.float32]:
-    s = np.sum(chunk_vecs, axis=0, dtype=np.float32)
-    if bridge_vecs:
-        q_b, _ = np.linalg.qr(np.column_stack(bridge_vecs).astype(np.float32), mode="reduced")
-        s = s - q_b @ (q_b.T @ s)
-    return (s / max(float(np.linalg.norm(s)), 1e-12)).astype(np.float32)
+def _make_rotation(dim: int, seed: int = 0x594157) -> NDArray[np.float32]:
+    if dim == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    q_rot, r_rot = np.linalg.qr(np.random.default_rng(seed + dim).standard_normal((dim, dim)).astype(np.float32))
+    return (q_rot * np.sign(np.diag(r_rot))).astype(np.float32, copy=False)
 
 
-def _creates_cycle(parents: dict[int, set[int]], src: int, dst: int) -> bool:
-    if src == dst:
-        return True
-    stack = [src]
-    seen: set[int] = set()
-    while stack:
-        cur = stack.pop()
-        if cur == dst:
-            return True
-        for par in parents.get(cur, ()):
-            if par not in seen:
-                seen.add(par)
-                stack.append(par)
-    return False
-
-
-def select_mdl_dag(
-    q_hat: NDArray[np.float32],
-    chains: list[tuple[tuple[int, ...], tuple[tuple[str, int], ...], NDArray[np.float32]]],
-    chunk_bytes: dict[int, bytes],
-    n_corpus: int,
-    d_eff: float,
-    max_branches: int = 6,
-) -> tuple[tuple[int, ...], tuple[DagEdge, ...], float, float, NDArray[np.float32]]:
-    if not chains:
-        return (), (), 0.0, 0.0, q_hat
-    d_mat = np.column_stack([c[2] for c in chains]).astype(np.float64)
-    q64 = q_hat.astype(np.float64)
-    root_cost = float(np.log2(max(2, n_corpus)))
-
-    selected: list[int] = []
-    seen_nodes: set[int] = set()
-    seen_edges: set[tuple[int, int]] = set()
-    dag_parents: dict[int, set[int]] = {}
-    edge_ledger: list[DagEdge] = []
-    r2_curr = 0.0
-    net_bits = 0.0
-    best_w = np.zeros(0, dtype=np.float64)
-
-    for _ in range(min(max_branches, len(chains))):
-        path_zdict = (
-            b"\n".join(chunk_bytes.get(cid, b"") for cid in TopologicalSorter(dag_parents).static_order())
-            if dag_parents
-            else b""
+def build_vector_search(conn: sqlite3.Connection, corpus_root: Path | None = None) -> VectorSearch:
+    db_file = _db_file_path(conn)
+    root = corpus_root or (db_file.parent.parent if db_file and db_file.parent.name == ".yaw" else None)
+    ptr_rows = conn.execute(
+        "SELECT chunk_id, rel_path, source_hash, start_line, end_line, "
+        "char_start, char_end, ast_island_start, ast_island_end, title "
+        "FROM chunks ORDER BY chunk_id ASC"
+    ).fetchall()
+    if not ptr_rows:
+        z = np.zeros(0, dtype=np.float32)
+        z2 = np.zeros((0, 0), dtype=np.float32)
+        return VectorSearch(
+            (), {}, (), 0, z, 8.0, z2,
+            np.zeros((0, 0), dtype=np.uint64), np.zeros(0, dtype=np.float16), np.zeros(0, dtype=np.uint16), root,
         )
-        best_j: int | None = None
-        best_gain = 0.0
-        best_r2 = r2_curr
-        best_delta_s = 0.0
-        best_w_trial = best_w
 
-        for j, (nodes, bridges, _) in enumerate(chains):
-            if j in selected:
-                continue
-            w_trial, rnorm = nnls(d_mat[:, [*selected, j]], q64)
-            r2_new = float(np.clip(1.0 - rnorm * rnorm, 0.0, 0.999999))
-            if r2_new <= r2_curr + 1e-6:
-                continue
-            delta_s = 0.5 * d_eff * float(np.log2((1.0 - r2_curr) / (1.0 - r2_new)))
-            new_nodes = [nid for nid in nodes if nid not in seen_nodes]
-            if new_nodes and path_zdict:
-                blob = b"\n".join(chunk_bytes.get(nid, b"") for nid in new_nodes)
-                eta_path = min(1.0, zlen_bytes(blob, path_zdict) / float(zlen_bytes(blob)))
-            else:
-                eta_path = 1.0
-            delta_k = root_cost if nodes[0] not in seen_nodes else 0.0
-            for step_i, (_, df_val) in enumerate(bridges):
-                if (nodes[step_i], nodes[step_i + 1]) not in seen_edges:
-                    delta_k += float(np.log2(max(2, df_val - 1)))
-            gain = eta_path * delta_s - delta_k
-            if gain > best_gain:
-                best_gain, best_j, best_r2, best_delta_s, best_w_trial = gain, j, r2_new, eta_path * delta_s, w_trial
+    cids = tuple(int(r[0]) for r in ptr_rows)
+    ptrs = tuple(
+        ChunkPointer(
+            int(r[0]), str(r[1]), str(r[2]), int(r[3]), int(r[4]),
+            int(r[5]), int(r[6]), int(r[7]), int(r[8]), str(r[9]),
+        )
+        for r in ptr_rows
+    )
+    n = len(cids)
+    max_cid = cids[-1]
+    stage1_dir = (db_file.parent / "stage1") if db_file else None
 
-        if best_j is None:
+    # Fast zero-copy mmap attach when .yaw/stage1/ matches (count, max_chunk_id):
+    if stage1_dir is not None and (stage1_dir / "meta.json").is_file():
+        meta = json.loads((stage1_dir / "meta.json").read_text("utf-8"))
+        if meta.get("n") == n and meta.get("max_cid") == max_cid:
+            dim = int(meta["dim"])
+            return VectorSearch(
+                cids, {c: i for i, c in enumerate(cids)}, ptrs, dim,
+                np.load(stage1_dir / "mu.npy"), float(meta["d_eff"]), _make_rotation(dim),
+                np.load(stage1_dir / "bits.npy", mmap_mode="r"),
+                np.load(stage1_dir / "s.npy", mmap_mode="r"),
+                np.load(stage1_dir / "ones.npy", mmap_mode="r"),
+                root,
+            )
+
+    vec_rows = conn.execute("SELECT embedding FROM chunks ORDER BY chunk_id ASC").fetchall()
+    dim = int(np.frombuffer(vec_rows[0][0], dtype="<f4").shape[0])
+    raw = np.empty((n, dim), dtype=np.float32)
+    for i, (blob,) in enumerate(vec_rows):
+        raw[i] = np.frombuffer(blob, dtype="<f4")
+
+    if n < 8 or dim == 0:
+        mu = np.zeros(dim, dtype=np.float32)
+        d_eff = float(max(8, dim))
+    else:
+        samp = raw[np.random.default_rng(0x594157).choice(n, size=min(n, 2048), replace=False)]
+        mu = samp.mean(axis=0, dtype=np.float64).astype(np.float32)
+        _, sv, _ = np.linalg.svd((samp - mu) / math.sqrt(float(len(samp) - 1)), full_matrices=False)
+        lam = np.maximum(sv.astype(np.float64) ** 2, 1e-12)
+        d_eff = float(np.clip((lam.sum() ** 2) / float(np.sum(lam**2)), 8.0, float(dim)))
+
+    iso = _center_normalize(raw, mu)
+    rot = _make_rotation(dim)
+    x_rot = iso @ rot
+    rb_s = np.maximum((np.sum(np.abs(x_rot), axis=1) / math.sqrt(float(max(1, dim)))).astype(np.float16), np.float16(1e-4))
+    b_u8 = np.packbits(x_rot >= 0.0, axis=1, bitorder="little")
+    if rem := (b_u8.shape[1] % 8):
+        b_u8 = np.pad(b_u8, ((0, 0), (0, 8 - rem)))
+    rb_bits = np.ascontiguousarray(b_u8).view(np.uint64)
+    rb_ones = np.bitwise_count(rb_bits).sum(axis=1, dtype=np.uint16)
+    del raw, iso, x_rot
+
+    if stage1_dir is not None:
+        try:
+            stage1_dir.mkdir(parents=True, exist_ok=True)
+            for fname, arr in (("mu.npy", mu), ("bits.npy", rb_bits), ("s.npy", rb_s), ("ones.npy", rb_ones)):
+                mm = np.lib.format.open_memmap(stage1_dir / fname, mode="w+", dtype=arr.dtype, shape=arr.shape)
+                mm[:] = arr
+                mm.flush()
+            (stage1_dir / "meta.json").write_text(
+                json.dumps({"n": n, "max_cid": max_cid, "dim": dim, "d_eff": d_eff}), encoding="utf-8"
+            )
+        except OSError:
+            pass  # Read-only filesystem sandbox; keep in-memory Stage-1 arrays
+
+    return VectorSearch(cids, {c: i for i, c in enumerate(cids)}, ptrs, dim, mu, d_eff, rot, rb_bits, rb_s, rb_ones, root)
+
+
+def _rabitq_estimate(vs: VectorSearch, q_unit: NDArray[np.float32]) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    qr = q_unit @ vs.rot
+    qmin, qmax = float(qr.min()), float(qr.max())
+    spn = max(qmax - qmin, 1e-8)
+    qu4 = np.clip(np.round((qr - qmin) * (15.0 / spn)), 0, 15).astype(np.uint8)
+    dot_bq = np.zeros(vs.size, dtype=np.int32)
+    for pl in range(4):
+        pu8 = np.packbits((qu4 >> pl) & 1, bitorder="little")
+        if rem := (len(pu8) % 8):
+            pu8 = np.pad(pu8, (0, 8 - rem))
+        pu64 = pu8.view(np.uint64)
+        dot_bq += np.bitwise_count(vs.rabitq_bits & pu64[None, :]).sum(axis=1, dtype=np.int32) << pl
+    sbq = qmin * vs.rabitq_ones.astype(np.float32) + (spn / 15.0) * dot_bq.astype(np.float32)
+    sf = vs.rabitq_s.astype(np.float32)
+    est = (((2.0 * sbq - float(qr.sum())) / math.sqrt(float(max(1, vs.dim)))) / sf).astype(np.float32)
+    z_n = math.sqrt(2.0 * math.log(max(2, vs.size)))
+    eps = ((np.sqrt(np.maximum(0.0, 1.0 - sf * sf)) / sf) * (z_n / math.sqrt(max(1, vs.dim - 1)))).astype(np.float32)
+    return est, eps
+
+
+def _rabitq_bnb_top(vs: VectorSearch, conn: sqlite3.Connection, q_unit: NDArray[np.float32], k_want: int) -> list[int]:
+    est, eps = _rabitq_estimate(vs, q_unit)
+    k_c = min(vs.size, max(1, k_want))
+    lb = float(np.partition(est - eps, -k_c)[-k_c])
+    surv = np.flatnonzero((est + eps) >= lb)
+    if len(surv) > 4 * k_c:
+        surv = surv[np.argpartition(-est[surv], 4 * k_c)[: 4 * k_c]]
+    surv_cids = [vs.chunk_ids[int(p)] for p in surv]
+    rows = conn.execute(
+        f"SELECT chunk_id, embedding FROM chunks WHERE chunk_id IN ({','.join('?' * len(surv_cids))})", surv_cids
+    ).fetchall()
+    vecs = _center_normalize(np.vstack([np.frombuffer(r[1], dtype="<f4") for r in rows]), vs.mu)
+    order = np.argsort(-(vecs @ q_unit))[:k_c]
+    return [int(rows[int(i)][0]) for i in order]
+
+
+def _watershed_trigram_stems(
+    text_low: str,
+    gdf: dict[str, int],
+    conn: sqlite3.Connection,
+    n_tot: int,
+    min_df: int,
+    max_df: int,
+    limit: int,
+    match_cache: dict[str, int],
+    anchor_positions: list[int] | None = None,
+) -> list[tuple[str, float, int]]:
+    """1D Watershed Stemmer over FTS5 Trigrams (cuts suffixes/compounds/particles at df+1 > 2*(d_peak+1))."""
+    length = len(text_low) - 2
+    if length <= 0:
+        return []
+    dfs: list[int] = []
+    valid: list[bool] = []
+    for i in range(length):
+        g = text_low[i : i + 3]
+        if g.isalnum():
+            d = gdf.get(g, 0)
+            ok = min_df <= d <= max_df
+            dfs.append(d if ok else n_tot + 1)
+            valid.append(ok)
+        else:
+            dfs.append(n_tot + 1)
+            valid.append(False)
+
+    used = [False] * length
+    if anchor_positions:
+        order = sorted(
+            (i for i in range(length) if valid[i]),
+            key=lambda i: -math.log((n_tot + 2.0) / (dfs[i] + 1.0))
+            / math.log(math.e + min(abs(i - ap) for ap in anchor_positions)),
+        )
+    else:
+        order = sorted((i for i in range(length) if valid[i]), key=lambda i: dfs[i])
+
+    raw_cands: list[tuple[float, str]] = []
+    seen_s: set[str] = set()
+    max_alpha = int(math.ceil(math.log2(max(4, n_tot)) * 2))
+    for k_star in order:
+        if used[k_star]:
+            continue
+        d_peak = dfs[k_star]
+        cap = 2 * (d_peak + 1) - 1
+        is_cjk = bool(_CJK_CH_RE.search(text_low[k_star : k_star + 3]))
+        max_ext = 1 if is_cjk else max_alpha
+        lo = k_star
+        while lo > 0 and (k_star - lo) < max_ext and not used[lo - 1] and valid[lo - 1] and dfs[lo - 1] <= cap:
+            lo -= 1
+        hi = k_star
+        while hi + 1 < length and (hi - lo) < max_ext and not used[hi + 1] and valid[hi + 1] and dfs[hi + 1] <= cap:
+            hi += 1
+        for idx_u in range(lo, hi + 1):
+            used[idx_u] = True
+        sub = text_low[lo : hi + 3]
+        if sub not in seen_s and (is_cjk or len(sub) >= 4):
+            seen_s.add(sub)
+            prox_div = math.log(math.e + min(abs(k_star - ap) for ap in anchor_positions)) if anchor_positions else 1.0
+            raw_cands.append((math.log((n_tot + 2.0) / (d_peak + 1.0)) / prox_div, sub))
+            if len(raw_cands) >= limit * 3:
+                break
+
+    verified: list[tuple[str, float, int, float]] = []
+    for prio, sub in raw_cands:
+        if sub not in match_cache:
+            match_cache[sub] = int(
+                conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH ?", (f'"{sub}"',)).fetchone()[0]
+            )
+        exact_d = match_cache[sub]
+        if min_df <= exact_d <= max_df:
+            verified.append((sub, math.log((n_tot + 2.0) / (exact_d + 1.0)), exact_d, prio))
+    verified.sort(key=lambda x: (-x[3], -x[1], -len(x[0])))
+    return [(x[0], x[1], x[2]) for x in verified[:limit]]
+
+
+def _gibbs_lattice_pass(
+    seed_log_pi: NDArray[np.float64],
+    node_masks: NDArray[np.uint8],
+    k_mat: NDArray[np.float64],
+    node_log_rho_stop: NDArray[np.float64],
+    facet_nats: NDArray[np.float64],
+    node_resid_nats: NDArray[np.float64],
+    init_mask: int = 0,
+    horizon: int = 4,
+) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64], tuple[int, ...], int]:
+    vc, fc = len(seed_log_pi), len(facet_nats)
+    mc = 1 << fc
+    masks = np.arange(mc, dtype=np.int32)
+    or_tab = node_masks[:, None].astype(np.int32) | masks[None, :]
+    v_idx = np.arange(vc, dtype=np.int32)[:, None]
+    flat_or = (v_idx * mc + or_tab).ravel()
+
+    bit_mat = ((masks[:, None] >> np.arange(fc, dtype=np.int32)) & 1).astype(np.float64) if fc else np.zeros((1, 0))
+    u_term = (bit_mat @ facet_nats)[None, :] + node_resid_nats[:, None]
+    u_sh = float(u_term.max())
+    g_h = np.exp(u_term - u_sh)
+    g = np.exp((node_log_rho_stop[:, None] + u_term) - u_sh)
+
+    b = np.empty((horizon + 1, vc, mc), dtype=np.float64)
+    b_sh = np.empty(horizon + 1, dtype=np.float64)
+    b[horizon], b_sh[horizon] = g_h, u_sh
+    for h in range(horizon - 1, -1, -1):
+        cont = k_mat @ b[h + 1, v_idx, or_tab]
+        sh = max(u_sh, float(b_sh[h + 1]))
+        raw = g * np.exp(u_sh - sh) + cont * np.exp(b_sh[h + 1] - sh)
+        pk = float(raw.max())
+        b[h] = raw / pk if pk > 0.0 else 0.0
+        b_sh[h] = sh + math.log(pk) if pk > 0.0 else -np.inf
+
+    sm = np.bitwise_or(init_mask, node_masks.astype(np.int32))
+    pi_sh = float(seed_log_pi.max())
+    pi_s = np.exp(seed_log_pi - pi_sh)
+    z0 = pi_s * b[0, np.arange(vc), sm]
+    log_z = pi_sh + float(b_sh[0]) + math.log(max(float(z0.sum()), 1e-300))
+    log_z0 = pi_sh + u_sh + math.log(max(float((pi_s * g[np.arange(vc), sm]).sum()), 1e-300))
+
+    a = np.zeros((horizon + 1, vc, mc), dtype=np.float64)
+    a_sh = np.full(horizon + 1, -np.inf, dtype=np.float64)
+    a[0, np.arange(vc), sm], a_sh[0] = pi_s, pi_sh
+    kt = np.ascontiguousarray(k_mat.T)
+    e_occ = np.zeros((vc, vc), dtype=np.float64)
+    s_pr = np.zeros((vc, mc), dtype=np.float64)
+
+    for h in range(horizon):
+        if not np.isfinite(a_sh[h]):
             break
-        selected.append(best_j)
-        r2_curr, net_bits, best_w = best_r2, net_bits + best_gain, best_w_trial
-        nodes, bridges, _ = chains[best_j]
-        for nid in nodes:
-            seen_nodes.add(nid)
-            dag_parents.setdefault(nid, set())
-        per_edge_save = best_delta_s / max(1, len(bridges))
-        for step_i, (anchor, df_val) in enumerate(bridges):
-            u, v = nodes[step_i], nodes[step_i + 1]
-            if (u, v) not in seen_edges and not _creates_cycle(dag_parents, u, v):
-                seen_edges.add((u, v))
-                dag_parents[v].add(u)
-                edge_ledger.append(DagEdge(u, v, anchor, per_edge_save, float(np.log2(max(2, df_val - 1)))))
+        s_pr += (a[h] * g) * np.exp(a_sh[h] + u_sh - log_z)
+        bl = b[h + 1, v_idx, or_tab]
+        e_occ += k_mat * ((a[h] @ bl.T) * np.exp(a_sh[h] + b_sh[h + 1] - log_z))
+        nxt = np.bincount(flat_or, weights=(kt @ a[h]).ravel(), minlength=vc * mc).reshape(vc, mc)
+        pk = float(nxt.max())
+        if pk > 0.0:
+            a[h + 1], a_sh[h + 1] = nxt / pk, a_sh[h] + math.log(pk)
+    if np.isfinite(a_sh[horizon]):
+        s_pr += (a[horizon] * g_h) * np.exp(a_sh[horizon] + u_sh - log_z)
 
-    if not selected:
-        j0 = int(np.argmax(d_mat.T @ q64))
-        w0, rn0 = nnls(d_mat[:, [j0]], q64)
-        r2_0 = float(np.clip(1.0 - rn0 * rn0, 0.0, 0.999999))
-        return chains[j0][0], (), r2_0, 0.0, (q64 - d_mat[:, [j0]] @ w0).astype(np.float32)
+    cur = int(np.argmax(z0))
+    cm = int(sm[cur])
+    route = [cur]
+    for h in range(horizon):
+        w_st = float(g[cur, cm]) * np.exp(u_sh - b_sh[h + 1]) if np.isfinite(b_sh[h + 1]) else 1.0
+        cand_m = cm | node_masks.astype(np.int32)
+        w_go = k_mat[cur] * b[h + 1, np.arange(vc), cand_m]
+        for pr in route:
+            w_go[pr] = 0.0
+        jb = int(np.argmax(w_go))
+        if w_go[jb] <= w_st or w_go[jb] <= 0.0:
+            break
+        route.append(jb)
+        cm, cur = int(cand_m[jb]), jb
 
-    ordered = tuple(TopologicalSorter(dag_parents).static_order())
-    residual = (q64 - d_mat[:, selected] @ best_w).astype(np.float32)
-    return ordered, tuple(edge_ledger), r2_curr, net_bits, residual
+    return log_z, log_z0, s_pr.sum(1) + e_occ.sum(1), e_occ, tuple(route), cm
+
+
+def _component_completeness(chosen: list[int], w_cond: NDArray[np.float64], n_masks: NDArray[np.uint8], f_nats: NDArray[np.float64]) -> float:
+    tot = float(f_nats.sum())
+    if tot <= 1e-9 or not chosen:
+        return 0.0
+    fc = len(f_nats)
+    c_set = set(chosen)
+    seen: set[int] = set()
+    best = 0.0
+    for start in chosen:
+        if start in seen:
+            continue
+        cm = 0
+        stack = [start]
+        seen.add(start)
+        while stack:
+            u = stack.pop()
+            cm |= int(n_masks[u])
+            for v in c_set:
+                if v not in seen and (w_cond[u, v] > 0.0 or w_cond[v, u] > 0.0):
+                    seen.add(v)
+                    stack.append(v)
+        best = max(best, sum(float(f_nats[b]) for b in range(fc) if (cm >> b) & 1) / tot)
+    return best
+
+
+def solve_evidence_dag(
+    vs: VectorSearch,
+    query_embedding: NDArray[np.float32],
+    *,
+    query_text: str,
+    conn: sqlite3.Connection,
+    corpus_root: Path | None = None,
+    exclude_chunk_ids: Sequence[int] = (),
+    top_k: int = 5,
+) -> tuple[list[tuple[int, float]], SearchTrace]:
+    if vs.size == 0 or top_k <= 0:
+        return [], SearchTrace()
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunk_vocab USING fts5vocab(main, 'chunk_fts', 'row')")
+    db_file = _db_file_path(conn)
+    root = corpus_root or vs.corpus_root or (db_file.parent.parent if db_file and db_file.parent.name == ".yaw" else None)
+    n_tot = vs.size
+    qh = _center_normalize(query_embedding, vs.mu)
+
+    d_bridge_max = max(4, int(math.ceil(math.sqrt(n_tot))))
+    d_query_max = max(8, n_tot // 2)
+    f_max = min(6, max(2, int(math.log2(max(4, n_tot)) // 2)))
+    max_cand = 3 * d_bridge_max
+
+    q_low = query_text.lower()
+    match_cache: dict[str, int] = {}
+    gram_df_cache: dict[str, int] = {}
+    qg = list(dict.fromkeys(_alnum_grams(q_low)))
+    if qg:
+        gram_df_cache.update(
+            conn.execute(f"SELECT term, doc FROM temp.chunk_vocab WHERE term IN ({','.join('?' * len(qg))})", qg).fetchall()
+        )
+    facets = _watershed_trigram_stems(q_low, gram_df_cache, conn, n_tot, 1, d_query_max, f_max, match_cache)
+    for w_miss in [w for w in re.split(r"\W+", q_low) if len(w) >= 4 and "_" not in w]:
+        if len(facets) < f_max and not any(st in w_miss or w_miss in st for st, _, _ in facets):
+            if w_miss not in match_cache:
+                match_cache[w_miss] = int(
+                    conn.execute("SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH ?", (f'"{w_miss}"',)).fetchone()[0]
+                )
+            if match_cache[w_miss] == 0:
+                facets.append((w_miss, math.log(n_tot + 2.0), 0))
+
+    live_facets = [f for f in facets if f[2] > 0]
+    excl_set = {int(x) for x in exclude_chunk_ids if int(x) in vs.id_to_pos}
+    if not live_facets:
+        cids_only = [c for c in _rabitq_bnb_top(vs, conn, qh, top_k + len(excl_set)) if c not in excl_set][:top_k]
+        return [(c, 1.0) for c in cids_only], SearchTrace()
+
+    fts_ids: list[int] = []
+    per_f = max(2, d_bridge_max // len(live_facets))
+    for f_str, _, _ in live_facets:
+        for (rc,) in conn.execute(
+            "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY bm25(chunk_fts) ASC LIMIT ?",
+            (f'"{f_str}"', per_f),
+        ).fetchall():
+            if int(rc) in vs.id_to_pos and int(rc) not in fts_ids:
+                fts_ids.append(int(rc))
+    top_d = _rabitq_bnb_top(vs, conn, qh, max(8, d_bridge_max // 2))
+    seeds = list(dict.fromkeys([*excl_set, *fts_ids, *top_d]))[: d_bridge_max + len(excl_set)]
+
+    visited_vecs: dict[int, NDArray[np.float32]] = {}
+    low_texts: dict[int, str] = {}
+    rare_sets: dict[int, frozenset[str]] = {}
+    file_cache: dict[str, list[str]] = {}
+
+    def _visit(cids: list[int]) -> list[int]:
+        need = [c for c in cids if c in vs.id_to_pos and c not in visited_vecs][: max(0, max_cand - len(visited_vecs))]
+        if not need:
+            return []
+        rows = conn.execute(
+            f"SELECT chunk_id, embedding FROM chunks WHERE chunk_id IN ({','.join('?' * len(need))})", need
+        ).fetchall()
+        vecs = _center_normalize(np.vstack([np.frombuffer(r[1], dtype="<f4") for r in rows]), vs.mu)
+        new_grams: list[str] = []
+        chunk_grams: dict[int, frozenset[str]] = {}
+        added: list[int] = []
+        for idx_r, r in enumerate(rows):
+            cid = int(r[0])
+            visited_vecs[cid] = vecs[idx_r]
+            ptr = vs.pointers[vs.id_to_pos[cid]]
+            txt = ""
+            if root is not None:
+                if ptr.rel_posix_path not in file_cache:
+                    fp = root / ptr.rel_posix_path
+                    file_cache[ptr.rel_posix_path] = fp.read_text("utf-8", errors="ignore").splitlines() if fp.is_file() else []
+                lines = file_cache[ptr.rel_posix_path]
+                txt = "\n".join(lines[max(0, ptr.start_line - 1) : ptr.end_line])
+            lt = txt.lower()
+            low_texts[cid] = lt
+            gs = frozenset(_alnum_grams(lt))
+            chunk_grams[cid] = gs
+            new_grams.extend(g for g in gs if g not in gram_df_cache)
+            added.append(cid)
+        unk = list(dict.fromkeys(new_grams))
+        for k0 in range(0, len(unk), 400):
+            batch = unk[k0 : k0 + 400]
+            gram_df_cache.update(
+                conn.execute(f"SELECT term, doc FROM temp.chunk_vocab WHERE term IN ({','.join('?' * len(batch))})", batch).fetchall()
+            )
+        for cid, gs in chunk_grams.items():
+            rare_sets[cid] = frozenset(g for g in gs if 1 <= gram_df_cache.get(g, 0) <= d_bridge_max)
+        return added
+
+    frontier = [c for c in _visit(seeds) if c not in excl_set]
+    bridge_df: dict[str, int] = {}
+    q_fset = {f[0] for f in facets}
+    spec_q = {f[0] for f in live_facets if f[2] <= d_bridge_max}
+    entry_stems: dict[int, set[str]] = {c: set(spec_q) for c in frontier}
+
+    for _ in range(2):
+        dedup_f: list[int] = []
+        union_r: set[str] = set().union(*(rare_sets[c] for c in excl_set if c in rare_sets))
+        for fc in frontier:
+            rs = rare_sets[fc]
+            if not rs or not union_r or (len(rs - union_r) * 2 >= len(rs)):
+                dedup_f.append(fc)
+                union_r |= rs
+            if len(dedup_f) >= 16:
+                break
+        cand_b: dict[str, tuple[float, int]] = {}
+        for c in dedup_f:
+            lt = low_texts[c]
+            u_n = float(_null_nats(float(visited_vecs[c] @ qh), vs.d_eff))
+            apos = [idx_p for st in entry_stems.get(c, ()) if (idx_p := lt.find(st)) != -1]
+            for st, surp, mdf in _watershed_trigram_stems(lt, gram_df_cache, conn, n_tot, 2, d_bridge_max, f_max, match_cache, apos or None):
+                if not any(st in qf or qf in st for qf in q_fset) and st not in bridge_df:
+                    d_ch = min((abs(lt.find(st) - ap) for ap in apos), default=0) if apos else 0
+                    prox = 1.0 / math.log(math.e + d_ch) if apos else 1.0
+                    sc_b = surp * prox + (u_n / math.log(n_tot + 2.0))
+                    if sc_b > cand_b.get(st, (-1.0, 0))[0]:
+                        cand_b[st] = (sc_b, mdf)
+        wave_b = [ph for ph, _ in sorted(cand_b.items(), key=lambda kv: -kv[1][0])[:10]]
+        for ph in wave_b:
+            bridge_df[ph] = cand_b[ph][1]
+        if not wave_b or len(visited_vecs) >= max_cand:
+            break
+        per_b = max(2, (max_cand - len(visited_vecs)) // len(wave_b))
+        wave_cids: list[int] = []
+        for pb in wave_b:
+            for (rc,) in conn.execute(
+                "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY bm25(chunk_fts) ASC LIMIT ?",
+                (f'"{pb}"', per_b),
+            ).fetchall():
+                ic = int(rc)
+                entry_stems.setdefault(ic, set()).add(pb)
+                wave_cids.append(ic)
+        frontier = [c for c in _visit(wave_cids) if c not in excl_set]
+        if not frontier:
+            break
+
+    c_list = sorted(c for c in visited_vecs if c not in excl_set)
+    vc = len(c_list)
+    if vc == 0:
+        return [], SearchTrace()
+    v_mat = np.vstack([visited_vecs[c] for c in c_list])
+    rsets = [rare_sets[c] for c in c_list]
+
+    fc_len = len(facets)
+    f_nats = np.array([f[1] for f in facets], dtype=np.float64)
+    n_masks = np.array(
+        [sum((1 << bi) for bi, (ph, _, _) in enumerate(facets) if ph in low_texts[c_list[i]]) for i in range(vc)],
+        dtype=np.uint8,
+    )
+
+    def _rnov(u_r: frozenset[str], v_r: frozenset[str]) -> float:
+        return 1.0 - (len(u_r & v_r) / float(len(v_r))) if v_r else 1.0
+
+    w_cond = np.zeros((vc, vc), dtype=np.float64)
+    edge_anchor: dict[tuple[int, int], str] = {}
+    for ph, dfb in bridge_df.items():
+        members = [i for i in range(vc) if ph in low_texts[c_list[i]]]
+        if len(members) < 2:
+            continue
+        base_c = math.log((n_tot + 2.0) / (dfb + 1.0)) / float(dfb - 1)
+        for ui in members:
+            for vi in members:
+                if ui != vi:
+                    w_cond[ui, vi] += base_c * _rnov(rsets[ui], rsets[vi])
+                    edge_anchor.setdefault((ui, vi), ph)
+
+    out_deg = (w_cond > 0.0).sum(axis=1)
+    rho_stop = 1.0 / (1.0 + out_deg)
+    row_w = w_cond.sum(axis=1)
+    k_mat = np.where(row_w[:, None] > 0.0, (w_cond / np.maximum(row_w[:, None], 1e-12)) * (1.0 - rho_stop[:, None]), 0.0)
+
+    # Seed stateful QR & rare-trigram exclusion from exclude_chunk_ids when exploring orthogonal branches:
+    excl_vecs = [visited_vecs[c] for c in excl_set if c in visited_vecs]
+    excl_rset: frozenset[str] = frozenset().union(*(rare_sets[c] for c in excl_set if c in rare_sets))
+    q_rem = qh.copy()
+    if excl_vecs:
+        qx, _ = np.linalg.qr(np.column_stack(excl_vecs), mode="reduced")
+        rem0 = qh - qx @ (qx.T @ qh)
+        if np.linalg.norm(rem0) > 1e-6:
+            q_rem = (rem0 / np.linalg.norm(rem0)).astype(np.float32)
+
+    q_nats0 = _null_nats(v_mat @ q_rem, vs.d_eff)
+    seed_n = q_nats0 + np.array([sum(f_nats[b] for b in range(fc_len) if (n_masks[i] >> b) & 1) for i in range(vc)])
+    seed_lp = seed_n - float(np.max(seed_n))
+    seed_lp -= float(np.log(np.sum(np.exp(seed_lp))))
+
+    chosen: list[int] = []
+    hops_out: list[EvidenceHop] = []
+    cov_m = 0
+    full_m = (1 << fc_len) - 1
+    last_occ = np.zeros(vc, dtype=np.float64)
+    first_bf = 0.0
+
+    for pass_i in range(2):
+        if len(chosen) >= top_k:
+            break
+        d_rem = max(8.0, vs.d_eff - len(chosen) - len(excl_vecs))
+        r_nats = _null_nats(v_mat @ q_rem, d_rem)
+        u_ch = excl_rset.union(*(rsets[j] for j in chosen))
+        if u_ch:
+            for iv in range(vc):
+                r_nats[iv] *= _rnov(u_ch, rsets[iv])
+        for p in chosen:
+            r_nats[p] = 0.0
+
+        log_z, log_z0, last_occ, e_occ, route, end_m = _gibbs_lattice_pass(
+            seed_lp, n_masks, k_mat, np.log(rho_stop), f_nats, r_nats, init_mask=cov_m
+        )
+        if pass_i == 0:
+            first_bf = float(log_z - log_z0)
+        for s_i, node_i in enumerate(route):
+            if node_i not in chosen and len(chosen) < top_k:
+                chosen.append(node_i)
+            if s_i > 0:
+                ui, vi = route[s_i - 1], node_i
+                hops_out.append(EvidenceHop(c_list[ui], c_list[vi], edge_anchor.get((ui, vi), ""), round(float(e_occ[ui, vi]), 4)))
+        cov_m |= end_m
+        if full_m > 0 and cov_m == full_m:
+            break
+        basis_vecs = [*excl_vecs, *(v_mat[i] for i in chosen)]
+        qc, _ = np.linalg.qr(np.column_stack(basis_vecs), mode="reduced")
+        rem = qh - qc @ (qc.T @ qh)
+        if np.linalg.norm(rem) <= 1e-6:
+            break
+        q_rc = (rem / np.linalg.norm(rem)).astype(np.float32)
+        if float(np.max(_null_nats(v_mat @ q_rc, d_rem))) < math.log(vc + 1.0):
+            break
+        q_rem = q_rc
+
+    while len(chosen) < min(top_k, vc):
+        u_ch = excl_rset.union(*(rsets[j] for j in chosen))
+        best_ic = max((i for i in range(vc) if i not in chosen), key=lambda i: float(last_occ[i]) * _rnov(u_ch, rsets[i]))
+        chosen.append(best_ic)
+
+    cc_comp = _component_completeness(chosen, w_cond, n_masks, f_nats)
+    unexplained = tuple(facets[b][0] for b in range(fc_len) if not ((cov_m >> b) & 1))
+    used_anchors = {h.anchor for h in hops_out if h.anchor}
+    dead_ends = tuple(b_st for b_st in list(bridge_df)[:6] if b_st not in used_anchors) if cc_comp < 0.99 else ()
+    ranked = [(c_list[i], float(last_occ[i])) for i in chosen[:top_k]]
+    return ranked, SearchTrace(tuple(hops_out), round(cc_comp, 4), round(first_bf, 4), unexplained, dead_ends)
+
+
+def search_vectors(
+    vs: VectorSearch,
+    query_embedding: NDArray[np.float32],
+    *,
+    query_text: str = "",
+    conn: sqlite3.Connection | None = None,
+    top_k: int = 10,
+    **_ignored: Any,
+) -> list[tuple[int, float]]:
+    if vs.size == 0 or top_k <= 0:
+        return []
+    if conn is None:
+        qh = _center_normalize(query_embedding, vs.mu)
+        est, _ = _rabitq_estimate(vs, qh)
+        order = np.argsort(-est)[: min(vs.size, top_k)]
+        return [(vs.chunk_ids[int(i)], float(est[int(i)])) for i in order]
+    ranked, _ = solve_evidence_dag(vs, query_embedding, query_text=query_text, conn=conn, top_k=top_k)
+    return ranked
+
+
+def expand_neighbors_ranked(
+    vs: VectorSearch, conn: sqlite3.Connection, chunk_id: int, *, top_k: int = 6
+) -> list[tuple[int, float]]:
+    pos = vs.id_to_pos.get(chunk_id)
+    if pos is None or vs.size <= 1:
+        return []
+    row = conn.execute("SELECT embedding FROM chunks WHERE chunk_id = ?", (chunk_id,)).fetchone()
+    if row is None:
+        return []
+    u_hat = _center_normalize(np.frombuffer(row[0], dtype="<f4"), vs.mu)
+    est, _ = _rabitq_estimate(vs, u_hat)
+    scores = _null_nats(est, vs.d_eff)
+    scores[pos] = -1.0
+    order = np.argsort(-scores)[: min(top_k, vs.size - 1)]
+    return [(vs.chunk_ids[int(i)], float(scores[int(i)])) for i in order if scores[int(i)] >= 0.0]
+
+
+def lexical_search(vs: VectorSearch, query_text: str, conn: sqlite3.Connection, *, top_k: int = 8) -> list[tuple[int, float]]:
+    if vs.size == 0 or top_k <= 0:
+        return []
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunk_vocab USING fts5vocab(main, 'chunk_fts', 'row')")
+    q_low = query_text.lower()
+    qg = list(dict.fromkeys(_alnum_grams(q_low)))
+    if not qg:
+        return []
+    gdf = dict(conn.execute(f"SELECT term, doc FROM temp.chunk_vocab WHERE term IN ({','.join('?' * len(qg))})", qg).fetchall())
+    stems = _watershed_trigram_stems(q_low, gdf, conn, vs.size, 1, max(8, vs.size // 2), 6, {})
+    if not stems:
+        return []
+    rows = conn.execute(
+        "SELECT rowid, -bm25(chunk_fts) FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY bm25(chunk_fts) ASC LIMIT ?",
+        (" OR ".join(f'"{s[0]}"' for s in stems), min(vs.size, top_k)),
+    ).fetchall()
+    return [(int(cid), float(sc)) for cid, sc in rows if int(cid) in vs.id_to_pos]
+
+
+def build_query_hints(vs: VectorSearch, query_text: str, *, limit: int = 5) -> list[str]:
+    del vs, query_text, limit
+    return []
+
+
+def _hydrate_one(
+    ptr: ChunkPointer, score: float, corpus_root: Path, file_cache: dict[str, tuple[str, list[str]]], *, include_island: bool = False
+) -> HydratedPassage:
+    rel = ptr.rel_posix_path
+    full_path = (corpus_root / rel).resolve()
+    if not full_path.is_relative_to(corpus_root.resolve()):
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"Pointer escaped corpus_root: {rel}")
+    if rel not in file_cache:
+        if not full_path.is_file():
+            return HydratedPassage(ptr.chunk_id, score, "", ptr, stale_on_disk=True)
+        raw_bytes = full_path.read_bytes()
+        file_cache[rel] = (hashlib.sha256(raw_bytes).hexdigest(), raw_bytes.decode("utf-8", errors="replace").splitlines())
+    else:
+        digest, _ = file_cache[rel]
+        if not full_path.is_file() or hashlib.sha256(full_path.read_bytes()).hexdigest() != digest:
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"File mutated mid-hydration: {rel}")
+
+    actual_hash, lines = file_cache[rel]
+    if actual_hash != ptr.source_hash:
+        return HydratedPassage(ptr.chunk_id, score, "", ptr, stale_on_disk=True)
+    use_island = include_island and (ptr.ast_island_start, ptr.ast_island_end) != _NO_ISLAND
+    s_line = ptr.ast_island_start if use_island else ptr.start_line
+    e_line = ptr.ast_island_end if use_island else ptr.end_line
+    if s_line < 1 or e_line < s_line or e_line > max(1, len(lines)):
+        return HydratedPassage(ptr.chunk_id, score, "", ptr, stale_on_disk=True)
+    return HydratedPassage(ptr.chunk_id, score, "\n".join(lines[s_line - 1 : e_line]), ptr, stale_on_disk=False)
+
+
+def hydrate_passage(vs: VectorSearch, chunk_id: int, corpus_root: Path, *, include_island: bool = False) -> HydratedPassage | None:
+    pos = vs.id_to_pos.get(chunk_id)
+    return None if pos is None else _hydrate_one(vs.pointers[pos], 1.0, corpus_root, {}, include_island=include_island)
+
+
+def hydrate_ranked_passages(
+    vs: VectorSearch, ranked: list[tuple[int, float]], corpus_root: Path, *, top_k: int | None = None, include_island: bool = False
+) -> tuple[HydratedPassage, ...]:
+    cache: dict[str, tuple[str, list[str]]] = {}
+    items = ranked[:top_k] if top_k is not None else ranked
+    return tuple(
+        _hydrate_one(vs.pointers[vs.id_to_pos[cid]], sc, corpus_root, cache, include_island=include_island)
+        for cid, sc in items
+        if cid in vs.id_to_pos
+    )
 ```
 
 ---
 
-## 3. Atomic Implementation Checkpoints
+## 2. Mandatory Acceptance Gates (`MDL-3` & `MDL-4`)
 
-### Checkpoint `MDL-1`: Storage, AST Islands, Ingest Gate, and Dual `FTS5`
-**Files touched:** `pyproject.toml`, `yaw/core/types.py`, `yaw/core/__init__.py`, `yaw/pipeline.py`.
-
-1. **`pyproject.toml`:** Remove `spacy`, `en-core-web-sm` (and `[tool.uv.sources]`), and `optuna`. Add `tree-sitter-language-pack>=1.25`. Run `uv lock && uv sync`.
-2. **`yaw/core/types.py` & `yaw/core/__init__.py`:**
-   - Delete dead legacy types (`TextChunk`, `Entity`, `Triple`, `Quad`, `ExtractionRecord`, `DropReason`, `PassMetrics`, `AxiomViolation`, `ValidationSummary`, `ManifoldDiagnostics`, `OntologySummary`, `PipelineResult`, `DatasetStats`, `ChunkMetadata`, `SeedSelection`, `RecallHit`, `RecallResult`, `EvalQuestionResult`, `EvalAggregate`) and dead `.constants` lazy mappings in `yaw/core/__init__.py`.
-   - Add `mtime_ns: int = 0` and `novelty_q8: int = 255` to `ChunkPointer`. Add `DagEdge` and `RecallPacket` (§2.4).
-3. **`yaw/pipeline.py`:**
-   - **Keep** `ChunkVecRow.embedding: NDArray[np.float32]` unchanged so `CocoIndex` `sqlite.Vec0TableDef` continues to mount `chunks` natively.
-   - **Replace** `tokens_json` and `entities_json` in `ChunkVecRow` and `_CHUNK_AUXILIARY_COLS` with `mtime_ns: int` and `novelty_q8: int`. Add `anchors: str` to `SourceChunk`.
-   - **In `chunk_file_content`:**
-     - If `rel_path.endswith(".json")`, extract `(doc_title, raw_body)` via `json_document_fields(json.loads(text))`.
-     - Extract AST `(ast_island_start, ast_island_end, title)` and structural `anchors` (symbols, imports, config keys, Markdown headings/links/inline `` `code` ``, plus regex paths/CVEs/identifiers matching `[A-Za-z0-9_./:@$-]+` containing at least one of `_ - . / : @ $`) via `tree-sitter-language-pack`. Never emit hardcoded `1, len(lines), ""` when AST/heading structure exists.
-   - **In `_compute_chunk_features`:** Delete `extract_text_features` (`spacy`). Apply `simhash64` + `corpus_novelty_q8` (§2.1) against an `ingest_templates(simhash INTEGER PRIMARY KEY, proto_bytes BLOB, proto_vec BLOB)` table in `yaw.db`: when `novelty_q8 < 51` (`eta < 0.20`), reuse `proto_vec` **without** calling `embedder.embed()`; otherwise call `embedder.embed(format_doc_for_embedding(body, title=title, task_mode=task_mode))` and upsert prototype if bucket empty.
-   - **In `_apply_fts_tables` & `_indexing_main`:** Keep `_FtsRowHandler` tuple `(title, body)` intact, and mount **two** contentless FTS5 targets:
-     1. `"chunk_fts"`: `USING fts5(title, body, content='', contentless_delete=1, tokenize='unicode61')` + `CREATE VIRTUAL TABLE IF NOT EXISTS "chunk_vocab" USING fts5vocab("chunk_fts", 'row')`.
-     2. `"anchor_fts"` (receiving `(piece.title, piece.anchors)`): `USING fts5(title, body, content='', contentless_delete=1, tokenize="unicode61 tokenchars '_-./:@$'")` + `CREATE VIRTUAL TABLE IF NOT EXISTS "anchor_vocab" USING fts5vocab("anchor_fts", 'row')`.
-     Update `list_user_tables` `shadow_prefixes` to exclude `"anchor_fts_"`, `"chunk_vocab"`, `"anchor_vocab"`, and `"ingest_templates"`.
-
----
-
-### Checkpoint `MDL-2`: Stage-1 RaBitQ View & Deterministic MDL DAG Engine
-**Files touched:** `yaw/retrieval.py`, `yaw/core/config.py`, `yaw/optimize.py`.
-
-1. **`yaw/retrieval.py`:**
-   - **Delete:** `import spacy`, `_get_spacy_nlp`, `extract_text_features`, `entity_keys`, `entity_to_idx`, `entity_to_chunk`, `chunk_to_entity`, `doc_freqs`, `chunk_tokens`, and the silent `except sqlite3.OperationalError: pass` + Python token-loop fallback in `_bm25_scores`.
-   - **`VectorSearch` dataclass (Stage-1 Compact View):** Hold **zero** full-corpus `float32` matrices. Store `chunk_ids`, `id_to_pos`, `pointers`, `dim`, `mu`, `v_spike`, `delta_w`, `d_eff`, `rot`, `rabitq_bits` (`uint64[N, ceil(D/64)]`), `rabitq_s` (`float16[N]`), `rabitq_ones` (`uint16[N]`), `csls_rk` (`float16[N]`, mean top-16 Stage-1 neighbor cosine), and `next_in_file` (`int32[N]`, index of the next sequential chunk in the same `rel_path`, or `-1`).
-   - **Fix `_bm25_scores`:** Query `chunk_fts` and `anchor_fts` with explicit `ORDER BY bm25(...) ASC LIMIT ?`. Never swallow `sqlite3.OperationalError`.
-   - **Implement `solve_evidence_dag(vs, query_embedding, *, query_text, conn, corpus_root, embed_fn=None, task_mode="distinct-titled", top_k=5) -> RecallPacket`:**
-     1. **Vocabulary & Zero-Hit Probe:** Query `chunk_vocab` / `anchor_vocab` (`WHERE term IN (...)` — B-tree `INDEX 1` seek only). For any query token/identifier with `df == 0` and `len >= 4`, run `WHERE term >= ? AND term < ? LIMIT 5` using the 4-char prefix to populate `near_miss_terms`. Check adjacent non-stopword pairs via `chunk_fts MATCH '"w1 w2"'` for super-additive phrase surprisal.
-     2. **Bidirectional Wavefront:** Whiten `query_embedding` $\to \hat{q}$. If `embed_fn` is provided and query anchors $E(q)$ exist, micro-batch embed unique anchor strings (caching `(model, anchor) -> blob` in SQLite `entity_vec_cache`) $\to Q_{E(q)}$, and compute target residual $\hat{q}_{\text{target}} = \text{normalize}((I - Q_{E(q)}Q_{E(q)}^\top)\hat{q})$. Score Stage-1 `rabitq_query` (`est - 0.5 * csls_rk`, pruning via `est + eps >= lb_cutoff`) + ordered `FTS5` for $\hat{q}$ (forward wave $F_{\text{fwd}}$) and $\hat{q}_{\text{target}}$ (backward wave $F_{\text{bwd}}$).
-     3. **Stage-2 Fetch & Splice:** Fetch exact `embedding` blobs from `chunks WHERE chunk_id IN (...)` **only** for wavefront + anchor-bridge survivors (`<= 192` chunks), whiten via `whiten_normalize`, hydrate disk slices into a request-local `file_cache`, and build candidate chains ($k \in \{1, 2, 3, 4\}$) across shared anchors ($2 \le \text{df}(e) \le \max(32, 0.05 N)$ in `chunk_vocab`/`anchor_vocab`), `F_fwd <-> F_bwd` intersections, and `next_in_file` continuations, weighted by temporal proximity $\exp(-|\Delta\text{mtime}| / \tau)$ when `mtime_ns > 0`.
-     4. **Cut & MDL Selection:** Embed unique candidate bridge strings ($\le 24$, cached) $\to \hat{z}_e$, compute `cut_chain_atom` (§2.4), prune extensions where $\hat{q}^\top \psi(p') \le \hat{q}^\top \psi(p) + 0.01$, and run `select_mdl_dag` (§2.4). Populate `stalled_anchors` with any query anchor whose whitened vector still has `dot(residual, z_a) > 0.25` when `explained_r2 < 0.55`.
-   - **Implement `expand_neighbors_ranked(vs, conn, chunk_id, *, top_k=6) -> list[tuple[int, float]]`:** Fetch chunk `chunk_id`'s exact vector from `chunks`, whiten, score via `rabitq_query` + AST-island sibling bonus (only when `(ast_island_start, ast_island_end) != (1, 1)` and island span `< file_lines`) + `next_in_file` adjacency + shared rare `anchor_fts` terms.
-2. **`yaw/core/config.py` & `yaw/optimize.py`:**
-   - Remove `RetrievalParams`, `write_retrieval_section`, `write_manifold_section`, `manifold_overrides`, `retriever_mode`, and retired OpenIE/RLM/GBNF fields from `YawConfig`.
-   - Delete `optimize_optuna` from `yaw/optimize.py`. In `optimize_dspy`: add `"insufficient references in corpus"` to `_ABSTAIN_PHRASES` (matching `QASignature` in `yaw/qa.py`), and strip `"tools"` keys from `Inputs` dicts inside `make_react_instruction_proposer` before `json.dumps` truncation.
-
----
-
-### Checkpoint `MDL-3`: Lazy Tier-0 Runtime, MCP Librarian Surface, CLI, and Docs Sync
-**Files touched:** `yaw/runtime.py`, `yaw/mcp_server.py`, `yaw/cli.py`, `yaw/qa.py`, `AGENTS.md`, `FOUNDATIONAL.md`.
-
-1. **`yaw/runtime.py`:**
-   - Change `YawRuntime.lm` to `dspy.LM | None = None`. Do **not** call `create_lm(cfg)` inside `start_runtime`; initialize it lazily under `rt.lm_sem` inside `ask()` so `start_runtime` and `recall()` run with **zero generative LLM endpoint configured or reachable**.
-   - Update `recall(rt, query, *, top_k=5) -> RecallPacket` to call `solve_evidence_dag(..., embed_fn=rt.embed_fn)` and add `neighbors(rt, chunk_id, *, top_k=6) -> tuple[HydratedPassage, ...]`.
-   - Enforce `len(cleaned.encode("utf-8")) <= 1024` inside `_validate_text_input` (`INVALID_INPUT`).
-2. **`yaw/mcp_server.py`:**
-   - Pass explicit `instructions` to `FastMCP("yaw", instructions=...)` documenting: (a) prefer concurrent zero-LLM `recall` + `neighbors` over serialized `Semaphore(1)` `qa`; (b) interpret `explained_r2`, `edges`, `stalled_anchors`, `near_miss_terms`, and `stale_on_disk`; (c) pass natural-language + exact identifier queries (`<= 1024` UTF-8 bytes).
-   - Update `recall` response dict to include `explained_r2`, `net_bits_saved`, `edges`, `stalled_anchors`, `near_miss_terms`, and `results`.
-   - Register read-only `@mcp.tool` `neighbors(chunk_id: int, top_k: int = 6)`.
-3. **`yaw/cli.py` & `yaw/qa.py`:**
-   - Lazy-import `yaw.optimize` inside the `args.command == "optimize"` branch of `yaw/cli.py` (remove top-level `from yaw.optimize import ...`) and remove the `optimize optuna` subparser.
-   - Wire `yaw/qa.py`'s `search_passages` and `expand_neighbors` tools to `solve_evidence_dag` and `expand_neighbors_ranked`.
-4. **`AGENTS.md` & `FOUNDATIONAL.md`:**
-   - Reconcile stale `yaw/daemon/...` paths, retired SKOS/OWL/SHACL/GBNF/`RLM` rules, and `uv run yaw optimize dspy` CLI invocations against the active 14-file architecture.
-
----
-
-## 4. Mandatory Falsifiable Acceptance Tests (`tests/test_mdl_dag.py`)
-
-Before dispatching `critic (Model="flash")`, add `tests/test_mdl_dag.py` proving all six invariants without external network calls:
-
-1. **`test_ingest_gate_skips_embedder_on_boilerplate_clones`:** Feed 20 log/policy clones differing only in timestamps/UUIDs + 1 unique ADR through `pipeline.py` with a counting mock `embed_fn`. Assert `embed_fn` is invoked **at most twice** (1 prototype + 1 ADR), while all 21 chunks are searchable by unique ID in `anchor_fts`.
-2. **`test_ast_islands_and_json_titles_populated`:** Chunk a Python file with two classes, a Markdown file with `## Section`, and a benchmark `.json` doc. Assert `title != ""` on all three and `(ast_island_start, ast_island_end)` bounds each class/section strictly tighter than `(1, total_lines)`.
-3. **`test_stage1_memory_footprint_has_no_float32_matrix`:** Build `VectorSearch` over 500 `768d` chunks; assert no attribute on `VectorSearch` holds an `(N, D)` float array and total NumPy array bytes per chunk `< 120` bytes.
-4. **`test_hilbert_cut_beats_trivia_and_unlinked_decoy`:** Construct synthetic 3-hop silent-bridge + trivia + unlinked-decoy corpus (`s1: EU -> Munich-Edge`, `s2: Munich-Edge -> Core-Collector`, `s2_trivia: Munich-Edge -> 2021`, `s3: Core-Collector -> port 8443`, `decoy: Postgres -> port 5432`). Assert `solve_evidence_dag` returns topological order `(s1, s2, s3)`, excludes `s2_trivia` and `decoy`, and reports `explained_r2 > 0.80`.
-5. **`test_diamond_dag_and_cycle_safety`:** Construct a 2-branch convergent query (`SvcA -> GwA -> Vault` and `SvcB -> GwB -> Vault` plus symmetric anchor sharing `u <-> v`). Assert `solve_evidence_dag` recovers both branches without raising `graphlib.CycleError`.
-6. **`test_popqa_single_hop_stops_at_one_node_and_zero_hit_radar_fires`:** Query a 1-hop fact plus a non-existent identifier `webhook_retry_policy` when `webhook_backoff` is indexed. Assert `edges == ()` (1-hop MDL stop) and `"webhook_backoff"` appears in `near_miss_terms["webhook_retry_policy"]`.
+1. **Adversarial Inflection, Compound, CJK, Clone & Stateful-Exclusion Suite (`tests/test_trigram_watershed_dag.py`):**
+   - Stage `title == ""` chunks in `tokenize='trigram'` `chunk_fts` over `?mode=ro` (`PRAGMA query_only = ON`).
+   - Verify inflected Finnish (`Äänekorvella` $\to$ `Äänekorven` $\to$ `Järvenlahtisolmuun` $\leftrightarrow$ `Järvenlahtisolmussa`), German compounds (`Prüfnordkanaldienst` $\to$ `Prüfnordkanal`), unspaced Chinese (`瀚海乾流`), and embedded log paths (`svc::Auriga0_Ledger`) all recover full 3-hop chains despite 5 clones + 4 distant red herrings + 3 decoy sinks.
+   - Verify `exclude_chunk_ids=[branch_a_ids]` on Turn 2 returns an orthogonal second branch without repeating Turn 1's chunks.
+   - Verify `trace.route_completeness` strictly separates connected 3-hop chains from dead-end `NullSink0` chains (`dead_end_bridges` non-empty).
+2. **Real Corpus Benchmark (`G3`):** Run `[0, 10)` (`n = 40`) regression and `[10, 60)` (`n = 200`) across `2wikimultihopqa`, `musique`, `hotpotqa`, and `popqa`, reporting paired Wilcoxon $p$-values against `B5-S` Random Selection, `B5-A` Random Bridge Acquisition, and 0-Hop Hybrid.
