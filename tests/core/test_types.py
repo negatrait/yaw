@@ -1,17 +1,29 @@
-"""Unit tests for yaw.core.types frozen dataclasses and pure coordinate/ID helpers."""
+"""Unit tests for yaw.core.types frozen dataclasses, live ErrorCode, and pure ID/formatting helpers."""
+
+from __future__ import annotations
 
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any, cast, get_args
 
+import yaw.core.types as core_types
 from yaw.core.types import (
     ChunkPointer,
+    DaemonStatus,
+    ErrorCode,
     HydratedPassage,
     QAResult,
-    compute_chunk_id,
+    YawRuntimeError,
+    canonical_chunk_span_key,
     compute_chunk_int_id,
+    format_doc_for_embedding,
+    format_query_for_embedding,
     inclusive_end_line,
+    normalize_entity,
+    redact_secrets,
+    render_document_text,
     resolve_corpus_path,
 )
 
@@ -34,7 +46,7 @@ class TypesTests(unittest.TestCase):
 
         # Frozen contract
         with self.assertRaises((FrozenInstanceError, AttributeError)):
-            pointer.start_line = 2  # type: ignore
+            cast(Any, pointer).start_line = 2
 
         # Slots contract (no __dict__)
         self.assertFalse(hasattr(pointer, "__dict__"))
@@ -64,41 +76,119 @@ class TypesTests(unittest.TestCase):
         self.assertTrue(stale_passage.stale_on_disk)
 
         with self.assertRaises((FrozenInstanceError, AttributeError)):
-            passage.score = 1.0  # type: ignore
+            cast(Any, passage).score = 1.0
         self.assertFalse(hasattr(passage, "__dict__"))
 
-    def test_qa_result_keeps_citation_labels_and_hydrated_passages(self):
+    def test_qa_result_and_daemon_status_contracts(self):
         pointer = ChunkPointer(1, "p.md", "hash", 1, 10)
         passage = HydratedPassage(pointer=pointer, text="Hello world", score=0.95)
         result = QAResult("What is this?", "A greeting.", ("p.md:1-10",), (passage,))
         self.assertEqual(result.citations, ("p.md:1-10",))
         self.assertEqual(result.passages, (passage,))
+        status = DaemonStatus(lifecycle="ready", provider_ready=True, num_chunks=2)
+        self.assertEqual(status.to_dict()["num_chunks"], 2)
 
-    def test_chunk_ids_are_deterministic_and_include_source_coordinates(self):
-        chunk_id = compute_chunk_id("doc.md", 1, 10, source_hash="hash")
-        self.assertEqual(chunk_id, compute_chunk_id("doc.md", 1, 10, source_hash="hash"))
-        self.assertNotEqual(chunk_id, compute_chunk_id("doc.md", 2, 10, source_hash="hash"))
-        self.assertGreater(compute_chunk_int_id("doc.md", 1, 10, source_hash="hash"), 0)
+    def test_chunk_int_ids_are_deterministic_and_include_source_coordinates(self):
+        cid = compute_chunk_int_id("doc.md", 1, 10, source_hash="hash")
+        self.assertEqual(cid, compute_chunk_int_id("doc.md", 1, 10, source_hash="hash"))
+        self.assertNotEqual(cid, compute_chunk_int_id("doc.md", 2, 10, source_hash="hash"))
+        self.assertNotEqual(cid, compute_chunk_int_id("doc.md", 1, 10, char_start=1, char_end=5, source_hash="hash"))
+        self.assertTrue(0 < cid < (1 << 63))
+        self.assertEqual(canonical_chunk_span_key("a\\b.md", 1, 3, 2, 10, "h"), "a/b.md:1:3:2:10:h")
 
     def test_inclusive_end_line(self):
-        # When end_column == 1 and end_line > start_line, slice ended at trailing newline
         self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=1), 4)
-        # When end_line == start_line, never decrement below start_line
         self.assertEqual(inclusive_end_line(start_line=1, end_line=1, end_column=1), 1)
-        # When end_column > 1, slice ended midway on end_line
         self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=15), 5)
 
-    def test_resolve_corpus_path_and_to_rel_posix_path(self):
+    def test_resolve_corpus_path_and_rejection(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir).resolve()
             sub = root / "nested" / "doc.md"
             sub.parent.mkdir(parents=True)
             sub.write_text("content", encoding="utf-8")
 
-            # Valid resolution
             resolved = resolve_corpus_path(root, "nested/doc.md")
             self.assertEqual(resolved, sub)
 
-            # Traversal attempt rejection
             with self.assertRaises(ValueError):
                 resolve_corpus_path(root, "../outside.txt")
+
+    def test_live_error_codes_redaction_and_embedding_formatters(self):
+        codes = set(get_args(ErrorCode))
+        self.assertEqual(
+            codes,
+            {
+                "BUSY",
+                "CONSISTENCY_ERROR",
+                "EMPTY_INDEX",
+                "INDEX_NOT_READY",
+                "INVALID_INPUT",
+                "MODEL_ERROR",
+                "NOT_READY",
+                "SHUTTING_DOWN",
+            },
+        )
+        err = YawRuntimeError("INVALID_INPUT", "bad input")
+        self.assertEqual(str(err), "[INVALID_INPUT] bad input")
+
+        self.assertEqual(normalize_entity("  New   York "), "new york")
+        masked = redact_secrets(
+            "Bearer abc123 sk-secret123456 https://user:pass@host/api api_key=tok_99 my-raw-secret",
+            "my-raw-secret",
+        )
+        self.assertNotIn("abc123", masked)
+        self.assertNotIn("sk-secret123456", masked)
+        self.assertNotIn("user:pass", masked)
+        self.assertNotIn("tok_99", masked)
+        self.assertNotIn("my-raw-secret", masked)
+
+        self.assertEqual(render_document_text("Doc", "Body"), "Doc\nBody")
+        self.assertEqual(format_query_for_embedding("who?"), "task: question answering | query: who?")
+        self.assertEqual(format_doc_for_embedding("Body", title="Doc"), "title: Doc | text: Body")
+
+    def test_retired_legacy_types_removed(self):
+        expected_all = [
+            "ChunkPointer",
+            "DaemonStatus",
+            "EmbedFn",
+            "ErrorCode",
+            "HydratedPassage",
+            "QAResult",
+            "YawRuntimeError",
+            "canonical_chunk_span_key",
+            "compute_chunk_int_id",
+            "format_doc_for_embedding",
+            "format_query_for_embedding",
+            "inclusive_end_line",
+            "normalize_entity",
+            "redact_secrets",
+            "render_document_text",
+            "resolve_corpus_path",
+        ]
+        self.assertEqual(core_types.__all__, expected_all)
+        for retired in (
+            "json_document_fields",
+            "FatalGraphPublicationError",
+            "TextChunk",
+            "Entity",
+            "Triple",
+            "Quad",
+            "ExtractionRecord",
+            "DropReason",
+            "PassMetrics",
+            "AxiomViolation",
+            "ValidationSummary",
+            "ManifoldDiagnostics",
+            "OntologySummary",
+            "PipelineResult",
+            "DatasetStats",
+            "ChunkMetadata",
+            "RecallHit",
+            "RecallResult",
+            "EvalQuestionResult",
+            "EvalAggregate",
+            "compute_chunk_id",
+            "stable_hash_id",
+        ):
+            self.assertFalse(hasattr(core_types, retired), f"Retired symbol {retired} still present")

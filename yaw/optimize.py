@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import math
 import os
@@ -31,20 +30,16 @@ from yaw.core import (
     write_text_atomic,
 )
 from yaw.datasets import (
-    DATASET_REGISTRY,
-    DATASET_SOURCE_FIELDS,
     DEFAULT_PARITY_DATASETS,
     TIER2_CORPORA,
     DatasetBundle,
     build_benchmark_slice,
     compute_qa_em_f1,
     doc_matches_gold,
-    document_identity,
-    document_text,
     load_dataset_bundle,
-    load_dataset_files,
     resolve_dataset_bundle,
     resolve_dataset_name,
+    resolve_slice_corpus_scope,
     score_retrieval_recalls,
 )
 from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
@@ -263,77 +258,65 @@ def make_react_instruction_proposer(
     return propose
 
 
+def _require_opt_path(path: Path | None, label: str) -> Path:
+    if path is None:
+        raise YawRuntimeError("INVALID_INPUT", f"Configuration {label} must not be empty.")
+    return path
+
+
 @dataclass(frozen=True, slots=True)
 class _DatasetSpecRef:
     canonical: str
-    bundle: DatasetBundle | None
+    bundle: DatasetBundle
 
 
-def _resolve_dataset_refs(ws: Path, names: Sequence[str]) -> list[_DatasetSpecRef]:
-    out: list[_DatasetSpecRef] = []
+def _guard_optimization_slice(canonicals: Sequence[str], offset: int) -> None:
+    if offset < 10 and any(c in TIER2_CORPORA or c in DEFAULT_PARITY_DATASETS for c in canonicals):
+        raise YawRuntimeError(
+            "INVALID_INPUT",
+            "query_offset < 10 overlaps held-out evaluation; pass --query-offset 10 "
+            "or set [optimization].query_offset >= 10 in yaw.toml.",
+        )
+
+
+def _resolve_dataset_refs(ws: Path, names: Sequence[str], *, query_offset: int) -> list[_DatasetSpecRef]:
+    if not names:
+        raise YawRuntimeError("INVALID_INPUT", "At least one dataset must be specified for optimization.")
+    specs: list[tuple[str, DatasetBundle | Path]] = []
     for raw in names:
         path = Path(raw)
         if path.is_dir() or path.is_file():
             bundle = resolve_dataset_bundle(path)
-            out.append(_DatasetSpecRef(bundle.dataset, bundle))
-            continue
-        canonical = resolve_dataset_name(raw)
-        root = ws / "outputs" / "datasets" / canonical
-        bundle = load_dataset_bundle(root) if (root / "manifest.json").is_file() else None
-        out.append(_DatasetSpecRef(canonical, bundle))
+            specs.append((bundle.dataset, bundle))
+        else:
+            canonical = resolve_dataset_name(raw)
+            specs.append((canonical, ws / "outputs" / "datasets" / canonical))
+    _guard_optimization_slice([c for c, _ in specs], query_offset)
+    out: list[_DatasetSpecRef] = []
+    for canonical, src in specs:
+        if isinstance(src, DatasetBundle):
+            out.append(_DatasetSpecRef(canonical, src))
+        elif (src / "manifest.json").is_file():
+            out.append(_DatasetSpecRef(canonical, load_dataset_bundle(src)))
+        else:
+            raise YawRuntimeError(
+                "INVALID_INPUT",
+                f"Prepared dataset bundle not found for {canonical!r}; "
+                f"run scripts/download-datasets.py --dataset {canonical}.",
+            )
     return out
 
 
 def _load_slice(
-    ws: Path, ref: _DatasetSpecRef, *, max_queries: int, query_offset: int, index_queries: int | None = None
-) -> tuple[list[str], list[str], list[list[str]] | None, list[list[str]], Sequence[Mapping[str, Any]], str, str]:
-    if ref.bundle is not None:
-        samples, doc_rows = ref.bundle.read_inputs()
-        corpus = [dict(r, idx=d.document_id) for d, r in zip(ref.bundle.documents, doc_rows, strict=True)]
-        t_key, b_key = ref.bundle.title_key, ref.bundle.body_key
-    else:
-        raw_dir = ws / "data" / "benchmarks"
-        q_file, c_file = DATASET_REGISTRY[ref.canonical]
-        if not ((raw_dir / q_file).is_file() and (raw_dir / c_file).is_file()):
-            raise YawRuntimeError(
-                "INVALID_INPUT", f"Dataset {ref.canonical!r} not found under outputs/datasets or {raw_dir}."
-            )
-        samples, corpus = load_dataset_files(ref.canonical, dataset_dir=raw_dir, project_root=ws)
-        fields = DATASET_SOURCE_FIELDS.get(ref.canonical, {})
-        t_key, b_key = str(fields.get("title_key", "title")), str(fields.get("body_key", "text"))
-
+    ref: _DatasetSpecRef, *, max_queries: int, query_offset: int
+) -> tuple[list[str], list[str], list[list[str]] | None, list[list[str]]]:
+    samples, corpus = ref.bundle.read_inputs()
     doc_ids, questions, gold_docs, gold_answers = build_benchmark_slice(
-        ref.canonical, samples, corpus, max_queries=max_queries, query_offset=query_offset, index_queries=index_queries
+        ref.canonical, samples, corpus, max_queries=max_queries, query_offset=query_offset
     )
     if len(questions) < 2:
         raise YawRuntimeError("INVALID_INPUT", f"Dataset {ref.canonical!r} yielded < 2 questions.")
-    return doc_ids, questions, gold_docs, gold_answers, corpus, t_key, b_key
-
-
-def _guard_optimization_slice(refs: Sequence[_DatasetSpecRef], offset: int) -> None:
-    if offset < 10 and any(ref.canonical in TIER2_CORPORA or ref.canonical in DEFAULT_PARITY_DATASETS for ref in refs):
-        raise YawRuntimeError("INVALID_INPUT", "query_offset < 10 overlaps held-out evaluation.")
-
-
-def _stage_slice_documents(
-    stage_dir: Path, slices: Sequence[tuple[str, Sequence[str], Sequence[Mapping[str, Any]], str, str]]
-) -> None:
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    desired: set[Path] = set()
-    for canonical, doc_ids, corpus, title_key, body_key in slices:
-        by_id = {document_identity(row): row for row in corpus}
-        for did in doc_ids:
-            if (row := by_id.get(did)) is None:
-                continue
-            rendered = document_text(row, title_key, body_key)
-            digest = hashlib.sha256(f"{canonical}\0{did}".encode()).hexdigest()[:16]
-            target = (stage_dir / f"{canonical}_{digest}.txt").resolve()
-            desired.add(target)
-            if not target.exists() or target.read_bytes() != rendered.encode("utf-8"):
-                write_text_atomic(target, rendered, newline="")
-    for stale in stage_dir.iterdir():
-        if stale.is_file() and stale.resolve() not in desired:
-            stale.unlink(missing_ok=True)
+    return doc_ids, questions, gold_docs, gold_answers
 
 
 def _unlink_sqlite_artifacts(db_file: Path) -> None:
@@ -341,34 +324,31 @@ def _unlink_sqlite_artifacts(db_file: Path) -> None:
         Path(f"{db_file}{suffix}").unlink(missing_ok=True)
 
 
-def _index_staged_slices(
+def _index_bundle_slices(
     cfg: YawConfig,
-    stage_dir: Path,
+    corpus_root: Path,
+    slice_patterns: tuple[str, ...],
     db_file: Path,
     embed_fn: Callable[[list[str]], NDArray[np.float32]],
-    slices: Sequence[tuple[str, Sequence[str], Sequence[Mapping[str, Any]], str, str]],
     *,
     fresh: bool,
     extra_wipe: Sequence[Path] = (),
 ) -> None:
+    idx_cfg = replace(cfg, db_path=db_file, corpus_root=corpus_root, included_patterns=slice_patterns)
     if fresh:
         if cfg.state_dir is not None and resolve_coco_state_root(cfg.state_dir).exists():
-            drop_session = start_pipeline(
-                replace(cfg, corpus_root=stage_dir), live=False, embed_fn=embed_fn, vector_dim=1
-            )
+            drop_session = start_pipeline(idx_cfg, live=False, embed_fn=embed_fn, vector_dim=1)
             try:
                 drop_session.app.drop_blocking()
             finally:
                 close_pipeline(drop_session)
         _unlink_sqlite_artifacts(db_file)
-        for p in (stage_dir, *extra_wipe):
+        for p in extra_wipe:
             if p.is_dir():
                 shutil.rmtree(p)
             elif p.exists():
                 p.unlink(missing_ok=True)
 
-    _stage_slice_documents(stage_dir, slices)
-    idx_cfg = replace(cfg, db_path=db_file, corpus_root=stage_dir)
     session = start_pipeline(idx_cfg, embed_fn=embed_fn, live=False)
     try:
         update_pipeline_once(session)
@@ -417,52 +397,50 @@ def optimize_optuna(
     eff_trials = _require_int_param(trials, 64, name="trials", min_value=1)
     eff_max_q = _require_int_param(max_queries, cfg.optimize_max_queries, name="max_queries", min_value=1)
     eff_offset = _require_int_param(query_offset, cfg.optimize_query_offset, name="query_offset", min_value=0)
-    opt_cfg = cfg.for_optimization(".yaw/optuna_index.db")
-    assert opt_cfg.lock_path is not None and opt_cfg.db_path is not None and opt_cfg.state_dir is not None
-    opt_cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = FileLock(str(opt_cfg.lock_path), timeout=0)
+    base_dir = Path(cfg.db_path).parent if cfg.db_path else cfg.workspace_root / ".yaw"
+    opt_cfg = cfg.for_optimization(base_dir / "optuna_index.db")
+    lock_path = _require_opt_path(opt_cfg.lock_path, "optuna lock_path")
+    db_path = _require_opt_path(opt_cfg.db_path, "optuna db_path")
+    status_path = _require_opt_path(opt_cfg.status_path, "optuna status_path")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(lock_path), timeout=0)
     try:
         lock.acquire()
     except Timeout as exc:
-        raise YawRuntimeError("BUSY", f"Optimization lock is already held: {opt_cfg.lock_path}") from exc
+        raise YawRuntimeError("BUSY", f"Optimization lock is already held: {lock_path}") from exc
     try:
         ws = opt_cfg.workspace_root
-        opt_dir = opt_cfg.db_path.parent
+        opt_dir = db_path.parent
         opt_dir.mkdir(parents=True, exist_ok=True)
         study_db = opt_dir / "optuna_study.db"
-        status_path = opt_dir / "optuna_status.json"
         params_path = opt_dir / "optuna_best_params.json"
-        stage_dir = opt_dir / "optuna_corpus"
 
         ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
-        refs = _resolve_dataset_refs(ws, ds_names)
-        _guard_optimization_slice(refs, eff_offset)
-
-        loaded = [_load_slice(ws, r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
-        staged = [
-            (ref.canonical, doc_ids, corpus, title_key, body_key)
-            for ref, (doc_ids, _, _, _, corpus, title_key, body_key) in zip(refs, loaded, strict=True)
-        ]
+        refs = _resolve_dataset_refs(ws, ds_names, query_offset=eff_offset)
+        loaded = [_load_slice(r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
+        corpus_root, slice_patterns = resolve_slice_corpus_scope(
+            [(ref.bundle, doc_ids) for ref, (doc_ids, _, _, _) in zip(refs, loaded, strict=True)]
+        )
         active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
 
         with _optimization_status(status_path, opt_cfg.api_key):
             conn: sqlite3.Connection | None = None
             storage: Any = None
             try:
-                _index_staged_slices(
+                _index_bundle_slices(
                     opt_cfg,
-                    stage_dir,
-                    opt_cfg.db_path,
+                    corpus_root,
+                    slice_patterns,
+                    db_path,
                     active_embed,
-                    staged,
                     fresh=fresh,
                     extra_wipe=(study_db, params_path),
                 )
 
-                conn = open_readonly_db(opt_cfg.db_path)
+                conn = open_readonly_db(db_path)
                 vs = build_vector_search(conn)
                 eval_items: list[tuple[str, NDArray[np.float32], list[str]]] = []
-                for _, questions, gold_docs, _, _, _, _ in loaded:
+                for _, questions, gold_docs, _ in loaded:
                     if not gold_docs:
                         continue
                     formatted_qs = [
@@ -506,7 +484,7 @@ def optimize_optuna(
                             hybrid_alpha=h_alpha,
                             ppr_alpha=p_alpha,
                         )
-                        hydrated = hydrate_ranked_passages(vs, ranked, stage_dir, top_k=5)
+                        hydrated = hydrate_ranked_passages(vs, ranked, corpus_root, top_k=5)
                         texts = [hp.text for hp in hydrated if not hp.stale_on_disk]
                         r_k = score_retrieval_recalls([gd], [texts], k_list=(5,))[0]["Recall@5"]
                         n_k = compute_ndcg_at_k(texts, gd, 5) or 0.0
@@ -604,34 +582,30 @@ def _compile_dspy(
     reflection_lm: Any,
     instruction_proposer: Callable[..., dict[str, str]] | None,
 ) -> dict[str, Any]:
-    assert opt_cfg.db_path is not None and opt_cfg.state_dir is not None
+    db_path = _require_opt_path(opt_cfg.db_path, "dspy db_path")
+    prog_path = _require_opt_path(opt_cfg.compiled_program_path, "compiled_program_path")
+    status_path = _require_opt_path(opt_cfg.status_path, "dspy status_path")
     ws = opt_cfg.workspace_root
-    opt_dir = opt_cfg.db_path.parent
+    opt_dir = db_path.parent
     opt_dir.mkdir(parents=True, exist_ok=True)
-    prog_path = opt_dir / "qa_program.json"
-    status_path = opt_dir / "dspy_status.json"
     audit_path = opt_dir / "dspy_gepa_audit.json"
     telem_dir = opt_dir / "gepa_logs"
-    stage_dir = opt_dir / "dspy_corpus"
 
     ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
-    refs = _resolve_dataset_refs(ws, ds_names)
-    _guard_optimization_slice(refs, query_offset)
-
-    loaded = [_load_slice(ws, r, max_queries=max_queries, query_offset=query_offset) for r in refs]
-    staged = [
-        (ref.canonical, doc_ids, corpus, title_key, body_key)
-        for ref, (doc_ids, _, _, _, corpus, title_key, body_key) in zip(refs, loaded, strict=True)
-    ]
+    refs = _resolve_dataset_refs(ws, ds_names, query_offset=query_offset)
+    loaded = [_load_slice(r, max_queries=max_queries, query_offset=query_offset) for r in refs]
+    corpus_root, slice_patterns = resolve_slice_corpus_scope(
+        [(ref.bundle, doc_ids) for ref, (doc_ids, _, _, _) in zip(refs, loaded, strict=True)]
+    )
     active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
 
     with _optimization_status(status_path, opt_cfg.api_key):
-        _index_staged_slices(
+        _index_bundle_slices(
             opt_cfg,
-            stage_dir,
-            opt_cfg.db_path,
+            corpus_root,
+            slice_patterns,
+            db_path,
             active_embed,
-            staged,
             fresh=fresh,
             extra_wipe=(prog_path, audit_path, telem_dir),
         )
@@ -639,7 +613,7 @@ def _compile_dspy(
 
         trainset: list[dspy.Example] = []
         valset: list[dspy.Example] = []
-        for _, questions, gold_docs, gold_answers, _, _, _ in loaded:
+        for _, questions, gold_docs, gold_answers in loaded:
             examples: list[dspy.Example] = []
             for idx, q in enumerate(questions):
                 ga = gold_answers[idx] if idx < len(gold_answers) else []
@@ -658,8 +632,8 @@ def _compile_dspy(
             valset.extend(examples[split_at:])
 
         s_lm = student_lm or create_lm(opt_cfg, temperature=1.0)
-        r_lm = reflection_lm or create_lm(opt_cfg, temperature=0.7)
-        proposer = instruction_proposer or make_react_instruction_proposer(r_lm)
+        r_lm = reflection_lm or create_lm(opt_cfg, temperature=1.0)
+        proposer = instruction_proposer or make_react_instruction_proposer(r_lm, max_iters=opt_cfg.react_max_iters)
 
         gepa_kwargs: dict[str, Any] = {
             "metric": qa_gepa_metric,
@@ -676,13 +650,13 @@ def _compile_dspy(
             eff_auto = auto if auto is not None else opt_cfg.optimize_auto
             gepa_kwargs["auto"] = eff_auto
 
-        with contextlib.closing(open_readonly_db(opt_cfg.db_path)) as init_conn:
+        with contextlib.closing(open_readonly_db(db_path)) as init_conn:
             vs = build_vector_search(init_conn)
         tools = make_qa_tools(
             vs,
-            stage_dir,
+            corpus_root,
             active_embed,
-            opt_cfg.db_path,
+            db_path,
             task_mode=opt_cfg.embedding_task_mode,
             search_params=resolve_retrieval_params(opt_cfg),
         )

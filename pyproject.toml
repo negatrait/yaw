@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "cocoindex>=1.1.0",
-    "dspy[deno,openai]>=3.5.0",
+    "dspy[openai]>=3.5.0",
     "en-core-web-sm",
     "fastmcp>=4.2.0",
     "filelock>=3.32.7",
@@ -56,6 +56,12 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+exclude = ["docs/**"]
+
+[tool.ty.src]
+exclude = ["docs/reviews/inference-backend-probes/**"]
 
 [tool.pytest.ini_options]
 addopts = ["--testmon"]

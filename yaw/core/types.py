@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
-from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,16 +13,12 @@ type EmbedFn = Callable[[list[str]], Any]
 
 ErrorCode = Literal[
     "BUSY",
+    "CONSISTENCY_ERROR",
     "EMPTY_INDEX",
+    "INDEX_NOT_READY",
+    "INVALID_INPUT",
     "MODEL_ERROR",
     "NOT_READY",
-    "INDEX_NOT_READY",
-    "INDEX_EMPTY",
-    "BACKEND_UNREACHABLE",
-    "BACKEND_TIMEOUT",
-    "CONSISTENCY_ERROR",
-    "INVALID_INPUT",
-    "OPTIMIZATION_NOT_RUN",
     "SHUTTING_DOWN",
 ]
 
@@ -35,13 +30,6 @@ class YawRuntimeError(RuntimeError):
         super().__init__(f"[{code}] {message}")
         self.code: ErrorCode = code
         self.detail: str = message
-
-
-class FatalGraphPublicationError(YawRuntimeError):
-    """Raised when an invariant or storage publication check fails."""
-
-    def __init__(self, message: str, *, code: ErrorCode = "CONSISTENCY_ERROR") -> None:
-        super().__init__(code, message)
 
 
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -68,19 +56,8 @@ def normalize_entity(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
-def stable_hash_id(prefix: str, value: str, hex_chars: int = 16) -> str:
-    """Generate a deterministic prefixed SHA-256 hex identifier."""
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:hex_chars]
-    return f"{prefix}{digest}"
-
-
 def canonical_chunk_span_key(
-    rel_path: str,
-    start_line: int,
-    end_line: int,
-    char_start: int = 0,
-    char_end: int = 0,
-    source_hash: str = "",
+    rel_path: str, start_line: int, end_line: int, char_start: int = 0, char_end: int = 0, source_hash: str = ""
 ) -> str:
     """Build the canonical provenance span key for deterministic chunk identity."""
     norm_path = rel_path.replace("\\", "/")
@@ -90,26 +67,8 @@ def canonical_chunk_span_key(
     return f"{base}:{source_hash}" if source_hash else base
 
 
-def compute_chunk_id(
-    rel_path: str,
-    start_line: int,
-    end_line: int,
-    char_start: int = 0,
-    char_end: int = 0,
-    source_hash: str = "",
-) -> str:
-    """Compute prefixed string chunk identifier from canonical chunk span."""
-    key = canonical_chunk_span_key(rel_path, start_line, end_line, char_start, char_end, source_hash)
-    return stable_hash_id("chk_", key, hex_chars=16)
-
-
 def compute_chunk_int_id(
-    rel_path: str,
-    start_line: int,
-    end_line: int,
-    char_start: int = 0,
-    char_end: int = 0,
-    source_hash: str = "",
+    rel_path: str, start_line: int, end_line: int, char_start: int = 0, char_end: int = 0, source_hash: str = ""
 ) -> int:
     """Compute positive signed 63-bit integer primary key from canonical chunk span."""
     key = canonical_chunk_span_key(rel_path, start_line, end_line, char_start, char_end, source_hash)
@@ -194,6 +153,8 @@ class QAResult:
 
 @dataclass(frozen=True, slots=True)
 class DaemonStatus:
+    """Non-blocking daemon lifecycle, sync state, and chunk count snapshot."""
+
     lifecycle: str = "stopped"
     provider_ready: bool = False
     sync_state: str = "idle"
@@ -208,175 +169,6 @@ class DaemonStatus:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
-class TextChunk:
-    chunk_id: str
-    doc_id: str
-    text: str
-    index: int
-    title: str = ""
-    char_start: int = 0
-    char_end: int = 0
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class Entity:
-    entity_id: str
-    name: str
-    canonical_name: str
-    source_chunk_ids: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class Triple:
-    subject: str
-    predicate: str
-    object: str
-    chunk_id: str
-    confidence: float = 1.0
-
-
-@dataclass(frozen=True, slots=True)
-class Quad:
-    subject: str
-    predicate: str
-    object: str
-    graph: str
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractionRecord:
-    chunk_id: str
-    entities: tuple[str, ...]
-    triples: tuple[Triple, ...]
-    raw_response: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class DropReason:
-    stage: str
-    reason: str
-    count: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class PassMetrics:
-    pass_name: str
-    duration_ms: float
-    items_in: int = 0
-    items_out: int = 0
-    dropped: tuple[DropReason, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class AxiomViolation:
-    focus_node: str
-    constraint: str
-    message: str
-    severity: str = "Violation"
-
-
-@dataclass(frozen=True, slots=True)
-class ValidationSummary:
-    conforms: bool
-    violations: tuple[AxiomViolation, ...] = ()
-    triples_checked: int = 0
-    triples_repaired: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class ManifoldDiagnostics:
-    ambient_dim: int
-    intrinsic_dim: float
-    explained_variance: float
-    sample_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class OntologySummary:
-    class_count: int
-    property_count: int
-    individual_count: int
-    axiom_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class PipelineResult:
-    chunks_indexed: int
-    entities_extracted: int = 0
-    triples_extracted: int = 0
-    passes: tuple[PassMetrics, ...] = ()
-    validation: ValidationSummary | None = None
-    manifold: ManifoldDiagnostics | None = None
-    ontology: OntologySummary | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetStats:
-    name: str
-    question_count: int
-    document_count: int
-    gold_doc_coverage: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class ChunkMetadata:
-    """Disk-backed provenance metadata hydrated from SQLite `chunks` without storing raw body text."""
-
-    chunk_id: int
-    rel_path: str
-    source_hash: str
-    start_line: int
-    end_line: int
-    char_start: int = 0
-    char_end: int = 0
-    ast_island_start: int = 1
-    ast_island_end: int = 1
-    title: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class RecallHit:
-    chunk_id: int
-    score: float
-    text: str
-    rel_path: str
-    start_line: int
-    end_line: int
-    title: str = ""
-    dense_score: float = 0.0
-    sparse_score: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class RecallResult:
-    query: str
-    hits: tuple[RecallHit, ...]
-    latency_ms: float = 0.0
-
-
-@dataclass(frozen=True, slots=True)
-class EvalQuestionResult:
-    question: str
-    predicted_answer: str
-    gold_answers: tuple[str, ...]
-    exact_match: float
-    f1: float
-    recall_at_k: dict[int, float] = field(default_factory=dict)
-    retrieved_doc_ids: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class EvalAggregate:
-    dataset: str
-    count: int
-    exact_match: float
-    f1: float
-    recall_at_k: dict[int, float] = field(default_factory=dict)
-    per_question: Sequence[EvalQuestionResult] = ()
-
-
 _ALREADY_PREFIXED_DOC_RE = re.compile(r"^title: (?:none|[^\r\n]+?) \| text: ")
 _MAX_EMBED_TITLE_CHARS = 256
 _QUERY_PREFIXES: dict[str, str] = {
@@ -388,21 +180,6 @@ _QUERY_PREFIXES: dict[str, str] = {
     "fact": "task: fact checking | query: ",
 }
 _DOCUMENT_PREFIX = "title: none | text: "
-
-
-def json_document_fields(data: object, default_title: str = "") -> tuple[str, str]:
-    """Extract `(title, body)` from a benchmark dataset record during dataset ingestion."""
-    if isinstance(data, dict):
-        title = data.get("title")
-        title_str = title if isinstance(title, str) and title.strip() else default_title
-        for key in ("text", "body", "content", "passage", "paragraph_text", "context"):
-            value = data.get(key)
-            if isinstance(value, str) and value:
-                return title_str, value
-        return title_str, json.dumps(data, ensure_ascii=False, sort_keys=True)
-    if isinstance(data, str):
-        return default_title, data
-    return default_title, json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
 def render_document_text(title: str, body: str) -> str:
@@ -431,7 +208,6 @@ def format_doc_for_embedding(text: str, title: str = "", task_mode: str = "disti
         raise ValueError(f"Unsupported embedding task_mode: {task_mode!r}")
     if text.startswith(_DOCUMENT_PREFIX) or _ALREADY_PREFIXED_DOC_RE.match(text):
         raise ValueError("Pass raw document text, not an already prefixed embedding input.")
-    # Never guess or regex-parse headers out of `text`; chunking supplies a known `title` or `""`.
     if task_mode in ("titled", "distinct-titled") and title:
         clean_title = " ".join(title.split()).replace(" | text: ", " - text: ")
         if clean_title and len(clean_title) <= _MAX_EMBED_TITLE_CHARS:
@@ -440,42 +216,20 @@ def format_doc_for_embedding(text: str, title: str = "", task_mode: str = "disti
 
 
 __all__ = [
-    "AxiomViolation",
-    "ChunkMetadata",
     "ChunkPointer",
     "DaemonStatus",
-    "DatasetStats",
-    "DropReason",
     "EmbedFn",
-    "Entity",
     "ErrorCode",
-    "EvalAggregate",
-    "EvalQuestionResult",
-    "ExtractionRecord",
-    "FatalGraphPublicationError",
     "HydratedPassage",
-    "ManifoldDiagnostics",
-    "OntologySummary",
-    "PassMetrics",
-    "PipelineResult",
     "QAResult",
-    "Quad",
-    "RecallHit",
-    "RecallResult",
-    "TextChunk",
-    "Triple",
-    "ValidationSummary",
     "YawRuntimeError",
     "canonical_chunk_span_key",
-    "compute_chunk_id",
     "compute_chunk_int_id",
     "format_doc_for_embedding",
     "format_query_for_embedding",
     "inclusive_end_line",
-    "json_document_fields",
     "normalize_entity",
     "redact_secrets",
     "render_document_text",
     "resolve_corpus_path",
-    "stable_hash_id",
 ]

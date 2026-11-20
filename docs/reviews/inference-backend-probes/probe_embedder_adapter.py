@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-
 from yaw.daemon.graph.inference.embedding import PASSAGE_INSTRUCTION, DSPyEmbeddingAdapter, resolve_embedding_profile
 
 KEY = os.environ["UNSLOTH_STUDIO_AUTH_TOKEN"]

@@ -76,7 +76,9 @@ def _tool_reply(thought: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _start_openai_stub(chat_responder: Any = None) -> tuple[ThreadingHTTPServer, dict[str, int]]:
+def _start_openai_stub(
+    chat_responder: Any = None, *, embed_inputs: list[str] | None = None
+) -> tuple[ThreadingHTTPServer, dict[str, int]]:
     counts = {"embeddings": 0, "chat": 0}
     lock = threading.Lock()
 
@@ -85,10 +87,12 @@ def _start_openai_stub(chat_responder: Any = None) -> tuple[ThreadingHTTPServer,
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if self.path.endswith("/embeddings"):
-                with lock:
-                    counts["embeddings"] += 1
                 raw_inputs = payload.get("input", [])
                 texts = raw_inputs if isinstance(raw_inputs, list) else [raw_inputs]
+                with lock:
+                    counts["embeddings"] += 1
+                    if embed_inputs is not None:
+                        embed_inputs.extend(str(t) for t in texts)
                 data = [
                     {"object": "embedding", "index": i, "embedding": _topic_embed_vec(str(t)).tolist()}
                     for i, t in enumerate(texts)
@@ -175,7 +179,6 @@ def _write_toml(
                 f"chunk_size = {chunk_size}",
                 f"chunk_overlap = {chunk_overlap}",
                 f"min_chunk_size = {min_chunk_size}",
-                "poll_interval_seconds = 0.2",
                 "",
                 "[inference]",
                 f'base_url = "http://127.0.0.1:{port}/v1"',
@@ -711,21 +714,21 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
     bundle_14 = _prepare_sample_bundle(tmp_path, dataset_name="sample14", total_questions=14)
     seen_chat_blobs: list[str] = []
 
-    def assert_plaintext_staging(stage: str, database: str) -> None:
-        source = json.loads((tmp_path / "_raw_src_sample" / "corpus.json").read_text(encoding="utf-8"))
-        expected = {
-            "sample_"
-            + hashlib.sha256(f"sample\0{row['idx']}".encode()).hexdigest()[:16]
-            + ".txt": f"{row['title']}\n{row['text']}"
-            for row in source
+    def assert_direct_bundle_md_indexing(forbidden_stage: str, database: str) -> None:
+        assert not (tmp_path / ".yaw" / forbidden_stage).exists()
+        md_files = {
+            p.name: p.read_text(encoding="utf-8") for p in (bundle / "documents").iterdir() if p.suffix == ".md"
         }
-        files = list((tmp_path / ".yaw" / stage).iterdir())
-        assert files and all(path.suffix == ".txt" for path in files)
-        for path in files:
-            assert path.read_bytes() == expected[path.name].encode("utf-8")
+        assert md_files
         with open_readonly_db(tmp_path / ".yaw" / database) as conn:
-            titles = conn.execute("SELECT title FROM chunks").fetchall()
-            assert titles and all(row[0] == "" for row in titles)
+            rows = conn.execute("SELECT rel_path, source_hash, title FROM chunks").fetchall()
+            assert rows
+            assert {r[0] for r in rows} == set(md_files)
+            assert all(
+                r[1] == hashlib.sha256("\n".join(md_files[r[0]].splitlines()).encode("utf-8")).hexdigest()
+                and r[2] == ""
+                for r in rows
+            )
 
     def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
         msgs = payload.get("messages", [])
@@ -747,9 +750,25 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         ans = f"Neil Armstrong [chunk_id={cid}]" if "Apollo" in blob else f"XylophoneZither [chunk_id={cid}]"
         return 200, _tool_reply("Submit answer", [{"name": "submit", "args": {"answer": ans}}])
 
-    srv, _ = _start_openai_stub(chat_responder)
+    seen_embed_inputs: list[str] = []
+    srv, _ = _start_openai_stub(chat_responder, embed_inputs=seen_embed_inputs)
     try:
         toml_path = _write_toml(tmp_path, port=srv.server_port)
+        assert (
+            main(
+                [
+                    "optimize",
+                    "optuna",
+                    "--dataset",
+                    "2wikimultihopqa",
+                    "--config",
+                    str(toml_path),
+                ]
+            )
+            == 1
+        )
+        assert "query_offset" in capsys.readouterr().err
+
         assert (
             main(
                 [
@@ -793,10 +812,10 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         dspy_res = json.loads(capsys.readouterr().out)
         program = Path(dspy_res["program_path"])
         assert program.is_file()
-        assert_plaintext_staging("dspy_corpus", "optimize_yaw.db")
+        assert_direct_bundle_md_indexing("dspy_corpus", "optimize_yaw.db")
         assert json.loads(program.with_name("dspy_gepa_audit.json").read_text(encoding="utf-8")) == dspy_res
 
-        # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml
+        # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml for both dspy and optuna
         seen_chat_blobs.clear()
         offset_ws = tmp_path / "offset_ws"
         offset_ws.mkdir()
@@ -830,6 +849,32 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         assert "OffsetCheck question 10" in joined_chats
         assert "OffsetCheck question 6" not in joined_chats
 
+        seen_embed_inputs.clear()
+        assert (
+            main(
+                [
+                    "optimize",
+                    "optuna",
+                    "--config",
+                    str(offset_toml),
+                    "--dataset",
+                    str(bundle_14),
+                    "--max-queries",
+                    "4",
+                    "--trials",
+                    "1",
+                    "--fresh",
+                    "--json",
+                ]
+            )
+            == 0
+        )
+        optuna_offset_res = json.loads(capsys.readouterr().out)
+        assert optuna_offset_res["total_trials"] == 1
+        joined_embeds = "\n".join(seen_embed_inputs)
+        assert "OffsetCheck question 10" in joined_embeds
+        assert "OffsetCheck question 6" not in joined_embeds
+
         assert (
             main(
                 [
@@ -853,7 +898,9 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         )
         optuna_res = json.loads(capsys.readouterr().out)
         assert optuna_res["total_trials"] == 2
-        assert_plaintext_staging("optuna_corpus", "optuna_index.db")
+        assert_direct_bundle_md_indexing("optuna_corpus", "optuna_index.db")
+        assert not (offset_ws / ".yaw" / "dspy_corpus").exists()
+        assert not (offset_ws / ".yaw" / "optuna_corpus").exists()
         assert (tmp_path / ".yaw" / "optuna_study.db").is_file()
         assert set(optuna_res["best_params"]) == {"hybrid_alpha", "ppr_alpha", "seed_top_k"}
     finally:

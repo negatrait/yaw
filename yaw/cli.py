@@ -393,9 +393,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_optuna = sub_opt.add_parser("optuna", parents=[common], help="Tune retrieval hyperparameters with Optuna")
     p_optuna.add_argument("--dataset", nargs="+", default=None, dest="datasets")
-    p_optuna.add_argument("--query-offset", type=int, default=10)
-    p_optuna.add_argument("--max-queries", type=int, default=20)
-    p_optuna.add_argument("--trials", type=int, default=64)
+    p_optuna.add_argument("--query-offset", type=int, default=None)
+    p_optuna.add_argument("--max-queries", type=int, default=None)
+    p_optuna.add_argument("--trials", type=int, default=None, help="Number of Optuna trials (default: 64)")
     p_optuna.add_argument("--fresh", action="store_true", default=False)
 
     p_cfg = sub.add_parser("config", parents=[common], help="Inspect or update yaw.toml settings")

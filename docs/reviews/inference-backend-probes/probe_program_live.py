@@ -3,9 +3,10 @@ import os
 import time
 from pathlib import Path
 
-from yaw.core.config import load_config
 from yaw.daemon.graph.inference.program import YawProgram
 from yaw.daemon.ingestion.corpus import chunk_source_text
+
+from yaw.core.config import load_config
 
 assert os.environ.get("UNSLOTH_STUDIO_AUTH_TOKEN"), "export UNSLOTH_STUDIO_AUTH_TOKEN first"
 cfg = load_config("yaw.toml")

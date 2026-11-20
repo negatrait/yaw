@@ -12,7 +12,7 @@ from typing import TypedDict
 
 import pytest
 
-from yaw.daemon.ingestion import download_dataset_file, prepare_dataset_bundle, select_enterprise_questions
+from yaw.datasets import prepare_dataset_bundle
 
 
 class DownloadState(TypedDict):
@@ -60,28 +60,26 @@ def download_server():
         thread.join(timeout=5)
 
 
-def test_download_fallback_streams_complete_bytes_and_force_replaces_atomically(
-    tmp_path, monkeypatch, downloader, download_server
-):
+def test_download_fallback_streams_complete_bytes_and_force_replaces_atomically(tmp_path, downloader, download_server):
     state, url = download_server
-    target = download_dataset_file(
+    target = downloader.download_dataset_file(
         "sample.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
     )
     assert target.read_bytes() == state["payload"]
     assert state["requests"] == ["/primary/sample.json", "/fallback/sample.json"]
     assert not target.with_suffix(".json.tmp").exists()
-    download_dataset_file("sample.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback")
+    downloader.download_dataset_file(
+        "sample.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
+    )
     assert len(state["requests"]) == 2
     state["payload"] = b"replacement"
-    download_dataset_file(
+    downloader.download_dataset_file(
         "sample.json", tmp_path, force=True, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
     )
     assert target.read_bytes() == b"replacement"
 
 
-def test_failed_download_preserves_previous_target_and_removes_temporary_file(
-    tmp_path, monkeypatch, downloader, download_server
-):
+def test_failed_download_preserves_previous_target_and_removes_temporary_file(tmp_path, downloader, download_server):
     state, url = download_server
     state["fail_all"] = True
     target = tmp_path / "sample.json"
@@ -89,12 +87,26 @@ def test_failed_download_preserves_previous_target_and_removes_temporary_file(
     temporary = tmp_path / "sample.json.tmp"
     temporary.write_bytes(b"incomplete")
     with pytest.raises(RuntimeError, match="Could not download.*any source"):
-        download_dataset_file(
+        downloader.download_dataset_file(
             "sample.json", tmp_path, force=True, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
         )
     assert target.read_bytes() == b"original"
     assert not temporary.exists()
     assert len(state["requests"]) == 2
+
+
+def test_download_rejects_path_traversal_and_honors_disabled_github_fallback(tmp_path, downloader, download_server):
+    state, url = download_server
+    for bad_name in ("", ".", "..", "../secret.json", "sub/file.json", "sub\\file.json"):
+        with pytest.raises(ValueError, match="single file name"):
+            downloader.download_dataset_file(bad_name, tmp_path)
+
+    # nq_rear.json sets allow_upstream_github_fallback = false in baselines.json
+    with pytest.raises(RuntimeError, match="Could not download.*any source"):
+        downloader.download_dataset_file(
+            "nq_rear.json", tmp_path, hf_base_url=url + "/primary", upstream_base_url=url + "/fallback"
+        )
+    assert state["requests"] == ["/primary/nq_rear.json"]
 
 
 @pytest.mark.parametrize(
@@ -138,11 +150,9 @@ def test_downloader_cli_reports_real_bundle_integrity_without_external_network(t
         assert "[FAIL] sample" in result.stdout
     elif mode not in ("invalid-source", "alias-cached"):
         assert "[OK]" in result.stdout
-
-
-def test_undersized_enterprise_selection_is_rejected_by_loader_without_touching_sources(tmp_path):
-    source = tmp_path / "questions.json"
-    source.write_text("[]", encoding="utf-8")
-    with pytest.raises(ValueError, match="Enterprise category"):
-        select_enterprise_questions(json.loads(source.read_text(encoding="utf-8")))
-    assert source.read_text(encoding="utf-8") == "[]"
+    if mode in ("all-cached", "single-cached"):
+        manifest = json.loads((prepared / "nq" / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["version"] == 2
+        doc_rel = manifest["documents"][0]["path"]
+        assert doc_rel.endswith(".md")
+        assert (prepared / "nq" / doc_rel).read_text(encoding="utf-8") == "# Original\n\nContent\n"

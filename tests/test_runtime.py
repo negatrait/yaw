@@ -9,6 +9,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -408,6 +409,13 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         opt_prog_path = cfg.workspace_root / ".yaw" / "qa_program.json"
         opt_agent.save(str(opt_prog_path), save_program=False)
         assert resolve_program_path(cfg) == opt_prog_path
+
+        alt_dir = cfg.workspace_root / "custom_rt"
+        alt_dir.mkdir()
+        alt_prog = alt_dir / "qa_program.json"
+        opt_agent.save(str(alt_prog), save_program=False)
+        alt_cfg = replace(cfg, compiled_program_path=None, db_path=alt_dir / "yaw.db")
+        assert resolve_program_path(alt_cfg) == alt_prog
 
         qa_res_opt = ask(rt, "What instrument?")
         assert qa_res_opt.answer == "XylophoneZither"

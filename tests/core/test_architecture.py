@@ -138,19 +138,6 @@ def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
     if importer_pkg == "yaw.core" or importer_pkg.startswith("yaw.core."):
         return False
 
-    # Rule: Top-level __main__.py can import daemon.cli
-    if importer_pkg == "yaw" and (imported_mod == "yaw.daemon.cli" or imported_mod.startswith("yaw.daemon.cli.")):
-        return True
-
-    # Rule: daemon.runtime is the daemon orchestrator and can import direct children (ingestion, graph)
-    if importer_pkg == "yaw.daemon" and imported_mod.startswith("yaw.daemon."):
-        # runtime.py or cli.py or mcp_server.py
-        return True
-
-    # Rule: graph.engine is the graph orchestrator and can import direct children (storage, inference, ppr)
-    if importer_pkg == "yaw.daemon.graph" and imported_mod.startswith("yaw.daemon.graph."):
-        return True
-
     # General Rule: package P imports only P.* (itself or its descendants)
     return bool(imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}."))
 
@@ -266,91 +253,94 @@ class ArchitectureTests(unittest.TestCase):
             )
 
     def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
-        """Rule 1b: Leaf packages export their public API contract for caller convenience and leaf mutation."""
+        """Rule 1b: yaw.core exports its slim public contract and yaw/ preserves the exact 14-file boundary."""
+        import yaw.core as core
         from yaw.core import (
             ChunkPointer,
             DaemonStatus,
-            IndexStats,
+            HydratedPassage,
+            QAResult,
             YawConfig,
             YawRuntimeError,
+            compute_chunk_int_id,
+            configure_logging,
+            format_doc_for_embedding,
+            format_query_for_embedding,
+            get_config_value,
+            get_logger,
+            inclusive_end_line,
             load_config,
+            normalize_entity,
+            parse_dataset_list,
+            redact_secrets,
+            render_document_text,
+            resolve_coco_state_root,
+            resolve_corpus_path,
+            set_config_value,
+            write_text_atomic,
+            write_via_temp_atomic,
         )
 
-        self.assertTrue(issubclass(ChunkPointer, object))
-        self.assertTrue(issubclass(YawConfig, object))
-        self.assertTrue(issubclass(IndexStats, object))
-        self.assertTrue(issubclass(DaemonStatus, object))
+        for cls in (ChunkPointer, DaemonStatus, HydratedPassage, QAResult, YawConfig):
+            self.assertTrue(isinstance(cls, type))
         self.assertTrue(issubclass(YawRuntimeError, RuntimeError))
-        self.assertTrue(callable(load_config))
+        for fn in (
+            compute_chunk_int_id,
+            configure_logging,
+            format_doc_for_embedding,
+            format_query_for_embedding,
+            get_config_value,
+            get_logger,
+            inclusive_end_line,
+            load_config,
+            normalize_entity,
+            parse_dataset_list,
+            redact_secrets,
+            render_document_text,
+            resolve_coco_state_root,
+            resolve_corpus_path,
+            set_config_value,
+            write_text_atomic,
+            write_via_temp_atomic,
+        ):
+            self.assertTrue(callable(fn))
 
-        import yaw.daemon.graph.inference as inference
+        for retired in (
+            "json_document_fields",
+            "IndexStats",
+            "FatalGraphPublicationError",
+            "RetrievalParams",
+            "write_manifold_section",
+            "write_retrieval_section",
+            "compute_chunk_id",
+        ):
+            self.assertFalse(hasattr(core, retired), f"Retired symbol {retired} leaked through yaw.core")
 
-        self.assertTrue(hasattr(inference, "create_dspy_lm"))
-        self.assertTrue(hasattr(inference, "YawProgram"))
-        self.assertTrue(hasattr(inference, "DSPyEmbeddingAdapter"))
-        self.assertTrue(hasattr(inference, "compute_task_quality_score"))
-        self.assertTrue(hasattr(inference, "check_benchmark_integrity"))
-        self.assertTrue(hasattr(inference, "GepaProgress"))
-        self.assertTrue(hasattr(inference, "GraphOptimizationHooks"))
-        self.assertTrue(hasattr(inference, "ActiveTraceComponentSelector"))
-        self.assertTrue(hasattr(inference, "configure_simba_task_learning"))
-        self.assertTrue(hasattr(inference, "evolve_program_prompts"))
-        self.assertTrue(hasattr(inference, "evaluate_program"))
-        self.assertFalse(hasattr(inference, "RetrievalEmbedding"))
-        self.assertFalse(hasattr(inference, "LocalChat"))
-        self.assertFalse(hasattr(inference, "CacheOpenAI"))
-        self.assertFalse(hasattr(inference, "chat_identity"))
-
-        # Graph orchestration and deterministic transforms remain in their owning domain.
-        graph_files = {f.name for f in (YAW_DIR / "daemon" / "graph").glob("*.py")}
-        self.assertEqual(
-            graph_files,
-            {"__init__.py", "engine.py", "hmm.py", "normalization.py", "planner.py", "ppr.py"},
-        )
-
-        # Verify storage public facade
-        import yaw.daemon.graph.storage as storage
-
-        self.assertTrue(hasattr(storage, "open_yaw_db"))
-        self.assertTrue(hasattr(storage, "search_chunks_fts"))
-        self.assertTrue(hasattr(storage, "search_chunk_vectors_knn"))
-        self.assertTrue(hasattr(storage, "hydrate_chunk_pointer"))
-        self.assertTrue(hasattr(storage, "make_chunk_hydrator"))
-        self.assertTrue(hasattr(storage, "get_graph_counts"))
-        self.assertTrue(hasattr(storage, "get_meta"))
-        self.assertTrue(hasattr(storage, "set_meta"))
-
+        self.assertTrue(all(not name.startswith("_") for name in core.__all__))
         with self.assertRaises(AttributeError):
-            _ = storage._CREATE_SCHEMA_SQL
+            _ = core._parse_config_scalar
 
-        # Verify ingestion public facade
-        import yaw.daemon.ingestion as ingestion
+        self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must remain absent")
+        self.assertFalse((YAW_DIR / "core" / "constants.py").exists(), "Retired yaw/core/constants.py must be deleted")
 
-        self.assertTrue(hasattr(ingestion, "declare_source_file"))
-        self.assertTrue(hasattr(ingestion, "chunk_source_text"))
-        self.assertTrue(hasattr(ingestion, "SourceMetadata"))
-        self.assertTrue(hasattr(ingestion, "chunk_source_text"))
-        self.assertFalse(hasattr(ingestion, "chunk_markdown_text"))
-        self.assertFalse(hasattr(ingestion, "chunk_json_text"))
-        self.assertFalse(hasattr(ingestion, "CorpusIngestor"))
-        self.assertFalse(hasattr(ingestion, "sync_corpus_once"))
-
-        with self.assertRaises(AttributeError):
-            _ = ingestion._CHUNK_HANDLER
-        with self.assertRaises(AttributeError):
-            _ = ingestion._ChunkSpec
-
-        # Verify facade is strictly constricted: internal helpers cannot leak through
-        with self.assertRaises(AttributeError):
-            _ = inference._nullable_text
-        with self.assertRaises(AttributeError):
-            _ = inference._build_default_ner_demos
-        with self.assertRaises(AttributeError):
-            _ = inference._extract_json_list_field
-        with self.assertRaises(AttributeError):
-            _ = inference._PositionalSafeRLM
-        with self.assertRaises(AttributeError):
-            _ = inference._LLMConfig
+        actual_files = {p.relative_to(YAW_DIR).as_posix() for p in YAW_DIR.rglob("*.py")}
+        expected_files = {
+            "__init__.py",
+            "__main__.py",
+            "cli.py",
+            "core/__init__.py",
+            "core/config.py",
+            "core/logger.py",
+            "core/types.py",
+            "datasets.py",
+            "mcp_server.py",
+            "optimize.py",
+            "pipeline.py",
+            "qa.py",
+            "retrieval.py",
+            "runtime.py",
+        }
+        self.assertEqual(actual_files, expected_files)
 
     def test_domain_containment_and_zero_cross_domain_imports(self):
         """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
@@ -378,11 +368,11 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_core_imports_stdlib_only(self):
-        """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero daemon)."""
+        """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero runtime)."""
         core_files = list((YAW_DIR / "core").glob("*.py"))
         self.assertEqual(
             {f.name for f in core_files},
-            {"__init__.py", "config.py", "constants.py", "logger.py", "types.py"},
+            {"__init__.py", "config.py", "logger.py", "types.py"},
         )
 
         # Python supplies the authoritative set, including platform-specific modules.
@@ -408,20 +398,12 @@ class ArchitectureTests(unittest.TestCase):
 
     def test_synthetic_boundary_violation_detection(self):
         """Verify the test architecture checker properly rejects synthetic cross-domain and parent imports."""
-        # storage importing inference (horizontal sibling edge) -> must be rejected
-        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.storage", "yaw.daemon.graph.inference.models"))
-        # inference importing storage (horizontal sibling edge) -> must be rejected
-        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.storage.db"))
-        # ingestion importing graph (horizontal sibling edge) -> must be rejected
-        self.assertFalse(is_allowed_internal_import("yaw.daemon.ingestion", "yaw.daemon.graph.engine"))
-        # inference importing daemon runtime (child importing parent) -> must be rejected
-        self.assertFalse(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.runtime"))
-        # core importing daemon (core importing non-core) -> must be rejected
-        self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.daemon.graph.inference"))
-        # inference importing core -> allowed
-        self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.core.types"))
-        # inference importing internal sibling -> allowed
-        self.assertTrue(is_allowed_internal_import("yaw.daemon.graph.inference", "yaw.daemon.graph.inference.models"))
+        self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.runtime"))
+        self.assertTrue(is_allowed_internal_import("yaw.core", "yaw.core.types"))
+        self.assertFalse(is_allowed_internal_import("yaw.pkg_a", "yaw.pkg_b"))
+        self.assertFalse(is_allowed_internal_import("yaw.pkg_a.sub", "yaw.pkg_a"))
+        self.assertTrue(is_allowed_internal_import("yaw.pkg_a", "yaw.pkg_a.sub"))
+        self.assertTrue(is_allowed_internal_import("yaw.pkg_a", "yaw.core.types"))
 
     def test_zero_hipporag_imports_in_yaw(self):
         """Rule 4: Zero hipporag imports across the entire repository (yaw/, benchmark.py, scripts/, tests/)."""
@@ -500,11 +482,10 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_zero_cross_module_private_attributes(self):
-        """Rule 5b: Zero cross-object private/protected attribute access across storage, ingestion, and graph.
+        """Rule 5b: Zero cross-object private/protected attribute access across all 14 files in yaw/.
 
-        Forbids accessing _-prefixed attributes on objects other than self, cls, or super(),
-        with the sole documented exemption of managed._conn in db.py for low-level PRAGMA configuration.
-        Also forbids any access to ._provider across all of yaw/ outside managed_sqlite.py.
+        Forbids accessing _-prefixed attributes on objects other than self, cls, or super()
+        (allowing stdlib os._exit), and forbids any access to ._provider across yaw/.
         """
 
         def is_self_cls_super(val_node: ast.AST) -> bool:
@@ -514,20 +495,11 @@ class ArchitectureTests(unittest.TestCase):
                 isinstance(val_node, ast.Call) and isinstance(val_node.func, ast.Name) and val_node.func.id == "super"
             )
 
-        target_files = (
-            sorted((YAW_DIR / "daemon" / "graph" / "storage").glob("*.py"))
-            + [YAW_DIR / "daemon" / "indexing.py"]
-            + sorted((YAW_DIR / "daemon" / "ingestion").glob("*.py"))
-            + [
-                YAW_DIR / "daemon" / "graph" / "hmm.py",
-                YAW_DIR / "daemon" / "graph" / "planner.py",
-                YAW_DIR / "daemon" / "graph" / "normalization.py",
-                YAW_DIR / "daemon" / "graph" / "ppr.py",
-            ]
-        )
-        self.assertGreater(len(target_files), 0, "No target files found for private attribute scan")
+        target_files = sorted(YAW_DIR.rglob("*.py"))
+        self.assertEqual(len(target_files), 14, f"Expected exact 14 Python files in yaw/, got {len(target_files)}")
 
         violations: list[str] = []
+        provider_violations: list[str] = []
         for py_file in target_files:
             source = py_file.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(py_file))
@@ -538,11 +510,16 @@ class ArchitectureTests(unittest.TestCase):
                     and not node.attr.startswith("__")
                     and not is_self_cls_super(node.value)
                 ):
-                    if py_file.name == "db.py" and node.attr == "_conn":
+                    if isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr == "_exit":
                         continue
                     violations.append(
                         f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
                         f"cross-object access of private attribute '{node.attr}'"
+                    )
+                if isinstance(node, ast.Attribute) and node.attr == "_provider":
+                    provider_violations.append(
+                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                        f"access of ._provider attribute is forbidden"
                     )
 
         self.assertEqual(
@@ -550,26 +527,10 @@ class ArchitectureTests(unittest.TestCase):
             [],
             "Cross-object private attribute accesses detected:\n" + "\n".join(violations),
         )
-
-        all_yaw_files = sorted(YAW_DIR.rglob("*.py"))
-        provider_violations: list[str] = []
-        for py_file in all_yaw_files:
-            if py_file.name == "managed_sqlite.py":
-                continue
-            source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(py_file))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) and node.attr == "_provider":
-                    provider_violations.append(
-                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
-                        f"cross-module access of TableTarget._provider is forbidden"
-                    )
-
         self.assertEqual(
             provider_violations,
             [],
-            "Forbidden ._provider attribute accesses detected outside managed_sqlite.py:\n"
-            + "\n".join(provider_violations),
+            "Forbidden ._provider attribute accesses detected in yaw/:\n" + "\n".join(provider_violations),
         )
 
     def test_zero_circular_dependencies_across_all_yaw_modules(self):
@@ -789,135 +750,125 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_canonical_module_purity_and_behavioral_contracts(self):
-        """Rule 12: Canonical Category A modules preserve strict AST import purity and behavioral boundaries."""
-        stdlib = sys.stdlib_module_names
+        """Rule 12: Clean-slate 14-file architecture obeys LOC cap, zero wrappers/legacy terms, and L0-L5 DAG."""
+        stdlib = set(sys.stdlib_module_names)
+        py_files = sorted(YAW_DIR.rglob("*.py"))
+        self.assertEqual(len(py_files), 14, f"Expected exact 14 Python files in yaw/, got {len(py_files)}")
+        self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must not exist")
 
-        # 1. ppr.py & hmm.py: pure numpy/scipy/yaw.core sparse math operators
-        #    (zero sqlite3, dspy, cocoindex, or daemon imports; hmm.py permits spacy per Decision 16)
-        allowed_by_module = {
-            "ppr.py": stdlib | {"numpy", "scipy", "yaw"},
-            "hmm.py": stdlib | {"numpy", "scipy", "spacy", "yaw"},
+        total_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in py_files)
+        self.assertLessEqual(total_loc, 5500, f"yaw/ total LOC {total_loc} exceeds 5,500 ceiling")
+        core_files = sorted((YAW_DIR / "core").glob("*.py"))
+        core_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in core_files)
+        self.assertLessEqual(core_loc, 960, f"yaw/core/* LOC {core_loc} exceeds 960 ceiling")
+        watchdog_loc = len((PROJECT_ROOT / "scripts" / "watchdog.py").read_text(encoding="utf-8").splitlines())
+        self.assertLessEqual(watchdog_loc, 350, f"scripts/watchdog.py LOC {watchdog_loc} exceeds 350 ceiling")
+
+        legacy_terms_re = re.compile(
+            r"manifold|hmm|hipporag|DatabaseSink|ReflectionLM|YawQA|"
+            r"DSPyEmbeddingAdapter|RLMInstructionProposer|YawProgram|YawGBNFAdapter",
+            re.IGNORECASE,
+        )
+        forbidden_bases = {"Module", "BaseLM", "Adapter", "dspy.Module", "dspy.BaseLM", "dspy.Adapter"}
+
+        for py_file in py_files:
+            rel = py_file.relative_to(PROJECT_ROOT)
+            text = py_file.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if m := legacy_terms_re.search(line):
+                    self.fail(f"{rel}:{lineno} contains forbidden legacy symbol/term {m.group(0)!r}")
+            tree = ast.parse(text, filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for base in node.bases:
+                        base_txt = ast.unparse(base)
+                        self.assertFalse(
+                            base_txt in forbidden_bases or base_txt.endswith((".Module", ".BaseLM", ".Adapter")),
+                            f"{rel}:{node.lineno}: class {node.name} must not subclass {base_txt}",
+                        )
+
+        http_mods = {"httpx", "openai", "urllib", "http", "socket", "requests"}
+        layer_rules: dict[str, tuple[set[str], set[str]]] = {
+            # filename: (allowed_top_level_packages, allowed_yaw_internal_modules)
+            "datasets.py": (stdlib | {"filelock", "numpy", "yaw"}, {"yaw.core"}),
+            "retrieval.py": (
+                stdlib | {"numpy", "scipy", "spacy", "sqlite3", "sqlite_vec", "yaw"},
+                {"yaw.core"},
+            ),
+            "pipeline.py": (
+                stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "sqlite_vec", "yaw"},
+                {"yaw.core", "yaw.retrieval"},
+            ),
+            "qa.py": (stdlib | {"dspy", "numpy", "sqlite3", "yaw"}, {"yaw.core", "yaw.retrieval"}),
+            "runtime.py": (
+                stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
+                {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval"},
+            ),
+            "mcp_server.py": (
+                stdlib | {"fastmcp", "pydantic", "starlette", "uvicorn", "yaw"},
+                {"yaw.core", "yaw.runtime"},
+            ),
+            "optimize.py": (
+                stdlib | {"dspy", "filelock", "numpy", "optuna", "sqlite3", "yaw"},
+                {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval"},
+            ),
+            "cli.py": (
+                stdlib | {"filelock", "yaw"},
+                {"yaw.core", "yaw.runtime", "yaw.mcp_server", "yaw.optimize"},
+            ),
+            "__main__.py": (stdlib | {"yaw"}, {"yaw.cli"}),
         }
-        for math_name in ("ppr.py", "hmm.py"):
-            math_path = YAW_DIR / "daemon" / "graph" / math_name
-            for lineno, mod in parse_module_imports(math_path):
+        forbidden_explicit: dict[str, set[str]] = {
+            "datasets.py": {"dspy", "cocoindex", "sqlite3"} | http_mods,
+            "retrieval.py": {"dspy", "cocoindex"} | http_mods,
+            "qa.py": {"cocoindex", "spacy", "sqlite_vec"} | http_mods,
+            "runtime.py": {"cocoindex", "fastmcp", "starlette", "uvicorn", "optuna"},
+            "cli.py": {"dspy", "sqlite3", "cocoindex", "optuna", "fastmcp", "starlette", "uvicorn", "numpy"},
+        }
+
+        for mod_name, (allowed_top, allowed_yaw) in layer_rules.items():
+            mod_path = YAW_DIR / mod_name
+            for lineno, mod in parse_module_imports(mod_path):
                 top = mod.split(".")[0]
-                self.assertIn(
+                self.assertIn(top, allowed_top, f"{mod_name}:{lineno} imports forbidden package '{mod}'")
+                self.assertNotIn(
                     top,
-                    allowed_by_module[math_name],
-                    f"{math_name}:{lineno} imports forbidden package '{mod}'",
+                    forbidden_explicit.get(mod_name, set()),
+                    f"{mod_name}:{lineno} explicitly forbidden import '{mod}'",
                 )
-                self.assertNotEqual(top, "sqlite3", f"{math_name}:{lineno} must not import sqlite3")
-                if math_name == "hmm.py":
-                    self.assertFalse(
-                        mod == "scipy.sparse._sparsetools" or mod.startswith("scipy.sparse._sparsetools."),
-                        f"hmm.py:{lineno} must not import private module '{mod}'",
-                    )
-                    self.assertFalse(
-                        any(part.startswith("_") for part in mod.split(".")),
-                        f"hmm.py:{lineno} must not import private submodule '{mod}'",
-                    )
                 if top == "yaw":
                     self.assertTrue(
-                        mod == "yaw.core" or mod.startswith("yaw.core."),
-                        f"{math_name}:{lineno} must only import yaw.core, got '{mod}'",
+                        any(mod == a or mod.startswith(f"{a}.") for a in allowed_yaw),
+                        f"{mod_name}:{lineno} violates DAG by importing '{mod}' (allowed: {sorted(allowed_yaw)})",
                     )
 
-        hmm_path = YAW_DIR / "daemon" / "graph" / "hmm.py"
-        hmm_tree = ast.parse(hmm_path.read_text(encoding="utf-8"), filename=str(hmm_path))
-        for node in ast.walk(hmm_tree):
-            if isinstance(node, ast.ImportFrom):
-                for alias in node.names:
+        # Verify lazy top-level exclusions in cli.py and optimize.py
+        cli_tree = ast.parse((YAW_DIR / "cli.py").read_text(encoding="utf-8"))
+        for stmt in cli_tree.body:
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
                     self.assertFalse(
-                        alias.name.startswith("_"),
-                        f"hmm.py:{node.lineno} must not import private symbol '{alias.name}'",
+                        alias.name.startswith(("yaw.optimize", "yaw.datasets", "optuna")),
+                        f"cli.py:{stmt.lineno} must lazy-import {alias.name}",
                     )
-
-        # 2. normalization.py: stateless OpenIE normalization (zero sqlite3, dspy, cocoindex, network, or storage)
-        norm_path = YAW_DIR / "daemon" / "graph" / "normalization.py"
-        forbidden_norm = {"sqlite3", "dspy", "cocoindex", "httpx", "openai", "urllib", "http", "socket"}
-        for lineno, mod in parse_module_imports(norm_path):
-            top = mod.split(".")[0]
-            self.assertNotIn(top, forbidden_norm, f"normalization.py:{lineno} imports forbidden module '{mod}'")
-            self.assertFalse(
-                mod.startswith("yaw.daemon.graph.storage"),
-                f"normalization.py:{lineno} must not import storage '{mod}'",
-            )
-
-        # 3. Storage leaf modules: zero network/HTTP imports anywhere in storage/*.py,
-        #    and zero dspy imports in canonical graph storage modules
-        storage_dir = YAW_DIR / "daemon" / "graph" / "storage"
-        forbidden_storage_net = {"openai", "httpx", "urllib", "http", "socket"}
-        for storage_file in sorted(storage_dir.glob("*.py")):
-            rel = storage_file.relative_to(PROJECT_ROOT)
-            for lineno, mod in parse_module_imports(storage_file):
-                top = mod.split(".")[0]
-                self.assertNotIn(top, forbidden_storage_net, f"{rel}:{lineno} imports forbidden module '{mod}'")
-
-        canonical_storage_files = (
-            "db.py",
-            "vectors.py",
-            "graph_ops.py",
-            "managed_sqlite.py",
-            "rows.py",
-            "evidence.py",
-            "hydration.py",
-            "shacl.py",
-        )
-        for storage_name in canonical_storage_files:
-            storage_file = storage_dir / storage_name
-            for lineno, mod in parse_module_imports(storage_file):
-                top = mod.split(".")[0]
-                self.assertNotEqual(top, "dspy", f"{storage_name}:{lineno} must not import dspy ('{mod}')")
-
-        # 3b. vectors.py: pure sqlite3 + numpy + .db vector/FTS primitives
-        vectors_path = storage_dir / "vectors.py"
-        for lineno, mod in parse_module_imports(vectors_path):
-            top = mod.split(".")[0]
-            self.assertIn(
-                top,
-                stdlib | {"numpy", "yaw"},
-                f"vectors.py:{lineno} imports unexpected package '{mod}'",
-            )
-            if top == "yaw":
-                self.assertEqual(mod, "yaw.daemon.graph.storage.db", f"vectors.py:{lineno} unexpected import '{mod}'")
-
-        # 3c. shacl.py: pure in-process SQLite SHACL & Turtle serializer (stdlib + yaw.core + storage siblings only)
-        shacl_path = storage_dir / "shacl.py"
-        for lineno, mod in parse_module_imports(shacl_path):
-            top = mod.split(".")[0]
-            self.assertIn(top, stdlib | {"yaw"}, f"shacl.py:{lineno} imports unexpected package '{mod}'")
-
-        # 3d. The target sink must use the managed transaction, never commit independently.
-        pub_path = storage_dir / "managed_sqlite.py"
-        pub_tree = ast.parse(pub_path.read_text(encoding="utf-8"), filename=str(pub_path))
-        for node in ast.walk(pub_tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                self.assertNotEqual(
-                    node.func.attr,
-                    "commit",
-                    f"managed_sqlite.py:{node.lineno} must not call .commit() directly",
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module:
+                self.assertFalse(
+                    stmt.module.startswith(("yaw.optimize", "yaw.datasets", "optuna")),
+                    f"cli.py:{stmt.lineno} must lazy-import {stmt.module}",
                 )
 
-        # 4. adapter.py & retriever.py: thin DSPy bridges (zero sqlite3, cocoindex, or raw HTTP imports;
-        #    YawGBNFAdapter never overrides JSONAdapter.parse or JSONAdapter.format)
-        inference_dir = YAW_DIR / "daemon" / "graph" / "inference"
-        forbidden_bridge = {"sqlite3", "cocoindex", "httpx", "openai", "urllib", "http", "socket"}
-        for bridge_name in ("adapter.py", "retriever.py"):
-            bridge_path = inference_dir / bridge_name
-            for lineno, mod in parse_module_imports(bridge_path):
-                top = mod.split(".")[0]
-                self.assertNotIn(top, forbidden_bridge, f"{bridge_name}:{lineno} imports forbidden module '{mod}'")
+        opt_tree = ast.parse((YAW_DIR / "optimize.py").read_text(encoding="utf-8"))
+        for stmt in opt_tree.body:
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    self.assertFalse(
+                        alias.name == "optuna" or alias.name.startswith("optuna."),
+                        f"optimize.py:{stmt.lineno} must lazy-import optuna",
+                    )
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module:
+                self.assertFalse(
+                    stmt.module == "optuna" or stmt.module.startswith("optuna."),
+                    f"optimize.py:{stmt.lineno} must lazy-import optuna",
+                )
 
-        adapter_path = inference_dir / "adapter.py"
-        adapter_tree = ast.parse(adapter_path.read_text(encoding="utf-8"), filename=str(adapter_path))
-        adapter_classes = [n for n in adapter_tree.body if isinstance(n, ast.ClassDef) and n.name == "YawGBNFAdapter"]
-        self.assertEqual(len(adapter_classes), 1, "YawGBNFAdapter class not found in adapter.py")
-        adapter_methods = {
-            n.name for n in adapter_classes[0].body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        self.assertEqual(
-            adapter_methods,
-            {"__init__", "resolve_grammar", "_prepare_gbnf_kwargs", "__call__", "acall"},
-            f"YawGBNFAdapter must not override parse/format or add recovery methods: {sorted(adapter_methods)}",
-        )
+        self.assertLessEqual(len((YAW_DIR / "__main__.py").read_text(encoding="utf-8").splitlines()), 10)

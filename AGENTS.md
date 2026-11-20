@@ -37,7 +37,7 @@ git diff --check
 ```
 
 - `uv run yaw daemon {start|stop|status|run}`: Streamable HTTP FastMCP + live ingestion daemon.
-- `uv run yaw recall "<query>" --top-k 5 [--json]`: standalone read-only Tier-0 MDL DAG recall.
+- `uv run yaw recall "<query>" --top-k 5 [--json]`: standalone read-only Tier-0 zero-LLM recall.
 - `uv run yaw qa "<question>" [--json]`: Tier-1 `dspy.ReAct` benchmark QA.
 - `uv run yaw optimize dspy [--fresh]`: launch or resume `dspy.GEPA` QA prompt compilation.
 - `uv run yaw config {show|get|set}`: inspect or update `yaw.toml` atomically (secrets redacted).

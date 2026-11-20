@@ -199,7 +199,12 @@ def test_mcp_server_containment_bind_validation_and_tool_inventory(tmp_path: Pat
             serve_http(bad_cfg)
         assert exc_h.value.code == "INVALID_INPUT"
 
-    bad_path_cfg = _make_cfg(tmp_path / "badp", http_path="mcp")
+    with pytest.raises(YawRuntimeError) as exc_cfg_p:
+        _make_cfg(tmp_path / "badp", http_path="mcp")
+    assert exc_cfg_p.value.code == "INVALID_INPUT"
+
+    bad_path_cfg = _make_cfg(tmp_path / "badp")
+    object.__setattr__(bad_path_cfg, "http_path", "mcp")
     with pytest.raises(YawRuntimeError) as exc_p:
         serve_http(bad_path_cfg)
     assert exc_p.value.code == "INVALID_INPUT"

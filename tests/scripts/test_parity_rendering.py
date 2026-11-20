@@ -100,7 +100,7 @@ def test_parity_cli_parses_explicit_budget_and_rejects_unknown_mode():
 
 
 def test_statistical_parity_gate_computes_confidence_and_enforces_strict_zero_tolerance():
-    from yaw.daemon.graph.inference import evaluate_benchmark_gate
+    from scripts.evaluation import evaluate_benchmark_gate
 
     payload = gate_payload(exact_match=0.8)
     ds_entry = payload["datasets"]["musique"]
@@ -205,3 +205,75 @@ def test_statistical_parity_gate_computes_confidence_and_enforces_strict_zero_to
     assert mixed_summary["yaw_mean"]["ExactMatch"] == pytest.approx(0.8)
     assert mixed_summary["delta_mean"]["ExactMatch"] == pytest.approx(0.1)
     assert mixed_summary["overall_gate_passed"] is True
+
+
+def test_run_parity_gate_handles_qa_only_dataset_and_cache_reuse(tmp_path, monkeypatch) -> None:
+    import scripts.verify_paper_parity_gate as parity_mod
+    from yaw.core import YawConfig
+
+    monkeypatch.delenv("YAW_ARTIFACT_DIR", raising=False)
+    monkeypatch.setattr(parity_mod, "load_config", lambda _path: YawConfig(workspace_root=tmp_path))
+    monkeypatch.setattr(parity_mod, "wipe_benchmark_indexes", lambda _ds=None: None)
+
+    calls = 0
+
+    def _fake_benchmark_main(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "engine": "yaw",
+            "status": "completed",
+            "qa_model": "gemma-4-e4b",
+            "num_docs": 10,
+            "num_queries": 2,
+            "indexing_seconds": 1.0,
+            "evaluation_seconds": 2.0,
+            "elapsed_seconds": 3.0,
+            "retrieval": {},
+            "qa": {"ExactMatch": 0.55, "F1": 0.6},
+            "standard_dpr": {},
+            "recognition_memory": {},
+        }
+
+    monkeypatch.setattr(parity_mod.benchmark, "main", _fake_benchmark_main)
+    out_json = tmp_path / "gate.json"
+    out_md = tmp_path / "gate.md"
+
+    first = parity_mod.run_parity_gate(
+        datasets=["lveval"],
+        queries_per_dataset=2,
+        index_queries=3,
+        mode="eval",
+        output_json=out_json,
+        output_md=out_md,
+        config_path=tmp_path / "yaw.toml",
+    )
+    assert calls == 1
+    assert first["datasets"]["lveval"]["gate_passed"] is True
+    assert first["datasets"]["lveval"]["delta_yaw_vs_hipporag"]["Recall@5"] is None
+    assert first["summary"]["yaw_mean"]["Recall@5"] is None
+    assert first["summary"]["delta_mean"]["Recall@5"] is None
+    assert first["summary"]["overall_gate_passed"] is True
+
+    quality_svg = generate_quality_svg(first)
+    latency_svg = generate_latency_svg(first)
+    assert "ΔR@5=n/a" in quality_svg
+    assert "YAW n/a" in quality_svg
+    assert "gemma-4-e4b" in quality_svg
+    assert "Native YAW (Qwen3-4B" not in quality_svg
+    assert "-95.00%" not in quality_svg
+    assert "dspy.ReAct" in latency_svg
+    assert "GBNF" not in latency_svg
+
+    second = parity_mod.run_parity_gate(
+        datasets=["lveval"],
+        queries_per_dataset=2,
+        index_queries=3,
+        mode="eval",
+        output_json=out_json,
+        output_md=out_md,
+        fresh=False,
+        config_path=tmp_path / "yaw.toml",
+    )
+    assert calls == 1
+    assert second["datasets"]["lveval"] == first["datasets"]["lveval"]

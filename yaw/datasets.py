@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import string
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,52 @@ def _dataset_spec(name: str | Path | None) -> dict[str, Any]:
     return {}
 
 
+_WIN_RESERVED_NAMES: frozenset[str] = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+)
+_SAFE_DOC_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def allow_upstream_github_fallback(name: str | Path | None) -> bool:
+    """Return whether raw dataset downloads may fall back to upstream GitHub URLs."""
+    return bool(_dataset_spec(name).get("allow_upstream_github_fallback", True))
+
+
+def document_filename(doc_id: str) -> str:
+    """Return a safe `.md` filename inside `documents/` for `doc_id`."""
+    if (
+        _SAFE_DOC_ID_RE.match(doc_id)
+        and doc_id not in (".", "..")
+        and len(doc_id) <= 128
+        and doc_id.split(".", 1)[0].upper() not in _WIN_RESERVED_NAMES
+    ):
+        return f"{doc_id}.md"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", doc_id).strip("._") or "doc"
+    digest = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:12]
+    return f"{sanitized[:80]}_{digest}.md"
+
+
+def render_document_markdown(title: str, body: str) -> str:
+    """Render `(title, body)` as UTF-8 Markdown with an H1 heading when distinct."""
+    clean_title = title.replace("\r\n", "\n").replace("\r", "\n").strip()
+    norm_body = body.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in norm_body and norm_body.count("\\n") >= 2:
+        norm_body = norm_body.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if clean_title and norm_body != clean_title and not norm_body.startswith((f"{clean_title}\n", "# ")):
+        rendered = f"# {clean_title}\n\n{norm_body}"
+    else:
+        rendered = norm_body
+    return f"{rendered}\n" if rendered and not rendered.endswith("\n") else rendered
+
+
+def _strip_markdown_h1(md_text: str, title: str) -> str:
+    """Strip at most one trailing newline and synthetic `# {title}` H1 prefix."""
+    text = md_text[:-1] if md_text.endswith("\n") else md_text
+    if (clean_title := title.strip()) and text.startswith(prefix := f"# {clean_title}\n\n"):
+        return text[len(prefix) :]
+    return text
+
+
 @dataclass(frozen=True, slots=True)
 class DatasetDocument:
     """One immutable dataset corpus document entry recorded in manifest.json."""
@@ -64,6 +111,7 @@ class DatasetDocument:
     document_id: str
     path: str
     content_hash: str
+    title: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,26 +137,35 @@ class DatasetBundle:
     def manifest_path(self) -> Path:
         return self.root / "manifest.json"
 
+    def _doc_row(self, doc: DatasetDocument) -> dict[str, Any]:
+        md = (self.root / doc.path).read_text(encoding="utf-8")
+        row = {self.title_key: doc.title, self.body_key: _strip_markdown_h1(md, doc.title), "idx": doc.document_id}
+        if self.id_key and self.id_key != "idx":
+            row[self.id_key] = doc.document_id
+        return row
+
     def read_documents(self) -> list[dict[str, Any]]:
-        """Validate manifest and return all prepared corpus JSON objects."""
+        """Validate manifest and return all prepared corpus document dicts."""
         with FileLock(str(self.root / "bundle.lock")):
             validate_dataset_bundle(self)
-            return [json.loads((self.root / doc.path).read_text(encoding="utf-8")) for doc in self.documents]
+            return [self._doc_row(doc) for doc in self.documents]
 
     def read_inputs(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Validate manifest and return `(evaluation_questions, corpus_documents)`."""
         with FileLock(str(self.root / "bundle.lock")):
             validate_dataset_bundle(self)
             questions = json.loads(self.evaluation_path.read_bytes())
-            documents = [json.loads((self.root / doc.path).read_bytes()) for doc in self.documents]
+            documents = [self._doc_row(doc) for doc in self.documents]
             return questions, documents
 
     def corpus_by_id(self) -> dict[str, str]:
-        """Return `{document_id: rendered_document_text}` across the bundle."""
-        return {
-            doc.document_id: document_text(row, self.title_key, self.body_key)
-            for doc, row in zip(self.documents, self.read_documents(), strict=True)
-        }
+        """Return `{document_id: markdown_text}` across the bundle."""
+        with FileLock(str(self.root / "bundle.lock")):
+            validate_dataset_bundle(self)
+            return {
+                doc.document_id: (self.root / doc.path).read_text(encoding="utf-8").rstrip("\n")
+                for doc in self.documents
+            }
 
 
 def document_text(row: Mapping[str, Any], title_key: str = "title", body_key: str = "text") -> str:
@@ -119,12 +176,20 @@ def document_text(row: Mapping[str, Any], title_key: str = "title", body_key: st
     return render_document_text(title, body)
 
 
-def document_identity(row: Mapping[str, Any], *, id_key: str | None = "idx") -> str:
-    """Return deterministic document identity from `id_key` or SHA-256 of `(title, text)`."""
+def document_identity(
+    row: Mapping[str, Any],
+    *,
+    id_key: str | None = "idx",
+    title_key: str = "title",
+    body_key: str = "text",
+) -> str:
+    """Return deterministic document identity from `id_key` or SHA-256[:16] of Markdown."""
     if id_key and row.get(id_key) is not None:
         return str(row[id_key])
-    rendered = json.dumps({"title": row["title"], "text": row["text"]}, ensure_ascii=False, indent=2) + "\n"
-    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    if row.get("idx") is not None:
+        return str(row["idx"])
+    md = render_document_markdown(str(row.get(title_key, "")), str(row.get(body_key, "")))
+    return hashlib.sha256(md.encode("utf-8")).hexdigest()[:16]
 
 
 def prepare_dataset_bundle(
@@ -137,7 +202,7 @@ def prepare_dataset_bundle(
     title_key: str = "title",
     body_key: str = "text",
 ) -> DatasetBundle:
-    """Write an atomic content-verified dataset bundle under `output_root / dataset`."""
+    """Write an atomic content-verified v2 Markdown dataset bundle under `output_root / dataset`."""
     if not dataset or Path(dataset).name != dataset or dataset in (".", ".."):
         raise ValueError("Dataset identity must be a single directory name")
     corpus_bytes, question_bytes = corpus_path.read_bytes(), questions_path.read_bytes()
@@ -150,23 +215,26 @@ def prepare_dataset_bundle(
         raise ValueError("Corpus and evaluation inputs must be JSON arrays of objects")
 
     prepared: dict[str, tuple[DatasetDocument, str]] = {}
+    seen_lower_paths: dict[str, str] = {}
     for index, row in enumerate(corpus):
         if not isinstance(row, dict):
             raise ValueError(f"Corpus record {index} must be an object")
         if missing := ({title_key, body_key} - row.keys()):
             raise ValueError(f"{corpus_path}: record {index} missing document fields {sorted(missing)}")
-        fields = {key: row[key] for key in (title_key, body_key)}
-        if id_key and id_key in row:
-            fields[id_key] = row[id_key]
-        document_text(fields, title_key, body_key)
-        rendered = json.dumps(fields, ensure_ascii=False, indent=2) + "\n"
+        title_val, body_val = row[title_key], row[body_key]
+        if not isinstance(title_val, str) or not isinstance(body_val, str):
+            raise ValueError(f"Document fields {title_key!r}/{body_key!r} must be strings")
+        rendered = render_document_markdown(title_val, body_val)
         digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         raw_id = row.get(id_key) if id_key else None
-        doc_id = str(raw_id) if raw_id is not None else digest
+        doc_id = str(raw_id) if raw_id is not None else digest[:16]
         if not doc_id:
             raise ValueError(f"Empty document ID in corpus record {index}")
-        filename = hashlib.sha256(f"{dataset}\0{doc_id}".encode()).hexdigest() + ".json"
-        doc = DatasetDocument(doc_id, f"documents/{filename}", digest)
+        rel_path = f"documents/{document_filename(doc_id)}"
+        if (owner := seen_lower_paths.get(rel_path.lower())) is not None and owner != doc_id:
+            raise ValueError(f"Case-insensitive filename collision between {owner!r} and {doc_id!r}: {rel_path}")
+        seen_lower_paths[rel_path.lower()] = doc_id
+        doc = DatasetDocument(doc_id, rel_path, digest, title_val)
         previous = prepared.get(doc_id)
         if previous is not None and previous[0].content_hash != digest:
             raise ValueError(f"Conflicting duplicate document ID {doc_id!r}")
@@ -177,15 +245,13 @@ def prepare_dataset_bundle(
     (root / "documents").mkdir(exist_ok=True)
     bundle = DatasetBundle(dataset, root, tuple(doc for doc, _ in prepared.values()), title_key, body_key, id_key)
     manifest = {
-        "version": 1,
+        "version": 2,
         "dataset": dataset,
         "title_key": title_key,
         "body_key": body_key,
         "id_key": id_key,
         "source_corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
-        "documents": [
-            {"document_id": d.document_id, "path": d.path, "content_hash": d.content_hash} for d in bundle.documents
-        ],
+        "documents": [asdict(d) for d in bundle.documents],
         "evaluation_sha256": hashlib.sha256(question_bytes).hexdigest(),
     }
     with FileLock(str(root / "bundle.lock")):
@@ -197,7 +263,7 @@ def prepare_dataset_bundle(
                 str(doc["path"]) for doc in json.loads(bundle.manifest_path.read_text("utf-8"))["documents"]
             }
         desired_paths = {doc.path for doc in bundle.documents}
-        actual_paths = {p.relative_to(root).as_posix() for p in bundle.documents_root.glob("*.json")}
+        actual_paths = {p.relative_to(root).as_posix() for p in bundle.documents_root.iterdir() if p.is_file()}
         if actual_paths - previous_paths - desired_paths:
             raise ValueError("Unmanaged files in prepared documents directory; choose a fresh destination")
         for doc, rendered in prepared.values():
@@ -206,9 +272,9 @@ def prepare_dataset_bundle(
                 write_text_atomic(target, rendered, newline="")
         if not bundle.evaluation_path.exists() or bundle.evaluation_path.read_bytes() != question_bytes:
             write_text_atomic(bundle.evaluation_path, question_bytes.decode("utf-8"), newline="")
-        live_paths = {root / doc.path for doc in bundle.documents}
-        for stale in bundle.documents_root.glob("*.json"):
-            if stale not in live_paths:
+        live_paths = {(root / doc.path).resolve() for doc in bundle.documents}
+        for stale in bundle.documents_root.iterdir():
+            if stale.is_file() and stale.resolve() not in live_paths:
                 stale.unlink()
         rendered_manifest = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         write_text_atomic(bundle.manifest_path, rendered_manifest, newline="")
@@ -224,7 +290,7 @@ def load_dataset_bundle(root: Path | str) -> DatasetBundle:
         raise FileNotFoundError(f"Dataset manifest missing: {manifest_file}")
     with FileLock(str(resolved / "bundle.lock")):
         data = json.loads(manifest_file.read_text(encoding="utf-8"))
-        if data.get("version") != 1:
+        if data.get("version") != 2:
             raise ValueError("Unsupported dataset manifest version; prepare a fresh bundle")
         bundle = DatasetBundle(
             data["dataset"],
@@ -243,16 +309,11 @@ def validate_dataset_bundle(bundle: DatasetBundle) -> None:
     if not bundle.manifest_path.is_file():
         raise ValueError(f"Dataset manifest missing: {bundle.manifest_path}")
     manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") != 1:
+    if manifest.get("version") != 2:
         raise ValueError("Unsupported dataset manifest version")
-    current = (
-        manifest["dataset"],
-        manifest["title_key"],
-        manifest["body_key"],
-        manifest["id_key"],
-        tuple(DatasetDocument(**doc) for doc in manifest["documents"]),
-    )
-    if current != (bundle.dataset, bundle.title_key, bundle.body_key, bundle.id_key, bundle.documents):
+    current = (manifest["dataset"], manifest["title_key"], manifest["body_key"], manifest["id_key"])
+    docs = tuple(DatasetDocument(**doc) for doc in manifest["documents"])
+    if current != (bundle.dataset, bundle.title_key, bundle.body_key, bundle.id_key) or docs != bundle.documents:
         raise ValueError("Dataset bundle changed; resolve the current manifest before reading")
     if hashlib.sha256(bundle.evaluation_path.read_bytes()).hexdigest() != manifest["evaluation_sha256"]:
         raise ValueError(f"Incomplete or corrupt evaluation export: {bundle.evaluation_path}")
@@ -260,14 +321,14 @@ def validate_dataset_bundle(bundle: DatasetBundle) -> None:
     docs_root = bundle.documents_root.resolve()
     for doc in bundle.documents:
         path = (bundle.root / doc.path).resolve()
-        if path.parent != docs_root or path.suffix != ".json":
+        if path.parent != docs_root or path.suffix != ".md":
             raise ValueError(f"Invalid document path: {doc.path}")
         if doc.document_id in seen_ids:
             raise ValueError(f"Duplicate document ID: {doc.document_id}")
         seen_ids.add(doc.document_id)
         if hashlib.sha256(path.read_bytes()).hexdigest() != doc.content_hash:
             raise ValueError(f"Corrupt or incomplete document export: {path}")
-    actual = {p.resolve() for p in bundle.documents_root.glob("*.json")}
+    actual = {p.resolve() for p in bundle.documents_root.iterdir() if p.is_file()}
     if actual != {(bundle.root / doc.path).resolve() for doc in bundle.documents}:
         raise ValueError("Dataset document inventory does not match manifest")
 
@@ -308,18 +369,18 @@ def load_dataset_files(
     if max_queries is not None and max_queries < 1:
         raise ValueError("max_queries must be positive")
     canonical = resolve_dataset_name(dataset_name)
+    bundle: DatasetBundle | None = None
     if dataset_dir is not None and (dataset_dir / canonical / "manifest.json").is_file():
         bundle = load_dataset_bundle(dataset_dir / canonical)
-        samples, doc_rows = bundle.read_inputs()
-        corpus_rows = [dict(r, idx=d.document_id) for d, r in zip(bundle.documents, doc_rows, strict=True)]
-    elif dataset_dir is not None:
+    elif dataset_dir is None:
+        bundle = resolve_dataset_bundle(canonical, workspace_root=project_root)
+    if bundle is not None:
+        samples, corpus_rows = bundle.read_inputs()
+    else:
+        assert dataset_dir is not None
         q_file, c_file = DATASET_REGISTRY[canonical]
         samples = json.loads((dataset_dir / q_file).read_text(encoding="utf-8"))
         corpus_rows = json.loads((dataset_dir / c_file).read_text(encoding="utf-8")) if include_corpus else []
-    else:
-        bundle = resolve_dataset_bundle(canonical, workspace_root=project_root)
-        samples, doc_rows = bundle.read_inputs()
-        corpus_rows = [dict(r, idx=d.document_id) for d, r in zip(bundle.documents, doc_rows, strict=True)]
     if max_queries is not None:
         samples = samples[:max_queries]
     return samples, (corpus_rows if include_corpus else [])
@@ -505,16 +566,48 @@ def build_benchmark_slice(
         for glist in gold_docs:
             docs.extend(glist)
     selected_text = set(docs)
-    document_ids = [document_identity(row) for row in corpus if _rendered_row_text(row) in selected_text]
+    sf = spec.get("source_fields", {})
+    id_k = sf.get("id_key", "idx")
+    t_k, b_k = str(sf.get("title_key", "title")), str(sf.get("body_key", "text"))
+    document_ids = [
+        document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
+        for row in corpus
+        if _rendered_row_text(row) in selected_text
+    ]
     seen_ids = set(document_ids)
     for row in corpus:
         if len(document_ids) >= minimum_docs:
             break
-        did = document_identity(row)
+        did = document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
         if did not in seen_ids:
             document_ids.append(did)
             seen_ids.add(did)
     return document_ids, queries, gold_docs, gold_answers
+
+
+def resolve_slice_corpus_scope(
+    bundle_slices: Sequence[tuple[DatasetBundle, Sequence[str]]],
+) -> tuple[Path, tuple[str, ...]]:
+    """Return `(corpus_root, included_patterns)` indexing prepared `.md` files directly."""
+    if not bundle_slices:
+        raise ValueError("At least one bundle slice is required.")
+    selected: list[tuple[DatasetBundle, list[DatasetDocument]]] = []
+    for bundle, doc_ids in bundle_slices:
+        by_id = {doc.document_id: doc for doc in bundle.documents}
+        selected.append((bundle, [by_id[str(did)] for did in dict.fromkeys(doc_ids) if str(did) in by_id]))
+    if len(selected) == 1:
+        bundle, matched = selected[0]
+        if not matched:
+            raise ValueError(f"Dataset slice {bundle.dataset!r} matched zero bundle documents.")
+        patterns = ("*.md",) if len(matched) == len(bundle.documents) else tuple(Path(d.path).name for d in matched)
+        return bundle.documents_root.resolve(), patterns
+    common_root = Path(os.path.commonpath([str(b.documents_root.resolve()) for b, _ in selected])).resolve()
+    patterns = tuple(
+        dict.fromkeys((b.root / d.path).resolve().relative_to(common_root).as_posix() for b, m in selected for d in m)
+    )
+    if not patterns:
+        raise ValueError("Selected bundle slices matched zero documents.")
+    return common_root, patterns
 
 
 def normalize_answer(text: str) -> str:
@@ -563,7 +656,7 @@ def doc_matches_gold(retrieved_doc: str, gold_doc: str) -> bool:
         or (clean_gold.startswith("chunk-") and clean_gold == "chunk-" + hashlib.md5(clean_ret.encode()).hexdigest())
     ):
         return True
-    for pfx in ("Wikipedia Title: ", "Title: "):
+    for pfx in ("Wikipedia Title: ", "Title: ", "# "):
         if clean_ret.startswith(pfx):
             clean_ret = clean_ret[len(pfx) :].strip()
         if clean_gold.startswith(pfx):

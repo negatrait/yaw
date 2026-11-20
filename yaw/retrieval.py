@@ -50,7 +50,8 @@ class SearchParams(TypedDict, total=False):
 
 def resolve_retrieval_params(cfg: YawConfig) -> SearchParams:
     """Load and strictly validate Optuna-tuned retrieval parameters from `optuna_best_params.json`."""
-    opt_db = cfg.for_optimization(".yaw/optuna_index.db").db_path
+    base_dir = Path(cfg.db_path).parent if cfg.db_path else cfg.workspace_root / ".yaw"
+    opt_db = cfg.for_optimization(base_dir / "optuna_index.db").db_path
     if opt_db is None:
         return {}
     params_path = opt_db.parent / "optuna_best_params.json"

@@ -51,8 +51,15 @@ def _hash_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
     return rows
 
 
-def _make_cfg(root: Path, *, chunk_size: int = 300, chunk_overlap: int = 40, min_chunk_size: int = 20) -> YawConfig:
-    return YawConfig(
+def _make_cfg(
+    root: Path,
+    *,
+    chunk_size: int = 300,
+    chunk_overlap: int = 40,
+    min_chunk_size: int = 20,
+    embed_batch_size: int | None = None,
+) -> YawConfig:
+    cfg = YawConfig(
         workspace_root=root,
         corpus_root=root / "corpus",
         db_path=root / ".yaw" / "yaw.db",
@@ -64,6 +71,7 @@ def _make_cfg(root: Path, *, chunk_size: int = 300, chunk_overlap: int = 40, min
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
     )
+    return cfg if embed_batch_size is None else replace(cfg, embed_batch_size=embed_batch_size)
 
 
 def _open_ro(db_path: Path) -> sqlite3.Connection:
@@ -136,8 +144,8 @@ def test_declarative_two_table_schema_edit_and_delete(tmp_path: Path) -> None:
 def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
     root_a = tmp_path / "batch_64_64"
     root_b = tmp_path / "batch_128"
-    cfg_a = _make_cfg(root_a, chunk_size=500, chunk_overlap=0, min_chunk_size=10)
-    cfg_b = _make_cfg(root_b, chunk_size=500, chunk_overlap=0, min_chunk_size=10)
+    cfg_a = _make_cfg(root_a, chunk_size=500, chunk_overlap=0, min_chunk_size=10, embed_batch_size=64)
+    cfg_b = _make_cfg(root_b, chunk_size=500, chunk_overlap=0, min_chunk_size=10, embed_batch_size=64)
     assert cfg_a.corpus_root is not None and cfg_b.corpus_root is not None
     assert cfg_a.db_path is not None and cfg_b.db_path is not None
     cfg_a.corpus_root.mkdir(parents=True)
@@ -173,7 +181,7 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
     finally:
         close_pipeline(sess_b)
 
-    assert max(batch_sizes_seen) <= 64
+    assert max(batch_sizes_seen) <= cfg_a.embed_batch_size
 
     with _open_ro(cfg_a.db_path) as conn_a, _open_ro(cfg_b.db_path) as conn_b:
         sel = (
@@ -524,7 +532,7 @@ def test_live_pipeline_inside_asyncio_run_uses_dedicated_loop(tmp_path: Path) ->
 
 
 def test_memo_hit_and_cross_file_batching(tmp_path: Path) -> None:
-    cfg = _make_cfg(tmp_path, chunk_size=500, chunk_overlap=0, min_chunk_size=10)
+    cfg = _make_cfg(tmp_path, chunk_size=500, chunk_overlap=0, min_chunk_size=10, embed_batch_size=16)
     assert cfg.corpus_root is not None and cfg.db_path is not None
     sub_dir = cfg.corpus_root / "sub" / "nested"
     sub_dir.mkdir(parents=True)
@@ -545,8 +553,9 @@ def test_memo_hit_and_cross_file_batching(tmp_path: Path) -> None:
     try:
         update_pipeline_once(sess)
         assert sum(batch_sizes) == 10
+        assert max(batch_sizes) > 1
         assert len(batch_sizes) <= 3
-        assert max(batch_sizes) <= 64
+        assert max(batch_sizes) <= cfg.embed_batch_size
 
         with _open_ro(cfg.db_path) as conn:
             sel = "SELECT chunk_id, embedding, rel_path FROM chunks ORDER BY chunk_id"

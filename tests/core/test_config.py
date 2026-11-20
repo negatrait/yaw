@@ -1,41 +1,144 @@
-"""Unit tests for YawConfig contract, TOML loading, optimization sandbox derivation, and get/set."""
+"""Unit tests for slim YawConfig contract, active local defaults, yaw.toml bijection, and strict loading."""
+
+from __future__ import annotations
 
 import os
+import re
+import tomllib
+from dataclasses import fields, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
+import yaw.core.config as config_mod
 from yaw.core import (
+    DEFAULT_EXCLUDED_PATTERNS,
+    DEFAULT_INCLUDED_PATTERNS,
     YawConfig,
     YawRuntimeError,
     get_config_value,
     load_config,
     parse_dataset_list,
+    resolve_coco_state_root,
     set_config_value,
-    write_manifold_section,
+    write_text_atomic,
     write_via_temp_atomic,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_OPTIONAL_COMMENT_KV_RE = re.compile(r"^#\s*([a-z][a-z0-9_]*)\s*=")
+_SECTION_HEADER_RE = re.compile(r"^\[([a-z][a-z0-9_]*)\]\s*$")
 
 
 def test_yaw_config_defaults() -> None:
     cfg = YawConfig()
-    assert cfg.optimize_auto == "light"
-    assert not hasattr(cfg, "optimize_max_metric_calls")
-    assert cfg.optimize_mode == "hybrid"
-    assert cfg.optimize_max_bootstrapped_demos == 1
-    assert cfg.optimize_max_labeled_demos == 1
-    assert cfg.retrieval_top_k == 10
+    assert len(fields(YawConfig)) == 31
+    assert cfg.corpus_root is not None and cfg.corpus_root.name == "corpus"
     assert cfg.state_dir is not None and cfg.state_dir.name == "coco_lmdb"
+    assert cfg.included_patterns == DEFAULT_INCLUDED_PATTERNS
+    assert cfg.excluded_patterns == DEFAULT_EXCLUDED_PATTERNS
+    assert cfg.chunk_size == 1000
+    assert cfg.chunk_overlap == 150
+    assert cfg.min_chunk_size == 100
+    assert cfg.embed_batch_size == 5
+    assert cfg.base_url == "http://127.0.0.1:8888/v1"
+    assert cfg.provider == "openai"
+    assert cfg.embedding_model == "embeddinggemma-2"
+    assert cfg.embedding_task_mode == "distinct-titled"
+    assert cfg.embed_max_in_flight == 2
+    assert cfg.qa_model == "gemma-4-e4b"
+    assert cfg.max_output_tokens is None
+    assert cfg.react_max_iters == 6
+    assert cfg.queue_maxsize == 32
+    assert cfg.http_host == "127.0.0.1"
+    assert cfg.http_port == 13306
+    assert cfg.http_path == "/mcp"
+    assert cfg.optimize_datasets == ("enterprise_rag_bench",)
+    assert cfg.optimize_max_queries == 162
+    assert cfg.optimize_query_offset == 0
+    assert cfg.optimize_auto == "light"
 
-    zero_demos = YawConfig(optimize_max_bootstrapped_demos=0, optimize_max_labeled_demos=0)
-    assert zero_demos.optimize_max_bootstrapped_demos == 0
-    assert zero_demos.optimize_max_labeled_demos == 0
+    for retired in (
+        "poll_interval_seconds",
+        "json_keys_whitelist",
+        "json_keys_blacklist",
+        "extraction_model",
+        "context_window_tokens",
+        "rlm_max_iters",
+        "rlm_max_llm_calls",
+        "rlm_max_output_chars",
+        "reflection_input_chars",
+        "enable_gbnf",
+        "gbnf_max_entities",
+        "gbnf_max_triples",
+        "gbnf_max_facts",
+        "gbnf_max_reasoning_chars",
+        "linking_top_k",
+        "retrieval_top_k",
+        "damping",
+        "retriever_mode",
+        "candidate_dense_threshold",
+        "candidate_lexical_threshold",
+        "auto_merge_threshold",
+        "candidate_volume_ratio",
+        "semantic_adjudication_batch_size",
+        "max_context_chars",
+        "max_ast_expansion_hops",
+        "ast_context_hops",
+        "optimize_mode",
+        "optimize_train_queries",
+        "optimize_sleep_seconds",
+        "optimize_max_bootstrapped_demos",
+        "optimize_max_labeled_demos",
+        "retrieval",
+        "manifold_overrides",
+    ):
+        assert not hasattr(cfg, retired), f"Retired attribute {retired} still on YawConfig"
+
+    for retired_sym in (
+        "RetrievalParams",
+        "write_manifold_section",
+        "write_retrieval_section",
+        "scale_context_budget",
+        "context_char_limit",
+        "DEFAULT_CONTEXT_WINDOW_TOKENS",
+    ):
+        assert not hasattr(config_mod, retired_sym), f"Retired symbol {retired_sym} still in yaw.core.config"
 
 
-def test_yaw_config_validation() -> None:
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"optimize_auto": "invalid"},
+        {"embedding_task_mode": "invalid"},
+        {"chunk_size": 0},
+        {"chunk_overlap": -1},
+        {"chunk_size": 100, "chunk_overlap": 100},
+        {"chunk_size": 100, "chunk_overlap": 150},
+        {"min_chunk_size": 0},
+        {"embed_batch_size": 0},
+        {"embed_max_in_flight": 0},
+        {"react_max_iters": 0},
+        {"queue_maxsize": 0},
+        {"max_output_tokens": 0},
+        {"max_output_tokens": -5},
+        {"max_output_tokens": True},
+        {"max_output_tokens": 1.5},
+        {"http_port": 0},
+        {"http_port": 65536},
+        {"http_path": "mcp"},
+        {"http_path": ""},
+        {"optimize_max_queries": 0},
+        {"optimize_query_offset": -1},
+        {"chunk_size": True},
+        {"http_port": 80.5},
+        {"react_max_iters": None},
+    ],
+)
+def test_yaw_config_validation(kwargs: dict[str, Any]) -> None:
     with pytest.raises(YawRuntimeError) as exc_info:
-        YawConfig(optimize_auto=cast(Any, "invalid"))
+        YawConfig(**kwargs)
     assert exc_info.value.code == "INVALID_INPUT"
 
 
@@ -43,27 +146,22 @@ def test_yaw_config_for_optimization(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
     opt = cfg.for_optimization()
 
-    assert opt.corpus_root is not None
-    assert opt.db_path is not None
-    assert opt.lock_path is not None
-    assert opt.status_path is not None
-    assert opt.state_dir is not None
-    assert opt.compiled_program_path is not None
-
     assert opt.corpus_root == cfg.workspace_root
-    assert "corpus_optimize_" not in str(opt.corpus_root)
-    assert opt.db_path.name == "optimize_yaw.db"
-    assert opt.lock_path.name == "optimize_yaw.db.lock"
-    assert opt.status_path.name == "optimize_status.json"
-    assert opt.state_dir.name == "coco_lmdb"
-    assert opt.compiled_program_path.name == "optimize_program.json"
-    assert opt.poll_interval_seconds == 0.0
-
-    # Model and retrieval parameters preserved
+    assert opt.db_path is not None and opt.db_path.name == "optimize_yaw.db"
+    assert opt.lock_path is not None and opt.lock_path.name == "optimize_yaw.db.lock"
+    assert opt.status_path is not None and opt.status_path.name == "dspy_status.json"
+    assert opt.state_dir is not None and opt.state_dir.name == "coco_lmdb"
+    assert opt.compiled_program_path is not None and opt.compiled_program_path.name == "qa_program.json"
     assert opt.embedding_model == cfg.embedding_model
     assert opt.qa_model == cfg.qa_model
-    assert opt.retrieval_top_k == cfg.retrieval_top_k
     assert opt.optimize_auto == cfg.optimize_auto
+    assert opt.react_max_iters == cfg.react_max_iters
+
+    optuna = cfg.for_optimization(tmp_path / "custom" / "optuna_index.db")
+    assert optuna.db_path == (tmp_path / "custom" / "optuna_index.db").resolve()
+    assert optuna.status_path == (tmp_path / "custom" / "optuna_status.json").resolve()
+    assert optuna.compiled_program_path == (tmp_path / "custom" / "qa_program.json").resolve()
+    assert resolve_coco_state_root(tmp_path / "coco_state") == (tmp_path / "coco_state" / "coco_lmdb").resolve()
 
 
 def test_optimization_empty_db_override_raises(tmp_path: Path) -> None:
@@ -102,52 +200,21 @@ def test_parse_dataset_list() -> None:
     ]
 
 
-def test_yaw_config_for_benchmark(tmp_path: Path) -> None:
-    cfg = YawConfig(workspace_root=tmp_path)
-    idx_root = tmp_path / "bench_idx"
-    bench = cfg.for_benchmark("2wikimultihopqa", "a1b2c3d4", index_root=idx_root, fresh=False)
-
-    assert bench.workspace_root == idx_root / "2wikimultihopqa_a1b2c3d4"
-    assert bench.corpus_root == bench.workspace_root
-    assert bench.db_path == bench.workspace_root / "yaw.db"
-    assert bench.lock_path == bench.workspace_root / "yaw.db.lock"
-    assert bench.status_path == bench.workspace_root / "status.json"
-    assert bench.state_dir == bench.workspace_root / "coco_state"
-    assert bench.log_path == bench.workspace_root / "yaw.log"
-    assert bench.poll_interval_seconds == 0.0
-    assert bench.json_keys_whitelist == cfg.json_keys_whitelist
-    assert bench.json_keys_blacklist == cfg.json_keys_blacklist
-
-    # Verify fresh=True cleans existing sandbox dir
-    marker = bench.workspace_root / "stale.txt"
-    marker.write_text("stale", encoding="utf-8")
-    bench_fresh = cfg.for_benchmark("2wikimultihopqa", "a1b2c3d4", index_root=idx_root, fresh=True)
-    assert bench_fresh.workspace_root == bench.workspace_root
-    assert not marker.exists()
-
-
 def test_config_get_and_set_values(tmp_path: Path) -> None:
     toml_file = tmp_path / "yaw.toml"
     toml_file.write_text(
         """[optimization]
 auto = "light"
-mode = "gepa"
 
 [inference]
-qa_model = "Qwen3-4B-Instruct-2507-GGUF"
+qa_model = "gemma-4-e4b"
 """,
         encoding="utf-8",
     )
 
-    # 1. get specific keys
-    auto_val = get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path)
-    assert auto_val == "light"
+    assert get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path) == "light"
+    assert get_config_value(path=toml_file, key="auto", workspace_override=tmp_path) == "light"
 
-    # Alias check
-    auto_alias = get_config_value(path=toml_file, key="auto", workspace_override=tmp_path)
-    assert auto_alias == "light"
-
-    # 2. set key
     key, val = set_config_value(
         key="optimization.auto",
         raw_value="heavy",
@@ -156,53 +223,22 @@ qa_model = "Qwen3-4B-Instruct-2507-GGUF"
     )
     assert key == "optimization.auto"
     assert val == "heavy"
-
-    # Verify updated
     assert get_config_value(path=toml_file, key="optimization.auto", workspace_override=tmp_path) == "heavy"
 
-    # 3. get all keys
     all_cfg = get_config_value(path=toml_file, workspace_override=tmp_path)
     assert isinstance(all_cfg, dict)
     assert all_cfg["optimize_auto"] == "heavy"
 
 
-def test_yaw_config_json_keys_and_patterns(tmp_path: Path) -> None:
+def test_yaw_config_patterns(tmp_path: Path) -> None:
     cfg = YawConfig(workspace_root=tmp_path)
-    assert cfg.json_keys_whitelist == ("*",)
-    assert cfg.json_keys_blacklist == ()
-    for ext in (
-        "*.md",
-        "*.txt",
-        "*.json",
-        "*.jsonl",
-        "*.py",
-        "*.rs",
-        "*.ts",
-        "*.html",
-        "*.toml",
-        "*.yaml",
-    ):
+    for ext in ("*.md", "*.txt", "*.json", "*.jsonl", "*.py", "*.rs", "*.ts", "*.html", "*.toml", "*.yaml"):
         assert ext in cfg.included_patterns
-
-    fp_default = cfg.config_fingerprint()
-    cfg_filtered = YawConfig(
-        workspace_root=tmp_path,
-        json_keys_whitelist=cast(Any, "title,text,paragraphs.*"),
-        json_keys_blacklist=("question*", "answer*", "Bearer*"),
-    )
-    assert cfg_filtered.json_keys_whitelist == ("title", "text", "paragraphs.*")
-    assert cfg_filtered.json_keys_blacklist == ("question*", "answer*", "Bearer*")
-    assert cfg_filtered.config_fingerprint() != fp_default
+    assert not hasattr(cfg, "for_benchmark")
+    assert not hasattr(cfg, "config_fingerprint")
 
 
 def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-
-    from yaw.core import (
-        DEFAULT_EXCLUDED_PATTERNS,
-        DEFAULT_INCLUDED_PATTERNS,
-        write_text_atomic,
-    )
-
     cfg = YawConfig(workspace_root=tmp_path)
     assert cfg.included_patterns == DEFAULT_INCLUDED_PATTERNS
     assert cfg.excluded_patterns == DEFAULT_EXCLUDED_PATTERNS
@@ -243,56 +279,103 @@ def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pyt
     assert not list(target.parent.glob(".*tmp*"))
 
 
-def test_manifold_toml_section_roundtrip_and_validation(tmp_path: Path) -> None:
-    """[manifold] parses strictly, excludes config_fingerprint, supports get/set, and replaces atomically."""
-    toml_path = tmp_path / "yaw.toml"
-    toml_path.write_text(
-        '[paths]\ncorpus_dir = "corpus"\n\n[retrieval]\nretriever_mode = "manifold"\n\n[runtime]\nhttp_port = 8765\n',
-        encoding="utf-8",
-    )
-    cfg_plain = load_config(toml_path)
-    assert cfg_plain.manifold_overrides == ()
-    fp_plain = cfg_plain.config_fingerprint()
+def test_project_yaw_toml_bijection_with_yaw_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checked-in yaw.toml loads equal to YawConfig defaults and matches _FIELD_TO_SECTION 1-to-1."""
+    monkeypatch.delenv("UNSLOTH_STUDIO_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    with pytest.raises(KeyError):
-        get_config_value(toml_path, "manifold.peclet")
+    toml_path = PROJECT_ROOT / "yaw.toml"
+    loaded = load_config(toml_path)
+    expected = YawConfig(workspace_root=PROJECT_ROOT)
+    assert replace(loaded, api_key="") == replace(expected, api_key="")
+    assert loaded == expected
 
-    updated_key, updated_val = set_config_value("manifold.peclet", "0.55", toml_path)
-    assert updated_key == "manifold.peclet"
-    assert updated_val == pytest.approx(0.55)
-    assert get_config_value(toml_path, "manifold.peclet") == pytest.approx(0.55)
-    assert get_config_value(toml_path, "manifold") == {"peclet": pytest.approx(0.55)}
+    raw_text = toml_path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(raw_text)
+    assert set(parsed.keys()) == {"paths", "ingestion", "inference", "runtime", "optimization"}
 
-    cfg_overridden = load_config(toml_path)
-    assert dict(cfg_overridden.manifold_overrides) == {"peclet": pytest.approx(0.55)}
-    assert cfg_overridden.config_fingerprint() == fp_plain
+    toml_pairs: set[tuple[str, str]] = set()
+    for sec_name, table in parsed.items():
+        assert isinstance(table, dict)
+        for key in table:
+            field_name = config_mod._OPTIMIZATION_KEY_ALIASES.get(key, key) if sec_name == "optimization" else key
+            toml_pairs.add((sec_name, field_name))
 
-    for bad_raw in ("true", "nan", "inf", "not_a_number"):
-        with pytest.raises(ValueError):
-            set_config_value("manifold.peclet", bad_raw, toml_path)
-    assert get_config_value(toml_path, "manifold.peclet") == pytest.approx(0.55)
+    commented_optional: set[tuple[str, str]] = set()
+    cur_section: str | None = None
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if sec_match := _SECTION_HEADER_RE.match(stripped):
+            cur_section = sec_match.group(1)
+            continue
+        if cur_section is not None and (opt_match := _OPTIONAL_COMMENT_KV_RE.match(stripped)):
+            commented_optional.add((cur_section, opt_match.group(1)))
 
-    written_path = write_manifold_section({"alpha_sprt": 0.04, "external_trust": 0.4}, toml_path)
-    assert written_path == toml_path.resolve()
-    reloaded = load_config(toml_path)
-    assert dict(reloaded.manifold_overrides) == {
-        "alpha_sprt": pytest.approx(0.04),
-        "external_trust": pytest.approx(0.4),
-    }
-    assert reloaded.http_port == 8765
-    assert reloaded.retriever_mode == "manifold"
-    assert reloaded.config_fingerprint() == fp_plain
-    with pytest.raises(KeyError):
-        get_config_value(toml_path, "manifold.peclet")
+    assert commented_optional == {("inference", "api_key"), ("inference", "max_output_tokens")}
+    assert toml_pairs.isdisjoint(commented_optional)
 
-    bad_toml = tmp_path / "bad_manifold.toml"
-    for bad_doc in (
-        "[manifold]\npeclet = true\n",
-        "[manifold]\npeclet = nan\n",
-        '[manifold]\npeclet = "invalid"\n',
+    expected_pairs = {(sec, field_name) for field_name, sec in config_mod._FIELD_TO_SECTION.items()}
+    assert len(config_mod._FIELD_TO_SECTION) == 30
+    assert (toml_pairs | commented_optional) == expected_pairs
+
+
+@pytest.mark.parametrize(
+    "bad_toml",
+    [
+        "[graph]\n",
+        "[graph]\nlinking_top_k = 8\n",
+        "[retrieval]\n",
+        "[retrieval]\npeclet = 0.338\n",
+        "[manifold]\npeclet = 0.55\n",
+        "[unknown]\nfoo = 1\n",
         'manifold = "not_a_table"\n',
         "manifold = [1, 2, 3]\n",
+        'inference = "not_a_table"\n',
+        "[ingestion]\npoll_interval_seconds = 0.2\n",
+        "[ingestion]\nembed_batch_chars = 2048\n",
+        "[inference]\nrlm_max_iters = 20\n",
+        "[inference]\nextraction_model = 'gemma-4-e4b'\n",
+        "[optimization]\nmode = 'gepa'\n",
+        "[optimization]\ntrain_queries = 10\n",
+        "[paths]\ncorpus_dir = 'corpus'\n",
+        "[runtime]\nchunk_size = 500\n",
+        "[ingestion]\nhttp_port = 13306\n",
+        "[paths]\nqa_model = 'gemma-4-e4b'\n",
+        "[inference]\nworkspace_root = '.'\n",
+        "[inference]\nauto = 'light'\n",
+        "[inference]\noptimize_auto = 'light'\n",
+    ],
+)
+def test_load_config_rejects_retired_sections_keys_and_wrong_sections(tmp_path: Path, bad_toml: str) -> None:
+    toml_path = tmp_path / "yaw.toml"
+    toml_path.write_text(bad_toml, encoding="utf-8")
+    with pytest.raises(YawRuntimeError) as exc_info:
+        load_config(toml_path)
+    assert exc_info.value.code == "INVALID_INPUT"
+
+
+def test_get_and_set_reject_retired_and_wrong_section_keys(tmp_path: Path) -> None:
+    toml_path = tmp_path / "yaw.toml"
+    original = "[runtime]\nhttp_port = 13306\n\n[ingestion]\nchunk_size = 1000\n"
+    toml_path.write_text(original, encoding="utf-8")
+
+    for bad_key in (
+        "manifold",
+        "manifold.peclet",
+        "retrieval",
+        "retrieval.peclet",
+        "poll_interval_seconds",
+        "mode",
+        "runtime.chunk_size",
+        "ingestion.http_port",
+        "paths.qa_model",
     ):
-        bad_toml.write_text(bad_doc, encoding="utf-8")
-        with pytest.raises(ValueError):
-            load_config(bad_toml)
+        with pytest.raises(YawRuntimeError) as exc_get:
+            get_config_value(toml_path, bad_key)
+        assert exc_get.value.code == "INVALID_INPUT"
+
+        with pytest.raises(YawRuntimeError) as exc_set:
+            set_config_value(bad_key, "1", toml_path)
+        assert exc_set.value.code == "INVALID_INPUT"
+
+    assert toml_path.read_text(encoding="utf-8") == original

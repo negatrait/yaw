@@ -87,9 +87,9 @@ class YawRuntime:
     last_sync_at: float | None
     file_lock: filelock.FileLock
     stop_event: threading.Event
-    _win32_stop_handle: int | None = None
-    _win32_waiter_thread: threading.Thread | None = None
-    _ready_thread: threading.Thread | None = None
+    win32_stop_handle: int | None = field(default=None, repr=False)
+    win32_waiter_thread: threading.Thread | None = field(default=None, repr=False)
+    ready_thread: threading.Thread | None = field(default=None, repr=False)
     probe_conn: sqlite3.Connection | None = None
     probe_lock: threading.Lock = field(default_factory=threading.Lock)
     state_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -124,7 +124,7 @@ def _start_win32_stop_event(rt: YawRuntime) -> None:
     if not handle:
         return
     _kernel32.ResetEvent(handle)
-    rt._win32_stop_handle = int(handle)
+    rt.win32_stop_handle = int(handle)
 
     def _wait_kernel_event(ev_handle: int) -> None:
         if _kernel32.WaitForSingleObject(ev_handle, 0xFFFFFFFF) == 0:
@@ -136,22 +136,22 @@ def _start_win32_stop_event(rt: YawRuntime) -> None:
         name="yaw-win32-stop-waiter",
         daemon=True,
     )
-    rt._win32_waiter_thread = thread
+    rt.win32_waiter_thread = thread
     thread.start()
 
 
 def _close_win32_stop_event(rt: YawRuntime) -> None:
     if os.name != "nt" or _kernel32 is None:
         return
-    handle = rt._win32_stop_handle
-    rt._win32_stop_handle = None
+    handle = rt.win32_stop_handle
+    rt.win32_stop_handle = None
     if handle:
         with contextlib.suppress(OSError):
             _kernel32.SetEvent(handle)
-    waiter = rt._win32_waiter_thread
+    waiter = rt.win32_waiter_thread
     if waiter is not None and waiter.is_alive() and waiter is not threading.current_thread():
         waiter.join(timeout=1.0)
-    rt._win32_waiter_thread = None
+    rt.win32_waiter_thread = None
     if handle:
         with contextlib.suppress(OSError):
             _kernel32.CloseHandle(handle)
@@ -270,8 +270,8 @@ def start_runtime(
                         rt.pipeline.ready_event.set()
                         get_status(rt)
 
-            rt._ready_thread = threading.Thread(target=_await_initial_ready, name="yaw-ready-waiter", daemon=True)
-            rt._ready_thread.start()
+            rt.ready_thread = threading.Thread(target=_await_initial_ready, name="yaw-ready-waiter", daemon=True)
+            rt.ready_thread.start()
         return rt
     except BaseException:
         if rt is not None:
@@ -445,7 +445,7 @@ def resolve_program_path(cfg: YawConfig) -> Path | None:
     """Resolve the configured compiled program or the optimizer's artifact."""
     if cfg.compiled_program_path is not None and Path(cfg.compiled_program_path).is_file():
         return Path(cfg.compiled_program_path)
-    fallback = require_path(cfg.for_optimization().db_path, "optimization db_path").parent / "qa_program.json"
+    fallback = require_path(cfg.for_optimization().compiled_program_path, "optimization compiled_program_path")
     return fallback if fallback.is_file() else None
 
 
@@ -560,13 +560,9 @@ def close_runtime(rt: YawRuntime) -> None:
             return
         rt.lifecycle = "stopping"
     rt.pipeline.ready_event.set()
-    if (
-        rt._ready_thread is not None
-        and rt._ready_thread.is_alive()
-        and rt._ready_thread is not threading.current_thread()
-    ):
-        rt._ready_thread.join(timeout=2.0)
-    rt._ready_thread = None
+    if rt.ready_thread is not None and rt.ready_thread.is_alive() and rt.ready_thread is not threading.current_thread():
+        rt.ready_thread.join(timeout=2.0)
+    rt.ready_thread = None
     _close_win32_stop_event(rt)
     try:
         with rt.probe_lock:

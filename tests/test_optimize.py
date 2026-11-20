@@ -220,6 +220,11 @@ def test_optimizers_reject_held_out_overlap_before_indexing(tmp_path):
     for optimize in (optimize_dspy, optimize_optuna):
         with pytest.raises(YawRuntimeError, match="held-out"):
             optimize(cfg, datasets="2wikimultihopqa", query_offset=0)
+        with pytest.raises(
+            YawRuntimeError, match=r"Prepared dataset bundle not found.*scripts/download-datasets\.py --dataset"
+        ) as exc_missing:
+            optimize(cfg, datasets="hotpotqa", query_offset=10)
+        assert exc_missing.value.code == "INVALID_INPUT"
 
     guard_cfg = YawConfig(workspace_root=tmp_path / "int_guard")
     for bad_val in (0, -5, True, False):
@@ -601,9 +606,12 @@ def test_optimize_optuna_uses_maxp_pool_and_persists_best_params(tmp_path: Path)
     params_path = opt_dir / "optuna_best_params.json"
     status_path = opt_dir / "optuna_status.json"
     study_db = opt_dir / "optuna_study.db"
+    assert not (opt_dir / "optuna_corpus").exists()
     assert params_path.is_file()
     assert status_path.is_file()
     assert study_db.is_file()
+    md_before = {p.name: p.read_bytes() for p in bundle.documents_root.glob("*.md")}
+    assert set(md_before) == {"d1.md", "d2.md"}
 
     saved_params = json.loads(params_path.read_text(encoding="utf-8"))
     saved_status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -618,7 +626,7 @@ def test_optimize_optuna_uses_maxp_pool_and_persists_best_params(tmp_path: Path)
     assert "yaw_retrieval_ppr" in study_names
     assert trial_count == 1
 
-    # Consecutive fresh=True run succeeds on the same workspace (RDBStorage properly disposed)
+    # Consecutive fresh=True run succeeds without staging copies or mutating bundle .md files
     payload_2 = optimize_optuna(
         cfg,
         datasets=str(bundle.root),
@@ -630,6 +638,8 @@ def test_optimize_optuna_uses_maxp_pool_and_persists_best_params(tmp_path: Path)
     )
     assert payload_2["best_score"] == pytest.approx(payload["best_score"])
     assert payload_2["total_trials"] == 1
+    assert not (opt_dir / "optuna_corpus").exists()
+    assert {p.name: p.read_bytes() for p in bundle.documents_root.glob("*.md")} == md_before
 
 
 def test_optimize_optuna_and_dspy_locks_and_redacted_failure_status(tmp_path: Path) -> None:
@@ -798,6 +808,7 @@ def test_optimize_dspy_multithreaded_uses_per_call_readonly_sqlite(tmp_path: Pat
 
     stat_lock = threading.Lock()
     tools_used: set[str] = set()
+    reflection_temps: list[float | None] = []
 
     def _responder(_turn_idx: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         msgs = payload.get("messages", [])
@@ -805,6 +816,8 @@ def test_optimize_dspy_multithreaded_uses_per_call_readonly_sqlite(tmp_path: Pat
         has_tool_obs = any(m.get("role") == "tool" for m in msgs)
         blob = json.dumps(msgs)
         if "list_examples" in tool_names:
+            with stat_lock:
+                reflection_temps.append(payload.get("temperature"))
             if not has_tool_obs:
                 return 200, _tool_reply("List examples", [{"name": "list_examples", "args": {}}])
             return 200, _tool_reply(
@@ -840,10 +853,15 @@ def test_optimize_dspy_multithreaded_uses_per_call_readonly_sqlite(tmp_path: Pat
     try:
         ws = tmp_path / "ws"
         ws.mkdir()
-        cfg = YawConfig(workspace_root=ws, chunk_size=240, chunk_overlap=0, min_chunk_size=20)
-        lm_cfg = replace(cfg, base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        lm_cfg = YawConfig(
+            workspace_root=ws,
+            base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+            chunk_size=240,
+            chunk_overlap=0,
+            min_chunk_size=20,
+        )
         audit = optimize_dspy(
-            cfg,
+            lm_cfg,
             datasets=str(bundle.root),
             threads=4,
             max_metric_calls=4,
@@ -852,16 +870,17 @@ def test_optimize_dspy_multithreaded_uses_per_call_readonly_sqlite(tmp_path: Pat
             fresh=True,
             embed_fn=_embed,
             student_lm=create_lm(lm_cfg, temperature=1.0),
-            reflection_lm=create_lm(lm_cfg, temperature=0.7),
         )
     finally:
         srv.shutdown()
 
     assert audit["train_size"] == 3 and audit["val_size"] == 1
     assert {"search_passages", "lexical_grep"} <= tools_used
-    opt_db = cfg.for_optimization().db_path
+    assert reflection_temps and all(t == 1.0 for t in reflection_temps)
+    opt_db = lm_cfg.for_optimization().db_path
     assert opt_db is not None
     opt_dir = opt_db.parent
+    assert not (opt_dir / "dspy_corpus").exists()
     assert (opt_dir / "qa_program.json").is_file()
     assert (opt_dir / "dspy_gepa_audit.json").is_file()
     status_data = json.loads((opt_dir / "dspy_status.json").read_text(encoding="utf-8"))

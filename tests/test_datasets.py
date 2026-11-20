@@ -9,17 +9,22 @@ import pytest
 
 from yaw.datasets import (
     DATASET_REGISTRY,
+    allow_upstream_github_fallback,
     build_benchmark_slice,
     compute_qa_em_f1,
     doc_matches_gold,
+    document_filename,
+    document_identity,
     extract_gold_answers,
     get_gold_docs,
     load_dataset_bundle,
     load_dataset_files,
     normalize_answer,
     prepare_dataset_bundle,
+    render_document_markdown,
     resolve_dataset_bundle,
     resolve_dataset_name,
+    resolve_slice_corpus_scope,
     score_qa_em_f1,
     score_retrieval_recalls,
     validate_dataset_bundle,
@@ -42,6 +47,10 @@ def test_bundle_lifecycle_and_validation(tmp_path: Path) -> None:
     bundle = prepare_dataset_bundle("sample", corpus_p, qa_p, tmp_path)
     assert bundle.dataset == "sample"
     assert len(bundle.documents) == 2
+    assert bundle.documents[0].path == "documents/d1.md"
+    assert bundle.documents[1].path == "documents/d2.md"
+    assert (bundle.root / "documents" / "d1.md").read_text(encoding="utf-8") == "# Doc 1\n\nContent of document 1.\n"
+    assert json.loads(bundle.manifest_path.read_text(encoding="utf-8"))["version"] == 2
     assert bundle.documents_root.exists()
     assert bundle.evaluation_path.exists()
     assert bundle.manifest_path.exists()
@@ -51,15 +60,27 @@ def test_bundle_lifecycle_and_validation(tmp_path: Path) -> None:
     assert len(loaded.documents) == 2
     validate_dataset_bundle(loaded)
 
-    # Test read methods
+    # Test read methods round-trip H1 strip and raw markdown lookup
     docs = bundle.read_documents()
-    assert len(docs) == 2
+    assert docs == [
+        {"title": "Doc 1", "text": "Content of document 1.", "idx": "d1"},
+        {"title": "Doc 2", "text": "Content of document 2.", "idx": "d2"},
+    ]
     inputs_qa, inputs_docs = bundle.read_inputs()
     assert len(inputs_qa) == 1
-    assert len(inputs_docs) == 2
+    assert inputs_docs == docs
     by_id = bundle.corpus_by_id()
-    assert "d1" in by_id
-    assert "Content of document 1." in by_id["d1"]
+    assert by_id["d1"] == "# Doc 1\n\nContent of document 1."
+
+    # Upgrading from a v1 .json manifest removes stale .json files automatically
+    stale_json = bundle.documents_root / "legacy_01.json"
+    stale_json.write_text('{"title": "Old", "text": "Body"}\n', encoding="utf-8")
+    v1_manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+    v1_manifest["documents"] = [{"document_id": "old", "path": "documents/legacy_01.json", "content_hash": "0" * 64}]
+    bundle.manifest_path.write_text(json.dumps(v1_manifest), encoding="utf-8")
+    upgraded = prepare_dataset_bundle("sample", corpus_p, qa_p, tmp_path)
+    assert not stale_json.exists()
+    validate_dataset_bundle(upgraded)
 
     # Test resolve_dataset_bundle
     resolved = resolve_dataset_bundle(bundle.root)
@@ -68,15 +89,15 @@ def test_bundle_lifecycle_and_validation(tmp_path: Path) -> None:
     # Corruption: tampered doc content
     doc_file = bundle.root / bundle.documents[0].path
     orig_bytes = doc_file.read_bytes()
-    doc_file.write_text('{"tampered": true}', encoding="utf-8")
+    doc_file.write_text("# Tampered\n\nBad body.\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Corrupt|invalid|hash"):
         validate_dataset_bundle(bundle)
     doc_file.write_bytes(orig_bytes)
     validate_dataset_bundle(bundle)
 
     # Corruption: unmanaged extra file in documents/
-    extra_file = bundle.documents_root / "unmanaged.json"
-    extra_file.write_text("{}", encoding="utf-8")
+    extra_file = bundle.documents_root / "unmanaged.md"
+    extra_file.write_text("# Rogue\n", encoding="utf-8")
     with pytest.raises(ValueError, match="inventory"):
         validate_dataset_bundle(bundle)
     extra_file.unlink()
@@ -90,7 +111,7 @@ def test_bundle_lifecycle_and_validation(tmp_path: Path) -> None:
     bundle.evaluation_path.write_bytes(eval_orig)
     validate_dataset_bundle(bundle)
 
-    # Reject conflicting duplicate document IDs
+    # Reject conflicting duplicate document IDs and case-insensitive filename collisions
     dup_corpus = tmp_path / "dup_corpus.json"
     dup_corpus.write_text(
         json.dumps([{"idx": "dup1", "title": "A", "text": "One"}, {"idx": "dup1", "title": "A", "text": "Two"}]),
@@ -99,9 +120,82 @@ def test_bundle_lifecycle_and_validation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Conflicting duplicate"):
         prepare_dataset_bundle("dup", dup_corpus, qa_p, tmp_path / "dup_out")
 
+    case_corpus = tmp_path / "case_corpus.json"
+    case_corpus.write_text(
+        json.dumps([{"idx": "DocA", "title": "A", "text": "One"}, {"idx": "doca", "title": "B", "text": "Two"}]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="collision"):
+        prepare_dataset_bundle("case_dup", case_corpus, qa_p, tmp_path / "case_out")
+
     # Missing manifest
     with pytest.raises(FileNotFoundError):
         load_dataset_bundle(tmp_path / "nonexistent")
+
+
+def test_markdown_helpers_scope_and_fallback_metadata(tmp_path: Path) -> None:
+    assert allow_upstream_github_fallback("nq") is False
+    assert allow_upstream_github_fallback("hotpotqa") is True
+
+    assert document_filename("doc_1") == "doc_1.md"
+    assert document_filename("CON") != "CON.md" and document_filename("CON").endswith(".md")
+    assert "/" not in document_filename("nested/id:1")
+    assert document_filename("..") != "...md"
+    assert len(document_filename("x" * 160)) < 120
+
+    assert render_document_markdown("Doc", "Line1\r\nLine2") == "# Doc\n\nLine1\nLine2\n"
+    assert render_document_markdown("Plan", "Step 1\\n\\nStep 2\\r\\nStep 3") == "# Plan\n\nStep 1\n\nStep 2\nStep 3\n"
+    assert render_document_markdown("Code", "line1\nprint('a\\nb\\nc')") == "# Code\n\nline1\nprint('a\\nb\\nc')\n"
+    assert render_document_markdown("Intro", "# Intro\n\nAlready H1") == "# Intro\n\nAlready H1\n"
+
+    # source_fields id_key=None uses SHA-256[:16] of rendered Markdown identically in prepare + slice
+    c_path = tmp_path / "c2.json"
+    q_path = tmp_path / "q2.json"
+    c_rows = [
+        {"title": "Alpha", "text": "Alpha body."},
+        {"title": "Beta", "text": "Beta body."},
+    ]
+    q_rows = [
+        {
+            "question": "What?",
+            "answer": "Alpha",
+            "supporting_facts": [["Alpha", 0]],
+            "context": [["Alpha", ["Alpha body."]], ["Beta", ["Beta body."]]],
+        }
+    ]
+    c_path.write_text(json.dumps(c_rows), encoding="utf-8")
+    q_path.write_text(json.dumps(q_rows), encoding="utf-8")
+    b1 = prepare_dataset_bundle("2wikimultihopqa", c_path, q_path, tmp_path / "bundles", id_key=None)
+    expected_alpha_id = document_identity(c_rows[0], id_key=None)
+    expected_beta_id = document_identity(c_rows[1], id_key=None)
+    assert len(expected_alpha_id) == 16
+    assert b1.documents[0].document_id == expected_alpha_id
+    slice_ids, _, _, _ = build_benchmark_slice("2wikimultihopqa", q_rows, c_rows, max_queries=1)
+    assert slice_ids == [expected_alpha_id, expected_beta_id]
+
+    assert resolve_slice_corpus_scope([(b1, [b1.documents[0].document_id, b1.documents[1].document_id])]) == (
+        b1.documents_root.resolve(),
+        ("*.md",),
+    )
+    assert resolve_slice_corpus_scope([(b1, [expected_alpha_id])]) == (
+        b1.documents_root.resolve(),
+        (f"{expected_alpha_id}.md",),
+    )
+
+    c_other = tmp_path / "c_other.json"
+    c_other.write_text(json.dumps([{"idx": "other_1", "title": "Gamma", "text": "Gamma body."}]), encoding="utf-8")
+    b2 = prepare_dataset_bundle("sample", c_other, q_path, tmp_path / "bundles")
+    common_root, multi_patterns = resolve_slice_corpus_scope([(b1, [expected_alpha_id]), (b2, ["other_1"])])
+    assert common_root == (tmp_path / "bundles").resolve()
+    assert multi_patterns == (
+        f"2wikimultihopqa/documents/{expected_alpha_id}.md",
+        "sample/documents/other_1.md",
+    )
+
+    with pytest.raises(ValueError):
+        resolve_slice_corpus_scope([])
+    with pytest.raises(ValueError):
+        resolve_slice_corpus_scope([(b1, ["missing_id"])])
 
 
 def test_dataset_name_resolution() -> None:
@@ -233,8 +327,10 @@ def test_metrics_and_doc_matching() -> None:
 
     # doc_matches_gold
     assert doc_matches_gold("Exact match text", "Exact match text")
-    # Title prefix strip
+    # Title prefix strip (including Markdown H1 "# ")
     assert doc_matches_gold("Wikipedia Title: Paris\nCapital of France.", "Title: Paris\nCapital of France.")
+    assert doc_matches_gold("# Paris\n\nCapital of France.", "Paris\nCapital of France.")
+    assert doc_matches_gold("Paris\nCapital of France.", "# Paris\n\nCapital of France.")
     # AST section cropped
     assert doc_matches_gold("Paris\nCapital of France.\n[... AST section cropped", "Paris\nCapital of France.")
     # chunk- md5 match

@@ -25,6 +25,7 @@ from yaw.retrieval import (
     hydrate_ranked_passages,
     lexical_search,
     open_readonly_db,
+    resolve_retrieval_params,
     search_vectors,
 )
 
@@ -315,3 +316,20 @@ def test_missing_chunk_fts_raises_consistency_error_while_in_memory_works(tmp_pa
     assert in_mem_lex and in_mem_vec
     assert in_mem_lex[0][0] == vs.chunk_ids[0]
     assert in_mem_vec[0][0] == vs.chunk_ids[0]
+
+
+def test_resolve_retrieval_params_uses_configured_db_parent(tmp_path: Path) -> None:
+    custom_dir = tmp_path / "custom_db_dir"
+    custom_dir.mkdir(parents=True)
+    yaw_dir = tmp_path / ".yaw"
+    yaw_dir.mkdir(parents=True)
+    (yaw_dir / "optuna_best_params.json").write_text(
+        json.dumps({"best_params": {"hybrid_alpha": 0.25, "ppr_alpha": 0.15, "seed_top_k": 7}}),
+        encoding="utf-8",
+    )
+    (custom_dir / "optuna_best_params.json").write_text(
+        json.dumps({"best_params": {"hybrid_alpha": 0.85, "ppr_alpha": 0.45, "seed_top_k": 19}}),
+        encoding="utf-8",
+    )
+    custom_cfg = YawConfig(workspace_root=tmp_path, db_path=custom_dir / "yaw.db")
+    assert resolve_retrieval_params(custom_cfg) == {"hybrid_alpha": 0.85, "ppr_alpha": 0.45, "seed_top_k": 19}

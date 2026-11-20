@@ -1,21 +1,18 @@
-"""Executable specifications for HippoRAG benchmark slicing, evaluation, and integrity gates."""
+"""Executable specifications for YAW benchmark slicing, evaluation, and integrity gates."""
 
-import hashlib
+from __future__ import annotations
+
+import contextlib
 import json
-import sqlite3
+import re
 import tempfile
-import threading
 import unittest
-from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pytest
-from embedding_fixture import IdentifiedEmbeddingCallable
+from numpy.typing import NDArray
 
-import benchmark
 from benchmark import (
     BASELINES,
     DATASET_REGISTRY,
@@ -26,20 +23,26 @@ from benchmark import (
     get_gold_docs,
     load_dataset_files,
 )
-from yaw.daemon.graph.inference import DSPyEmbeddingAdapter, YawProgram, create_dspy_embedder
-from yaw.daemon.indexing import bind_native_indexing
-from yaw.daemon.ingestion import prepare_dataset_bundle, resolve_dataset_name
-from yaw.daemon.ingestion.bundles import document_identity
-from yaw.daemon.ingestion.corpus import chunk_source_text
+from scripts.evaluation import RetrievalRecall
+from yaw.core import ChunkPointer, YawConfig, render_document_text
+from yaw.datasets import document_identity, prepare_dataset_bundle, resolve_dataset_name
+from yaw.pipeline import chunk_file_content, close_pipeline, start_pipeline, update_pipeline_once
+from yaw.retrieval import (
+    build_vector_search,
+    hydrate_passage,
+    hydrate_ranked_passages,
+    open_readonly_db,
+    search_vectors,
+)
 
 
-def selected_texts(ids, corpus):
-    by_id = {document_identity(row): f"{row['title']}\n{row['text']}" for row in corpus}
+def selected_texts(ids: list[str], corpus: list[dict[str, Any]]) -> list[str]:
+    by_id = {document_identity(row): render_document_text(str(row["title"]), str(row["text"])) for row in corpus}
     return [by_id[document_id] for document_id in ids]
 
 
 class DatasetSliceTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.musique_samples = [
             {
                 "id": "m1",
@@ -91,7 +94,7 @@ class DatasetSliceTests(unittest.TestCase):
             {"title": "Extra Corpus Doc", "text": "Only in full corpus."},
         ]
 
-    def test_musique_gold_docs_and_answers_preserve_aliases_and_order(self):
+    def test_musique_gold_docs_and_answers_preserve_aliases_and_order(self) -> None:
         gold_docs = get_gold_docs(self.musique_samples, "musique")
         self.assertEqual(
             gold_docs,
@@ -109,7 +112,7 @@ class DatasetSliceTests(unittest.TestCase):
             [["Rockland County", "Rockland County, New York"], ["Politician"]],
         )
 
-    def test_2wiki_and_hotpotqa_supporting_facts_separator_contract(self):
+    def test_2wiki_and_hotpotqa_supporting_facts_separator_contract(self) -> None:
         sample = {
             "question": "Who directed film X?",
             "answer": "Director Y",
@@ -124,16 +127,18 @@ class DatasetSliceTests(unittest.TestCase):
         self.assertEqual(wiki_gold, [["Film X\nSentence one. Sentence two."]])
         self.assertEqual(hotpot_gold, [["Film X\nSentence one.Sentence two."]])
 
-    def test_slice_invariant_gold_docs_always_subset_of_candidate_docs(self):
+    def test_slice_invariant_gold_docs_always_subset_of_candidate_docs(self) -> None:
         for max_q in (1, 2):
-            docs, queries, gold_docs, gold_answers = build_benchmark_slice(
+            doc_ids, queries, gold_docs, gold_answers = build_benchmark_slice(
                 "musique",
                 self.musique_samples,
                 self.musique_corpus,
                 max_queries=max_q,
                 full_corpus=False,
             )
-            docs = selected_texts(docs, self.musique_corpus)
+            docs = selected_texts(doc_ids, self.musique_corpus)
+            self.assertIsNotNone(gold_docs)
+            assert gold_docs is not None
             self.assertEqual(len(queries), max_q)
             self.assertEqual(len(gold_docs), max_q)
             self.assertEqual(len(gold_answers), max_q)
@@ -142,16 +147,16 @@ class DatasetSliceTests(unittest.TestCase):
                 self.assertTrue(set(g).issubset(set(docs)))
             self.assertNotIn("Extra Corpus Doc\nOnly in full corpus.", docs)
 
-    def test_full_corpus_flag_includes_entire_corpus(self):
-        docs, queries, _, _ = build_benchmark_slice(
+    def test_full_corpus_flag_includes_entire_corpus(self) -> None:
+        doc_ids, queries, _, _ = build_benchmark_slice(
             "musique", self.musique_samples, self.musique_corpus, max_queries=1, full_corpus=True
         )
-        docs = selected_texts(docs, self.musique_corpus)
+        docs = selected_texts(doc_ids, self.musique_corpus)
         self.assertEqual(len(queries), 1)
         self.assertEqual(len(docs), 6)
         self.assertIn("Extra Corpus Doc\nOnly in full corpus.", docs)
 
-    def test_negative_boundaries_on_malformed_samples_and_max_queries(self):
+    def test_negative_boundaries_on_malformed_samples_and_max_queries(self) -> None:
         with self.assertRaises(ValueError):
             build_benchmark_slice("musique", self.musique_samples, self.musique_corpus, max_queries=0)
         with self.assertRaises(ValueError):
@@ -161,7 +166,7 @@ class DatasetSliceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_gold_answers([{"question": "Null answer", "answer": None}])
 
-    def test_load_dataset_files_reads_local_disk_without_network(self):
+    def test_load_dataset_files_reads_local_disk_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "sample.json").write_text(json.dumps(self.musique_samples), encoding="utf-8")
@@ -171,7 +176,6 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertEqual(len(samples), 2)
             self.assertEqual(len(corpus), 3)
 
-            # When include_corpus=False and max_queries=1, corpus file is not required and samples are sliced
             (tmp_path / "sample_corpus.json").unlink()
             sliced_samples, empty_corpus = load_dataset_files(
                 "sample",
@@ -184,7 +188,7 @@ class DatasetSliceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_dataset_files("sample", dataset_dir=tmp_path, max_queries=0, include_corpus=False)
 
-    def test_dataset_aliasing_and_registry_resolution(self):
+    def test_dataset_aliasing_and_registry_resolution(self) -> None:
         rejected_aliases = (
             "2wiki",
             "hotpot",
@@ -222,7 +226,6 @@ class DatasetSliceTests(unittest.TestCase):
         for ds in DATASETS:
             self.assertIn(ds, DATASET_REGISTRY)
 
-        # Verify load_dataset_files accepts canonical names and rejects aliases
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "nq_rear.json").write_text(
@@ -239,7 +242,7 @@ class DatasetSliceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_dataset_files(alias, dataset_dir=tmp_path)
 
-    def test_distractor_padding_in_benchmark_slice(self):
+    def test_distractor_padding_in_benchmark_slice(self) -> None:
         samples: list[dict[str, Any]] = [
             {
                 "question": f"Question {i}?",
@@ -252,39 +255,36 @@ class DatasetSliceTests(unittest.TestCase):
             for i in range(15)
         ]
         corpus = [{"title": c["title"], "text": c["text"]} for q in samples for c in q["contexts"]]
-        # Explicit index_queries: max_queries=2, index_queries=4 -> pools passages from samples 0..3
-        docs, queries, gold_docs, gold_answers = build_benchmark_slice(
+        doc_ids, queries, gold_docs, gold_answers = build_benchmark_slice(
             "nq", samples, corpus=corpus, max_queries=2, index_queries=4, full_corpus=False
         )
-        docs = selected_texts(docs, corpus)
+        docs = selected_texts(doc_ids, corpus)
+        self.assertIsNotNone(gold_docs)
+        assert gold_docs is not None
         self.assertEqual(len(queries), 2)
         self.assertEqual(len(gold_docs), 2)
         self.assertEqual(len(gold_answers), 2)
-        # Docs must contain passages from samples 0..3 (both supporting and distractors)
         self.assertIn("Doc 0\nContent 0", docs)
         self.assertIn("Distractor 0\nNoise 0", docs)
         self.assertIn("Doc 3\nContent 3", docs)
         self.assertIn("Distractor 3\nNoise 3", docs)
-        # Sample 4 must not be in docs
         self.assertNotIn("Doc 4\nContent 4", docs)
 
-        # Default index_queries: max_queries=10, index_queries=None -> defaults to int(10 * 1.4) = 14
-        docs_def, queries_def, gold_docs_def, _ = build_benchmark_slice(
+        doc_ids_def, queries_def, gold_docs_def, _ = build_benchmark_slice(
             "nq", samples, corpus=corpus, max_queries=10, index_queries=None, full_corpus=False
         )
-        docs_def = selected_texts(docs_def, corpus)
+        docs_def = selected_texts(doc_ids_def, corpus)
+        self.assertIsNotNone(gold_docs_def)
+        assert gold_docs_def is not None
         self.assertEqual(len(queries_def), 10)
         self.assertEqual(len(gold_docs_def), 10)
-        # Sample 13 must be in docs (pooled up to index 14)
         self.assertIn("Doc 13\nContent 13", docs_def)
-        # Sample 14 must not be in docs
         self.assertNotIn("Doc 14\nContent 14", docs_def)
 
-        # Negative boundary on index_queries
         with self.assertRaises(ValueError):
             build_benchmark_slice("nq", samples, corpus=corpus, max_queries=2, index_queries=0)
 
-    def test_nq_gold_extraction(self):
+    def test_nq_gold_extraction(self) -> None:
         samples = [
             {
                 "question": "who has the oldest team in the nba",
@@ -308,7 +308,7 @@ class DatasetSliceTests(unittest.TestCase):
         gold_docs = get_gold_docs(samples, "nq")
         self.assertEqual(gold_docs, [["Eddie Gottlieb\nBasketball Association..."]])
 
-    def test_popqa_gold_extraction(self):
+    def test_popqa_gold_extraction(self) -> None:
         samples = [
             {
                 "question": "What is George Rankin's occupation?",
@@ -346,10 +346,11 @@ class DatasetSliceTests(unittest.TestCase):
         self.assertEqual(gold_answers[1], ["author", "writer"])
 
         gold_docs = get_gold_docs(samples, "popqa")
+        assert gold_docs is not None
         self.assertEqual(gold_docs[0], ["George Rankin\nGeorge was a politician."])
         self.assertEqual(gold_docs[1], ["Author Doc\nAuthor text."])
 
-    def test_lveval_gold_extraction(self):
+    def test_lveval_gold_extraction(self) -> None:
         samples = [
             {
                 "question": "Who is Poly Ii, Duke Of Bob's paternal grandfather?",
@@ -365,27 +366,22 @@ class DatasetSliceTests(unittest.TestCase):
         ]
         gold_answers = get_gold_answers(samples)
         self.assertEqual(gold_answers, [["Arenas"]])
-
-        gold_docs = get_gold_docs(samples, "lveval")
-        self.assertIsNone(gold_docs)
-
-        import re
+        self.assertIsNone(get_gold_docs(samples, "lveval"))
 
         corpus = [
             {"title": "", "text": text.strip()}
             for text in re.split(r"### Passage \d+\n", samples[0]["context"])
             if text.strip()
         ]
-        # LV-Eval is QA-only and selects the full corpus in build_benchmark_slice
-        slice_docs, queries, s_gold, _ = build_benchmark_slice(
+        doc_ids, queries, s_gold, _ = build_benchmark_slice(
             "lveval", samples, corpus=corpus, max_queries=1, index_queries=2, full_corpus=False
         )
-        slice_docs = selected_texts(slice_docs, corpus)
+        slice_docs = selected_texts(doc_ids, corpus)
         self.assertEqual(len(queries), 1)
         self.assertIsNone(s_gold)
         self.assertEqual(len(slice_docs), len(corpus))
 
-    def test_narrativeqa_gold_extraction(self):
+    def test_narrativeqa_gold_extraction(self) -> None:
         samples = [
             {
                 "question": "What is Mary Horowitz's job?",
@@ -411,83 +407,55 @@ class DatasetSliceTests(unittest.TestCase):
 
         corpus = [
             {"idx": "doc123_0", "title": "Script", "text": "Unrelated scene."},
-            {
-                "idx": "doc123_1",
-                "title": "Script",
-                "text": "Mary works as a crossword writer for the Herald.",
-            },
+            {"idx": "doc123_1", "title": "Script", "text": "Mary works as a crossword writer for the Herald."},
             {"idx": "other_0", "title": "Other", "text": "Different document."},
         ]
         self.assertIsNone(get_gold_docs(samples, "narrativeqa", corpus=corpus))
 
-        # NarrativeQA is QA-only and selects the full corpus in build_benchmark_slice
-        slice_docs, queries, s_gold, _ = build_benchmark_slice(
+        doc_ids, queries, s_gold, _ = build_benchmark_slice(
             "narrativeqa", samples, corpus, max_queries=1, index_queries=2, full_corpus=False
         )
-        slice_docs = selected_texts(slice_docs, corpus)
+        slice_docs = selected_texts(doc_ids, corpus)
         self.assertEqual(len(queries), 1)
         self.assertIsNone(s_gold)
         self.assertEqual(len(slice_docs), len(corpus))
 
-    def test_paper_baselines_contain_all_required_datasets(self):
-        for name in (
-            "musique",
-            "2wikimultihopqa",
-            "hotpotqa",
-            "nq",
-            "popqa",
-            "lveval",
-            "narrativeqa",
-        ):
-            self.assertIn(name, BASELINES)
+    def test_enterprise_rag_bench_expected_doc_ids_slicing_and_bundle(self) -> None:
+        documents = [
+            {"idx": "doc-a", "title": "Spec A", "text": "Service A listens on port 8080."},
+            {"idx": "doc-b", "title": "Spec B", "text": "Service B uses SQLite WAL."},
+            {"idx": "distractor", "title": "Noise", "text": "Unrelated archive notes."},
+        ]
+        questions = [
+            {
+                "question_id": "q1",
+                "question": "What port does Service A use?",
+                "gold_answer": "8080",
+                "expected_doc_ids": ["doc-a"],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            cp, qp = root / "corpus.json", root / "questions.json"
+            cp.write_text(json.dumps(documents), encoding="utf-8")
+            qp.write_text(json.dumps(questions), encoding="utf-8")
+            bundle = prepare_dataset_bundle("enterprise_rag_bench", cp, qp, root / "outputs/datasets")
+            loaded_q, loaded_c = load_dataset_files("enterprise_rag_bench", dataset_dir=root / "outputs/datasets")
+            doc_ids, queries, gold_docs, gold_answers = build_benchmark_slice(
+                "enterprise_rag_bench", loaded_q, loaded_c, max_queries=1
+            )
+            self.assertEqual(len(bundle.documents), 3)
+            self.assertEqual(doc_ids, ["doc-a", "doc-b", "distractor"])
+            self.assertEqual(queries, ["What port does Service A use?"])
+            self.assertEqual(gold_docs, [["Spec A\nService A listens on port 8080."]])
+            self.assertEqual(gold_answers, [["8080"]])
 
-        # NQ
-        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.780)
-        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.485)
-        self.assertEqual(BASELINES["nq"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.633)
-        self.assertEqual(BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.754)
-        self.assertEqual(BASELINES["nq"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.619)
-        self.assertEqual(BASELINES["nq"]["hipporag_reproduced"]["Recall@5"], 0.444)
-        self.assertEqual(BASELINES["nq"]["hipporag_reproduced"]["F1"], 0.553)
-
-        # PopQA
-        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["Recall@5"], 0.517)
-        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.490)
-        self.assertEqual(BASELINES["popqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.562)
-        self.assertEqual(BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["Recall@5"], 0.510)
-        self.assertEqual(BASELINES["popqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.557)
-        self.assertEqual(BASELINES["popqa"]["hipporag_reproduced"]["Recall@5"], 0.538)
-        self.assertEqual(BASELINES["popqa"]["hipporag_reproduced"]["F1"], 0.559)
-
-        # LV-Eval
-        self.assertEqual(BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.080)
-        self.assertEqual(BASELINES["lveval"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.129)
-        self.assertEqual(BASELINES["lveval"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.098)
-        self.assertEqual(BASELINES["lveval"]["hipporag_reproduced"]["F1"], 0.084)
-
-        # NarrativeQA
-        self.assertEqual(BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["ExactMatch"], 0.180)
-        self.assertEqual(BASELINES["narrativeqa"]["hipporag2_llama3.3_70b_nvembed_v2"]["F1"], 0.259)
-        self.assertEqual(BASELINES["narrativeqa"]["standard_nvembed_v2_llama3.3_70b"]["F1"], 0.257)
-        self.assertEqual(BASELINES["narrativeqa"]["hipporag_reproduced"]["F1"], 0.163)
-
-    def test_monkeypatched_hipporag_baselines_contain_all_required_datasets(self):
-        for name in (
-            "musique",
-            "2wikimultihopqa",
-            "hotpotqa",
-            "nq",
-            "popqa",
-            "lveval",
-            "narrativeqa",
-        ):
+    def test_paper_baselines_and_catalog_consistency(self) -> None:
+        for name in ("musique", "2wikimultihopqa", "hotpotqa", "nq", "popqa", "lveval", "narrativeqa"):
             self.assertIn(name, BASELINES)
             entry = BASELINES[name]["monkeypatched_hipporag"]
-            self.assertIn("Recall@1", entry)
-            self.assertIn("Recall@2", entry)
-            self.assertIn("Recall@5", entry)
-            self.assertIn("ExactMatch", entry)
-            self.assertIn("F1", entry)
+            for key in ("Recall@1", "Recall@2", "Recall@5", "ExactMatch", "F1"):
+                self.assertIn(key, entry)
             self.assertGreater(entry["indexing_seconds"], 0.0)
             self.assertGreater(entry["evaluation_seconds"], 0.0)
             self.assertGreater(entry["elapsed_seconds"], 0.0)
@@ -497,113 +465,62 @@ class DatasetSliceTests(unittest.TestCase):
         self.assertEqual(set(spec["datasets"]), set(DATASETS))
         self.assertEqual(spec["baselines"], BASELINES)
 
-    def test_enterprise_rag_bench_10_category_stratification_and_distractors(self):
-        from yaw.daemon.cli import _load_dataset_splits
-        from yaw.daemon.ingestion import ENTERPRISE_CATEGORY_QUOTAS
-
-        questions, documents = [], []
-        for category, (nt, nv) in ENTERPRISE_CATEGORY_QUOTAS.items():
-            for i in range(nt + nv + 2):
-                did = f"{category}-{i}"
-                documents.append({"idx": did, "title": did, "text": "Original text"})
-                questions.append(
-                    {
-                        "question_id": did,
-                        "question_type": category,
-                        "question": did,
-                        "gold_answer": "Original answer",
-                        "expected_doc_ids": [did],
-                    }
-                )
-        # Couple 10 question pairs via shared doc IDs so naive shuffling splits pairs across train/val/holdout
-        for k in range(10):
-            shared = [questions[2 * k]["question_id"], questions[2 * k + 1]["question_id"]]
-            questions[2 * k]["expected_doc_ids"] = shared
-            questions[2 * k + 1]["expected_doc_ids"] = shared
-        documents.extend({"idx": f"d-{i}", "title": f"Distractor {i}", "text": "Noise"} for i in range(100))
-        with tempfile.TemporaryDirectory() as name:
-            root = Path(name)
-            cp, qp = root / "corpus.json", root / "questions.json"
-            cp.write_text(json.dumps(documents), encoding="utf-8")
-            qp.write_text(json.dumps(questions), encoding="utf-8")
-            bundle = prepare_dataset_bundle("enterprise_rag_bench", cp, qp, root / "outputs/datasets")
-            self.assertEqual(len(bundle.documents), len(documents))
-            self.assertEqual(json.loads(bundle.evaluation_path.read_text(encoding="utf-8")), questions)
-            train, val, corpus = _load_dataset_splits(
-                ["enterprise_rag_bench"], workspace_root=root, max_queries=162, train_queries=135
-            )
-            assert val is not None
-            self.assertEqual((len(train), len(val), len(corpus)), (135, 27, 162))
-            self.assertTrue(all("Distractor" not in doc for doc in corpus))
-            train_dids = {did for ex in train for did in ex.expected_doc_ids}
-            val_dids = {did for ex in val for did in ex.expected_doc_ids}
-            selected_qids = {ex.question for ex in [*train, *val]}
-            holdout_dids = {
-                did for q in questions if q["question_id"] not in selected_qids for did in q["expected_doc_ids"]
-            }
-            self.assertTrue(train_dids.isdisjoint(val_dids))
-            self.assertTrue((train_dids | val_dids).isdisjoint(holdout_dids))
-
 
 class EvaluationAndIntegrityTests(unittest.TestCase):
-    def setUp(self):
-        self.queries = [
-            "What county is Erik Hort's birthplace a part of?",
-            "What is George Rankin's occupation?",
-        ]
-        self.gold_docs = [
-            [
-                "Erik Hort\nErik Hort was born in Montebello.",
-                "Montebello\nMontebello is in Rockland County.",
-            ],
-            ["George Rankin\nGeorge Rankin is a politician."],
-        ]
-        self.gold_answers = [["Rockland County"], ["Politician"]]
-
-    def test_integrity_gate_catches_silent_failures(self):
+    def test_integrity_gate_catches_silent_failures(self) -> None:
         valid_records = [
             {
-                "question": self.queries[0],
+                "question": "Q1?",
                 "answer": "Rockland County",
-                "dpr_answer": "Montebello",
-                "graph_seeds": [("erik hort", "born in", "montebello")],
+                "retrieved_chunk_ids": [101],
             },
             {
-                "question": self.queries[1],
+                "question": "Q2?",
                 "answer": "Politician",
-                "dpr_answer": "Politician",
-                "graph_seeds": [],
+                "retrieved_chunk_ids": [],
             },
         ]
-        valid_graph = {"num_passage_nodes": 5, "num_extracted_triples": 12}
+        valid_graph = {"num_passage_nodes": 5, "num_indexed_docs": 5}
         self.assertEqual(
             check_benchmark_integrity(valid_records, valid_graph, expected_doc_count=5),
             [],
         )
 
-        # Trap 1: chat errors
-        errs = check_benchmark_integrity(
-            valid_records, valid_graph, expected_doc_count=5, extraction_errors=["ValueError: bad"]
-        )
-        self.assertTrue(any("extraction_llm" in e for e in errs))
-
-        # Trap 2: passage count mismatch or zero triples
+        # Trap 1: indexing/extraction errors and qa errors
         errs = check_benchmark_integrity(
             valid_records,
-            {"num_passage_nodes": 4, "num_extracted_triples": 0},
+            valid_graph,
+            expected_doc_count=5,
+            extraction_errors=["ValueError: bad"],
+            qa_errors=["TimeoutError: qa"],
+        )
+        self.assertTrue(any("extraction_llm" in e for e in errs))
+        self.assertTrue(any("qa_llm" in e for e in errs))
+
+        # Trap 2: passage/doc count mismatch, partial drop hidden behind multi-chunk count, and zero chunks
+        errs = check_benchmark_integrity(
+            valid_records,
+            {"num_passage_nodes": 0, "num_indexed_docs": 0},
             expected_doc_count=5,
         )
         self.assertTrue(any("passage count" in e.lower() for e in errs))
-        self.assertTrue(any("no triples" in e.lower() for e in errs))
+        self.assertTrue(any("no chunks indexed" in e.lower() for e in errs))
 
-        # Trap 3: all graph_seeds empty on multi-query benchmark
-        no_seed_records = [{**r, "graph_seeds": []} for r in valid_records]
+        drop_errs = check_benchmark_integrity(
+            valid_records,
+            {"num_passage_nodes": 8, "num_indexed_docs": 4},
+            expected_doc_count=5,
+        )
+        self.assertEqual(drop_errs, ["Index passage count mismatch: 4 != 5"])
+
+        # Trap 3: all retrieved_chunk_ids/graph_seeds empty on multi-query benchmark
+        no_seed_records = [{**r, "retrieved_chunk_ids": []} for r in valid_records]
         errs = check_benchmark_integrity(no_seed_records, valid_graph, expected_doc_count=5)
-        self.assertTrue(any("graph_seeds" in e for e in errs))
+        self.assertTrue(any("empty retrieval results" in e for e in errs))
 
 
 class PaperParityGateTests(unittest.TestCase):
-    def test_popqa_slice_pads_to_at_least_two_passages_per_index_query(self):
+    def test_popqa_slice_pads_to_at_least_two_passages_per_index_query(self) -> None:
         samples: list[dict[str, Any]] = [
             {
                 "question": f"PopQA Q{i}?",
@@ -614,23 +531,20 @@ class PaperParityGateTests(unittest.TestCase):
             }
             for i in range(10)
         ]
-        corpus = [
-            {"title": p["title"], "text": p.get("text", p.get("paragraph_text"))}
-            for q in samples
-            for p in q["paragraphs"]
-        ]
-        docs, queries, gold_docs, _ = build_benchmark_slice(
+        corpus = [{"title": p["title"], "text": p["text"]} for q in samples for p in q["paragraphs"]]
+        doc_ids, queries, gold_docs, _ = build_benchmark_slice(
             "popqa", samples, corpus=corpus, max_queries=2, index_queries=4, full_corpus=False
         )
         self.assertEqual(len(queries), 2)
+        self.assertIsNotNone(gold_docs)
+        assert gold_docs is not None
         self.assertEqual(len(gold_docs), 2)
-        # 4 index_queries * 2 = 8 passages padded from subsequent samples
-        self.assertEqual(len(docs), 8)
-        docs = selected_texts(docs, corpus)
+        self.assertEqual(len(doc_ids), 8)
+        docs = selected_texts(doc_ids, corpus)
         for g in gold_docs:
             self.assertTrue(set(g).issubset(set(docs)))
 
-    def test_compare_and_aggregate_gate_reports_and_markdown_table(self):
+    def test_compare_and_aggregate_gate_reports_and_markdown_table(self) -> None:
         from scripts.verify_paper_parity_gate import (
             aggregate_gate_summary,
             build_monkeypatched_baseline_report,
@@ -737,25 +651,11 @@ class PaperParityGateTests(unittest.TestCase):
         self.assertIn("| `musique` | — | — |", md)
         self.assertIn("**+0.0400**", md)
 
-    def test_maxp_passage_hydration_and_retrieval_recall_parity_on_split_json_passages(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        import numpy as np
-
-        from scripts.evaluation import RetrievalRecall as ScriptRetrievalRecall
-        from yaw.core import OpenIERecord
-        from yaw.daemon.graph.engine import YawGraphEngine
-        from yaw.daemon.graph.inference.embedding import resolve_embedding_profile
-        from yaw.daemon.ingestion.source_targets import SourceSettings
-
+    def test_maxp_passage_hydration_and_retrieval_recall_parity_on_split_passages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp_path = Path(tmp_str)
             corpus_dir = tmp_path / "corpus"
-            state_dir = tmp_path / "state"
             corpus_dir.mkdir()
-            state_dir.mkdir()
 
             long_body = (
                 "Montebello is an incorporated village in the town of Ramapo, Rockland County, New York. "
@@ -766,82 +666,20 @@ class PaperParityGateTests(unittest.TestCase):
                 "within the town of Ramapo in Rockland County."
             )
             full_gold_passage = f"Montebello\n{long_body}"
-            distractor_passage = (
-                "Albany\nAlbany is the capital city of the U.S. state of New York and seat of Albany County."
-            )
-
-            dataset_payload = [
-                {
-                    "id": "musique_maxp_1",
-                    "question": "Which county is Erik Hort's birthplace part of?",
-                    "answer": "Rockland County",
-                    "paragraphs": [
-                        {
-                            "idx": 0,
-                            "title": "Montebello",
-                            "paragraph_text": long_body,
-                            "is_supporting": True,
-                        },
-                        {
-                            "idx": 1,
-                            "title": "Albany",
-                            "paragraph_text": distractor_passage.split("\n", 1)[1],
-                            "is_supporting": False,
-                        },
-                    ],
-                }
-            ]
-            (corpus_dir / "musique.json").write_text(
-                json.dumps(dataset_payload, indent=2),
+            (corpus_dir / "montebello.md").write_text(f"# Montebello\n\n{long_body}\n", encoding="utf-8")
+            (corpus_dir / "albany.md").write_text(
+                "# Albany\n\nAlbany is the capital city of the U.S. state of New York and seat of Albany County.\n",
                 encoding="utf-8",
             )
 
-            source_corpus = tmp_path / "documents.json"
-            source_corpus.write_text(
-                json.dumps(
-                    [
-                        {"title": "Montebello", "text": long_body},
-                        {"title": "Albany", "text": distractor_passage.split("\n", 1)[1]},
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            bundle = prepare_dataset_bundle(
-                "musique", source_corpus, corpus_dir / "musique.json", tmp_path / "prepared"
-            )
-            corpus_dir = bundle.root.parent
-            added_chunks = tuple(
-                chunk
-                for doc in bundle.documents
-                for chunk in chunk_source_text(
-                    (bundle.root / doc.path).read_text(encoding="utf-8"),
-                    f"{bundle.dataset}/{doc.path}",
-                    chunk_size=180,
-                    chunk_overlap=20,
-                    min_chunk_size=30,
-                )
-            )
-            # Long passage is split into multiple sub-chunks, plus 1 distractor chunk
-            self.assertGreaterEqual(len(added_chunks), 3)
-            montebello_subchunks = [(ptr, txt) for ptr, txt in added_chunks if ptr.title == "Montebello"]
-            self.assertGreaterEqual(len(montebello_subchunks), 2)
-            # All Montebello sub-chunks share the exact same parent record AST island
-            ast_islands = {
-                (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end) for ptr, _ in montebello_subchunks
-            }
-            self.assertEqual(len(ast_islands), 1)
-
-            profile = resolve_embedding_profile(task_mode="distinct-titled")
-            formatted_doc_inputs: list[str] = []
-
-            def title_checking_embedder(texts):
-                formatted_doc_inputs.extend(t for t in texts if t.startswith("title: "))
+            def semantic_embed(texts: list[str]) -> NDArray[np.float32]:
                 out = []
                 for t in texts:
+                    low = t.lower()
                     v = np.array(
                         [
-                            1.0 if "montebello" in t.lower() or "erik hort" in t.lower() else 0.1,
-                            1.0 if "rockland" in t.lower() else 0.1,
+                            1.0 if "montebello" in low or "erik hort" in low else 0.1,
+                            1.0 if "rockland" in low else 0.1,
                             0.5,
                             0.2,
                         ],
@@ -851,366 +689,74 @@ class PaperParityGateTests(unittest.TestCase):
                     out.append(v)
                 return np.vstack(out)
 
-            profile = replace(profile, dimensions=4)
-
-            class MinimalProgram(YawProgram):
-                context_window_tokens = 32768
-                max_output_tokens = 4096
-
-                def __init__(self):
-                    super().__init__(context_window_tokens=32768, max_output_tokens=4096, enable_gbnf=False)
-
-                def _context_char_limit(self, base_chars: int = 8000) -> int:
-                    return base_chars
-
-                def set_retrieval_hook(self, hook):
-                    self.hook = hook
-
-                def extract_openie(self, chunk_id, text, **kwargs):
-                    if "montebello" in text.lower():
-                        return OpenIERecord(
-                            chunk_id=chunk_id,
-                            entities=("erik hort", "montebello", "rockland county"),
-                            triples=(
-                                ("erik hort", "born in", "montebello"),
-                                ("montebello", "part of", "rockland county"),
-                            ),
-                            entity_definitions=(
-                                ("erik hort", "Person born in Montebello."),
-                                ("montebello", "Incorporated village in Rockland County."),
-                                ("rockland county", "County in New York."),
-                            ),
-                        )
-                    return OpenIERecord(
-                        chunk_id=chunk_id,
-                        entities=("albany", "new york"),
-                        triples=(("albany", "capital of", "new york"),),
-                        entity_definitions=(
-                            ("albany", "Capital city of New York."),
-                            ("new york", "U.S. state."),
-                        ),
-                    )
-
-                def extract_query_intent(self, query):
-                    return query
-
-                def filter_triples(self, query, candidates):
-                    return [0] if candidates else []
-
-                def judge_semantics(self, candidates, *args, **kwargs):
-                    return []
-
-                def heal_shacl_violations(self, violations, focus_context="", *args, **kwargs):
-                    return []
-
-            engine = bind_native_indexing(
-                YawGraphEngine(
-                    db_path=tmp_path / "yaw.db",
-                    workspace_root=corpus_dir,
-                    program=MinimalProgram(),
-                    embedder=DSPyEmbeddingAdapter(
-                        profile,
-                        create_dspy_embedder(
-                            IdentifiedEmbeddingCallable(title_checking_embedder, "title-checking-fixture")
-                        ),
-                    ),
-                    retrieval_top_k=5,
-                ),
-                source_settings=SourceSettings(("**/*",), (), chunk_size=180, chunk_overlap=20, min_chunk_size=30),
+            cfg = YawConfig(
+                workspace_root=tmp_path,
+                corpus_root=corpus_dir,
+                db_path=tmp_path / ".yaw" / "yaw.db",
+                lock_path=tmp_path / ".yaw" / "yaw.db.lock",
+                state_dir=tmp_path / ".yaw" / "coco_lmdb",
+                log_path=tmp_path / ".yaw" / "yaw.log",
+                status_path=tmp_path / ".yaw" / "status.json",
+                chunk_size=180,
+                chunk_overlap=20,
+                min_chunk_size=30,
             )
+            session = start_pipeline(cfg, embed_fn=semantic_embed, vector_dim=4, live=False)
             try:
-                engine.index_chunks(added_chunks)
-                # Verify zero titled chunks degraded to 'title: none'
-                self.assertTrue(len(formatted_doc_inputs) >= len(added_chunks))
-                for fmt_str in formatted_doc_inputs[: len(added_chunks)]:
-                    self.assertFalse(
-                        fmt_str.startswith("title: none"),
-                        f"Expected AST title in formatted embedding input, got: {fmt_str!r}",
-                    )
-                    self.assertTrue(
-                        fmt_str.startswith(("title: Montebello | text:", "title: Albany | text:")),
-                    )
+                update_pipeline_once(session)
+            finally:
+                close_pipeline(session)
 
-                hits, _ = engine.retrieve_with_seeds("Which county is Erik Hort's birthplace part of?", top_k=5)
-                dpr_hits = engine.retrieve_dpr("Which county is Erik Hort's birthplace part of?", top_k=5)
-                # MaxP deduplicates the multiple Montebello sub-chunks into 1 full passage hit
-                self.assertEqual(len(hits), 2)
-                self.assertEqual(len(dpr_hits), 2)
-                self.assertEqual(hits[0][2], full_gold_passage)
-                self.assertEqual(dpr_hits[0][2], full_gold_passage)
-
-                overall, _ = ScriptRetrievalRecall().calculate_metric_scores(
+            assert cfg.db_path is not None
+            with contextlib.closing(open_readonly_db(cfg.db_path)) as conn:
+                vs = build_vector_search(conn)
+                self.assertGreaterEqual(vs.size, 3)
+                q_vec = semantic_embed(["task: question answering | query: Which county is Erik Hort born in?"])[0]
+                ranked = search_vectors(
+                    vs,
+                    q_vec,
+                    query_text="Which county is Erik Hort's birthplace part of?",
+                    conn=conn,
+                    top_k=max(5 * 4, 50),
+                )
+                hits = hydrate_ranked_passages(vs, ranked, corpus_dir, top_k=5)
+                self.assertGreaterEqual(len(hits), 2)
+                overall, _ = RetrievalRecall().calculate_metric_scores(
                     gold_docs=[[full_gold_passage]],
-                    retrieved_docs=[[text for _, _, text in hits]],
+                    retrieved_docs=[[hp.text for hp in hits]],
                     k_list=[1, 2, 5],
                 )
                 self.assertEqual(overall["Recall@1"], 1.0)
-            finally:
-                engine.close()
 
-    def test_benchmark_bundle_snapshot_is_complete_and_source_aligned(self):
-        from yaw.daemon.graph.storage import hydrate_chunk_pointer
-
+    def test_benchmark_bundle_snapshot_is_complete_and_source_aligned(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             cp, qp = root / "corpus.json", root / "questions.json"
             cp.write_text(json.dumps([{"idx": "a", "title": "A", "text": "Grounded text"}]), encoding="utf-8")
             qp.write_text(json.dumps([{"question": "Evaluation only", "answer": "Secret"}]), encoding="utf-8")
             bundle = prepare_dataset_bundle("sample", cp, qp, root / "prepared")
-            chunks = tuple(
-                chunk
-                for doc in bundle.documents
-                for chunk in chunk_source_text(
-                    (bundle.root / doc.path).read_text(encoding="utf-8"),
-                    f"{bundle.dataset}/{doc.path}",
-                    min_chunk_size=1,
-                )
+            doc = bundle.documents[0]
+            self.assertEqual(doc.path, "documents/a.md")
+            raw_md = (bundle.root / doc.path).read_text(encoding="utf-8")
+            self.assertEqual(raw_md, "# A\n\nGrounded text\n")
+            pieces = chunk_file_content(f"{bundle.dataset}/{doc.path}", raw_md, min_chunk_size=1)
+            self.assertEqual(len(pieces), 1)
+            piece = pieces[0]
+            ptr = ChunkPointer(
+                chunk_id=piece.chunk_id,
+                rel_path=piece.rel_path,
+                source_hash=piece.source_hash,
+                start_line=piece.start_line,
+                end_line=piece.end_line,
+                char_start=piece.char_start,
+                char_end=piece.char_end,
+                ast_island_start=piece.ast_island_start,
+                ast_island_end=piece.ast_island_end,
+                title=piece.title,
             )
-            self.assertEqual(len(chunks), 1)
-            pointer, text = chunks[0]
-            self.assertIn("/documents/", pointer.rel_posix_path)
-            self.assertEqual(hydrate_chunk_pointer(pointer, bundle.root.parent).text, text)
+            self.assertIn("/documents/", ptr.rel_posix_path)
+            self.assertEqual(hydrate_passage(ptr, bundle.root.parent).text, piece.body)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-@pytest.fixture
-def benchmark_inference_server():
-    requests = []
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            auth = self.headers.get("Authorization")
-            requests.append((self.path, auth, None))
-            if auth != "Bearer benchmark-key":
-                self.send_error(401)
-                return
-            if self.path != "/v1/models":
-                self.send_error(404)
-                return
-            data = [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "fixture",
-                    "loaded": True,
-                    "context_length": 131072,
-                    "alias_for": "fixture/" + name,
-                    "quant": "Q4",
-                }
-                for name in ("gemma-4-e4b", "embeddinggemma-2")
-            ]
-            raw = json.dumps({"object": "list", "data": data}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            auth = self.headers.get("Authorization")
-            requests.append((self.path, auth, body))
-            if auth != "Bearer benchmark-key":
-                self.send_error(401)
-                return
-            if self.path == "/v1/embeddings":
-                assert body["model"] == "embeddinggemma-2"
-                values = []
-                for text in body["input"]:
-                    seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "little")
-                    vector = np.random.default_rng(seed).standard_normal(768)
-                    vector /= np.linalg.norm(vector)
-                    values.append(vector.tolist())
-                response = {
-                    "object": "list",
-                    "model": body["model"],
-                    "data": [{"object": "embedding", "index": i, "embedding": v} for i, v in enumerate(values)],
-                    "usage": {"prompt_tokens": 20, "total_tokens": 20},
-                }
-            elif self.path == "/v1/completions":
-                assert body["model"] == "gemma-4-e4b"
-                assert body["max_tokens"] == 1024
-                grammar = body["grammar"]
-                if "named_entities" in grammar:
-                    result = {
-                        "named_entities": [["Alan Turing", "A mathematician."], ["Cambridge", "A university city."]]
-                    }
-                elif "triples" in grammar:
-                    result = {
-                        "triples": [
-                            {
-                                "sub": "Alan Turing",
-                                "pred": "worked in",
-                                "obj": "Cambridge",
-                                "def": "Alan Turing worked in Cambridge.",
-                            }
-                        ]
-                    }
-                elif "query_intent" in grammar:
-                    result = {"query_intent": "Alan Turing worked in a city."}
-                elif "fact" in grammar:
-                    result = {"fact": [["Alan Turing", "worked in", "Cambridge"]]}
-                else:
-                    assert "answer" in grammar
-                    result = {"plan": "The source names Cambridge.", "answer": "Cambridge"}
-                response = {
-                    "id": "benchmark-completion",
-                    "model": body["model"],
-                    "choices": [{"index": 0, "finish_reason": "stop", "text": json.dumps(result)}],
-                    "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
-                }
-            else:
-                self.send_error(404)
-                return
-            raw = json.dumps(response).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}/v1", requests
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(5)
-
-
-@pytest.mark.parametrize("mode", ["embeddings", "all"])
-def test_benchmark_uses_configured_inference_without_registry_plumbing(
-    tmp_path, monkeypatch, benchmark_inference_server, mode
-):
-    base_url, requests = benchmark_inference_server
-    corpus = tmp_path / "documents.json"
-    questions = tmp_path / "questions.json"
-    text = "Alan Turing worked in Cambridge. " * 7
-    corpus.write_text(json.dumps([{"idx": "turing", "title": "Alan Turing", "text": text}]), encoding="utf-8")
-    questions.write_text(
-        json.dumps(
-            [
-                {
-                    "question": "Where did Alan Turing work?",
-                    "answer": "Cambridge",
-                    "context": [["Alan Turing", [text]]],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    prepare_dataset_bundle("sample", corpus, questions, tmp_path / "outputs" / "datasets")
-    config_path = tmp_path / "yaw.toml"
-    config_path.write_text(
-        f'[inference]\nbase_url = "{base_url}"\nembedding_model = "embeddinggemma-2"\n'
-        'extraction_model = "gemma-4-e4b"\nqa_model = "gemma-4-e4b"\n'
-        "context_window_tokens = 32768\nmax_output_tokens = 1024\nenable_gbnf = true\n"
-        "[ingestion]\nchunk_size = 96\nchunk_overlap = 16\nmin_chunk_size = 30\n",
-        encoding="utf-8",
-    )
-    # Only the workspace and credential source change; the benchmark and inference stack run intact.
-    monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "benchmark-key")
-    report = benchmark.main(config_path=config_path, mode=mode, max_queries=1, fresh_index=True)
-    assert report["status"] == "passed"
-    assert report["base_url"] == base_url
-    assert report["embedding_model"] == "embeddinggemma-2"
-    assert report["context_window_tokens"] == 32768
-    assert report["max_output_tokens"] == 1024
-    assert report["identity_source"] == "configured-profile"
-    assert "model_registry" not in report and "chat_backends" not in report and "server" not in report
-    serialized = (Path(report["run_dir"]) / "report.json").read_text(encoding="utf-8")
-    assert "benchmark-key" not in serialized
-    assert requests and all(auth == "Bearer benchmark-key" for _, auth, _ in requests)
-    assert {route for route, _, _ in requests} <= {"/v1/embeddings", "/v1/completions"}
-    assert report["embedding_probes"]
-    if mode == "all":
-        assert any(route == "/v1/completions" for route, _, _ in requests)
-        assert report["records"][0]["answer"] == "Cambridge"
-        with sqlite3.connect(Path(report["index_dir"]) / "yaw.db") as conn:
-            assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 1
-            assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
-    else:
-        assert {route for route, _, _ in requests} == {"/v1/embeddings"}
-
-
-def test_parity_gate_propagates_configuration_and_invalidates_old_deployment(
-    tmp_path, monkeypatch, benchmark_inference_server
-):
-    from scripts import verify_paper_parity_gate as gate
-
-    base_url, requests = benchmark_inference_server
-    corpus, questions = tmp_path / "corpus.json", tmp_path / "questions.json"
-    text = "Alan Turing worked in Cambridge."
-    corpus.write_text(json.dumps([{"idx": "turing", "title": "Alan Turing", "text": text}]), encoding="utf-8")
-    questions.write_text(
-        json.dumps(
-            [
-                {
-                    "question": "Where did Alan Turing work?",
-                    "answer": "Cambridge",
-                    "context": [["Alan Turing", [text]]],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    prepare_dataset_bundle("musique", corpus, questions, tmp_path / "outputs" / "datasets")
-    config_path = tmp_path / "yaw.toml"
-    config_text = (
-        f'[inference]\nbase_url = "{base_url}"\ncontext_window_tokens = 32768\n'
-        "max_output_tokens = 1024\nenable_gbnf = true\n[ingestion]\nmin_chunk_size = 1\n"
-    )
-    config_path.write_text(config_text, encoding="utf-8")
-    monkeypatch.setattr(benchmark, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setenv("UNSLOTH_STUDIO_AUTH_TOKEN", "benchmark-key")
-
-    def run_gate():
-        return gate.run_parity_gate(
-            datasets=["musique"],
-            queries_per_dataset=1,
-            index_queries=1,
-            compiled_program=str(tmp_path / "uncompiled.json"),
-            mode="eval",
-            config_path=config_path,
-            output_json=tmp_path / "gate.json",
-            output_md=tmp_path / "gate.md",
-        )
-
-    first = run_gate()
-    assert first["config"]["qa_model"] == "gemma-4-e4b"
-    assert first["config"]["inference"]["base_url"] == base_url
-    assert first["datasets"]["musique"]["gate_passed"]
-    first_run = first["datasets"]["musique"]["yaw"]["run_dir"]
-    count = len(requests)
-    repeated = run_gate()
-    assert repeated["datasets"]["musique"]["yaw"]["run_dir"] == first_run
-    assert len(requests) == count
-    config_path.write_text(config_text.replace("32768", "65536"), encoding="utf-8")
-    changed = run_gate()
-    assert changed["config"]["inference"] != first["config"]["inference"]
-    assert changed["datasets"]["musique"]["yaw"]["run_dir"] != first_run
-    artifact = tmp_path / "uncompiled.json"
-    YawProgram().save(str(artifact))
-    changed_program = run_gate()
-    assert changed_program["config"]["inference"] != changed["config"]["inference"]
-    assert changed_program["datasets"]["musique"]["yaw"]["run_dir"] != changed["datasets"]["musique"]["yaw"]["run_dir"]
-    artifact.write_bytes(artifact.read_bytes() + b"\n")
-    changed_bytes = run_gate()
-    assert changed_bytes["config"]["inference"] != changed_program["config"]["inference"]
-    assert (
-        changed_bytes["datasets"]["musique"]["yaw"]["run_dir"]
-        != changed_program["datasets"]["musique"]["yaw"]["run_dir"]
-    )
-    assert all(auth == "Bearer benchmark-key" for _, auth, _ in requests)
-    assert {route for route, _, _ in requests} <= {"/v1/embeddings", "/v1/completions"}
