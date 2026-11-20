@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -13,7 +14,7 @@ import pytest
 import sqlite_vec
 from numpy.typing import NDArray
 
-from yaw.core import ChunkPointer, YawConfig, format_query_for_embedding
+from yaw.core import ChunkPointer, YawConfig, YawRuntimeError, format_query_for_embedding
 from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
 from yaw.retrieval import (
     VectorSearch,
@@ -219,7 +220,7 @@ def test_uncropped_hydration_corrupt_json_and_unbounded_routes(tmp_path: Path) -
         with pytest.raises(ValueError, match="max_chars"):
             hydrate_ranked_passages(vs, [(int(long_ptr.chunk_id), 0.9)], cfg.corpus_root, max_chars=-5)
 
-        # Corrupt JSON when source_hash matches (or empty source_hash) raises CONSISTENCY_ERROR
+        # Hash-valid non-standard or JSON payloads hydrate verbatim without serde JSON parsing
         for corrupt_payload in ("{broken json", "[]"):
             corrupt_path = cfg.corpus_root / "corrupt.json"
             corrupt_path.write_text(corrupt_payload, encoding="utf-8")
@@ -269,3 +270,48 @@ def test_retrieval_module_isolation_and_nlp() -> None:
             mod = node.module or ""
             assert not mod.startswith(("dspy", "cocoindex", "yaw.daemon", "yaw.pipeline"))
     assert sqlite_vec.__name__ == "sqlite_vec"
+
+
+def test_missing_chunk_fts_raises_consistency_error_while_in_memory_works(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "apollo.md").write_text(
+        "# Apollo 11 Mission\nNeil Armstrong served as Apollo 11 Lunar Module commander.\n",
+        encoding="utf-8",
+    )
+    session = start_pipeline(cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    try:
+        update_pipeline_once(session)
+    finally:
+        close_pipeline(session)
+
+    conn = open_readonly_db(cfg.db_path)
+    try:
+        vs = build_vector_search(conn)
+    finally:
+        conn.close()
+
+    with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
+        rw_conn.execute("DROP TABLE chunk_fts")
+        rw_conn.commit()
+
+    q_vec = _topic_embed([format_query_for_embedding("Apollo 11 commander", "distinct-titled")], dim=16)[0]
+    broken_conn = open_readonly_db(cfg.db_path)
+    try:
+        with pytest.raises(YawRuntimeError) as exc_lex:
+            lexical_search(vs, "Apollo commander", broken_conn, top_k=5)
+        assert exc_lex.value.code == "CONSISTENCY_ERROR"
+
+        with pytest.raises(YawRuntimeError) as exc_vec:
+            search_vectors(vs, q_vec, query_text="Apollo commander", conn=broken_conn, top_k=5)
+        assert exc_vec.value.code == "CONSISTENCY_ERROR"
+    finally:
+        broken_conn.close()
+
+    # In-memory ranking (conn=None) remains functional without SQLite FTS5
+    in_mem_lex = lexical_search(vs, "Apollo commander", None, top_k=5)
+    in_mem_vec = search_vectors(vs, q_vec, query_text="Apollo commander", conn=None, top_k=5)
+    assert in_mem_lex and in_mem_vec
+    assert in_mem_lex[0][0] == vs.chunk_ids[0]
+    assert in_mem_vec[0][0] == vs.chunk_ids[0]

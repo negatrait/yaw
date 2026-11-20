@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import re
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +17,18 @@ from dspy.lm15 import (
     ProviderDefinition,
     register_provider,
 )
-from dspy.utils.exceptions import AdapterParseError
+from dspy.utils.exceptions import AdapterParseError, ContextWindowExceededError
 
 from .core import EmbedFn, HydratedPassage, QAResult, YawConfig, YawRuntimeError, format_query_for_embedding
-from .retrieval import VectorSearch, hydrate_passage, hydrate_ranked_passages, lexical_search, search_vectors
+from .retrieval import (
+    SearchParams,
+    VectorSearch,
+    hydrate_passage,
+    hydrate_ranked_passages,
+    lexical_search,
+    open_readonly_db,
+    search_vectors,
+)
 
 _MAX_TOP_K = 25
 _NO_MATCHES = "No matching passages found."
@@ -28,6 +37,9 @@ _PASSAGE_HEAD_RE = re.compile(r"^\[chunk_id=(\d+)\]\s+\([^)\n]+\)\s+score=([-+]?
 _CHUNK_ID_RE = re.compile(r"\[chunk_id=(\d+)\]")
 _QUERY_DESC = {"query": "Non-empty search query.", "top_k": f"Max passages to return (1..{_MAX_TOP_K})."}
 _CHUNK_DESC = "Chunk ID from a prior [chunk_id=<int>] header."
+
+
+ABSTAIN_REPLY = "Insufficient references in corpus"
 
 
 class QASignature(dspy.Signature):
@@ -118,11 +130,20 @@ def make_qa_tools(
     vs: VectorSearch,
     corpus_root: Path,
     embed_fn: EmbedFn,
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | Path,
     *,
     task_mode: str = "distinct-titled",
+    search_params: SearchParams | None = None,
 ) -> list[dspy.Tool]:
     """Build closure-bound retrieval tools with explicit DSPy schemas for dspy.ReAct."""
+
+    @contextlib.contextmanager
+    def _tool_conn() -> Generator[sqlite3.Connection]:
+        if isinstance(conn, Path):
+            with contextlib.closing(open_readonly_db(conn)) as local_conn:
+                yield local_conn
+        else:
+            yield conn
 
     def search_passages(query: str, top_k: int = 8) -> str:
         """Search corpus passages using hybrid vector and lexical ranking."""
@@ -131,7 +152,10 @@ def make_qa_tools(
             return _NO_MATCHES
         raw_emb = np.asarray(embed_fn([format_query_for_embedding(q, task_mode)]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-        ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(k * 4, 50))
+        with _tool_conn() as db_conn:
+            ranked = search_vectors(
+                vs, q_vec, query_text=q, conn=db_conn, top_k=max(k * 4, 50), **(search_params or {})
+            )
         return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
@@ -140,7 +164,8 @@ def make_qa_tools(
         if vs.size == 0:
             return _NO_MATCHES
         # Over-fetch pool_k = max(k * 4, 50) to prevent sub-chunk starvation during MaxP span dedup.
-        ranked = lexical_search(vs, q, conn, top_k=max(k * 4, 50))
+        with _tool_conn() as db_conn:
+            ranked = lexical_search(vs, q, db_conn, top_k=max(k * 4, 50))
         return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
@@ -211,6 +236,31 @@ def _extract_seen_chunks(history_msgs: Sequence[Any]) -> dict[int, tuple[float, 
     return seen
 
 
+def extract_inline_chunk_ids(text: str) -> list[int]:
+    """Return deduplicated `[chunk_id=<int>]` identifiers in order of appearance."""
+    return list(dict.fromkeys(int(m.group(1)) for m in _CHUNK_ID_RE.finditer(text)))
+
+
+def strip_inline_citations(text: str) -> str:
+    """Remove inline `[chunk_id=<int>]` markers from an answer string."""
+    return _CHUNK_ID_RE.sub("", text).strip()
+
+
+def collect_tool_history(pred: Any) -> tuple[list[str], int, dict[int, tuple[float, int]]]:
+    """Extract tool observations, non-submit call count, and seen chunk scores from `pred.history`."""
+    history_msgs = _field(_field(pred, "history"), "messages") or ()
+    obs_blocks = list(iter_tool_observations(history_msgs))
+    tool_calls = 0
+    for msg in history_msgs:
+        if (tc := _field(msg, "tool_calls")) is None:
+            continue
+        for call in _field(tc, "tool_calls") or ():
+            if (name := _field(call, "name", "")) and name != "submit":
+                tool_calls += 1
+    seen = _extract_seen_chunks(history_msgs)
+    return obs_blocks, tool_calls, seen
+
+
 def build_qa_agent(
     tools: Sequence[dspy.Tool | Callable[..., Any]], *, max_iters: int = 6, artifact_path: Path | None = None
 ) -> dspy.ReAct:
@@ -236,15 +286,21 @@ def ask_question(
 
     try:
         pred = agent(question=q)
-    except AdapterParseError as exc:
-        raise YawRuntimeError("MODEL_ERROR", "QA model returned an invalid tool response.") from exc
+    except (AdapterParseError, ContextWindowExceededError, ValueError) as exc:
+        raise YawRuntimeError("MODEL_ERROR", f"QA model returned an invalid tool response: {exc}") from exc
+    termination_reason = getattr(pred, "termination_reason", None)
+    if termination_reason is not None and termination_reason not in ("submit", "forced_submit"):
+        raise YawRuntimeError(
+            "MODEL_ERROR",
+            f"QA agent terminated without submit (termination_reason={termination_reason!r}).",
+        )
     if not isinstance(raw_ans := _field(pred, "answer"), str) or not (answer := raw_ans.strip()):
         raise YawRuntimeError("MODEL_ERROR", "QA agent produced an empty answer.")
 
     # Verify inline [chunk_id] citations against tool-seen IDs and disk SHA-256 hashes.
     history_msgs = _field(_field(pred, "history"), "messages") or ()
     seen_scores = _extract_seen_chunks(history_msgs)
-    inline_ids = list(dict.fromkeys(int(m.group(1)) for m in _CHUNK_ID_RE.finditer(answer)))
+    inline_ids = extract_inline_chunk_ids(answer)
     for cid in inline_ids:
         if cid not in seen_scores or cid not in vs.id_to_pos:
             raise YawRuntimeError("MODEL_ERROR", f"Answer cites ungrounded chunk_id={cid}.")

@@ -323,18 +323,34 @@ def test_cli_containment_main_loc_zero_wrappers_and_clean_vocabulary() -> None:
                 base_txt = ast.unparse(base)
                 assert not any(w in base_txt for w in ("Module", "BaseLM", "Adapter"))
 
-    allowed_roots = {"dspy", "filelock", "yaw"}
+    allowed_roots = {"filelock", "yaw"}
     allowed_yaw = {
         "yaw.core",
-        "yaw.datasets",
-        "yaw.pipeline",
-        "yaw.retrieval",
-        "yaw.qa",
         "yaw.runtime",
         "yaw.mcp_server",
         "yaw.optimize",
     }
-    forbidden_pkgs = ("yaw.daemon", "cocoindex", "optuna", "fastmcp", "starlette", "uvicorn", "numpy")
+    forbidden_pkgs = (
+        "dspy",
+        "yaw.daemon",
+        "yaw.pipeline",
+        "yaw.retrieval",
+        "yaw.qa",
+        "cocoindex",
+        "optuna",
+        "fastmcp",
+        "starlette",
+        "uvicorn",
+        "numpy",
+    )
+    lazy_top_level = ("yaw.optimize", "yaw.datasets", "optuna")
+    for top_node in tree.body:
+        if isinstance(top_node, ast.Import):
+            for alias in top_node.names:
+                assert not alias.name.startswith(lazy_top_level)
+        elif isinstance(top_node, ast.ImportFrom):
+            mod = top_node.module or ""
+            assert not mod.startswith(lazy_top_level)
     stdlib_names = sys.stdlib_module_names
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -353,6 +369,26 @@ def test_cli_containment_main_loc_zero_wrappers_and_clean_vocabulary() -> None:
                 assert any(mod == a or mod.startswith(f"{a}.") for a in allowed_yaw)
                 for alias in node.names:
                     assert not alias.name.startswith("_")
+
+
+def test_cli_module_import_skips_optimize_datasets_and_optuna() -> None:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, yaw.cli; "
+                "assert 'yaw.optimize' not in sys.modules; "
+                "assert 'yaw.datasets' not in sys.modules; "
+                "assert 'optuna' not in sys.modules"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_cli_help_exit_codes_and_global_flag_order(

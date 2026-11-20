@@ -6,11 +6,11 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import threading
 import time
 from collections.abc import Generator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ from yaw.core import (
     configure_logging,
     format_query_for_embedding,
     get_logger,
+    redact_secrets,
     write_text_atomic,
 )
 from yaw.pipeline import (
@@ -45,13 +46,9 @@ from yaw.retrieval import (
     build_vector_search,
     hydrate_ranked_passages,
     open_readonly_db,
+    resolve_retrieval_params,
     search_vectors,
 )
-
-_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
-_URL_USERINFO_RE = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
-_API_KEY_KV_RE = re.compile(r"(?i)(api_key\s*[=:]\s*)([^\s,;\"']+)")
 
 _kernel32: Any = None
 if os.name == "nt":
@@ -98,19 +95,6 @@ class YawRuntime:
     state_lock: threading.Lock = field(default_factory=threading.Lock)
     active_queries: int = 0
     active_op: str | None = None
-
-
-def redact_secrets(text: str, api_key: str = "") -> str:
-    """Mask configured API keys, Bearer tokens, OpenAI keys, and URL credentials."""
-    if not text:
-        return text
-    cleaned = text
-    if api_key and len(api_key) >= 4:
-        cleaned = cleaned.replace(api_key, "[REDACTED]")
-    cleaned = _BEARER_RE.sub("Bearer [REDACTED]", cleaned)
-    cleaned = _SK_RE.sub("[REDACTED]", cleaned)
-    cleaned = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", cleaned)
-    return _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
 
 
 def win32_stop_event_name(lock_path: Path | str) -> str:
@@ -344,11 +328,29 @@ def _validate_text_input(raw: str, label: str) -> str:
     return cleaned
 
 
-def _ensure_ready(rt: YawRuntime) -> None:
+def _sync_pipeline_error(rt: YawRuntime) -> tuple[str, str | None]:
+    pipe_err = rt.pipeline.error
+    pipe_num_errors = getattr(rt.pipeline, "num_errors", 0)
+    err_msg: str | None = None
+    if pipe_err is not None:
+        err_msg = f"{type(pipe_err).__name__}: {pipe_err}"
+    elif pipe_num_errors and pipe_num_errors > 0:
+        err_msg = f"Pipeline reported {pipe_num_errors} component error(s)."
     with rt.state_lock:
-        lc = rt.lifecycle
+        if err_msg is not None:
+            if not rt.last_error or pipe_err is not None:
+                rt.last_error = err_msg
+            if rt.lifecycle not in ("stopping", "stopped"):
+                rt.lifecycle = "error"
+        return rt.lifecycle, rt.last_error
+
+
+def _ensure_ready(rt: YawRuntime) -> None:
+    lc, _ = _sync_pipeline_error(rt)
     if rt.stop_event.is_set() or lc in ("stopping", "stopped"):
         raise YawRuntimeError("SHUTTING_DOWN", "Daemon runtime is stopping or stopped.")
+    if lc == "error":
+        get_status(rt)
     if lc != "ready":
         raise YawRuntimeError("NOT_READY", f"Daemon runtime is not ready (lifecycle={lc}).")
 
@@ -370,24 +372,73 @@ def _admit_query(rt: YawRuntime, op_name: str) -> Generator[None]:
         rt.query_sem.release()
 
 
-def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
-    """Execute zero-LLM hybrid VectorSearch retrieval with MaxP disk hydration."""
+def _validate_recall_args(query: str, top_k: int) -> str:
     q = _validate_text_input(query, "Query")
     if isinstance(top_k, bool) or not isinstance(top_k, int) or not (1 <= top_k <= 20):
         raise YawRuntimeError("INVALID_INPUT", "recall(): top_k must be an integer between 1 and 20.")
+    return q
+
+
+def read_db_chunk_count(db_path: Path) -> int:
+    """Return indexed chunk count from a read-only SQLite DB, or 0 if uninitialized."""
+    if not db_path.is_file():
+        return 0
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
+            return 0
+        row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+        return int(row[0]) if row else 0
+
+
+@contextlib.contextmanager
+def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, VectorSearch, Path]]:
+    db_path = require_path(cfg.db_path, "db_path")
+    if not db_path.is_file():
+        raise YawRuntimeError("EMPTY_INDEX", f"Database not found: {db_path}")
+    corpus_root = require_path(cfg.corpus_root, "corpus_root")
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
+            raise YawRuntimeError("EMPTY_INDEX", f"Index table 'chunks' not initialized in {db_path}")
+        yield conn, build_vector_search(conn), corpus_root
+
+
+def _run_recall(
+    cfg: YawConfig,
+    conn: sqlite3.Connection,
+    vs: VectorSearch,
+    corpus_root: Path,
+    embed_fn: EmbedFn | None,
+    query: str,
+    top_k: int,
+) -> tuple[HydratedPassage, ...]:
+    params = resolve_retrieval_params(cfg)
+    if vs.size == 0:
+        return ()
+    active_embed = embed_fn or make_dspy_embed_fn(cfg)
+    formatted = format_query_for_embedding(query, cfg.embedding_task_mode)
+    raw_emb = np.asarray(active_embed([formatted]), dtype=np.float32)
+    q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
+    ranked = search_vectors(vs, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50), **params)
+    return hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
+
+
+def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
+    """Execute zero-LLM hybrid VectorSearch retrieval with MaxP disk hydration."""
+    q = _validate_recall_args(query, top_k)
     _ensure_ready(rt)
 
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "recall"), contextlib.closing(open_readonly_db(db_path)) as conn:
         vs = get_vector_search(rt, conn)
-        if vs.size == 0:
-            return ()
-        formatted = format_query_for_embedding(q, rt.config.embedding_task_mode)
-        raw_emb = np.asarray(rt.embed_fn([formatted]), dtype=np.float32)
-        q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-        ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(top_k * 4, 50))
-        return hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
+        return _run_recall(rt.config, conn, vs, corpus_root, rt.embed_fn, q, top_k)
+
+
+def recall_once(cfg: YawConfig, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
+    """Execute standalone read-only zero-LLM recall without acquiring the daemon lock."""
+    q = _validate_recall_args(query, top_k)
+    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
+        return _run_recall(cfg, conn, vs, corpus_root, None, q, top_k)
 
 
 def resolve_program_path(cfg: YawConfig) -> Path | None:
@@ -418,6 +469,29 @@ def serialize_passage(rank: int, hp: HydratedPassage) -> dict[str, Any]:
     }
 
 
+def _run_qa(
+    cfg: YawConfig,
+    conn: sqlite3.Connection,
+    vs: VectorSearch,
+    corpus_root: Path,
+    embed_fn: EmbedFn,
+    lm: dspy.LM,
+    question: str,
+    *,
+    lm_lock: AbstractContextManager[Any] | None = None,
+) -> QAResult:
+    if vs.size == 0:
+        raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
+    search_params = resolve_retrieval_params(cfg)
+    tools = make_qa_tools(
+        vs, corpus_root, embed_fn, conn, task_mode=cfg.embedding_task_mode, search_params=search_params
+    )
+    agent = build_qa_agent(tools, max_iters=cfg.react_max_iters, artifact_path=resolve_program_path(cfg))
+    lock_ctx = lm_lock if lm_lock is not None else contextlib.nullcontext()
+    with lock_ctx, dspy.context(lm=lm):
+        return ask_question(question, corpus_root=corpus_root, vs=vs, agent=agent)
+
+
 def ask(rt: YawRuntime, question: str) -> QAResult:
     """Execute bounded bare dspy.ReAct QA over indexed corpus passages with citation verification."""
     q = _validate_text_input(question, "Question")
@@ -427,15 +501,8 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "qa"), contextlib.closing(open_readonly_db(db_path)) as conn:
         vs = get_vector_search(rt, conn)
-        if vs.size == 0:
-            raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
-        tools = make_qa_tools(vs, corpus_root, rt.embed_fn, conn, task_mode=rt.config.embedding_task_mode)
-        agent = build_qa_agent(
-            tools, max_iters=rt.config.react_max_iters, artifact_path=resolve_program_path(rt.config)
-        )
         try:
-            with rt.lm_sem, dspy.context(lm=rt.lm):
-                result = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)
+            result = _run_qa(rt.config, conn, vs, corpus_root, rt.embed_fn, rt.lm, q, lm_lock=rt.lm_sem)
         except YawRuntimeError as exc:
             if exc.code in ("MODEL_ERROR", "CONSISTENCY_ERROR"):
                 with rt.state_lock:
@@ -446,20 +513,21 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
         return result
 
 
+def ask_once(cfg: YawConfig, question: str) -> QAResult:
+    """Execute standalone read-only ReAct QA without acquiring the daemon lock."""
+    q = _validate_text_input(question, "Question")
+    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
+        return _run_qa(cfg, conn, vs, corpus_root, make_dspy_embed_fn(cfg), create_lm(cfg), q)
+
+
 def get_status(rt: YawRuntime) -> DaemonStatus:
     """Return lock-free redacted DaemonStatus snapshot and persist status.json atomically."""
     num_chunks = rt.vector_search.size
+    lc, raw_err = _sync_pipeline_error(rt)
     with rt.state_lock:
-        lc = rt.lifecycle
         queue_depth = rt.active_queries
         active_op = rt.active_op
-        raw_err = rt.last_error
         last_sync_at = rt.last_sync_at
-    pipe_err = rt.pipeline.error
-    if pipe_err is not None:
-        raw_err = f"{type(pipe_err).__name__}: {pipe_err}"
-    elif (pipe_num_errors := getattr(rt.pipeline, "num_errors", 0)) and pipe_num_errors > 0 and not raw_err:
-        raw_err = f"Pipeline reported {pipe_num_errors} component error(s)."
     redacted_err = redact_secrets(raw_err, rt.config.api_key) if raw_err else None
     sync_state = "error" if redacted_err else ("syncing" if lc == "starting" else "idle")
     status = DaemonStatus(

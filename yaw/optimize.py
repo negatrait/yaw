@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import os
-import re
 import shutil
-import string
+import sqlite3
 import time
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import dspy
 import numpy as np
-import optuna
 from dspy.teleprompt.gepa.gepa_utils import DSPyTrace, ScoreWithFeedback
 from filelock import FileLock, Timeout
 from numpy.typing import NDArray
@@ -28,6 +26,7 @@ from yaw.core import (
     YawRuntimeError,
     format_query_for_embedding,
     parse_dataset_list,
+    redact_secrets,
     resolve_coco_state_root,
     write_text_atomic,
 )
@@ -38,6 +37,7 @@ from yaw.datasets import (
     TIER2_CORPORA,
     DatasetBundle,
     build_benchmark_slice,
+    compute_qa_em_f1,
     doc_matches_gold,
     document_identity,
     document_text,
@@ -45,71 +45,28 @@ from yaw.datasets import (
     load_dataset_files,
     resolve_dataset_bundle,
     resolve_dataset_name,
+    score_retrieval_recalls,
 )
 from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
-from yaw.qa import build_qa_agent, create_lm, iter_tool_observations, make_qa_tools
-from yaw.retrieval import build_vector_search, hydrate_ranked_passages, open_readonly_db, search_vectors
-
-_NORM_ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.UNICODE)
-_SPAN_HEADER_RE = re.compile(
-    r"\[(?:\d+\]\s*\[)?(?P<path>[^\]|:\s]+?\.[A-Za-z0-9]+):(?P<s1>\d+)-(?P<s2>\d+)(?:@\d+-\d+)?(?:\s*\|[^\]]*)?\]"
+from yaw.qa import (
+    ABSTAIN_REPLY,
+    build_qa_agent,
+    collect_tool_history,
+    create_lm,
+    extract_inline_chunk_ids,
+    make_qa_tools,
+    strip_inline_citations,
 )
-_ABSTAIN_PHRASES = ("insufficient evidence", "cannot determine", "not enough information", "no evidence")
-_INLINE_CITATION_RE = re.compile(r"\[chunk_id=(\d+)\]")
-_OBSERVED_CITATION_RE = re.compile(r"^\[chunk_id=(\d+)\].*score=", re.MULTILINE)
+from yaw.retrieval import (
+    build_vector_search,
+    hydrate_ranked_passages,
+    open_readonly_db,
+    resolve_retrieval_params,
+    search_vectors,
+)
 
-
-def normalize_qa_answer(text: str) -> str:
-    """SQuAD / HotpotQA standard answer normalization."""
-    lowered = text.lower()
-    no_punc = "".join(ch for ch in lowered if ch not in string.punctuation)
-    no_art = _NORM_ARTICLES_RE.sub(" ", no_punc)
-    return " ".join(no_art.split())
-
-
-def compute_em(prediction: str, gold_answers: Sequence[str]) -> float:
-    """Maximum normalized Exact Match across reference answers."""
-    if not gold_answers:
-        return 0.0
-    norm_pred = normalize_qa_answer(prediction)
-    return 1.0 if any(norm_pred == normalize_qa_answer(g) for g in gold_answers if g) else 0.0
-
-
-def compute_f1(prediction: str, gold_answers: Sequence[str]) -> float:
-    """Maximum token-level F1 score across reference answers."""
-    if not gold_answers:
-        return 0.0
-    pred_toks = normalize_qa_answer(prediction).split()
-    best = 0.0
-    for gold in gold_answers:
-        gold_toks = normalize_qa_answer(gold).split()
-        if not pred_toks and not gold_toks:
-            return 1.0
-        if not pred_toks or not gold_toks:
-            continue
-        common = Counter(pred_toks) & Counter(gold_toks)
-        num_same = sum(common.values())
-        if num_same == 0:
-            continue
-        prec = num_same / len(pred_toks)
-        rec = num_same / len(gold_toks)
-        best = max(best, 2.0 * prec * rec / (prec + rec))
-    return best
-
-
-def compute_recall_at_k(
-    retrieved_docs: Sequence[str],
-    gold_docs: Sequence[str] | None,
-    k: int,
-) -> float | None:
-    """Fraction of gold documents matched within the top-k hydrated passages."""
-    if gold_docs is None:
-        return None
-    if not gold_docs:
-        return 1.0
-    top = retrieved_docs[: max(0, k)]
-    hits = sum(1 for gd in gold_docs if any(doc_matches_gold(rd, gd) for rd in top))
-    return float(hits) / float(len(gold_docs))
+if TYPE_CHECKING:
+    import optuna
 
 
 def compute_ndcg_at_k(
@@ -132,38 +89,6 @@ def compute_ndcg_at_k(
     return float(dcg / idcg) if idcg > 0.0 else 0.0
 
 
-def _collect_tool_evidence(pred: Any, pred_trace: DSPyTrace | None) -> tuple[list[str], int]:
-    """Extract observed passage blocks and tool step count from ReAct trajectory or DSPy trace."""
-    blocks: list[str] = []
-    tool_calls = 0
-    history = getattr(pred, "history", None)
-    if history is not None:
-        messages = history.get("messages", ()) if isinstance(history, Mapping) else history.messages
-        blocks = list(iter_tool_observations(messages))
-        return blocks, len(blocks)
-    traj = getattr(pred, "trajectory", None)
-    if isinstance(traj, Mapping):
-        idx = 0
-        while f"tool_name_{idx}" in traj or f"observation_{idx}" in traj:
-            t_name = str(traj.get(f"tool_name_{idx}", ""))
-            if t_name and t_name != "finish":
-                tool_calls += 1
-            obs = str(traj.get(f"observation_{idx}", "")).strip()
-            if obs:
-                blocks.append(obs)
-            idx += 1
-    if not blocks and pred_trace:
-        for _, inputs, outputs in pred_trace:
-            if isinstance(inputs, Mapping) and "trajectory" in inputs and isinstance(inputs["trajectory"], str):
-                blocks.append(inputs["trajectory"])
-            out_t = getattr(outputs, "trajectory", None)
-            if isinstance(out_t, Mapping):
-                for key, val in out_t.items():
-                    if str(key).startswith("observation_") and val:
-                        blocks.append(str(val))
-    return blocks, tool_calls
-
-
 def qa_gepa_metric(
     gold: dspy.Example,
     pred: dspy.Prediction,
@@ -172,40 +97,31 @@ def qa_gepa_metric(
     pred_trace: DSPyTrace | None = None,
 ) -> ScoreWithFeedback:
     """5-argument GEPA metric returning ScoreWithFeedback with diagnostic grounding critique."""
-    _ = (trace, pred_name)
+    _ = (trace, pred_name, pred_trace)
     raw_ans = str(getattr(pred, "answer", "") or "").strip()
-    raw_cites = getattr(pred, "citations", None) or []
-    cites = [str(c).strip() for c in raw_cites if str(c).strip()] if isinstance(raw_cites, list) else []
 
     gold_answers_raw = getattr(gold, "gold_answers", None)
     if gold_answers_raw is None:
-        single = getattr(gold, "answer", "")
-        gold_answers = [str(single)] if single else []
+        single = getattr(gold, "answer", None)
+        gold_answers = [s] if single is not None and (s := str(single).strip()) else []
+    elif isinstance(gold_answers_raw, str):
+        gold_answers = [s] if (s := gold_answers_raw.strip()) else []
     else:
-        gold_answers = [str(a) for a in gold_answers_raw if str(a)]
+        gold_answers = [s for a in gold_answers_raw if a is not None and (s := str(a).strip())]
     gold_docs_raw = getattr(gold, "gold_docs", None)
-    gold_docs = [str(d) for d in gold_docs_raw] if isinstance(gold_docs_raw, list) else None
+    gold_docs = (
+        [s for d in gold_docs_raw if d is not None and (s := str(d).strip())]
+        if isinstance(gold_docs_raw, Sequence) and not isinstance(gold_docs_raw, (str, bytes))
+        else None
+    )
 
-    answer = _INLINE_CITATION_RE.sub("", raw_ans).strip()
-    f1 = compute_f1(answer, gold_answers)
-    em = compute_em(answer, gold_answers)
-    obs_blocks, tool_calls = _collect_tool_evidence(pred, pred_trace)
-    seen_spans = {
-        f"{m.group('path')}:{m.group('s1')}-{m.group('s2')}"
-        for blk in obs_blocks
-        for m in _SPAN_HEADER_RE.finditer(blk)
-    }
+    answer = strip_inline_citations(raw_ans)
+    em, f1 = compute_qa_em_f1(answer, gold_answers)
+    obs_blocks, tool_calls, seen_chunks = collect_tool_history(pred)
 
-    abstained = any(p in raw_ans.lower() for p in _ABSTAIN_PHRASES)
-    valid_cites = [
-        c
-        for c in cites
-        if any(c == sp or c.startswith(f"{sp}@") or sp.startswith(c.split("@", 1)[0]) for sp in seen_spans)
-    ]
-    if inline_cites := list(dict.fromkeys(_INLINE_CITATION_RE.findall(raw_ans))):
-        observed_ids = {cid for block in obs_blocks for cid in _OBSERVED_CITATION_RE.findall(block)}
-        cites = inline_cites
-        valid_cites = [cid for cid in cites if cid in observed_ids]
+    abstained = ABSTAIN_REPLY.lower() in raw_ans.lower()
+    cites = extract_inline_chunk_ids(raw_ans)
+    valid_cites = [cid for cid in cites if cid in seen_chunks]
     if abstained:
         cite_score = 1.0 if not cites else 0.5
     elif not cites:
@@ -213,10 +129,12 @@ def qa_gepa_metric(
     else:
         cite_score = len(valid_cites) / len(cites)
 
-    ev_recall = compute_recall_at_k(obs_blocks, gold_docs, max(len(obs_blocks), 1)) if gold_docs else None
-    if ev_recall is not None:
+    if gold_docs:
+        k_ev = max(len(obs_blocks), 1)
+        ev_recall = score_retrieval_recalls([gold_docs], [obs_blocks], k_list=(k_ev,))[0][f"Recall@{k_ev}"]
         score = 0.55 * f1 + 0.15 * em + 0.15 * cite_score + 0.15 * ev_recall
     else:
+        ev_recall = None
         score = 0.65 * f1 + 0.20 * em + 0.15 * cite_score
 
     notes: list[str] = [f"F1={f1:.3f}, EM={em:.1f}, citation_grounding={cite_score:.2f}, tool_calls={tool_calls}."]
@@ -232,33 +150,104 @@ def qa_gepa_metric(
 
 
 class ProposeInstruction(dspy.Signature):
-    """Refine a DSPy predictor instruction using execution traces and diagnostic feedback."""
+    """Inspect reflective traces via tools and refine the predictor instruction to fix failure modes.
 
+    Produce a general, transferable instruction without copying example-specific facts,
+    respecting the specified length guidance.
+    """
+
+    component_name: str = dspy.InputField(desc="Name of the DSPy predictor component being updated.")
     current_instruction: str = dspy.InputField(desc="Current system instruction for the target predictor.")
-    reflective_dataset_json: str = dspy.InputField(desc="JSON traces with inputs, outputs, and diagnostic feedback.")
+    num_examples: int = dspy.InputField(desc="Number of reflective trace examples available via tools.")
+    length_guidance: str = dspy.InputField(desc="Maximum length or conciseness guidance for the instruction.")
     improved_instruction: str = dspy.OutputField(desc="Improved concise instruction addressing failure modes.")
 
 
-def make_react_instruction_proposer(reflection_lm: dspy.LM) -> Callable[..., dict[str, str]]:
+def make_react_instruction_proposer(
+    reflection_lm: dspy.LM,
+    *,
+    max_chars: int | None = None,
+    max_iters: int = 6,
+) -> Callable[..., dict[str, str]]:
     """Build a bare dspy.ReAct GEPA instruction proposer with tools for inspecting reflective traces."""
+    if max_chars is not None and (isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars < 1):
+        raise ValueError("max_chars must be None or a positive integer.")
+    if isinstance(max_iters, bool) or not isinstance(max_iters, int) or max_iters < 1:
+        raise ValueError("max_iters must be a positive integer.")
 
-    def propose_component(current: str, rows: Sequence[Mapping[str, Any]]) -> str:
-        def count_examples() -> str:
-            """Return the number of reflective examples available for this component."""
-            return f"{len(rows)} reflective trace(s) available."
+    length_guidance = (
+        f"Must be at most {max_chars} characters."
+        if max_chars is not None
+        else "No hard character limit; be concise and clear."
+    )
 
-        def read_failure_case(index: int = 0) -> str:
-            """Read a specific reflective trace entry by zero-based index."""
-            if not rows:
-                return "No reflective traces recorded."
-            clamped = max(0, min(int(index), len(rows) - 1))
-            return json.dumps(rows[clamped], ensure_ascii=False, default=str)[:3000]
+    def propose_component(comp: str, current: str, rows: Sequence[Mapping[str, Any]]) -> str:
+        cleaned_rows: list[dict[str, Any]] = []
+        for ex in rows:
+            row = dict(ex)
+            inputs = row.get("Inputs")
+            if isinstance(inputs, Mapping):
+                row["Inputs"] = {k: v for k, v in inputs.items() if k != "tools"}
+            cleaned_rows.append(row)
 
-        proposer = dspy.ReAct(ProposeInstruction, tools=[count_examples, read_failure_case], max_iters=3)
-        summary = json.dumps(rows[:6], ensure_ascii=False, default=str)[:6000]
+        def list_examples() -> str:
+            """List available reflective example indices, keys, scores, and question/feedback overview."""
+            overview: list[dict[str, Any]] = []
+            for idx, row in enumerate(cleaned_rows):
+                entry: dict[str, Any] = {"index": idx, "fields": list(row.keys())}
+                inputs = row.get("Inputs")
+                if isinstance(inputs, Mapping):
+                    entry["input_keys"] = list(inputs.keys())
+                    if "question" in inputs:
+                        entry["question"] = inputs["question"]
+                outputs = row.get("Generated Outputs")
+                if isinstance(outputs, Mapping):
+                    entry["output_keys"] = list(outputs.keys())
+                for score_key in ("score", "Score"):
+                    if score_key in row:
+                        entry["score"] = row[score_key]
+                        break
+                for fb_key in ("Feedback", "feedback"):
+                    if fb_key in row:
+                        entry["feedback"] = row[fb_key]
+                        break
+                overview.append(entry)
+            return json.dumps(overview, ensure_ascii=False, default=str)
+
+        def inspect_example(index: int, field: str = "") -> str:
+            """Return the full uncropped JSON for one reflective example or a single top-level field."""
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("index must be an integer.")
+            if not isinstance(field, str):
+                raise TypeError("field must be a string.")
+            if index < 0 or index >= len(cleaned_rows):
+                raise IndexError(f"Example index {index} out of range for {len(cleaned_rows)} examples.")
+            row = cleaned_rows[index]
+            if not field:
+                return json.dumps(row, ensure_ascii=False, default=str)
+            if field not in row:
+                raise KeyError(f"Unknown field {field!r}.")
+            val = row[field]
+            return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=str)
+
+        proposer = dspy.ReAct(ProposeInstruction, tools=[list_examples, inspect_example], max_iters=max_iters)
+        proposer.react.update_config(tool_choice="required")
         with dspy.context(lm=reflection_lm):
-            res = proposer(current_instruction=current, reflective_dataset_json=summary)
-        return str(getattr(res, "improved_instruction", "") or "").strip() or current
+            res = proposer(
+                component_name=comp,
+                current_instruction=current,
+                num_examples=len(cleaned_rows),
+                length_guidance=length_guidance,
+            )
+        termination_reason = getattr(res, "termination_reason", None)
+        if termination_reason is not None and termination_reason not in ("submit", "forced_submit"):
+            raise ValueError(f"Instruction proposer did not submit (termination_reason={termination_reason!r}).")
+        improved = str(getattr(res, "improved_instruction", "") or "").strip()
+        if not improved:
+            raise ValueError("Instruction proposer returned an empty instruction.")
+        if max_chars is not None and len(improved) > max_chars:
+            raise ValueError(f"Proposed instruction length {len(improved)} exceeds max_chars={max_chars}.")
+        return improved
 
     def propose(
         candidate: dict[str, str],
@@ -266,8 +255,9 @@ def make_react_instruction_proposer(reflection_lm: dspy.LM) -> Callable[..., dic
         components_to_update: Sequence[str],
     ) -> dict[str, str]:
         return {
-            comp: propose_component(candidate.get(comp, ""), reflective_dataset.get(comp, ()))
+            comp: propose_component(comp, candidate[comp], rows)
             for comp in components_to_update
+            if comp in candidate and (rows := reflective_dataset.get(comp))
         }
 
     return propose
@@ -386,6 +376,31 @@ def _index_staged_slices(
         close_pipeline(session)
 
 
+@contextlib.contextmanager
+def _optimization_status(status_path: Path, api_key: str) -> Generator[None]:
+    write_text_atomic(
+        status_path,
+        json.dumps({"state": "running", "pid": os.getpid(), "started_at": time.time()}, indent=2) + "\n",
+    )
+    try:
+        yield
+    except KeyboardInterrupt:
+        write_text_atomic(status_path, json.dumps({"state": "interrupted", "pid": None}, indent=2) + "\n")
+        raise
+    except Exception as exc:
+        err = redact_secrets(f"{type(exc).__name__}: {exc}", api_key)
+        write_text_atomic(status_path, json.dumps({"state": "failed", "pid": None, "error": err}, indent=2) + "\n")
+        raise
+
+
+def _require_int_param(val: int | None, default: int, *, name: str, min_value: int = 1) -> int:
+    if val is None:
+        return default
+    if isinstance(val, bool) or not isinstance(val, int) or val < min_value:
+        raise YawRuntimeError("INVALID_INPUT", f"{name} must be a non-bool integer >= {min_value}.")
+    return val
+
+
 def optimize_optuna(
     cfg: YawConfig,
     *,
@@ -397,108 +412,128 @@ def optimize_optuna(
     embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
 ) -> dict[str, Any]:
     """Tune retrieval hyperparameters (hybrid_alpha, ppr_alpha, seed_top_k) via Optuna TPE."""
+    import optuna
+
+    eff_trials = _require_int_param(trials, 64, name="trials", min_value=1)
+    eff_max_q = _require_int_param(max_queries, cfg.optimize_max_queries, name="max_queries", min_value=1)
+    eff_offset = _require_int_param(query_offset, cfg.optimize_query_offset, name="query_offset", min_value=0)
     opt_cfg = cfg.for_optimization(".yaw/optuna_index.db")
-    assert opt_cfg.db_path is not None and opt_cfg.state_dir is not None
-    ws = opt_cfg.workspace_root
-    opt_dir = opt_cfg.db_path.parent
-    opt_dir.mkdir(parents=True, exist_ok=True)
-    study_db = opt_dir / "optuna_study.db"
-    status_path = opt_dir / "optuna_status.json"
-    params_path = opt_dir / "optuna_best_params.json"
-    stage_dir = opt_dir / "optuna_corpus"
-
-    ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
-    refs = _resolve_dataset_refs(ws, ds_names)
-    eff_max_q = int(max_queries if max_queries is not None else opt_cfg.optimize_max_queries)
-    eff_offset = int(query_offset if query_offset is not None else opt_cfg.optimize_query_offset)
-    _guard_optimization_slice(refs, eff_offset)
-    eff_trials = max(1, int(trials if trials is not None else 64))
-
-    loaded = [_load_slice(ws, r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
-    staged = [
-        (ref.canonical, doc_ids, corpus, title_key, body_key)
-        for ref, (doc_ids, _, _, _, corpus, title_key, body_key) in zip(refs, loaded, strict=True)
-    ]
-    active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
-
-    write_text_atomic(
-        status_path,
-        json.dumps({"state": "running", "pid": os.getpid(), "started_at": time.time()}, indent=2) + "\n",
-    )
-    _index_staged_slices(
-        opt_cfg,
-        stage_dir,
-        opt_cfg.db_path,
-        active_embed,
-        staged,
-        fresh=fresh,
-        extra_wipe=(study_db, params_path),
-    )
-
-    conn = open_readonly_db(opt_cfg.db_path)
+    assert opt_cfg.lock_path is not None and opt_cfg.db_path is not None and opt_cfg.state_dir is not None
+    opt_cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(opt_cfg.lock_path), timeout=0)
     try:
-        vs = build_vector_search(conn)
-        eval_items: list[tuple[str, NDArray[np.float32], list[str]]] = []
-        for _, questions, gold_docs, _, _, _, _ in loaded:
-            if not gold_docs:
-                continue
-            formatted_qs = [format_query_for_embedding(q, task_mode=opt_cfg.embedding_task_mode) for q in questions]
-            q_vecs = np.asarray(active_embed(formatted_qs), dtype=np.float32)
-            for idx, (q, gd) in enumerate(zip(questions, gold_docs, strict=True)):
-                if gd:
-                    eval_items.append((q, q_vecs[idx], gd))
-        if not eval_items:
-            raise YawRuntimeError("INVALID_INPUT", "Selected Optuna datasets contain no gold retrieval documents.")
+        lock.acquire()
+    except Timeout as exc:
+        raise YawRuntimeError("BUSY", f"Optimization lock is already held: {opt_cfg.lock_path}") from exc
+    try:
+        ws = opt_cfg.workspace_root
+        opt_dir = opt_cfg.db_path.parent
+        opt_dir.mkdir(parents=True, exist_ok=True)
+        study_db = opt_dir / "optuna_study.db"
+        status_path = opt_dir / "optuna_status.json"
+        params_path = opt_dir / "optuna_best_params.json"
+        stage_dir = opt_dir / "optuna_corpus"
 
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        storage_url = f"sqlite:///{study_db.resolve().as_posix()}"
-        sampler = optuna.samplers.TPESampler(seed=42)
-        study = optuna.create_study(
-            study_name="yaw_retrieval_ppr",
-            storage=storage_url,
-            direction="maximize",
-            load_if_exists=not fresh,
-            sampler=sampler,
-        )
+        ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
+        refs = _resolve_dataset_refs(ws, ds_names)
+        _guard_optimization_slice(refs, eff_offset)
 
-        def objective(trial: optuna.Trial) -> float:
-            h_alpha = trial.suggest_float("hybrid_alpha", 0.1, 0.95)
-            p_alpha = trial.suggest_float("ppr_alpha", 0.0, 0.95)
-            s_top_k = trial.suggest_int("seed_top_k", 5, 40)
-            scores: list[float] = []
-            for q_text, q_vec, gd in eval_items:
-                ranked = search_vectors(
-                    vs,
-                    q_vec,
-                    query_text=q_text,
-                    conn=conn,
-                    top_k=10,
-                    seed_top_k=s_top_k,
-                    hybrid_alpha=h_alpha,
-                    ppr_alpha=p_alpha,
+        loaded = [_load_slice(ws, r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
+        staged = [
+            (ref.canonical, doc_ids, corpus, title_key, body_key)
+            for ref, (doc_ids, _, _, _, corpus, title_key, body_key) in zip(refs, loaded, strict=True)
+        ]
+        active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
+
+        with _optimization_status(status_path, opt_cfg.api_key):
+            conn: sqlite3.Connection | None = None
+            storage: Any = None
+            try:
+                _index_staged_slices(
+                    opt_cfg,
+                    stage_dir,
+                    opt_cfg.db_path,
+                    active_embed,
+                    staged,
+                    fresh=fresh,
+                    extra_wipe=(study_db, params_path),
                 )
-                hydrated = hydrate_ranked_passages(vs, ranked, stage_dir, top_k=5)
-                texts = [hp.text for hp in hydrated if not hp.stale_on_disk]
-                r_k = compute_recall_at_k(texts, gd, 5) or 0.0
-                n_k = compute_ndcg_at_k(texts, gd, 5) or 0.0
-                scores.append(0.6 * r_k + 0.4 * n_k)
-            return float(np.mean(scores)) if scores else 0.0
 
-        study.optimize(objective, n_trials=eff_trials)
-        payload = {
-            "best_score": float(study.best_value),
-            "best_params": dict(study.best_params),
-            "total_trials": len(study.trials),
-            "datasets": [r.canonical for r in refs],
-        }
-        write_text_atomic(params_path, json.dumps(payload, indent=2) + "\n")
-        write_text_atomic(
-            status_path,
-            json.dumps({"state": "completed", "completed_at": time.time(), **payload}, indent=2) + "\n",
-        )
-        return payload
+                conn = open_readonly_db(opt_cfg.db_path)
+                vs = build_vector_search(conn)
+                eval_items: list[tuple[str, NDArray[np.float32], list[str]]] = []
+                for _, questions, gold_docs, _, _, _, _ in loaded:
+                    if not gold_docs:
+                        continue
+                    formatted_qs = [
+                        format_query_for_embedding(q, task_mode=opt_cfg.embedding_task_mode) for q in questions
+                    ]
+                    q_vecs = np.asarray(active_embed(formatted_qs), dtype=np.float32)
+                    for idx, (q, gd) in enumerate(zip(questions, gold_docs, strict=True)):
+                        if gd:
+                            eval_items.append((q, q_vecs[idx], gd))
+                if not eval_items:
+                    raise YawRuntimeError(
+                        "INVALID_INPUT",
+                        "Selected Optuna datasets contain no gold retrieval documents.",
+                    )
+
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+                storage_url = f"sqlite:///{study_db.resolve().as_posix()}"
+                storage = optuna.storages.RDBStorage(url=storage_url)
+                sampler = optuna.samplers.TPESampler(seed=42)
+                study = optuna.create_study(
+                    study_name="yaw_retrieval_ppr",
+                    storage=storage,
+                    direction="maximize",
+                    load_if_exists=not fresh,
+                    sampler=sampler,
+                )
+
+                def objective(trial: optuna.Trial) -> float:
+                    h_alpha = trial.suggest_float("hybrid_alpha", 0.1, 0.95)
+                    p_alpha = trial.suggest_float("ppr_alpha", 0.0, 0.95)
+                    s_top_k = trial.suggest_int("seed_top_k", 5, 40)
+                    scores: list[float] = []
+                    for q_text, q_vec, gd in eval_items:
+                        ranked = search_vectors(
+                            vs,
+                            q_vec,
+                            query_text=q_text,
+                            conn=conn,
+                            top_k=max(5 * 4, 50),
+                            seed_top_k=s_top_k,
+                            hybrid_alpha=h_alpha,
+                            ppr_alpha=p_alpha,
+                        )
+                        hydrated = hydrate_ranked_passages(vs, ranked, stage_dir, top_k=5)
+                        texts = [hp.text for hp in hydrated if not hp.stale_on_disk]
+                        r_k = score_retrieval_recalls([gd], [texts], k_list=(5,))[0]["Recall@5"]
+                        n_k = compute_ndcg_at_k(texts, gd, 5) or 0.0
+                        scores.append(0.6 * r_k + 0.4 * n_k)
+                    return float(np.mean(scores)) if scores else 0.0
+
+                study.optimize(objective, n_trials=eff_trials)
+                payload = {
+                    "best_score": float(study.best_value),
+                    "best_params": dict(study.best_params),
+                    "total_trials": len(study.trials),
+                    "datasets": [r.canonical for r in refs],
+                }
+                write_text_atomic(params_path, json.dumps(payload, indent=2) + "\n")
+                write_text_atomic(
+                    status_path,
+                    json.dumps({"state": "completed", "completed_at": time.time(), **payload}, indent=2) + "\n",
+                )
+                return payload
+            finally:
+                if conn is not None:
+                    conn.close()
+                if storage is not None:
+                    storage.remove_session()
+                    storage.engine.dispose()
     finally:
-        conn.close()
+        lock.release()
 
 
 def optimize_dspy(
@@ -519,8 +554,14 @@ def optimize_dspy(
     """Compile the bare dspy.ReAct QA agent with dspy.GEPA and persist program + audit artifacts."""
     if auto is not None and max_metric_calls is not None:
         raise YawRuntimeError("INVALID_INPUT", "auto and max_metric_calls are mutually exclusive.")
-    if threads is not None and threads < 1:
-        raise YawRuntimeError("INVALID_INPUT", "threads must be positive.")
+    eff_threads = _require_int_param(threads, 1, name="threads", min_value=1)
+    eff_max_calls = (
+        _require_int_param(max_metric_calls, 1, name="max_metric_calls", min_value=1)
+        if max_metric_calls is not None
+        else None
+    )
+    eff_max_q = _require_int_param(max_queries, cfg.optimize_max_queries, name="max_queries", min_value=1)
+    eff_offset = _require_int_param(query_offset, cfg.optimize_query_offset, name="query_offset", min_value=0)
     opt_cfg = cfg.for_optimization()
     assert opt_cfg.lock_path is not None and opt_cfg.db_path is not None
     opt_cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -534,22 +575,16 @@ def optimize_dspy(
             opt_cfg,
             datasets=datasets,
             auto=auto,
-            max_metric_calls=max_metric_calls,
-            max_queries=max_queries,
-            query_offset=query_offset,
-            threads=threads,
+            max_metric_calls=eff_max_calls,
+            max_queries=eff_max_q,
+            query_offset=eff_offset,
+            threads=eff_threads,
             fresh=fresh,
             embed_fn=embed_fn,
             student_lm=student_lm,
             reflection_lm=reflection_lm,
             instruction_proposer=instruction_proposer,
         )
-    except KeyboardInterrupt:
-        write_text_atomic(
-            opt_cfg.db_path.parent / "dspy_status.json",
-            json.dumps({"state": "interrupted", "pid": None}, indent=2) + "\n",
-        )
-        raise
     finally:
         lock.release()
 
@@ -560,9 +595,9 @@ def _compile_dspy(
     datasets: str | None,
     auto: str | None,
     max_metric_calls: int | None,
-    max_queries: int | None,
-    query_offset: int | None,
-    threads: int | None,
+    max_queries: int,
+    query_offset: int,
+    threads: int,
     fresh: bool,
     embed_fn: Callable[[list[str]], NDArray[np.float32]] | None,
     student_lm: Any,
@@ -581,76 +616,76 @@ def _compile_dspy(
 
     ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
     refs = _resolve_dataset_refs(ws, ds_names)
-    eff_max_q = int(max_queries if max_queries is not None else opt_cfg.optimize_max_queries)
-    eff_offset = int(query_offset if query_offset is not None else opt_cfg.optimize_query_offset)
-    eff_threads = threads if threads is not None else 1
-    _guard_optimization_slice(refs, eff_offset)
+    _guard_optimization_slice(refs, query_offset)
 
-    loaded = [_load_slice(ws, r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
+    loaded = [_load_slice(ws, r, max_queries=max_queries, query_offset=query_offset) for r in refs]
     staged = [
         (ref.canonical, doc_ids, corpus, title_key, body_key)
         for ref, (doc_ids, _, _, _, corpus, title_key, body_key) in zip(refs, loaded, strict=True)
     ]
     active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
 
-    write_text_atomic(
-        status_path,
-        json.dumps({"state": "running", "pid": os.getpid(), "started_at": time.time()}, indent=2) + "\n",
-    )
-    _index_staged_slices(
-        opt_cfg,
-        stage_dir,
-        opt_cfg.db_path,
-        active_embed,
-        staged,
-        fresh=fresh,
-        extra_wipe=(prog_path, audit_path, telem_dir),
-    )
-    telem_dir.mkdir(parents=True, exist_ok=True)
+    with _optimization_status(status_path, opt_cfg.api_key):
+        _index_staged_slices(
+            opt_cfg,
+            stage_dir,
+            opt_cfg.db_path,
+            active_embed,
+            staged,
+            fresh=fresh,
+            extra_wipe=(prog_path, audit_path, telem_dir),
+        )
+        telem_dir.mkdir(parents=True, exist_ok=True)
 
-    trainset: list[dspy.Example] = []
-    valset: list[dspy.Example] = []
-    for _, questions, gold_docs, gold_answers, _, _, _ in loaded:
-        examples: list[dspy.Example] = []
-        for idx, q in enumerate(questions):
-            ga = gold_answers[idx] if idx < len(gold_answers) else []
-            gd = gold_docs[idx] if gold_docs is not None and idx < len(gold_docs) else None
-            ex = dspy.Example(
-                question=q,
-                answer=ga[0] if ga else "",
-                gold_answers=ga,
-                gold_docs=gd,
-            ).with_inputs("question")
-            examples.append(ex)
-        split_at = max(1, int(round(len(examples) * 0.7)))
-        if split_at >= len(examples):
-            split_at = len(examples) - 1
-        trainset.extend(examples[:split_at])
-        valset.extend(examples[split_at:])
+        trainset: list[dspy.Example] = []
+        valset: list[dspy.Example] = []
+        for _, questions, gold_docs, gold_answers, _, _, _ in loaded:
+            examples: list[dspy.Example] = []
+            for idx, q in enumerate(questions):
+                ga = gold_answers[idx] if idx < len(gold_answers) else []
+                gd = gold_docs[idx] if gold_docs is not None and idx < len(gold_docs) else None
+                ex = dspy.Example(
+                    question=q,
+                    answer=ga[0] if ga else "",
+                    gold_answers=ga,
+                    gold_docs=gd,
+                ).with_inputs("question")
+                examples.append(ex)
+            split_at = max(1, int(round(len(examples) * 0.7)))
+            if split_at >= len(examples):
+                split_at = len(examples) - 1
+            trainset.extend(examples[:split_at])
+            valset.extend(examples[split_at:])
 
-    s_lm = student_lm or create_lm(opt_cfg, temperature=1.0)
-    r_lm = reflection_lm or create_lm(opt_cfg, temperature=0.7)
-    proposer = instruction_proposer or make_react_instruction_proposer(r_lm)
+        s_lm = student_lm or create_lm(opt_cfg, temperature=1.0)
+        r_lm = reflection_lm or create_lm(opt_cfg, temperature=0.7)
+        proposer = instruction_proposer or make_react_instruction_proposer(r_lm)
 
-    gepa_kwargs: dict[str, Any] = {
-        "metric": qa_gepa_metric,
-        "reflection_lm": r_lm,
-        "instruction_proposer": proposer,
-        "num_threads": eff_threads,
-        "log_dir": str(telem_dir),
-        "track_stats": True,
-        "seed": 42,
-    }
-    if max_metric_calls is not None:
-        gepa_kwargs["max_metric_calls"] = int(max_metric_calls)
-    else:
-        eff_auto = auto if auto is not None else opt_cfg.optimize_auto
-        gepa_kwargs["auto"] = eff_auto
+        gepa_kwargs: dict[str, Any] = {
+            "metric": qa_gepa_metric,
+            "reflection_lm": r_lm,
+            "instruction_proposer": proposer,
+            "num_threads": threads,
+            "log_dir": str(telem_dir),
+            "track_stats": True,
+            "seed": 42,
+        }
+        if max_metric_calls is not None:
+            gepa_kwargs["max_metric_calls"] = max_metric_calls
+        else:
+            eff_auto = auto if auto is not None else opt_cfg.optimize_auto
+            gepa_kwargs["auto"] = eff_auto
 
-    conn = open_readonly_db(opt_cfg.db_path)
-    try:
-        vs = build_vector_search(conn)
-        tools = make_qa_tools(vs, stage_dir, active_embed, conn, task_mode=opt_cfg.embedding_task_mode)
+        with contextlib.closing(open_readonly_db(opt_cfg.db_path)) as init_conn:
+            vs = build_vector_search(init_conn)
+        tools = make_qa_tools(
+            vs,
+            stage_dir,
+            active_embed,
+            opt_cfg.db_path,
+            task_mode=opt_cfg.embedding_task_mode,
+            search_params=resolve_retrieval_params(opt_cfg),
+        )
         student = build_qa_agent(tools, max_iters=opt_cfg.react_max_iters)
         optimizer = dspy.GEPA(**gepa_kwargs)
         with dspy.context(lm=s_lm):
@@ -675,89 +710,3 @@ def _compile_dspy(
             json.dumps({"state": "completed", "completed_at": time.time(), **audit}, indent=2) + "\n",
         )
         return audit
-    finally:
-        conn.close()
-
-
-def evaluate_optimization(
-    cfg: YawConfig,
-    *,
-    dataset: str = "2wikimultihopqa",
-    max_queries: int = 20,
-    query_offset: int = 1000,
-    fresh: bool = False,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
-    lm: Any = None,
-) -> dict[str, Any]:
-    """Evaluate baseline vs compiled QA program on a held-out benchmark slice."""
-    opt_cfg = cfg.for_optimization()
-    assert opt_cfg.db_path is not None
-    ws = opt_cfg.workspace_root
-    opt_dir = opt_cfg.db_path.parent
-    prog_path = opt_dir / "qa_program.json"
-    if not prog_path.is_file():
-        raise YawRuntimeError("OPTIMIZATION_NOT_RUN", f"Compiled program missing at {prog_path}")
-
-    eval_db = opt_dir / "eval_index.db"
-    eval_state = opt_dir / "eval_state"
-    eval_stage = opt_dir / "eval_corpus"
-    eval_out = opt_dir / "eval_held_out.json"
-    eval_cfg = replace(opt_cfg, db_path=eval_db, state_dir=eval_state, corpus_root=eval_stage)
-
-    ref = _resolve_dataset_refs(ws, [dataset])[0]
-    doc_ids, questions, gold_docs, gold_answers, corpus, t_key, b_key = _load_slice(
-        ws, ref, max_queries=max_queries, query_offset=query_offset
-    )
-    active_embed = embed_fn or make_dspy_embed_fn(eval_cfg)
-    _index_staged_slices(
-        eval_cfg,
-        eval_stage,
-        eval_db,
-        active_embed,
-        [(ref.canonical, doc_ids, corpus, t_key, b_key)],
-        fresh=fresh,
-        extra_wipe=(eval_out,),
-    )
-
-    active_lm = lm or create_lm(eval_cfg, temperature=1.0)
-    conn = open_readonly_db(eval_db)
-    try:
-        vs = build_vector_search(conn)
-        tools = make_qa_tools(vs, eval_stage, active_embed, conn, task_mode=eval_cfg.embedding_task_mode)
-        baseline_agent = build_qa_agent(tools, max_iters=eval_cfg.react_max_iters)
-        compiled_agent = build_qa_agent(tools, artifact_path=prog_path, max_iters=eval_cfg.react_max_iters)
-
-        def _score_agent(agent: dspy.Module) -> dict[str, float]:
-            ems: list[float] = []
-            f1s: list[float] = []
-            comp: list[float] = []
-            with dspy.context(lm=active_lm):
-                for idx, q in enumerate(questions):
-                    ga = gold_answers[idx] if idx < len(gold_answers) else []
-                    gd = gold_docs[idx] if gold_docs is not None and idx < len(gold_docs) else None
-                    ex = dspy.Example(question=q, gold_answers=ga, gold_docs=gd).with_inputs("question")
-                    pred = agent(question=q)
-                    ans = str(getattr(pred, "answer", "") or "")
-                    ems.append(compute_em(ans, ga))
-                    f1s.append(compute_f1(ans, ga))
-                    comp.append(float(qa_gepa_metric(ex, pred).score))
-            return {
-                "em": float(np.mean(ems)) if ems else 0.0,
-                "f1": float(np.mean(f1s)) if f1s else 0.0,
-                "composite": float(np.mean(comp)) if comp else 0.0,
-            }
-
-        base_m = _score_agent(baseline_agent)
-        comp_m = _score_agent(compiled_agent)
-        report = {
-            "dataset": ref.canonical,
-            "num_questions": len(questions),
-            "baseline": base_m,
-            "compiled": comp_m,
-            "delta_f1": comp_m["f1"] - base_m["f1"],
-            "delta_composite": comp_m["composite"] - base_m["composite"],
-        }
-        write_text_atomic(eval_out, json.dumps(report, indent=2) + "\n")
-        return report
-    finally:
-        conn.close()

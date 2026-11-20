@@ -38,6 +38,7 @@ _PUBLIC_API: dict[str, str] = {
     "load_config": ".config",
     "parse_dataset_list": ".config",
     "normalize_entity": ".types",
+    "redact_secrets": ".types",
     "render_document_text": ".types",
     "resolve_coco_state_root": ".config",
     "resolve_corpus_path": ".types",

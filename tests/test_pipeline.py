@@ -318,7 +318,7 @@ def test_batch_pipeline_propagates_component_failures(tmp_path: Path) -> None:
         close_pipeline(session)
 
 
-def test_live_pipeline_propagates_component_failures(tmp_path: Path) -> None:
+def test_live_pipeline_propagates_component_failures(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
     cfg = _make_cfg(tmp_path)
     assert cfg.corpus_root is not None
     cfg.corpus_root.mkdir(parents=True)
@@ -328,15 +328,22 @@ def test_live_pipeline_propagates_component_failures(tmp_path: Path) -> None:
         _ = texts
         raise RuntimeError("Model server is down 503")
 
+    capfd.readouterr()
     session = start_pipeline(cfg, embed_fn=failing_embed, vector_dim=4, live=True)
     try:
         with pytest.raises(RuntimeError, match="Model server is down 503"):
             wait_pipeline_ready(session, timeout=10.0)
     finally:
         close_pipeline(session)
+    time.sleep(0.1)
+    captured = capfd.readouterr()
+    assert "Failed to clean up pending stage token" not in captured.err
+    assert "environment is closed" not in captured.err
 
 
-def test_live_pipeline_propagates_incremental_failures_after_ready(tmp_path: Path) -> None:
+def test_live_pipeline_propagates_incremental_failures_after_ready(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
     cfg = _make_cfg(tmp_path)
     assert cfg.corpus_root is not None
     cfg.corpus_root.mkdir(parents=True)
@@ -350,6 +357,7 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(tmp_path: Pat
             raise RuntimeError("Mid-stream failure after ready")
         return _hash_embed(texts, dim=4)
 
+    capfd.readouterr()
     session = start_pipeline(cfg, embed_fn=flaky_embed, vector_dim=4, live=True)
     try:
         assert wait_pipeline_ready(session, timeout=15.0)
@@ -361,6 +369,10 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(tmp_path: Pat
             wait_pipeline_ready(session, timeout=1.0)
     finally:
         close_pipeline(session)
+    time.sleep(0.1)
+    captured = capfd.readouterr()
+    assert "Failed to clean up pending stage token" not in captured.err
+    assert "environment is closed" not in captured.err
 
 
 def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:

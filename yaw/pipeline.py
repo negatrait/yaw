@@ -515,13 +515,14 @@ class PipelineSession:
     thread: threading.Thread
     loop: asyncio.AbstractEventLoop
     stop_async: asyncio.Event
-    watch_handle: coco.UpdateHandle[Any] | None = None
     error: BaseException | None = None
 
 
-async def _watch_pipeline(session: PipelineSession, stop_async: asyncio.Event) -> None:
-    handle = session.app.update(live=True)
-    session.watch_handle = handle
+async def _watch_pipeline(
+    session: PipelineSession,
+    handle: coco.UpdateHandle[Any],
+    stop_async: asyncio.Event,
+) -> None:
     snaps: AsyncIterator[Any] | None = None
     had_errors = 0
     try:
@@ -665,7 +666,8 @@ def start_pipeline(
             await stop_async.wait()
             return
 
-        watch_task = asyncio.create_task(_watch_pipeline(session, stop_async))
+        handle = app.update(live=True)
+        watch_task = asyncio.create_task(_watch_pipeline(session, handle, stop_async))
         stop_task = asyncio.create_task(stop_async.wait())
         _, pending = await asyncio.wait({watch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
@@ -676,6 +678,21 @@ def start_pipeline(
                 if session.error is None:
                     session.error = res
                 session.ready_event.set()
+        cur = asyncio.current_task()
+        other = [t for t in asyncio.all_tasks(loop) if t is not cur and not t.done()]
+        for t in other:
+            t.cancel()
+        if other:
+            await asyncio.gather(*other, return_exceptions=True)
+        try:
+            await asyncio.wait_for(handle.result(), timeout=5.0)
+        except asyncio.CancelledError, TimeoutError:
+            pass
+        except BaseException as exc:
+            if session.error is None:
+                session.error = exc
+            session.ready_event.set()
+        del handle
 
     thread = threading.Thread(
         target=lambda: asyncio.run(_session_worker()),

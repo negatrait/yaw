@@ -22,16 +22,19 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from numpy.typing import NDArray
 
-from yaw.core import YawConfig, YawRuntimeError
-from yaw.qa import build_qa_agent
+from yaw.core import YawConfig, YawRuntimeError, write_text_atomic
+from yaw.qa import build_qa_agent, make_qa_tools
+from yaw.retrieval import build_vector_search, open_readonly_db, resolve_retrieval_params
 from yaw.runtime import (
     YawRuntime,
     ask,
+    ask_once,
     close_runtime,
     create_lm,
     get_status,
     get_vector_search,
     recall,
+    recall_once,
     redact_secrets,
     require_path,
     resolve_program_path,
@@ -484,3 +487,270 @@ def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_pa
         assert exc_nr.value.code == "NOT_READY"
     finally:
         close_runtime(rt)
+
+
+def test_optuna_best_params_wiring_rank_flip_and_strict_validation(tmp_path: Path) -> None:
+    import contextlib
+
+    def rank_embed(texts: list[str]) -> NDArray[np.float32]:
+        rows = np.zeros((len(texts), 16), dtype=np.float32)
+        for idx, text in enumerate(texts):
+            if text.startswith("task:") or "Orbital telemetry" in text:
+                rows[idx, 0] = 1.0
+            else:
+                rows[idx, 1] = 1.0
+        return rows
+
+    class _OpenAIHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path.endswith("/embeddings"):
+                raw_inp = payload.get("input", [])
+                texts = [raw_inp] if isinstance(raw_inp, str) else [str(x) for x in raw_inp]
+                vecs = rank_embed(texts)
+                body = {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": i, "embedding": vecs[i].tolist()} for i in range(len(texts))
+                    ],
+                    "model": payload.get("model", "embeddinggemma-2"),
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                }
+            else:
+                msgs = payload.get("messages", [])
+                blob = json.dumps(msgs)
+                if "tool" not in [m.get("role") for m in msgs]:
+                    msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_search",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_passages",
+                                    "arguments": json.dumps({"query": "QuasarPulse99", "top_k": 1}),
+                                },
+                            }
+                        ],
+                    }
+                else:
+                    import re as _re
+
+                    cids = _re.findall(r"\[chunk_id=(\d+)\]", blob)
+                    msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_sub",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit",
+                                    "arguments": json.dumps({"answer": f"Found [chunk_id={cids[0]}]"}),
+                                },
+                            }
+                        ],
+                    }
+                body = {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": payload.get("model", "gemma-4-e4b"),
+                    "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = YawConfig(
+            workspace_root=tmp_path,
+            corpus_root=tmp_path / "corpus",
+            db_path=tmp_path / ".yaw" / "yaw.db",
+            lock_path=tmp_path / ".yaw" / "yaw.db.lock",
+            state_dir=tmp_path / ".yaw" / "coco_lmdb",
+            log_path=tmp_path / ".yaw" / "yaw.log",
+            status_path=tmp_path / ".yaw" / "status.json",
+            compiled_program_path=tmp_path / ".yaw" / "compiled_program.json",
+            base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+            chunk_size=240,
+            chunk_overlap=0,
+            min_chunk_size=20,
+        )
+        assert cfg.corpus_root is not None and cfg.db_path is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "doc_lex.md").write_text(
+            "# Lexical Target\nQuasarPulse99 appears twice QuasarPulse99 in lexical target.\n",
+            encoding="utf-8",
+        )
+        (cfg.corpus_root / "doc_dense.md").write_text(
+            "# Dense Target\nOrbital telemetry station report alpha beta gamma.\n",
+            encoding="utf-8",
+        )
+
+        # Missing params file returns {} cleanly
+        assert resolve_retrieval_params(cfg) == {}
+
+        opt_db = cfg.for_optimization(".yaw/optuna_index.db").db_path
+        assert opt_db is not None
+        params_path = opt_db.parent / "optuna_best_params.json"
+
+        rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=rank_embed, lm=create_lm(cfg))
+        try:
+            # 1. Lexical-heavy Optuna override (hybrid_alpha=0.05) ranks doc_lex.md first
+            write_text_atomic(
+                params_path,
+                json.dumps({"best_params": {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}}),
+            )
+            assert resolve_retrieval_params(cfg) == {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}
+            assert recall(rt, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+
+            with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+                ro_vs = build_vector_search(ro_conn)
+                tools_lex = make_qa_tools(
+                    ro_vs, cfg.corpus_root, rank_embed, ro_conn, search_params=resolve_retrieval_params(cfg)
+                )
+                assert "doc_lex.md" in tools_lex[0].func("QuasarPulse99", top_k=1)
+
+            # 2. Dense-heavy Optuna override (hybrid_alpha=0.95) flips top rank to doc_dense.md
+            write_text_atomic(
+                params_path,
+                json.dumps({"best_params": {"hybrid_alpha": 0.95, "ppr_alpha": 0.0, "seed_top_k": 5}}),
+            )
+            assert recall(rt, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_dense.md"
+
+            with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+                ro_vs = build_vector_search(ro_conn)
+                tools_dense = make_qa_tools(
+                    ro_vs, cfg.corpus_root, rank_embed, ro_conn, search_params=resolve_retrieval_params(cfg)
+                )
+                assert "doc_dense.md" in tools_dense[0].func("QuasarPulse99", top_k=1)
+        finally:
+            close_runtime(rt)
+
+        # 3. Standalone recall_once and ask_once (lock-free) honor optuna_best_params.json
+        write_text_atomic(
+            params_path,
+            json.dumps({"best_params": {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}}),
+        )
+        assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+        qa_lex = ask_once(cfg, "Which doc matches QuasarPulse99?")
+        assert qa_lex.passages[0].pointer.rel_posix_path == "doc_lex.md"
+
+        write_text_atomic(
+            params_path,
+            json.dumps({"best_params": {"hybrid_alpha": 0.95, "ppr_alpha": 0.0, "seed_top_k": 5}}),
+        )
+        assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_dense.md"
+        qa_dense = ask_once(cfg, "Which doc matches QuasarPulse99?")
+        assert qa_dense.passages[0].pointer.rel_posix_path == "doc_dense.md"
+
+        # 4. Corrupt / unknown / boolean / NaN / out-of-range Optuna params fail fast with CONSISTENCY_ERROR
+        for bad_raw in (
+            "{not valid json",
+            json.dumps([1, 2, 3]),
+            json.dumps({"best_params": "not-a-dict"}),
+            json.dumps({"best_params": {"unknown_key": 0.5}}),
+            json.dumps({"best_params": {"hybrid_alpha": True}}),
+            json.dumps({"best_params": {"hybrid_alpha": 1.2}}),
+            json.dumps({"best_params": {"ppr_alpha": -0.1}}),
+            json.dumps({"best_params": {"seed_top_k": 0}}),
+            json.dumps({"best_params": {"seed_top_k": 2.5}}),
+            '{"best_params": {"hybrid_alpha": NaN}}',
+        ):
+            write_text_atomic(params_path, bad_raw)
+            with pytest.raises(YawRuntimeError) as exc_bad:
+                resolve_retrieval_params(cfg)
+            assert exc_bad.value.code == "CONSISTENCY_ERROR"
+            with pytest.raises(YawRuntimeError) as exc_rec:
+                recall_once(cfg, "QuasarPulse99", top_k=1)
+            assert exc_rec.value.code == "CONSISTENCY_ERROR"
+    finally:
+        srv.shutdown()
+
+
+def test_live_post_ready_pipeline_failure_transitions_to_error_and_blocks_queries(tmp_path: Path) -> None:
+    secret_tok = "tok-post-ready-secret777"
+    cfg = _make_cfg(tmp_path, api_key=secret_tok)
+    assert cfg.corpus_root is not None and cfg.status_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "apollo.md").write_text(
+        "# Apollo 11\nNeil Armstrong commanded Apollo 11 to the Moon.\n",
+        encoding="utf-8",
+    )
+
+    def post_ready_failing_embed(texts: list[str]) -> NDArray[np.float32]:
+        if any("POST_READY_EMBED_BOOM" in t for t in texts):
+            raise RuntimeError(f"post-ready embed boom key={secret_tok}")
+        return _topic_embed(texts, dim=16)
+
+    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> str:
+        _ = payload
+        return "Insufficient references in corpus"
+
+    srv, _ = _start_chat_server(chat_responder)
+    cfg = YawConfig(
+        workspace_root=tmp_path,
+        corpus_root=cfg.corpus_root,
+        db_path=cfg.db_path,
+        lock_path=cfg.lock_path,
+        state_dir=cfg.state_dir,
+        log_path=cfg.log_path,
+        status_path=cfg.status_path,
+        compiled_program_path=cfg.compiled_program_path,
+        base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+        api_key=secret_tok,
+        chunk_size=140,
+        chunk_overlap=20,
+        min_chunk_size=20,
+    )
+    rt = start_runtime(cfg, live=True, wait_for_ready=True, embed_fn=post_ready_failing_embed, lm=create_lm(cfg))
+    try:
+        assert get_status(rt).lifecycle == "ready"
+        assert get_status(rt).provider_ready is True
+        assert recall(rt, "Apollo", top_k=1)
+
+        (cfg.corpus_root / "boom_after.md").write_text(
+            "# Trigger\nPOST_READY_EMBED_BOOM breaks live ingestion.\n",
+            encoding="utf-8",
+        )
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if rt.pipeline.error is not None:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("Live watcher did not capture post-ready pipeline error")
+
+        # _ensure_ready must sync pipeline error -> persist error status & raise NOT_READY even before get_status()
+        with pytest.raises(YawRuntimeError) as exc_rec:
+            recall(rt, "Apollo")
+        assert exc_rec.value.code == "NOT_READY"
+        with pytest.raises(YawRuntimeError) as exc_ask:
+            ask(rt, "Who commanded Apollo 11?")
+        assert exc_ask.value.code == "NOT_READY"
+
+        st = get_status(rt)
+        assert st.lifecycle == "error"
+        assert st.provider_ready is False
+        assert st.sync_state == "error"
+        assert st.last_error is not None
+        assert "RuntimeError" in st.last_error
+        assert secret_tok not in st.last_error
+        disk_text = cfg.status_path.read_text(encoding="utf-8")
+        assert '"lifecycle": "error"' in disk_text
+        assert secret_tok not in disk_text
+    finally:
+        close_runtime(rt)
+        srv.shutdown()

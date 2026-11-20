@@ -18,6 +18,7 @@ from typing import Any, cast
 import dspy
 import numpy as np
 import pytest
+from dspy.utils.callback import BaseCallback
 from dspy.utils.exceptions import LMServerError
 from numpy.typing import NDArray
 
@@ -414,7 +415,7 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         assert long_cid not in nbr_cids
         assert any(cid in nbr_cids for cid in bridge_cids if cid != long_cid)
 
-        # read_chunk respects score=1.000 header, raises on invalid IDs, and returns full uncropped AST island
+        # read_chunk respects score=1.000 header, raises on invalid IDs, and returns full uncropped passage
         with pytest.raises(ValueError, match="-1"):
             read_chunk(-1)
         with pytest.raises(ValueError, match="999999"):
@@ -489,7 +490,7 @@ def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None
                     "Expand neighbors and read sibling context",
                     [
                         {"name": "expand_neighbors", "args": {"chunk_id": seed_cid, "top_k": 2}},
-                        {"name": "read_chunk", "args": {"chunk_id": seed_cid, "include_siblings": True}},
+                        {"name": "read_chunk", "args": {"chunk_id": seed_cid}},
                     ],
                 )
             c1, c2 = observed_cids[0], observed_cids[1]
@@ -503,23 +504,41 @@ def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None
                 ],
             )
 
+        captured_preds: list[dspy.Prediction] = []
+
+        class _CapturePred(BaseCallback):
+            def on_module_end(self, call_id: str, outputs: Any | None, exception: BaseException | None = None) -> None:
+                _ = (call_id, exception)
+                if isinstance(outputs, dspy.Prediction) and hasattr(outputs, "answer") and hasattr(outputs, "history"):
+                    captured_preds.append(outputs)
+
         server, requests_seen, _ = _start_loopback_chat_server(responder)
         try:
             lm = _make_loopback_lm(server)
-            res = ask_question(
-                agent,
-                "What unusual instrument did the Apollo 11 commander play?",
-                corpus_root=cfg.corpus_root,
-                vs=vs,
-                lm=lm,
-                lm_sem=threading.Semaphore(1),
-            )
+            with dspy.context(callbacks=[_CapturePred()]):
+                res = ask_question(
+                    agent,
+                    "What unusual instrument did the Apollo 11 commander play?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=lm,
+                    lm_sem=threading.Semaphore(1),
+                )
         finally:
             server.shutdown()
 
         ver_after = conn.execute("PRAGMA data_version").fetchone()[0]
         assert ver_before == ver_after
 
+    assert len(captured_preds) == 1
+    tool_results = [
+        r
+        for msg in captured_preds[0].history.messages
+        if isinstance(msg, dict) and (tc := msg.get("tool_calls")) is not None
+        for r in (getattr(getattr(tc, "tool_call_results", None), "tool_call_results", None) or ())
+    ]
+    assert len(tool_results) >= 5
+    assert all(not getattr(r, "is_error", False) for r in tool_results)
     assert len(requests_seen) == 3
     assert all(req.get("temperature") == 1.0 for req in requests_seen)
     assert res.turns == 3
@@ -787,6 +806,46 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
             assert any("non-empty string" in str(getattr(r, "value", "")) for r in err_results)
         finally:
             srv_react_err.shutdown()
+
+        # Forced-submit ValueError (max_iters=1, forced turn emits non-submit call) -> MODEL_ERROR
+        forced_agent = build_qa_agent(tools, max_iters=1)
+
+        def forced_non_submit(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            _ = payload
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Search once",
+                    [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}],
+                )
+            return 200, _xml_tool_reply(
+                "Refuse to submit",
+                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 1}}],
+            )
+
+        srv_forced_err, _, _ = _start_loopback_chat_server(forced_non_submit)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_forced_val:
+                ask_question(
+                    forced_agent,
+                    "Who commanded Apollo 11?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_forced_err),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_forced_val.value.code == "MODEL_ERROR"
+        finally:
+            srv_forced_err.shutdown()
+
+        # Non-submit termination_reason -> MODEL_ERROR
+        class _BadTerminationModule(dspy.Module):
+            def forward(self, question: str) -> dspy.Prediction:
+                _ = question
+                return dspy.Prediction(answer="Armstrong", termination_reason="max_iters")
+
+        with pytest.raises(YawRuntimeError) as exc_term:
+            run_qa("Who commanded Apollo 11?", vs=vs, corpus_root=cfg.corpus_root, agent=_BadTerminationModule())
+        assert exc_term.value.code == "MODEL_ERROR"
 
         # HTTP 500 server error must propagate unmasked (LMServerError), NOT be wrapped or swallowed
         srv_500, _, _ = _start_loopback_chat_server(lambda _i, _p: (500, "backend exploded"))

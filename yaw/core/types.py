@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
-from numpy.typing import NDArray
-
-type EmbedFn = Callable[[list[str]], NDArray[np.float32]]
+type EmbedFn = Callable[[list[str]], Any]
 
 ErrorCode = Literal[
     "BUSY",
@@ -47,6 +42,25 @@ class FatalGraphPublicationError(YawRuntimeError):
 
     def __init__(self, message: str, *, code: ErrorCode = "CONSISTENCY_ERROR") -> None:
         super().__init__(code, message)
+
+
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
+_URL_USERINFO_RE = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
+_API_KEY_KV_RE = re.compile(r"(?i)(api_key\s*[=:]\s*)([^\s,;\"']+)")
+
+
+def redact_secrets(text: str, api_key: str = "") -> str:
+    """Mask configured API keys, Bearer tokens, OpenAI keys, and URL credentials."""
+    if not text:
+        return text
+    cleaned = text
+    if api_key and len(api_key) >= 4:
+        cleaned = cleaned.replace(api_key, "[REDACTED]")
+    cleaned = _BEARER_RE.sub("Bearer [REDACTED]", cleaned)
+    cleaned = _SK_RE.sub("[REDACTED]", cleaned)
+    cleaned = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", cleaned)
+    return _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
 
 
 def normalize_entity(text: str) -> str:
@@ -127,28 +141,6 @@ def resolve_corpus_path(corpus_root: Path | str, rel_path: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"Path escapes corpus root: {rel_path!r}") from exc
     return resolved
-
-
-def resolve_coco_state_root(state_dir: Path | str) -> Path:
-    """Resolve dedicated CocoIndex state subdirectory without colliding with sibling files."""
-    base = Path(state_dir).resolve()
-    return base if base.name == "coco_lmdb" else base / "coco_lmdb"
-
-
-def write_text_atomic(path: Path, content: str, *, encoding: str = "utf-8", newline: str | None = "\n") -> None:
-    """Atomically write UTF-8 text via a sibling temporary file and os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,14 +337,6 @@ class ChunkMetadata:
 
 
 @dataclass(frozen=True, slots=True)
-class SeedSelection:
-    chunk_indices: NDArray[np.int64]
-    scores: NDArray[np.float32]
-    dense_scores: NDArray[np.float32]
-    sparse_scores: NDArray[np.float32]
-
-
-@dataclass(frozen=True, slots=True)
 class RecallHit:
     chunk_id: int
     score: float
@@ -478,7 +462,6 @@ __all__ = [
     "Quad",
     "RecallHit",
     "RecallResult",
-    "SeedSelection",
     "TextChunk",
     "Triple",
     "ValidationSummary",
@@ -491,9 +474,8 @@ __all__ = [
     "inclusive_end_line",
     "json_document_fields",
     "normalize_entity",
+    "redact_secrets",
     "render_document_text",
-    "resolve_coco_state_root",
     "resolve_corpus_path",
     "stable_hash_id",
-    "write_text_atomic",
 ]

@@ -27,7 +27,8 @@ from fastmcp.exceptions import ToolError
 
 from yaw.core import YawConfig, YawRuntimeError
 from yaw.mcp_server import create_mcp_app, serve_http
-from yaw.runtime import close_runtime, create_lm, signal_stop_event, start_runtime
+from yaw.qa import create_lm
+from yaw.runtime import close_runtime, signal_stop_event, start_runtime
 
 
 def _topic_embed_vec(text: str, *, dim: int = 16) -> np.ndarray:
@@ -89,6 +90,22 @@ def _make_cfg(
     )
 
 
+def _tool_reply(thought: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": thought,
+        "tool_calls": [
+            {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {"name": call["name"], "arguments": json.dumps(call["args"])},
+            }
+            for i, call in enumerate(calls)
+        ],
+    }
+
+
 def _start_openai_stub(
     chat_responder: Any,
     *,
@@ -128,7 +145,13 @@ def _start_openai_stub(
                     "created": 1,
                     "model": payload.get("model", "gemma-4-e4b"),
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": content
+                            if isinstance(content, dict)
+                            else {"role": "assistant", "content": content},
+                            "finish_reason": "tool_calls" if isinstance(content, dict) else "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
@@ -455,23 +478,24 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
             gate_embed.wait(timeout=5.0)
         return _topic_embed(texts)
 
-    def chat_responder(payload: dict[str, Any]) -> str:
+    def chat_responder(payload: dict[str, Any]) -> str | dict[str, Any]:
         if chat_mode["mode"] == "secret_garbage":
             return f"garbage Bearer tok_secret999 {secret_key} sk-secret123456"
-        msgs_blob = json.dumps(payload.get("messages", []))
-        alpha_match = re.search(r"\[chunk_id=(\d+)\]\s+\(alpha\.md:[^\n]+\)", msgs_blob)
+        msgs = payload.get("messages", [])
+        has_tool_obs = any(m.get("role") == "tool" for m in msgs)
+        msgs_blob = json.dumps(msgs)
+        alpha_match = re.search(r"\[chunk_id=(\d+)\]\s+\(alpha\.md:[^)\n]+\)", msgs_blob)
         cids = re.findall(r"\[chunk_id=(\d+)\]", msgs_blob)
-        if not cids:
-            search_call = {
-                "tool_calls": [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 3}}]
-            }
-            return (
-                "<next_thought>Search Apollo passages first</next_thought>\n"
-                f"<tool_calls>{json.dumps(search_call)}</tool_calls>"
+        if not has_tool_obs or not cids:
+            return _tool_reply(
+                "Search Apollo passages first",
+                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 3}}],
             )
         chosen = alpha_match.group(1) if alpha_match is not None else cids[0]
-        sub_call = {"tool_calls": [{"name": "submit", "args": {"answer": f"Neil Armstrong [chunk_id={chosen}]"}}]}
-        return f"<next_thought>Cite retrieved passage</next_thought>\n<tool_calls>{json.dumps(sub_call)}</tool_calls>"
+        return _tool_reply(
+            "Cite retrieved passage",
+            [{"name": "submit", "args": {"answer": f"Neil Armstrong [chunk_id={chosen}]"}}],
+        )
 
     srv = _start_openai_stub(chat_responder)
     cfg_lm = _make_cfg(tmp_path / "tools", base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key=secret_key)
@@ -617,18 +641,22 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
     embed_gate = threading.Event()
     embed_gate.set()
 
-    def chat_responder(payload: dict[str, Any]) -> str:
-        msgs_blob = json.dumps(payload.get("messages", []))
+    def chat_responder(payload: dict[str, Any]) -> dict[str, Any]:
+        msgs = payload.get("messages", [])
+        has_tool_obs = any(m.get("role") == "tool" for m in msgs)
+        msgs_blob = json.dumps(msgs)
         cids = re.findall(r"\[chunk_id=(\d+)\]", msgs_blob)
-        if not cids:
-            search_call = {
-                "tool_calls": [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}]
-            }
-            return f"<next_thought>Look up Apollo</next_thought>\n<tool_calls>{json.dumps(search_call)}</tool_calls>"
+        if not has_tool_obs or not cids:
+            return _tool_reply(
+                "Look up Apollo",
+                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}],
+            )
         qa_started.set()
         qa_release.wait(timeout=15.0)
-        sub_call = {"tool_calls": [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={cids[0]}]"}}]}
-        return f"<next_thought>Submit grounded answer</next_thought>\n<tool_calls>{json.dumps(sub_call)}</tool_calls>"
+        return _tool_reply(
+            "Submit grounded answer",
+            [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={cids[0]}]"}}],
+        )
 
     stub_srv = _start_openai_stub(chat_responder, embed_gate=embed_gate, hold_query_marker="hold_barrier")
     port = _free_port()
@@ -772,6 +800,90 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
     finally:
         qa_release.set()
         embed_gate.set()
+        if t_srv.is_alive() and os.name == "nt":
+            signal_stop_event(cfg.lock_path)
+            t_srv.join(timeout=5.0)
+        stub_srv.shutdown()
+
+
+def test_live_post_ready_pipeline_failure_flips_readyz_503_and_not_ready_mcp(tmp_path: Path) -> None:
+    stub_srv = _start_openai_stub(lambda _p: _tool_reply("Abstain", [{"name": "submit", "args": {"answer": "ok"}}]))
+    port = _free_port()
+    cfg = _make_cfg(
+        tmp_path / "post_ready_err",
+        http_host="127.0.0.1",
+        http_port=port,
+        base_url=f"http://127.0.0.1:{stub_srv.server_port}/v1",
+    )
+    assert cfg.corpus_root is not None and cfg.lock_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "apollo.md").write_text(
+        "# Apollo 11\nNeil Armstrong commanded Apollo 11.\n",
+        encoding="utf-8",
+    )
+
+    srv_errors: list[BaseException] = []
+
+    def _run_srv() -> None:
+        try:
+            serve_http(cfg)
+        except BaseException as exc:
+            srv_errors.append(exc)
+
+    t_srv = threading.Thread(target=_run_srv, daemon=True)
+    t_srv.start()
+
+    try:
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                r = httpx.get(f"http://127.0.0.1:{port}/readyz", timeout=1.0)
+                if r.status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"serve_http did not become ready; errors={srv_errors}")
+
+        # Trigger a live post-ready CocoIndex component failure (indivisible token > chunk_size=140)
+        (cfg.corpus_root / "oversize.md").write_text("X" * 300, encoding="utf-8")
+
+        err_deadline = time.monotonic() + 20.0
+        while time.monotonic() < err_deadline:
+            r = httpx.get(f"http://127.0.0.1:{port}/readyz", timeout=1.0)
+            if r.status_code == 503 and r.json() == {"status": "error"}:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("readyz did not transition to 503 {'status': 'error'} after post-ready failure")
+
+        async def _verify_mcp_blocked() -> None:
+            async with Client(f"http://127.0.0.1:{port}/mcp") as client:
+                st = (await client.call_tool("daemon_status", {})).data
+                assert st["lifecycle"] == "error"
+                assert st["provider_ready"] is False
+                assert st["sync_state"] == "error"
+                assert st["last_error"] is not None
+
+                with pytest.raises(ToolError) as exc_rec:
+                    await client.call_tool("recall", {"query": "Apollo 11"})
+                assert str(exc_rec.value).startswith("[NOT_READY]")
+
+                with pytest.raises(ToolError) as exc_qa:
+                    await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})
+                assert str(exc_qa.value).startswith("[NOT_READY]")
+
+        asyncio.run(_verify_mcp_blocked())
+
+        if os.name == "nt":
+            assert signal_stop_event(cfg.lock_path) is True
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)
+        t_srv.join(timeout=10.0)
+        assert not t_srv.is_alive()
+        assert srv_errors == []
+    finally:
         if t_srv.is_alive() and os.name == "nt":
             signal_stop_event(cfg.lock_path)
             t_srv.join(timeout=5.0)

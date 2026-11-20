@@ -8,46 +8,34 @@ import ctypes
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
 from typing import Any
 
-import dspy
 import filelock
 
 from yaw.core import (
     DaemonStatus,
-    HydratedPassage,
     YawConfig,
     YawRuntimeError,
-    format_query_for_embedding,
     get_config_value,
     load_config,
+    redact_secrets,
     set_config_value,
     write_text_atomic,
 )
 from yaw.mcp_server import serve_http
-from yaw.optimize import optimize_dspy, optimize_optuna
-from yaw.pipeline import make_dspy_embed_fn
-from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
-from yaw.retrieval import (
-    VectorSearch,
-    build_vector_search,
-    hydrate_ranked_passages,
-    open_readonly_db,
-    search_vectors,
-)
 from yaw.runtime import (
-    redact_secrets,
+    ask_once,
+    read_db_chunk_count,
+    recall_once,
     require_path,
-    resolve_program_path,
     serialize_passage,
     signal_stop_event,
 )
@@ -138,16 +126,6 @@ def _is_lock_held(lock_path: Path) -> bool:
     return False
 
 
-def _read_db_chunk_count(db_path: Path) -> int:
-    if not db_path.is_file():
-        return 0
-    with contextlib.closing(open_readonly_db(db_path)) as conn:
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
-            return 0
-        row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
-        return int(row[0]) if row else 0
-
-
 def _terminate_child(proc: subprocess.Popen[Any], lock_path: Path) -> None:
     if proc.poll() is not None:
         return
@@ -185,7 +163,7 @@ def _daemon_status(cfg: YawConfig) -> dict[str, Any]:
     db_path = require_path(cfg.db_path, "db_path")
     status_data = _read_status_file(status_path)
     pid = _resolve_pid(state_dir / "daemon.pid", status_data)
-    num_chunks = _read_db_chunk_count(db_path)
+    num_chunks = read_db_chunk_count(db_path)
     raw_err = status_data.get("last_error")
     err = redact_secrets(str(raw_err), cfg.api_key) if raw_err else None
     raw_sync = status_data.get("last_sync_at")
@@ -337,48 +315,19 @@ def _daemon_stop(cfg: YawConfig) -> dict[str, Any]:
     raise YawRuntimeError("BUSY", "Timed out waiting for daemon shutdown.")
 
 
-@contextlib.contextmanager
-def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, VectorSearch, Path]]:
-    db_path = require_path(cfg.db_path, "db_path")
-    if not db_path.is_file():
-        raise YawRuntimeError("EMPTY_INDEX", f"Database not found: {db_path}")
-    corpus_root = require_path(cfg.corpus_root, "corpus_root")
-    with contextlib.closing(open_readonly_db(db_path)) as conn:
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
-            raise YawRuntimeError("EMPTY_INDEX", f"Index table 'chunks' not initialized in {db_path}")
-        yield conn, build_vector_search(conn), corpus_root
-
-
 def _cmd_recall(cfg: YawConfig, query: str, top_k: int) -> dict[str, Any]:
-    q = query.strip() if isinstance(query, str) else ""
-    if not q:
-        raise YawRuntimeError("INVALID_INPUT", "Query must not be empty.")
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or not (1 <= top_k <= 20):
-        raise YawRuntimeError("INVALID_INPUT", "top_k must be an integer between 1 and 20.")
-    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
-        if vs.size == 0:
-            passages: tuple[HydratedPassage, ...] = ()
-        else:
-            q_vec = make_dspy_embed_fn(cfg)([format_query_for_embedding(q, cfg.embedding_task_mode)])[0]
-            ranked = search_vectors(vs, q_vec, query_text=q, conn=conn, top_k=max(top_k * 4, 50))
-            passages = hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
-    return {"query": q, "top_k": top_k, "results": [serialize_passage(i, hp) for i, hp in enumerate(passages, 1)]}
+    passages = recall_once(cfg, query, top_k=top_k)
+    return {
+        "query": query.strip(),
+        "top_k": top_k,
+        "results": [serialize_passage(i, hp) for i, hp in enumerate(passages, 1)],
+    }
 
 
 def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
-    q = question.strip() if isinstance(question, str) else ""
-    if not q:
-        raise YawRuntimeError("INVALID_INPUT", "Question must not be empty.")
-    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
-        if vs.size == 0:
-            raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
-        tools = make_qa_tools(vs, corpus_root, make_dspy_embed_fn(cfg), conn, task_mode=cfg.embedding_task_mode)
-        lm = create_lm(cfg)
-        agent = build_qa_agent(tools, max_iters=cfg.react_max_iters, artifact_path=resolve_program_path(cfg))
-        with dspy.context(lm=lm):
-            res = ask_question(q, corpus_root=corpus_root, vs=vs, agent=agent)
+    res = ask_once(cfg, question)
     return {
-        "question": q,
+        "question": res.question,
         "answer": res.answer,
         "turns": int(res.turns),
         "citations": [serialize_passage(i, hp) for i, hp in enumerate(res.passages, start=1)],
@@ -505,6 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cites = _format_passages_text(payload["citations"]) if payload["citations"] else ""
                     text = f"{payload['answer']}\n\n{cites}" if cites else payload["answer"]
                 else:
+                    from yaw.optimize import optimize_dspy, optimize_optuna
+
                     if args.optimize_cmd == "dspy":
                         payload = optimize_dspy(
                             cfg,

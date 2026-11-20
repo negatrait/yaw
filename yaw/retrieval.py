@@ -12,17 +12,19 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import scipy.sparse as sp
 import spacy
 import sqlite_vec
 from numpy.typing import NDArray
+from spacy.lang.en.stop_words import STOP_WORDS as _STOPWORDS
 
 from yaw.core import (
     ChunkPointer,
     HydratedPassage,
+    YawConfig,
     YawRuntimeError,
     normalize_entity,
     resolve_corpus_path,
@@ -33,60 +35,65 @@ _PROPER_SPAN_RE = re.compile(
     r"\b(?:[A-Z][A-Za-z0-9_-]*|[A-Z]{2,}[0-9]*)(?:\s+(?:[A-Z][A-Za-z0-9_-]*|[A-Z]{2,}[0-9]*))*"
 )
 _FTS_SAFE_RE = re.compile(r"[A-Za-z0-9_]+")
-_STOPWORDS = frozenset(
-    {
-        "a",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "by",
-        "did",
-        "do",
-        "does",
-        "for",
-        "from",
-        "had",
-        "has",
-        "have",
-        "how",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "of",
-        "on",
-        "or",
-        "that",
-        "the",
-        "their",
-        "them",
-        "there",
-        "these",
-        "they",
-        "this",
-        "to",
-        "was",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "who",
-        "whom",
-        "why",
-        "with",
-    }
-)
-_SENTENCE_INITIAL_SKIP = frozenset(
-    {"The", "This", "That", "These", "Those", "What", "When", "Where", "Which", "Who", "Why", "How", "In", "On", "At"}
-)
 _MAX_HYDRATE_SPAN = 10_000
 _NLP_LOCK = threading.Lock()
 _NLP: Any = None
+
+
+class SearchParams(TypedDict, total=False):
+    """Validated Optuna-tuned retrieval hyperparameters."""
+
+    hybrid_alpha: float
+    ppr_alpha: float
+    seed_top_k: int
+
+
+def resolve_retrieval_params(cfg: YawConfig) -> SearchParams:
+    """Load and strictly validate Optuna-tuned retrieval parameters from `optuna_best_params.json`."""
+    opt_db = cfg.for_optimization(".yaw/optuna_index.db").db_path
+    if opt_db is None:
+        return {}
+    params_path = opt_db.parent / "optuna_best_params.json"
+    if not params_path.is_file():
+        return {}
+    try:
+        raw = json.loads(params_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid Optuna params file: {params_path}") from exc
+    if not isinstance(raw, dict) or not isinstance(best := raw.get("best_params"), dict):
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid Optuna params file: {params_path}")
+
+    allowed = {"hybrid_alpha", "ppr_alpha", "seed_top_k"}
+    if unknown := (set(best) - allowed):
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"Unknown Optuna params in {params_path}: {sorted(unknown)}")
+
+    out: SearchParams = {}
+    if "hybrid_alpha" in best:
+        val = best["hybrid_alpha"]
+        if (
+            isinstance(val, bool)
+            or not isinstance(val, int | float)
+            or not math.isfinite(fval := float(val))
+            or not (0.0 <= fval <= 1.0)
+        ):
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid hybrid_alpha={val!r} in {params_path}")
+        out["hybrid_alpha"] = fval
+    if "ppr_alpha" in best:
+        val = best["ppr_alpha"]
+        if (
+            isinstance(val, bool)
+            or not isinstance(val, int | float)
+            or not math.isfinite(fval := float(val))
+            or not (0.0 <= fval <= 1.0)
+        ):
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid ppr_alpha={val!r} in {params_path}")
+        out["ppr_alpha"] = fval
+    if "seed_top_k" in best:
+        val = best["seed_top_k"]
+        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid seed_top_k={val!r} in {params_path}")
+        out["seed_top_k"] = int(val)
+    return out
 
 
 def _get_spacy_nlp() -> Any:
@@ -94,10 +101,7 @@ def _get_spacy_nlp() -> Any:
     if _NLP is None:
         with _NLP_LOCK:
             if _NLP is None:
-                try:
-                    _NLP = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer", "textcat"])
-                except OSError:
-                    _NLP = spacy.blank("en")
+                _NLP = spacy.load("en_core_web_sm", disable=["parser", "lemmatizer", "textcat"])
     return _NLP
 
 
@@ -110,18 +114,13 @@ def extract_text_features(title: str, text: str) -> tuple[dict[str, int], tuple[
     ents: dict[str, None] = {}
     if title and (clean_t := normalize_entity(title)) and clean_t not in _STOPWORDS:
         ents[clean_t] = None
-    nlp = _get_spacy_nlp()
-    if "ner" in nlp.pipe_names:
-        doc = nlp(combined[:25_000])
-        for ent in doc.ents:
-            norm = normalize_entity(ent.text)
-            if len(norm) > 1 and norm not in _STOPWORDS:
-                ents[norm] = None
+    doc = _get_spacy_nlp()(combined)
+    for ent in doc.ents:
+        norm = normalize_entity(ent.text)
+        if len(norm) > 1 and norm not in _STOPWORDS:
+            ents[norm] = None
     for match in _PROPER_SPAN_RE.finditer(combined):
-        raw = match.group(0).strip()
-        if raw in _SENTENCE_INITIAL_SKIP:
-            continue
-        norm = normalize_entity(raw)
+        norm = normalize_entity(match.group(0))
         if len(norm) > 1 and norm not in _STOPWORDS:
             ents[norm] = None
     return counts, tuple(ents)
@@ -324,22 +323,28 @@ def _bm25_scores(vs: VectorSearch, query_text: str, conn: sqlite3.Connection | N
         return scores
 
     if conn is not None:
+        has_fts = (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_fts'").fetchone() is not None
+        )
+        if not has_fts:
+            raise YawRuntimeError("CONSISTENCY_ERROR", "Missing chunk_fts table in SQLite index.")
         safe_terms = [t for t in _FTS_SAFE_RE.findall(query_text) if len(t) > 1 and t.lower() not in _STOPWORDS]
-        if safe_terms:
-            match_expr = " OR ".join(f'"{t}"' for t in dict.fromkeys(safe_terms))
-            try:
-                fts_rows = conn.execute(
-                    "SELECT rowid, -bm25(chunk_fts, 2.0, 1.0) FROM chunk_fts WHERE chunk_fts MATCH ? LIMIT ?",
-                    (match_expr, min(n, 256)),
-                ).fetchall()
-                for rid, val in fts_rows:
-                    pos = vs.id_to_pos.get(int(rid))
-                    if pos is not None and float(val) > 0.0:
-                        scores[pos] = float(val)
-                if float(scores.max()) > 0.0:
-                    return _minmax_norm(scores)
-            except sqlite3.OperationalError:
-                pass
+        if not safe_terms:
+            return scores
+        match_expr = " OR ".join(f'"{t}"' for t in dict.fromkeys(safe_terms))
+        fts_rows = conn.execute(
+            "SELECT rowid, -bm25(chunk_fts, 2.0, 1.0) "
+            "FROM chunk_fts "
+            "WHERE chunk_fts MATCH ? "
+            "ORDER BY bm25(chunk_fts, 2.0, 1.0) ASC "
+            "LIMIT ?",
+            (match_expr, min(n, 256)),
+        ).fetchall()
+        for rid, val in fts_rows:
+            pos = vs.id_to_pos.get(int(rid))
+            if pos is not None and float(val) > 0.0:
+                scores[pos] = float(val)
+        return _minmax_norm(scores)
 
     q_terms = [t for t in _TOKEN_RE.findall(query_text.lower()) if len(t) > 1 and t not in _STOPWORDS]
     if not q_terms:
@@ -626,36 +631,3 @@ def format_evidence_route(passages: Sequence[HydratedPassage]) -> str:
                 f"[{idx}] [{hp.pointer.span_label} | chunk_id={hp.pointer.chunk_id} | score={hp.score:.4f}]\n{hp.text}"
             )
     return "\n\n".join(blocks)
-
-
-def query_external_hints(
-    conn: sqlite3.Connection,
-    user_tables: Sequence[str],
-    query_terms: Sequence[str],
-    *,
-    limit: int = 5,
-) -> list[str]:
-    """Probe non-chunk user SQLite tables for rows matching lexical query terms."""
-    hints: list[str] = []
-    clean_terms = [t.lower() for t in query_terms if len(t) > 2 and t.lower() not in _STOPWORDS][:4]
-    if not clean_terms or limit <= 0:
-        return hints
-    for tbl in user_tables:
-        if tbl in ("chunks", "chunk_fts") or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", tbl):
-            continue
-        try:
-            cols = [str(r[1]) for r in conn.execute(f'PRAGMA table_info("{tbl}")').fetchall()]
-            text_cols = [c for c in cols if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", c)]
-            if not text_cols:
-                continue
-            where = " OR ".join(f'LOWER(CAST("{c}" AS TEXT)) LIKE ?' for c in text_cols[:4] for _ in clean_terms)
-            params = [f"%{t}%" for _ in text_cols[:4] for t in clean_terms]
-            rows = conn.execute(f'SELECT * FROM "{tbl}" WHERE {where} LIMIT ?', (*params, limit)).fetchall()
-            for r in rows:
-                rendered = ", ".join(f"{c}={v}" for c, v in zip(cols, r, strict=False) if v is not None)
-                hints.append(f"[{tbl}] {rendered[:240]}")
-                if len(hints) >= limit:
-                    return hints
-        except sqlite3.OperationalError:
-            continue
-    return hints
