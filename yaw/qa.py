@@ -34,7 +34,8 @@ _MAX_TOP_K = 25
 _NO_MATCHES = "No matching passages found."
 _NO_ISLAND = (1, 1)  # ChunkPointer default: the chunk carries no AST island.
 _PASSAGE_HEAD_RE = re.compile(r"^\[chunk_id=(\d+)\]\s+\([^)\n]+\)\s+score=([-+]?\d+(?:\.\d+)?):$", re.MULTILINE)
-_CHUNK_ID_RE = re.compile(r"\[chunk_id=(\d+)\]")
+_CITATION_BLOCK_RE = re.compile(r"\[(?:chunk_id=\d+(?:\s*[,;]\s*(?:chunk_id=)?\d+)*)\]")
+_CHUNK_NUM_RE = re.compile(r"\d+")
 _QUERY_DESC = {"query": "Non-empty search query.", "top_k": f"Max passages to return (1..{_MAX_TOP_K})."}
 _CHUNK_DESC = "Chunk ID from a prior [chunk_id=<int>] header."
 
@@ -43,11 +44,12 @@ ABSTAIN_REPLY = "Insufficient references in corpus"
 
 
 class QASignature(dspy.Signature):
-    """Answer strictly from retrieved corpus passages using inline [chunk_id=<int>] citations,
-    or reply 'Insufficient references in corpus' when evidence is lacking."""
+    """Verify multi-hop facts via tools and answer with ONLY the minimal canonical answer span grounded in retrieved
+    passages plus inline [chunk_id=<int>] citations — 'yes'/'no' for polar questions, bare entity/title/date/number/
+    single primary term without qualifiers, lists, or explanatory sentences — or 'Insufficient references in corpus'."""
 
-    question: str = dspy.InputField(desc="User question to answer from indexed corpus.")
-    answer: str = dspy.OutputField(desc="Grounded answer citing [chunk_id=<int>] or refusal.")
+    question: str = dspy.InputField(desc="Question to answer strictly from the indexed corpus.")
+    answer: str = dspy.OutputField(desc="Minimal bare answer span with [chunk_id=<int>] (no prose), or refusal.")
 
 
 def create_lm(cfg: YawConfig, *, temperature: float = 1.0) -> dspy.LM:
@@ -238,12 +240,13 @@ def _extract_seen_chunks(history_msgs: Sequence[Any]) -> dict[int, tuple[float, 
 
 def extract_inline_chunk_ids(text: str) -> list[int]:
     """Return deduplicated `[chunk_id=<int>]` identifiers in order of appearance."""
-    return list(dict.fromkeys(int(m.group(1)) for m in _CHUNK_ID_RE.finditer(text)))
+    ids = [int(n) for m in _CITATION_BLOCK_RE.finditer(text) for n in _CHUNK_NUM_RE.findall(m.group(0))]
+    return list(dict.fromkeys(ids))
 
 
 def strip_inline_citations(text: str) -> str:
     """Remove inline `[chunk_id=<int>]` markers from an answer string."""
-    return _CHUNK_ID_RE.sub("", text).strip()
+    return re.sub(r"\s+([.,;:!?])", r"\1", " ".join(_CITATION_BLOCK_RE.sub("", text).split()))
 
 
 def collect_tool_history(pred: Any) -> tuple[list[str], int, dict[int, tuple[float, int]]]:

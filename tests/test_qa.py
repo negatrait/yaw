@@ -24,7 +24,14 @@ from numpy.typing import NDArray
 
 from yaw.core import EmbedFn, YawConfig, YawRuntimeError
 from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
-from yaw.qa import QASignature, build_qa_agent, create_lm, make_qa_tools
+from yaw.qa import (
+    QASignature,
+    build_qa_agent,
+    create_lm,
+    extract_inline_chunk_ids,
+    make_qa_tools,
+    strip_inline_citations,
+)
 from yaw.qa import ask_question as run_qa
 from yaw.retrieval import build_vector_search, open_readonly_db
 
@@ -714,6 +721,32 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
         finally:
             srv_unseen.shutdown()
 
+        # Comma-joined multi-ID citation with one unseen/ungrounded ID -> MODEL_ERROR
+        def mixed_comma_citation(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Read first", [{"name": "read_chunk", "args": {"chunk_id": real_unseen_cid}}]
+                )
+            return 200, _xml_tool_reply(
+                "Cite seen and ungrounded id together",
+                [{"name": "submit", "args": {"answer": f"Grounded [chunk_id={real_unseen_cid}, chunk_id=999999]."}}],
+            )
+
+        srv_comma, _, _ = _start_loopback_chat_server(mixed_comma_citation)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_comma:
+                ask_question(
+                    agent,
+                    "Test comma-joined ungrounded citation",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_comma),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_comma.value.code == "MODEL_ERROR"
+        finally:
+            srv_comma.shutdown()
+
         # Whitespace-only submitted answer -> MODEL_ERROR
         srv_ws, _, _ = _start_loopback_chat_server(
             lambda _i, _p: (200, _xml_tool_reply("Empty", [{"name": "submit", "args": {"answer": "   "}}]))
@@ -861,3 +894,11 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                 )
         finally:
             srv_500.shutdown()
+
+
+def test_inline_citation_extract_and_strip_handles_multi_id_and_preserves_brackets() -> None:
+    sample = "Phoolwari [chunk_id=10, chunk_id=20] beats Foo [chunk_id=10, 30; chunk_id=40] [note]."
+    assert extract_inline_chunk_ids(sample) == [10, 20, 30, 40]
+    assert extract_inline_chunk_ids("Plain [chunk_id=7]") == [7]
+    assert strip_inline_citations("Phoolwari [chunk_id=1, chunk_id=2].") == "Phoolwari."
+    assert strip_inline_citations("Bar [note] [chunk_id=1, 2; chunk_id=3] , ok !") == "Bar [note], ok!"
