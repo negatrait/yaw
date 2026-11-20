@@ -10,7 +10,7 @@
 **A minimal line count codebase that fails fast is infinitely better than a fallback-heavy codebase that silently degrades performance to mask failures!**
 
 - **Zero Corporate Boilerplate:** Do **not** create manager/factory/helper classes, `ABC`/`Protocol` hierarchies, single-caller wrappers, compatibility shims, or speculative config knobs. Write flat functions, `frozen=True, slots=True` dataclasses, `stdlib` (`zlib`, `hashlib`, `graphlib`, `sqlite3`), and vectorized `NumPy`/`SciPy` kernels.
-- **Exact Math Over Heuristics:** Never replace specified linear algebra (`svd`, `qr`, `nnls`), `RaBitQ` concentration bounds, or Shannon bit costs ($\log_2 N$, $\log_2 \text{df}$) with arbitrary scalar weights or stopword lists.
+- **Exact Math Over Heuristics:** Never replace specified linear algebra (`svd`, `qr`, `nnls`), exact concentration bounds, or Shannon bit costs ($\log_2 N$, $\log_2 \text{df}$) with arbitrary scalar weights or stopword lists.
 - **Zero Masked Failures:** Obey `FOUNDATIONAL.md §5` strictly—no custom retry loops, no broad `except`, and no degraded Python fallbacks when SQLite or model endpoints fail.
 - **Atomic Deletions & DRY Docs:** Delete superseded code, config keys, and dead types in the same commit as their replacement, updating all callers and `scripts/watchdog.py` atomically. Keep documentation DRY—each invariant lives in **one** file.
 - **Push Back With Proof:** Surface hidden assumptions, degenerate math cases (`N < 8`, `df == 0`, graph cycles, `NaN` norms), and contradictions with evidence before coding. Precision beats speed.

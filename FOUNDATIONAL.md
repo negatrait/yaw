@@ -51,5 +51,5 @@ yaw/
 
 ## 6. Governing Specs
 
-- Active clean-slate sprint ledger (`CS-0`..`CS-6`): [docs/reviews/bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) *(queued post-`CS-6` next sprint: [docs/reviews/mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md))*
+- Active clean-slate sprint ledger (`CS-0`..`CS-6`, closed on `3cd3952`): [docs/reviews/bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) *(ablation-gated candidate spec — zero production code changes until undisputed benchmark proof: [docs/reviews/mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md))*
 - Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where older epic text references pre-cutover OpenIE/SHACL/PPR details, §§1–5 above take precedence)*.
