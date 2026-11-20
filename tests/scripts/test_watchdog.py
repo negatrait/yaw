@@ -1,314 +1,255 @@
-"""Graph selection and assertion trails over real SQLite and report files."""
+"""Real-substrate integration tests for the clean-slate YAW watchdog monitor."""
 
+from __future__ import annotations
+
+import json
+import os
 import sqlite3
+import threading
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import ClassVar
+from xml.etree import ElementTree
 
-from daemon.native_inference import publish_inference
+import filelock
+import numpy as np
+import pytest
+import sqlite_vec
 
-from scripts import watchdog
-from scripts.watchdog import (
-    generate_graph_projection_svg,
-    generate_report_markdown,
-    largest_one_hop_neighborhood,
-    recent_relation_assertions,
-)
-from yaw.core import OpenIERecord
+import scripts.watchdog as watchdog
+from yaw.core import DaemonStatus
 
 
-def test_watchdog_reads_native_artifacts_and_empty_withdrawal(tmp_path, monkeypatch):
-    import json
-
-    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
-    monkeypatch.setattr(watchdog, "ARTIFACT_DIR", tmp_path / "dashboard")
-    path = tmp_path / ".yaw" / "optimize_yaw.db"
-    records = [
-        OpenIERecord(chunk_id=cid, entities=("Mercury", "Sun"), triples=(("Mercury", "orbits", "Sun"),))
-        for cid in ("first", "second")
-    ]
-    publish_inference(path, records)
-    with closing(sqlite3.connect(path)) as conn:
+def _create_vec_fts_db(db_path: Path, num_chunks: int) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
         conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('optimization_run', ?)",
-            (json.dumps({"started_at": "2026-11-08T08:00:00+00:00"}),),
+            "CREATE VIRTUAL TABLE chunks USING vec0("
+            "chunk_id INTEGER PRIMARY KEY, "
+            "embedding float[4] distance_metric=cosine)"
         )
-        conn.commit()
-    populated = watchdog.get_active_sandbox_info()
-    assert "error" not in populated
-    assert populated["datestamp"] == "canonical"
-    assert populated["start_time"] == "2026-11-08T08:00:00+00:00"
-    assert populated["counts"]["chunk_inference"] == 2
-    assert "openie_chunks" not in populated["counts"]
-    assert populated["indexed_chunk_ids"] == {"first", "second"}
-    assert populated["kg_metrics"]["total_entities"] == 4
-    assert (tmp_path / ".yaw" / "optimize_telemetry.json").is_file()
-
-    publish_inference(path, [])
-    empty = watchdog.get_active_sandbox_info()
-    assert "error" not in empty
-    assert empty["counts"]["chunk_inference"] == 0
-    assert empty["indexed_chunk_ids"] == set()
-
-
-def test_largest_neighborhood_keeps_both_seeds_and_only_one_hop():
-    edges = [
-        ("a", "b", "owl:differentFrom"),
-        ("b", "c", "fact"),
-        ("c", "d", "fact"),
-        ("x", "y", "skos:related"),
-        ("x", "z", "fact"),
-        ("y", "w", "fact"),
-        ("w", "outside", "fact"),
-        ("lonely", "other", "fact"),
-    ]
-    assert largest_one_hop_neighborhood(edges) == {"x", "y", "z", "w"}
-    assert largest_one_hop_neighborhood(edges + [("c", "z", "fact")]) == {
-        "a",
-        "b",
-        "c",
-        "x",
-        "y",
-        "z",
-        "w",
-    }
-    assert largest_one_hop_neighborhood([("a", "b", "fact")]) == set()
-    assert largest_one_hop_neighborhood([]) == set()
-
-
-def test_component_ties_are_deterministic_and_unknown_edges_do_not_expand():
-    edges = [
-        ("x", "y", "skos:related"),
-        ("a", "b", "owl:differentFrom"),
-        ("a", "outside", "passage"),
-    ]
-    assert largest_one_hop_neighborhood(edges) == {"a", "b"}
-    assert largest_one_hop_neighborhood(list(reversed(edges))) == {"a", "b"}
-
-
-def test_recent_related_assertions_are_active_canonical_pairs(tmp_path):
-    with closing(sqlite3.connect(tmp_path / "assertions.db")) as conn:
-        conn.executescript(
-            "CREATE TABLE entities(entity_id TEXT PRIMARY KEY, name TEXT, definition TEXT);"
-            "CREATE TABLE edges(src_id TEXT, dst_id TEXT, kind TEXT, "
-            "PRIMARY KEY(src_id, dst_id, kind));"
-        )
-        for i in range(12):
-            a, b = f"a{i:02}", f"b{i:02}"
-            conn.executemany(
-                "INSERT INTO entities VALUES (?, ?, ?)",
-                [(a, a, "Definition A"), (b, b, "Definition B")],
+        conn.execute("CREATE VIRTUAL TABLE chunk_fts USING fts5(title, body, content='', contentless_delete=1)")
+        for idx in range(1, num_chunks + 1):
+            vec = np.array([1.0 if i == (idx % 4) else 0.0 for i in range(4)], dtype=np.float32).tobytes()
+            conn.execute("INSERT INTO chunks(chunk_id, embedding) VALUES (?, ?)", (idx, vec))
+            conn.execute(
+                "INSERT INTO chunk_fts(rowid, title, body) VALUES (?, ?, ?)", (idx, f"Title {idx}", f"Body {idx}")
             )
-            conn.executemany("INSERT INTO edges VALUES (?, ?, 'skos:related')", [(a, b), (b, a)])
-        rows = recent_relation_assertions(conn, "skos:related")
-        assert len(rows) == 10
-        assert [row[0] for row in rows] == [f"a{i:02}" for i in range(11, 1, -1)]
-        conn.execute("DELETE FROM edges WHERE src_id IN ('a11', 'b11')")
-        assert recent_relation_assertions(conn, "skos:related")[0][0] == "a10"
-        assert recent_relation_assertions(conn, "owl:differentFrom") == []
-
-    report = tmp_path / "report.md"
-    graph = {
-        "related_assertion_rows": rows,
-        "diff_from_rows": [("d1", "Ambiguous A", "First sense", "d2", "Ambiguous B", "Other")],
-    }
-    candidates = [
-        {"cand": 1, "n": 100, "val_score": 0.4, "f1": 0.8, "r5": 0.9},
-        {"cand": 2, "n": 110, "val_score": 0.5, "f1": 0.1, "r5": 0.8},
-    ]
-    generate_report_markdown(report, {"kg_graph": graph}, candidates, 210, ("TEST", "#38bdf8"))
-    text = report.read_text(encoding="utf-8")
-    assert text.index("![Fig. 2:") < text.index("### Graph Assertions")
-    assert text.index("### Graph Assertions") < text.index("### Most Recent `skos:related`")
-    assert text.index("### Most Recent `skos:related`") < text.index("![Fig. 3:")
-    assert text.index("**`a11`**") < text.index("**`a10`**")
-    assert "**`a00`**" not in text
-    assert "Best composite score **`#2` `0.5000`**" in text
-    assert "Best F1" not in text
-
-
-def test_projection_renders_only_largest_seeded_component(tmp_path):
-    edges = [("a", "b", "owl:differentFrom"), ("b", "c", "fact"), ("x", "y", "skos:related")]
-    sandbox = {"kg_graph": {"edges": edges, "entities": {n: (n, "Definition", 1) for n in "abcxy"}}}
-    output = tmp_path / "graph.svg"
-    result = generate_graph_projection_svg(output, sandbox, ("TEST", "#38bdf8"), layout_iterations=200)
-    assert result["nodes_rendered"] == 3
-    assert result["diff_edges"] == 1
-    assert result["related_edges"] == 0
-    assert result["layout_iterations"] == 200
-    assert "Largest 1-hop component" in output.read_text(encoding="utf-8")
-
-
-def test_watchdog_preserves_directed_fact_edges_and_word_boundary_truncation(tmp_path, monkeypatch):
-    import json
-    import os
-
-    from yaw.daemon.graph.storage import open_yaw_db
-
-    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
-    yaw_dir = tmp_path / ".yaw"
-    yaw_dir.mkdir(parents=True, exist_ok=True)
-    db_path = yaw_dir / "optimize_yaw.db"
-    status_path = yaw_dir / "optimize_status.json"
-    pools_path = yaw_dir / "optimize_program_pools.json"
-    status_path.write_text(
-        json.dumps({"status": {"lifecycle": "ready", "pid": os.getpid(), "active_op": "indexing: stale"}}),
-        encoding="utf-8",
-    )
-    pools_path.write_text(
-        json.dumps({"train_queries": 7, "val_queries": 13, "val_chunk_ids": ["c1"]}),
-        encoding="utf-8",
-    )
-    with closing(open_yaw_db(db_path)) as conn:
-        conn.executemany(
-            "INSERT INTO entities(entity_id, name, definition) VALUES (?, ?, ?)",
-            [
-                ("entity-z", "Zeta", "A very long definition that should truncate cleanly on a word boundary " * 3),
-                ("entity-a", "Alpha", "Short definition"),
-                ("entity-m", "Mu", "Connected only via directed fact where src_id > dst_id"),
-            ],
-        )
-        conn.executemany(
-            "INSERT INTO edges(src_id, dst_id, kind, weight) VALUES (?, ?, ?, 1.0)",
-            [
-                ("entity-a", "entity-z", "owl:differentFrom"),
-                ("entity-z", "entity-a", "owl:differentFrom"),
-                ("entity-z", "entity-m", "fact"),
-            ],
-        )
         conn.commit()
 
-    info = watchdog.get_active_sandbox_info()
-    assert info["datestamp"] == "canonical"
-    assert info["optimizer_alive"] is False
-    assert info["pools"]["train_queries"] == 7
-    assert ("entity-z", "entity-m", "fact") in info["kg_graph"]["edges"]
-    assert largest_one_hop_neighborhood(info["kg_graph"]["edges"]) == {"entity-a", "entity-z", "entity-m"}
 
-    report = tmp_path / "report.md"
-    generate_report_markdown(report, info, [], 0, ("TEST", "#38bdf8"))
-    report_text = report.read_text(encoding="utf-8")
-    assert any(tok in report_text for tok in ("boundary…", "cleanly…", "truncate…", "should…"))
+@pytest.fixture
+def prometheus_server():
+    seen: list[tuple[str, str | None]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        routes: ClassVar[list[tuple[str, str | None]]] = seen
+
+        def do_GET(self) -> None:
+            self.routes.append((self.path, self.headers.get("Authorization")))
+            body = b"# TYPE llamacpp:predicted_tokens_seconds gauge\nllamacpp:predicted_tokens_seconds 98.76\n"
+            self.send_response(200 if self.path == "/metrics" else 404)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}/v1", seen
+    server.shutdown()
+    server.server_close()
 
 
-def test_open_ro_sqlite_backoff_and_dark_figure_candidate_svgs(tmp_path):
-    import threading
-    import time
+def _populate_workspace(ws: Path, base_url: str, api_key: str) -> None:
+    yaw_dir = ws / ".yaw"
+    yaw_dir.mkdir(parents=True, exist_ok=True)
+    _create_vec_fts_db(yaw_dir / "yaw.db", 2)
+    _create_vec_fts_db(yaw_dir / "optimize_yaw.db", 1)
+    _create_vec_fts_db(yaw_dir / "optuna_index.db", 3)
 
-    from scripts.watchdog import (
-        _open_ro_sqlite,
-        generate_candidate_quality_svg,
-        generate_candidate_score_svg,
+    (ws / "yaw.toml").write_text(
+        f'[inference]\nbase_url = "{base_url}"\napi_key = "{api_key}"\n',
+        encoding="utf-8",
     )
-    from yaw.daemon.graph.storage import get_graph_counts, open_readonly_yaw_db, open_yaw_db
+    status = DaemonStatus(
+        lifecycle="ready",
+        provider_ready=True,
+        sync_state="idle",
+        pid=os.getpid(),
+        num_chunks=2,
+    ).to_dict()
+    (yaw_dir / "status.json").write_text(json.dumps(status), encoding="utf-8")
+    (yaw_dir / "dspy_status.json").write_text(json.dumps({"state": "running", "pid": os.getpid()}), encoding="utf-8")
+    (yaw_dir / "dspy_gepa_audit.json").write_text(
+        json.dumps(
+            {
+                "datasets": ["enterprise_rag_bench"],
+                "train_size": 10,
+                "val_size": 5,
+                "num_candidates": 3,
+                "best_val_score": 0.78,
+                "val_aggregate_scores": [0.45, 0.61, 0.78],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (yaw_dir / "optuna_status.json").write_text(
+        json.dumps({"state": "completed", "total_trials": 16, "best_score": 0.84}),
+        encoding="utf-8",
+    )
+    (yaw_dir / "optuna_best_params.json").write_text(
+        json.dumps(
+            {
+                "best_score": 0.84,
+                "best_params": {"hybrid_alpha": 0.65, "ppr_alpha": 0.5, "seed_top_k": 15},
+                "total_trials": 16,
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    missing_db = tmp_path / "delayed.db"
-    assert _open_ro_sqlite(missing_db, backoff=()) is None
 
-    def _create_delayed():
-        time.sleep(0.05)
-        with closing(open_yaw_db(missing_db)):
-            pass
+def test_snapshot_reads_real_sqlite_vec_fts_locks_json_and_metrics(tmp_path: Path, prometheus_server) -> None:
+    base_url, seen = prometheus_server
+    _populate_workspace(tmp_path, base_url, "tok-123")
+    yaw_dir = tmp_path / ".yaw"
+    (yaw_dir / "yaw.db.lock").write_text("", encoding="utf-8")
 
-    writer = threading.Thread(target=_create_delayed, daemon=True)
-    writer.start()
-    ro_conn = open_readonly_yaw_db(missing_db, timeout=1.0, backoff=(0.04, 0.08, 0.12))
+    held_lock = filelock.FileLock(str(yaw_dir / "optimize_yaw.db.lock"), timeout=0)
+    held_lock.acquire()
     try:
-        assert get_graph_counts(ro_conn) == (0, 0, 0, 0, 0)
+        snap = watchdog.get_active_snapshot(tmp_path)
     finally:
-        ro_conn.close()
-        writer.join(timeout=5.0)
-        assert not writer.is_alive()
+        held_lock.release()
 
-    cands = [
-        {
-            "cand": 1,
-            "n": 4,
-            "score": 0.65,
-            "score_min": 0.55,
-            "score_max": 0.75,
-            "val_score": 0.68,
-            "eff_score": 0.68,
-            "best_so_far": 0.68,
-            "is_best": True,
-            "s_per_it": 1.2,
-            "r1": 0.5,
-            "r2": 0.6,
-            "r5": 0.75,
-            "r10": 0.8,
-            "r20": 0.85,
-            "em": 0.6,
-            "f1": 0.7,
-            "evaluations": [{"eval": 1, "score": 0.65}],
-        }
-    ]
-    score_svg = tmp_path / "score.svg"
-    qual_svg = tmp_path / "qual.svg"
-    generate_candidate_score_svg(score_svg, cands, ("RUNNING", "#10b981"), {})
-    generate_candidate_quality_svg(qual_svg, cands, ("RUNNING", "#10b981"), {})
-    assert "<svg" in score_svg.read_text(encoding="utf-8")
-    assert "<svg" in qual_svg.read_text(encoding="utf-8")
-
-
-def test_kg_dashboard_throughput_entities_per_chunk_and_apng_projection(tmp_path, monkeypatch):
-    from PIL import Image
-
-    from scripts.watchdog import generate_kg_dashboard_svg
-
-    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
-    kg_svg = tmp_path / "kg_dashboard.svg"
-    sandbox_fig1 = {
-        "counts": {"chunk_inference": 10},
-        "kg_metrics": {"total_entities": 60, "total_triples": 45},
-        "timeseries_samples": [
-            {
-                "time_sec": 360.0,
-                "time_hours": 0.1,
-                "passages": 5,
-                "entities": 30,
-                "triples": 20,
-                "rolling_latency": 28.5,
-                "entities_per_chunk": 6.0,
-            },
-            {
-                "time_sec": 720.0,
-                "time_hours": 0.2,
-                "passages": 10,
-                "entities": 60,
-                "triples": 45,
-                "rolling_latency": 24.0,
-                "entities_per_chunk": 6.0,
-            },
-        ],
+    assert snap["databases"]["yaw.db"]["chunks"] == 2
+    assert snap["databases"]["yaw.db"]["tables"] == ["chunk_fts", "chunks"]
+    assert snap["databases"]["optimize_yaw.db"]["chunks"] == 1
+    assert snap["databases"]["optuna_index.db"]["chunks"] == 3
+    assert snap["locks"] == {
+        "yaw.db.lock": False,
+        "optimize_yaw.db.lock": True,
+        "optuna_index.db.lock": False,
     }
-    generate_kg_dashboard_svg(kg_svg, sandbox_fig1)
-    svg_text = kg_svg.read_text(encoding="utf-8")
-    assert "Throughput (s/chunk)" in svg_text
-    assert "Extraction (entities/chunk)" in svg_text
-    assert "Entities / chunk" in svg_text
+    assert snap["status"]["lifecycle"] == "ready"
+    assert snap["dspy_status"]["state"] == "running"
+    assert snap["dspy_gepa_audit"]["best_val_score"] == 0.78
+    assert snap["optuna_status"]["state"] == "completed"
+    assert snap["optuna_best_params"]["best_score"] == 0.84
+    assert snap["llm_metrics"] == {"server_up": True, "llm_tps": 98.8}
+    assert seen == [("/metrics", "Bearer tok-123")]
+    assert isinstance(snap["resources"]["pipeline_ram_gb"], float)
 
-    apng_dest = tmp_path / "knowledge_graph_2d_projection.png"
-    sandbox_step1 = {
-        "datestamp": "canonical",
-        "counts": {"chunk_inference": 1},
-        "kg_graph": {
-            "edges": [("a", "b", "skos:related")],
-            "entities": {"a": ("Alpha", "Def A", 1), "b": ("Beta", "Def B", 1)},
-        },
+
+def test_run_once_and_cli_emit_valid_svg_markdown_and_log(tmp_path: Path, prometheus_server) -> None:
+    base_url, _ = prometheus_server
+    _populate_workspace(tmp_path, base_url, "cli-secret")
+    out_dir = tmp_path / "artifacts"
+
+    rc = watchdog.main(["--once", "--workspace", str(tmp_path), "--artifact-dir", str(out_dir)])
+    assert rc == 0
+
+    svg_path = out_dir / "score_progress.svg"
+    md_path = out_dir / "benchmark_mobile_report.md"
+    assert svg_path.is_file()
+    assert md_path.is_file()
+
+    root = ElementTree.fromstring(svg_path.read_text(encoding="utf-8"))
+    assert root.tag.endswith("svg")
+    svg_text = " ".join(root.itertext())
+    assert "DSPy GEPA Score Progress" in svg_text
+    assert "0.7800" in svg_text
+    assert not watchdog.plt.get_fignums()
+
+    report = md_path.read_text(encoding="utf-8")
+    assert "![Score Progress](score_progress.svg)" in report
+    assert "`ready`" in report
+    assert "`running`" in report
+    assert "`completed`" in report
+    assert "`2` chunks" in report
+    assert "`1` chunks" in report
+    assert "`3` chunks" in report
+    assert "`0.7800`" in report
+    assert "`0.8400`" in report
+    assert "98.8 tok/s" in report
+
+    log_path = tmp_path / ".yaw" / "yaw.log"
+    assert log_path.is_file()
+    assert "Snapshot updated: daemon=ready, yaw_chunks=2" in log_path.read_text(encoding="utf-8")
+
+
+def test_thermal_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(watchdog, "get_gpu_temperature", lambda: None)
+    assert watchdog.check_thermal_guard() is False
+
+    monkeypatch.setattr(watchdog, "get_gpu_temperature", lambda: 70.0)
+    assert watchdog.check_thermal_guard(crisis_temp=82.0) is False
+
+    temps = iter([85.0, 80.0, 71.0])
+    monkeypatch.setattr(watchdog, "get_gpu_temperature", lambda: next(temps, 71.0))
+    assert watchdog.check_thermal_guard(crisis_temp=82.0, target_temp=72.0, max_pause_sec=1.0, poll_sec=0.005)
+
+
+def test_snapshot_respects_custom_paths_from_yaw_toml(tmp_path: Path) -> None:
+    custom_dir = tmp_path / "custom_state"
+    status_dir = tmp_path / "runtime_meta"
+    status_dir.mkdir(parents=True)
+
+    # Decoy default .yaw/ files must be ignored when yaw.toml configures custom paths.
+    decoy_dir = tmp_path / ".yaw"
+    decoy_dir.mkdir(parents=True)
+    _create_vec_fts_db(decoy_dir / "yaw.db", 9)
+    (decoy_dir / "status.json").write_text(json.dumps({"lifecycle": "error"}), encoding="utf-8")
+    (decoy_dir / "dspy_status.json").write_text(json.dumps({"state": "failed"}), encoding="utf-8")
+
+    (tmp_path / "yaw.toml").write_text(
+        "[paths]\n"
+        'db_path = "custom_state/main.db"\n'
+        'lock_path = "custom_state/main.db.lock"\n'
+        'status_path = "runtime_meta/daemon_status.json"\n',
+        encoding="utf-8",
+    )
+    _create_vec_fts_db(custom_dir / "main.db", 4)
+    _create_vec_fts_db(custom_dir / "optimize_yaw.db", 2)
+    _create_vec_fts_db(custom_dir / "optuna_index.db", 5)
+
+    (status_dir / "daemon_status.json").write_text(
+        json.dumps({"lifecycle": "ready", "num_chunks": 4}), encoding="utf-8"
+    )
+    (custom_dir / "dspy_status.json").write_text(json.dumps({"state": "running"}), encoding="utf-8")
+    (custom_dir / "dspy_gepa_audit.json").write_text(json.dumps({"best_val_score": 0.91}), encoding="utf-8")
+    (custom_dir / "optuna_status.json").write_text(json.dumps({"state": "completed"}), encoding="utf-8")
+    (custom_dir / "optuna_best_params.json").write_text(json.dumps({"best_score": 0.88}), encoding="utf-8")
+    (custom_dir / "optimize_yaw.db.lock").write_text("", encoding="utf-8")
+
+    main_lock = filelock.FileLock(str(custom_dir / "main.db.lock"), timeout=0)
+    optuna_lock = filelock.FileLock(str(custom_dir / "optuna_index.db.lock"), timeout=0)
+    main_lock.acquire()
+    optuna_lock.acquire()
+    try:
+        snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
+    finally:
+        optuna_lock.release()
+        main_lock.release()
+
+    assert Path(snap["databases"]["yaw.db"]["path"]) == (custom_dir / "main.db").resolve()
+    assert snap["databases"]["yaw.db"]["chunks"] == 4
+    assert snap["databases"]["optimize_yaw.db"]["chunks"] == 2
+    assert snap["databases"]["optuna_index.db"]["chunks"] == 5
+    assert snap["locks"] == {
+        "yaw.db.lock": True,
+        "optimize_yaw.db.lock": False,
+        "optuna_index.db.lock": True,
     }
-    sandbox_step2 = {
-        "datestamp": "canonical",
-        "counts": {"chunk_inference": 2},
-        "kg_graph": {
-            "edges": [("a", "b", "skos:related"), ("b", "c", "fact")],
-            "entities": {
-                "a": ("Alpha", "Def A", 1),
-                "b": ("Beta", "Def B", 1),
-                "c": ("Gamma", "Def C", 1),
-            },
-        },
-    }
-    generate_graph_projection_svg(apng_dest, sandbox_step1, ("STEP 1", "#38bdf8"), layout_iterations=30)
-    generate_graph_projection_svg(apng_dest, sandbox_step2, ("STEP 2", "#38bdf8"), layout_iterations=30)
-    assert (tmp_path / ".yaw" / "optimize_kg_frames").is_dir()
-    with Image.open(apng_dest) as img:
-        assert getattr(img, "is_animated", False) is True
-        assert getattr(img, "n_frames", 1) == 2
+    assert snap["status"] == {"lifecycle": "ready", "num_chunks": 4}
+    assert snap["dspy_status"] == {"state": "running"}
+    assert snap["dspy_gepa_audit"] == {"best_val_score": 0.91}
+    assert snap["optuna_status"] == {"state": "completed"}
+    assert snap["optuna_best_params"] == {"best_score": 0.88}

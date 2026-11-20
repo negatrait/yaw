@@ -1,8 +1,6 @@
 """Package entrypoint for `python -m yaw`."""
 
-import sys
-
-from yaw.daemon.cli import main
+from yaw.cli import cli_entrypoint
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli_entrypoint()

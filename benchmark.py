@@ -1,4 +1,4 @@
-"""Live Native YAW HippoRAG 2 vs. Dual-Target Baselines & StandardRAG (DPR) benchmark runner.
+"""Live Native YAW VectorSearch & ReAct QA benchmark runner.
 
 Tier 0 (sample):
   uv run --locked python benchmark.py --dataset sample --mode all
@@ -8,83 +8,129 @@ Tier 1 (calibration slice with pooled candidate passages):
   uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10
 """
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
-import logging
+import sys
 import tempfile
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
-from typing import Any, cast
+from typing import Any
 
+import dspy
 import numpy as np
+from numpy.typing import NDArray
 
-from scripts.evaluation import (
-    QAExactMatch as ScriptQAExactMatch,
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.evaluation import (  # noqa: E402
+    QAExactMatch,
+    QAF1Score,
+    RetrievalRecall,
+    check_benchmark_integrity,
 )
-from scripts.evaluation import (
-    QAF1Score as ScriptQAF1Score,
+from yaw.core import (  # noqa: E402
+    EmbedFn,
+    YawConfig,
+    configure_logging,
+    format_doc_for_embedding,
+    format_query_for_embedding,
+    load_config,
+    redact_secrets,
+    write_text_atomic,
 )
-from scripts.evaluation import (
-    RetrievalRecall as ScriptRetrievalRecall,
-)
-from yaw.core.logger import configure_logging
-from yaw.daemon.graph.inference import check_benchmark_integrity
-from yaw.daemon.graph.inference.embedding import (
-    FACT_INSTRUCTION,
-    GEMMA_TASK_MODES,
-    MODEL,
-    PASSAGE_INSTRUCTION,
-    PROFILES,
-    DSPyEmbeddingAdapter,
-    create_dspy_embedder,
-    resolve_embedding_profile,
-)
-from yaw.daemon.graph.inference.models import (
-    BASE_URL,
-    CHAT_MODELS,
-    DEFAULT_EXTRACTION_CHAT,
-    DEFAULT_QA_CHAT,
-    chat_evidence,
-    embedding_evidence,
-    preflight,
-)
-from yaw.daemon.indexing import bind_native_indexing
-from yaw.daemon.ingestion import (
-    DATASET_REGISTRY as DATASET_REGISTRY,
-)
-from yaw.daemon.ingestion import (
+from yaw.datasets import (  # noqa: E402
+    DATASET_REGISTRY,
+    DATASET_SOURCE_FIELDS,
     DATASETS,
+    PINNED_COMMIT,
     build_benchmark_slice,
+    document_identity,
+    document_text,
     get_gold_answers,
     get_gold_docs,
     resolve_dataset_bundle,
+    resolve_slice_corpus_scope,
 )
-from yaw.daemon.ingestion import (
-    PINNED_COMMIT as PINNED_COMMIT,
+from yaw.datasets import (  # noqa: E402
+    load_dataset_files as _datasets_load_dataset_files,
 )
-from yaw.daemon.ingestion import (
-    load_dataset_files as _ingestion_load_dataset_files,
+from yaw.pipeline import (  # noqa: E402
+    close_pipeline,
+    make_dspy_embed_fn,
+    start_pipeline,
+    update_pipeline_once,
+)
+from yaw.qa import (  # noqa: E402
+    ask_question,
+    build_qa_agent,
+    create_lm,
+    make_qa_tools,
+    strip_inline_citations,
+)
+from yaw.retrieval import (  # noqa: E402
+    build_vector_search,
+    hydrate_ranked_passages,
+    open_readonly_db,
+    resolve_retrieval_params,
+    search_vectors,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+__all__ = [
+    "BASELINES",
+    "DATASET_REGISTRY",
+    "DATASETS",
+    "PINNED_COMMIT",
+    "PROJECT_ROOT",
+    "QA_TOP_K",
+    "RETRIEVAL_TOP_K",
+    "benchmark_config_fingerprint",
+    "build_benchmark_slice",
+    "check_benchmark_integrity",
+    "clean_qa_answer",
+    "get_gold_answers",
+    "get_gold_docs",
+    "load_dataset_files",
+    "main",
+    "print_benchmark_summary",
+    "run_yaw_benchmark",
+    "verify_embeddings",
+]
+
 BASELINES: dict[str, dict[str, Any]] = json.loads(
     (PROJECT_ROOT / "data" / "benchmarks" / "baselines.json").read_text(encoding="utf-8")
 )["baselines"]
 
 QA_TOP_K = 5
-RETRIEVAL_TOP_K = 10
-LINKING_TOP_K = 8
-FACT_CANDIDATE_POOL_K = 50
-FACT_FTS_POOL_K = 50
-FACT_RRF_K = 60
-FACT_FTS_WEIGHT = 0.2
-FTS_WEIGHT = 0.2
-PASSAGE_NODE_WEIGHT = 0.05
-DAMPING = 0.5
-PASSAGE_SEED_POOL_K = 200
-FTS_SEED_POOL_K = 50
+RETRIEVAL_TOP_K = 20
+_EMBEDDING_TASK_MODES: tuple[str, ...] = ("search", "titled", "qa", "distinct", "distinct-titled", "fact")
+
+
+def benchmark_config_fingerprint(cfg: YawConfig) -> str:
+    """Return a deterministic SHA-256 fingerprint over live index and runtime config fields."""
+    payload = {
+        "corpus_root": str(cfg.corpus_root) if cfg.corpus_root is not None else None,
+        "included_patterns": list(cfg.included_patterns),
+        "excluded_patterns": list(cfg.excluded_patterns),
+        "chunk_size": int(cfg.chunk_size),
+        "chunk_overlap": int(cfg.chunk_overlap),
+        "min_chunk_size": int(cfg.min_chunk_size),
+        "embedding_model": cfg.embedding_model,
+        "embedding_task_mode": cfg.embedding_task_mode,
+        "qa_model": cfg.qa_model,
+        "max_output_tokens": cfg.max_output_tokens,
+        "react_max_iters": int(cfg.react_max_iters),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def clean_qa_answer(raw_ans: str) -> str:
@@ -103,9 +149,9 @@ def load_dataset_files(
     *,
     max_queries: int | None = None,
     include_corpus: bool = True,
-) -> tuple[list[dict], list[dict]]:
-    """Load dataset and (when needed) corpus JSON files from local cache, downloading if absent."""
-    return _ingestion_load_dataset_files(
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load dataset and (when needed) corpus JSON files from local cache."""
+    return _datasets_load_dataset_files(
         dataset_name,
         dataset_dir,
         max_queries=max_queries,
@@ -114,28 +160,64 @@ def load_dataset_files(
     )
 
 
-def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs: list[str]) -> list[dict[str, Any]]:
-    """Five repeats of batch, individual and reversed inputs across all active roles."""
-    probe_queries = queries[:3]
-    probe_docs = docs[:3]
-    probes = []
-    roles: list[tuple[str, list[str], dict[str, Any]]] = [
-        ("query", probe_queries, {"instruction": PASSAGE_INSTRUCTION}),
-    ]
-    if embedding.profile.query_instruction_mode == "distinct":
-        roles.append(("fact_query", probe_queries, {"instruction": FACT_INSTRUCTION}))
-    untitle_docs = [doc.split("\n", 1)[-1].replace("\n", " ") for doc in probe_docs]
-    roles.append(("document", untitle_docs, {}))
-    if embedding.profile.parse_document_title:
-        roles.append(("titled_document", probe_docs, {}))
-    for role, texts, options in roles:
-        observations = []
+def _encode_normalized(embed_fn: EmbedFn, texts: list[str]) -> NDArray[np.float32]:
+    arr = np.asarray(embed_fn(texts), dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    if np.any(norms <= 1e-12) or not np.all(np.isfinite(arr)):
+        raise RuntimeError("Embedding output contains zero-norm or non-finite vectors")
+    return (arr / norms).astype(np.float32, copy=False)
+
+
+def _split_doc_for_probe(doc: str) -> tuple[str, str]:
+    if "\n" in doc:
+        title, body = doc.split("\n", 1)
+        return title.strip(), body
+    return "", doc
+
+
+def verify_embeddings(
+    embed_fn: EmbedFn,
+    queries: Sequence[str],
+    docs: Sequence[str],
+    *,
+    task_mode: str = "distinct-titled",
+) -> list[dict[str, Any]]:
+    """Five repeats of batch, individual, and reversed inputs across all active formatted roles."""
+    probe_queries = [str(q) for q in queries[:3]]
+    probe_docs = [str(d) for d in docs[:3]]
+    roles: list[tuple[str, list[str]]] = []
+    if probe_queries:
+        roles.append(("query", [format_query_for_embedding(q, task_mode=task_mode) for q in probe_queries]))
+        if task_mode in ("distinct", "distinct-titled"):
+            roles.append(("fact_query", [format_query_for_embedding(q, task_mode="fact") for q in probe_queries]))
+    if probe_docs:
+        untitle_inputs = [
+            format_doc_for_embedding(
+                doc.split("\n", 1)[-1].replace("\n", " "),
+                title="",
+                task_mode="search",
+            )
+            for doc in probe_docs
+        ]
+        roles.append(("document", untitle_inputs))
+        if task_mode in ("titled", "distinct-titled"):
+            titled_inputs = [
+                format_doc_for_embedding(body, title=title, task_mode=task_mode)
+                for title, body in (_split_doc_for_probe(d) for d in probe_docs)
+            ]
+            roles.append(("titled_document", titled_inputs))
+
+    probes: list[dict[str, Any]] = []
+    for role, formatted in roles:
+        observations: list[NDArray[np.float32]] = []
         for _ in range(5):
             observations.extend(
                 [
-                    embedding.batch_encode(texts, norm=True, **options),
-                    np.concatenate([embedding.batch_encode([text], norm=True, **options) for text in texts]),
-                    embedding.batch_encode(texts[::-1], norm=True, **options)[::-1],
+                    _encode_normalized(embed_fn, formatted),
+                    np.concatenate([_encode_normalized(embed_fn, [text]) for text in formatted], axis=0),
+                    _encode_normalized(embed_fn, formatted[::-1])[::-1],
                 ]
             )
         samples = np.stack(observations)
@@ -144,12 +226,9 @@ def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs:
         probes.append(
             {
                 "role": role,
-                "inputs": [
-                    embedding.profile.format(text, query=bool(options), instruction=options.get("instruction", ""))
-                    for text in texts
-                ],
+                "inputs": formatted,
                 "repeats": 5,
-                "dimensions": embedding.profile.dimensions,
+                "dimensions": int(samples.shape[-1]),
                 "min_pairwise_cosine": minimum,
             }
         )
@@ -161,8 +240,8 @@ def verify_embeddings(embedding: DSPyEmbeddingAdapter, queries: list[str], docs:
 def print_benchmark_summary(
     dataset: str,
     num_docs: int,
-    records: list[dict],
-    metrics: dict,
+    records: list[dict[str, Any]],
+    metrics: dict[str, Any],
 ) -> None:
     print(f"\n{'=' * 72}")
     print(f"=== Benchmark Summary [NATIVE YAW ENGINE]: {dataset} ({len(records)} queries, {num_docs} passages) ===")
@@ -175,12 +254,12 @@ def print_benchmark_summary(
     print("Recognition Memory:     ", metrics["recognition_memory"])
     if "monkeypatched_hipporag_baseline" in metrics:
         print(
-            "Target 1 (Monkeypatched HippoRAG 2 Local Baseline):",
+            "Target 1 (Monkeypatched Baseline):",
             metrics["monkeypatched_hipporag_baseline"],
         )
     if "paper_baselines" in metrics and "hipporag2_llama3.3_70b_nvembed_v2" in metrics["paper_baselines"]:
         print(
-            "Target 2 (Paper Reference arXiv:2502.14802):       ",
+            "Target 2 (Paper Reference arXiv:2502.14802):",
             metrics["paper_baselines"]["hipporag2_llama3.3_70b_nvembed_v2"],
         )
     print(f"{'=' * 72}\n", flush=True)
@@ -189,404 +268,311 @@ def print_benchmark_summary(
 def run_yaw_benchmark(
     *,
     dataset: str,
-    document_ids: list[str],
-    queries: list[str],
+    document_ids: Sequence[str],
+    queries: Sequence[str],
     gold_docs: list[list[str]] | None,
     gold_answers: list[list[str]],
-    train_samples: list[dict],
-    profile: Any,
-    extraction_model: str,
-    qa_model: str,
-    include_qa: bool,
-    enable_gbnf: bool,
-    evolve: str,
-    compiled_program: str | None,
+    config: YawConfig,
+    include_qa: bool = True,
+    compiled_program: str | Path | None = None,
     index_dir: Path,
     report: dict[str, Any],
-    fact_candidate_pool_k: int = FACT_CANDIDATE_POOL_K,
-    fact_fts_pool_k: int = FACT_FTS_POOL_K,
-    fact_rrf_k: int = FACT_RRF_K,
-    fact_fts_weight: float = FACT_FTS_WEIGHT,
-    linking_top_k: int = LINKING_TOP_K,
-    passage_node_weight: float = PASSAGE_NODE_WEIGHT,
-    fts_weight: float = FTS_WEIGHT,
-    damping: float = DAMPING,
-    passage_seed_pool_k: int = PASSAGE_SEED_POOL_K,
-    fts_seed_pool_k: int = FTS_SEED_POOL_K,
-    graph_activation: str = "scaled_tanh",
-    graph_activation_param: float | None = 5.0,
-    graph_activation_renormalize: bool = False,
-    graph_beta: float = 0.5,
-    graph_dual_weight: float | None = 0.5,
+    embed_fn: EmbedFn | None = None,
+    lm: Any = None,
 ) -> dict[str, Any]:
-    """Execute live benchmark using native YawGraphEngine and DSPy HippoRAG 2 pipeline."""
-    import dspy
-
-    from yaw.daemon.graph.engine import YawGraphEngine
-    from yaw.daemon.graph.inference import (
-        YawProgram,
-        create_dspy_lm,
-        create_dspy_rlm_pair,
-    )
-
-    extraction_lm = create_dspy_lm(
-        model_name=extraction_model,
-        base_url=BASE_URL,
-        role="extraction",
-    )
-    qa_lm = (
-        create_dspy_lm(model_name=qa_model, base_url=BASE_URL, role="qa")
-        if qa_model != extraction_model
-        else extraction_lm
-    )
-    program = YawProgram(
-        orchestrator_lm=qa_lm,
-        rlm_sub_lm=extraction_lm,
-        enable_gbnf=enable_gbnf,
-        compiled_path=compiled_program,
-    )
-    dspy.settings.configure(lm=qa_lm)
-
-    embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
-    embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
+    """Execute live benchmark directly over prepared v2 Markdown bundles, VectorSearch, and ReAct QA."""
+    bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
+    selected_ids = list(dict.fromkeys(document_ids)) if document_ids else [d.document_id for d in bundle.documents]
+    corpus_dir, slice_patterns = resolve_slice_corpus_scope([(bundle, selected_ids)])
+    num_docs = len(selected_ids)
 
     index_dir.mkdir(parents=True, exist_ok=True)
     db_path = index_dir / "yaw.db"
 
-    yaw_engine = bind_native_indexing(
-        YawGraphEngine(
-            db_path=db_path,
-            workspace_root=PROJECT_ROOT,
-            program=program,
-            embedder=embedder,
-            retrieval_top_k=RETRIEVAL_TOP_K,
-            linking_top_k=linking_top_k,
-            fact_candidate_pool_k=fact_candidate_pool_k,
-            fact_fts_pool_k=fact_fts_pool_k,
-            fact_rrf_k=fact_rrf_k,
-            fact_fts_weight=fact_fts_weight,
-            passage_node_weight=passage_node_weight,
-            fts_weight=fts_weight,
-            damping=damping,
-            passage_seed_pool_k=passage_seed_pool_k,
-            fts_seed_pool_k=fts_seed_pool_k,
-            activation=graph_activation,
-            activation_param=graph_activation_param,
-            activation_renormalize=graph_activation_renormalize,
-            beta=graph_beta,
-            dual_weight=graph_dual_weight,
-        )
+    index_start = perf_counter()
+    active_embed = embed_fn or make_dspy_embed_fn(config)
+    idx_cfg = replace(
+        config,
+        db_path=db_path,
+        corpus_root=corpus_dir,
+        included_patterns=slice_patterns,
+        state_dir=index_dir / "coco_lmdb",
+        lock_path=index_dir / "yaw.db.lock",
     )
+
+    session = start_pipeline(idx_cfg, embed_fn=active_embed, live=False)
     try:
-        index_start = perf_counter()
-        num_docs = len(document_ids)
-        bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
-        yaw_engine.workspace_root = bundle.root
-        matched_files = (
-            tuple(doc.path for doc in bundle.documents if doc.document_id in document_ids)
-            if document_ids
-            else tuple(doc.path for doc in bundle.documents)
+        update_pipeline_once(session)
+    finally:
+        close_pipeline(session)
+
+    report["indexing_seconds"] = round(perf_counter() - index_start, 2)
+
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
+        vs = build_vector_search(conn)
+        num_chunks = vs.size
+        has_chunks = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
+        num_indexed_docs = (
+            int(conn.execute("SELECT COUNT(DISTINCT rel_path) FROM chunks").fetchone()[0]) if has_chunks else 0
         )
-        report["index_batches"] = yaw_engine.index_chunks(
-            included_files=matched_files,
-            progress_callback=lambda msg: print(f"[Native YAW] [{dataset}] {msg}", flush=True),
-        )
-        del document_ids
-        gc.collect()
-        report["indexing_seconds"] = round(perf_counter() - index_start, 2)
-        num_facts = int(yaw_engine.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
         report["graph"] = {
-            "num_passage_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
-            "num_entity_nodes": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]),
-            "num_fact_nodes": num_facts,
-            "num_extracted_triples": num_facts,
-            "num_edges": int(yaw_engine.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
+            "num_passage_nodes": num_chunks,
+            "num_indexed_docs": num_indexed_docs,
+            "num_entity_nodes": len(vs.entity_keys),
+            "num_edges": int(vs.entity_to_chunk.nnz),
         }
 
-        # Disjoint Prompt Evolution
-        if evolve != "none" and train_samples:
-            print(
-                f"[Prompt Evolution] Running {evolve} on {len(train_samples)} training queries...",
-                flush=True,
-            )
-            train_golds = get_gold_answers(train_samples)
-            train_gold_docs = get_gold_docs(train_samples, dataset, corpus_by_id=bundle.corpus_by_id())
-            trainset = [
-                dspy.Example(
-                    question=s["question"],
-                    gold_answers=train_golds[idx],
-                    gold_docs=train_gold_docs[idx] if train_gold_docs is not None else [],
-                ).with_inputs("question")
-                for idx, s in enumerate(train_samples)
-            ]
-            valset: list[Any] | None = None
-            train_q_set = {s["question"] for s in train_samples}
-            disjoint_val = [
-                (q, gold_answers[idx], gold_docs[idx] if gold_docs is not None else [])
-                for idx, q in enumerate(queries)
-                if q not in train_q_set
-            ]
-            if disjoint_val:
-                valset = [
-                    dspy.Example(
-                        question=q,
-                        gold_answers=ga,
-                        gold_docs=gd,
-                    ).with_inputs("question")
-                    for q, ga, gd in disjoint_val
-                ]
-            ref_lm, ref_worker_lm = create_dspy_rlm_pair(
-                orchestrator_model=DEFAULT_QA_CHAT,
-                sub_model=extraction_model,
-                base_url=BASE_URL,
-                reflection=True,
-            )
-            yaw_engine.evolve_prompts(
-                trainset,
-                valset=valset,
-                mode=cast(Any, evolve),
-                save_path=compiled_program,
-                reflection_lm=ref_lm,
-                reflection_worker_lm=ref_worker_lm,
-                auto="light",
-            )
-
+        search_params = resolve_retrieval_params(config)
         eval_start = perf_counter()
         records: list[dict[str, Any]] = []
         all_retrieved_passages: list[list[str]] = []
         all_dpr_passages: list[list[str]] = []
-        kept_facts_per_query: list[list[str]] = []
+        retrieved_ids_list: list[list[int]] = []
         qa_answers: list[str] = []
         timing_records: list[tuple[float, float]] = []
-        retrieved_ids_list: list[list[str]] = []
 
+        if queries:
+            formatted_qs = [format_query_for_embedding(q, task_mode=config.embedding_task_mode) for q in queries]
+            q_vecs = _encode_normalized(active_embed, formatted_qs)
+        else:
+            q_vecs = np.zeros((0, 0), dtype=np.float32)
+
+        agent = None
+        qa_lm = None
+        if include_qa:
+            qa_lm = lm or create_lm(config)
+            tools = make_qa_tools(
+                vs,
+                corpus_dir,
+                active_embed,
+                conn,
+                task_mode=config.embedding_task_mode,
+                search_params=search_params,
+            )
+            compiled_path = Path(compiled_program) if compiled_program else None
+            agent = build_qa_agent(tools, max_iters=config.react_max_iters, artifact_path=compiled_path)
+
+        pool_k = max(RETRIEVAL_TOP_K * 4, 50)
         total_queries = len(queries)
-        for q_idx, query in enumerate(queries, start=1):
+        for q_idx, query in enumerate(queries):
+            q_unit = q_vecs[q_idx]
             t_q0 = perf_counter()
-            hits, kept_facts = yaw_engine.retrieve_with_seeds(query, top_k=RETRIEVAL_TOP_K)
+            ranked = search_vectors(vs, q_unit, query_text=query, conn=conn, top_k=pool_k, **search_params)
+            hydrated = hydrate_ranked_passages(vs, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
             retrieval_elapsed = perf_counter() - t_q0
 
-            dpr_hits = yaw_engine.retrieve_dpr(query, top_k=RETRIEVAL_TOP_K)
+            if vs.size > 0:
+                dpr_scores = (vs.embeddings @ q_unit).astype(np.float32, copy=False)
+                dpr_k = min(vs.size, pool_k)
+                if dpr_k < vs.size:
+                    top_pos = np.argpartition(-dpr_scores, dpr_k - 1)[:dpr_k]
+                    top_pos = top_pos[np.argsort(-dpr_scores[top_pos], kind="stable")]
+                else:
+                    top_pos = np.argsort(-dpr_scores, kind="stable")
+                dpr_ranked = [(vs.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
+                dpr_hydrated = hydrate_ranked_passages(vs, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
+            else:
+                dpr_hydrated = ()
 
-            retrieved_passages = [text for _, _, text in hits]
-            dpr_passages = [text for _, _, text in dpr_hits]
-            retrieved_ids = [p.chunk_id for p, _, _ in hits]
+            retrieved_passages = [hp.text for hp in hydrated if not hp.stale_on_disk]
+            dpr_passages = [hp.text for hp in dpr_hydrated if not hp.stale_on_disk]
+            retrieved_ids = [int(hp.pointer.chunk_id) for hp in hydrated]
             all_retrieved_passages.append(retrieved_passages)
             all_dpr_passages.append(dpr_passages)
             retrieved_ids_list.append(retrieved_ids)
-            kept_facts_per_query.append([f"({t[0]}, {t[1]}, {t[2]})" for t in kept_facts])
 
             qa_answer = ""
             qa_elapsed = 0.0
-            if include_qa:
+            if include_qa and agent is not None and qa_lm is not None:
                 t_qa0 = perf_counter()
-                context = yaw_engine.format_qa_context(hits[:QA_TOP_K])
-                pred = yaw_engine.program.answer_question(context=context, question=query)
+                with dspy.context(lm=qa_lm):
+                    qa_res = ask_question(query, vs=vs, corpus_root=corpus_dir, agent=agent)
+                qa_answer = clean_qa_answer(strip_inline_citations(qa_res.answer))
                 qa_elapsed = perf_counter() - t_qa0
-                qa_raw = str(getattr(pred, "answer", "")).strip()
-                qa_answer = clean_qa_answer(qa_raw)
                 qa_answers.append(qa_answer)
+
             timing_records.append((retrieval_elapsed, qa_elapsed))
-            if q_idx % 5 == 0 or q_idx == total_queries:
+            if (q_idx + 1) % 5 == 0 or (q_idx + 1) == total_queries:
                 print(
-                    f"[Native YAW] [{dataset}] Query {q_idx}/{total_queries} completed "
+                    f"[Native YAW] [{dataset}] Query {q_idx + 1}/{total_queries} completed "
                     f"(retrieval={retrieval_elapsed:.2f}s, qa={qa_elapsed:.2f}s)",
                     flush=True,
                 )
 
-        if gold_docs is not None:
-            gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
-            ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
-            dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
+    if gold_docs is not None:
+        gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
+        ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
+        dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
 
-            _, ret_per_query = ScriptRetrievalRecall().calculate_metric_scores(
-                gold_docs=gold_docs_norm,
-                retrieved_docs=ret_docs_norm,
-                k_list=[1, 2, 5, 10],
-            )
-            _, dpr_per_query = ScriptRetrievalRecall().calculate_metric_scores(
-                gold_docs=gold_docs_norm,
-                retrieved_docs=dpr_docs_norm,
-                k_list=[1, 2, 5, 10],
-            )
-            recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
-            recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
-            recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
-            recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
-            dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
-            dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
-            dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
-            dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
-        else:
-            recalls_1 = recalls_2 = recalls_5 = recalls_10 = []
-            dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = []
-
-        qa_metrics = None
-        em_list: list[float] = []
-        f1_list: list[float] = []
-        if include_qa:
-            em_overall, per_query_em_raw = ScriptQAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
-            f1_overall, per_query_f1_raw = ScriptQAF1Score().calculate_metric_scores(gold_answers, qa_answers)
-            em_list = [float(item["ExactMatch"]) for item in per_query_em_raw]
-            f1_list = [float(item["F1"]) for item in per_query_f1_raw]
-            qa_metrics = {
-                "ExactMatch": round(float(em_overall["ExactMatch"]), 4),
-                "F1": round(float(f1_overall["F1"]), 4),
-            }
-
-        for q_idx, query in enumerate(queries):
-            retrieval_elapsed, qa_elapsed = timing_records[q_idx]
-            records.append(
-                {
-                    "query_index": q_idx,
-                    "question": query,
-                    "answer": qa_answers[q_idx] if include_qa else "",
-                    "dpr_answer": "",
-                    "gold_answers": gold_answers[q_idx],
-                    "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
-                    "qa_evidence": all_retrieved_passages[q_idx],
-                    "dpr_evidence": all_dpr_passages[q_idx],
-                    "graph_seeds": kept_facts_per_query[q_idx],
-                    "recall": (
-                        {
-                            "@1": recalls_1[q_idx],
-                            "@2": recalls_2[q_idx],
-                            "@5": recalls_5[q_idx],
-                            "@10": recalls_10[q_idx],
-                        }
-                        if gold_docs is not None
-                        else None
-                    ),
-                    "dpr_recall": (
-                        {
-                            "@1": dpr_recalls_1[q_idx],
-                            "@2": dpr_recalls_2[q_idx],
-                            "@5": dpr_recalls_5[q_idx],
-                            "@10": dpr_recalls_10[q_idx],
-                        }
-                        if gold_docs is not None
-                        else None
-                    ),
-                    "retrieved_chunk_ids": retrieved_ids_list[q_idx],
-                    "exact_match": em_list[q_idx] if include_qa else None,
-                    "f1": f1_list[q_idx] if include_qa else None,
-                    "retrieval_seconds": round(retrieval_elapsed, 4),
-                    "qa_seconds": round(qa_elapsed, 4),
-                }
-            )
-
-        report["evaluation_seconds"] = round(perf_counter() - eval_start, 2)
-        seeds_active = sum(1 for seeds in kept_facts_per_query if seeds)
-        fallback_count = len(records) - seeds_active
-        avg_facts_kept = (
-            round(float(np.mean([len(s) for s in kept_facts_per_query])), 4) if kept_facts_per_query else 0.0
+        _, ret_per_query = RetrievalRecall().calculate_metric_scores(
+            gold_docs=gold_docs_norm,
+            retrieved_docs=ret_docs_norm,
+            k_list=[1, 2, 5, 10, 20],
         )
-        if gold_docs is not None:
-            hipporag_ret: dict[str, Any] = {
-                "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
-                "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
-                "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
-                "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
-            }
-            dpr_ret: dict[str, Any] = {
-                "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
-                "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
-                "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
-                "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
-            }
-            delta_vs_dpr: dict[str, Any] = {
-                "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
-                "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
-                "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
-                "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
-            }
-        else:
-            hipporag_ret = {}
-            dpr_ret = {}
-            delta_vs_dpr = {}
-        metrics: dict[str, Any] = {
-            "hipporag": {
-                "retrieval": hipporag_ret,
-                "qa": qa_metrics,
-            },
-            "standard_dpr": {
-                "retrieval": dpr_ret,
-                "qa": None,
-            },
-            "delta_vs_dpr": delta_vs_dpr,
-            "recognition_memory": {
-                "queries_with_graph_seeds": seeds_active,
-                "dpr_fallback_count": fallback_count,
-                "dpr_fallback_rate": round(fallback_count / len(records), 4) if records else 0.0,
-                "average_facts_kept": avg_facts_kept,
-            },
+        _, dpr_per_query = RetrievalRecall().calculate_metric_scores(
+            gold_docs=gold_docs_norm,
+            retrieved_docs=dpr_docs_norm,
+            k_list=[1, 2, 5, 10, 20],
+        )
+        recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
+        recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
+        recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
+        recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
+        recalls_20 = [round(float(r["Recall@20"]), 4) for r in ret_per_query]
+        dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
+        dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
+        dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
+        dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
+        dpr_recalls_20 = [round(float(r["Recall@20"]), 4) for r in dpr_per_query]
+    else:
+        recalls_1 = recalls_2 = recalls_5 = recalls_10 = recalls_20 = []
+        dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = dpr_recalls_20 = []
+
+    qa_metrics: dict[str, float] | None = None
+    em_list: list[float] = []
+    f1_list: list[float] = []
+    if include_qa:
+        em_overall, per_query_em_raw = QAExactMatch().calculate_metric_scores(gold_answers, qa_answers)
+        f1_overall, per_query_f1_raw = QAF1Score().calculate_metric_scores(gold_answers, qa_answers)
+        em_list = [float(item["ExactMatch"]) for item in per_query_em_raw]
+        f1_list = [float(item["F1"]) for item in per_query_f1_raw]
+        qa_metrics = {
+            "ExactMatch": round(float(em_overall["ExactMatch"]), 4),
+            "F1": round(float(f1_overall["F1"]), 4),
         }
-        ds_baselines = BASELINES.get(dataset, {})
-        mp = ds_baselines.get("monkeypatched_hipporag")
-        if isinstance(mp, dict):
-            metrics["monkeypatched_hipporag_baseline"] = mp
-            metrics["delta_vs_monkeypatched_hipporag"] = {
-                "Recall@1": (
-                    round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4)
-                    if "Recall@1" in hipporag_ret and mp.get("Recall@1") is not None
+
+    for q_idx, query in enumerate(queries):
+        retrieval_elapsed, qa_elapsed = timing_records[q_idx]
+        records.append(
+            {
+                "query_index": q_idx,
+                "question": query,
+                "answer": qa_answers[q_idx] if include_qa else "",
+                "gold_answers": gold_answers[q_idx],
+                "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
+                "qa_evidence": all_retrieved_passages[q_idx][:QA_TOP_K],
+                "dpr_evidence": all_dpr_passages[q_idx][:QA_TOP_K],
+                "recall": (
+                    {
+                        "@1": recalls_1[q_idx],
+                        "@2": recalls_2[q_idx],
+                        "@5": recalls_5[q_idx],
+                        "@10": recalls_10[q_idx],
+                        "@20": recalls_20[q_idx],
+                    }
+                    if gold_docs is not None
                     else None
                 ),
-                "Recall@2": (
-                    round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4)
-                    if "Recall@2" in hipporag_ret and mp.get("Recall@2") is not None
+                "dpr_recall": (
+                    {
+                        "@1": dpr_recalls_1[q_idx],
+                        "@2": dpr_recalls_2[q_idx],
+                        "@5": dpr_recalls_5[q_idx],
+                        "@10": dpr_recalls_10[q_idx],
+                        "@20": dpr_recalls_20[q_idx],
+                    }
+                    if gold_docs is not None
                     else None
                 ),
-                "Recall@5": (
-                    round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4)
-                    if "Recall@5" in hipporag_ret and mp.get("Recall@5") is not None
-                    else None
-                ),
-                "ExactMatch": (
-                    round(float(qa_metrics["ExactMatch"]) - float(mp["ExactMatch"]), 4)
-                    if qa_metrics is not None and mp.get("ExactMatch") is not None
-                    else None
-                ),
-                "F1": (
-                    round(float(qa_metrics["F1"]) - float(mp["F1"]), 4)
-                    if qa_metrics is not None and mp.get("F1") is not None
-                    else None
-                ),
+                "retrieved_chunk_ids": retrieved_ids_list[q_idx],
+                "exact_match": em_list[q_idx] if include_qa else None,
+                "f1": f1_list[q_idx] if include_qa else None,
+                "retrieval_seconds": round(retrieval_elapsed, 4),
+                "qa_seconds": round(qa_elapsed, 4),
             }
-        paper_baselines = {k: v for k, v in ds_baselines.items() if k != "monkeypatched_hipporag"}
-        if paper_baselines:
-            metrics["paper_baselines"] = paper_baselines
-        report["hyperparameters"] = {
-            "linking_top_k": linking_top_k,
-            "fact_candidate_pool_k": fact_candidate_pool_k,
-            "fact_fts_pool_k": fact_fts_pool_k,
-            "fact_rrf_k": fact_rrf_k,
-            "fact_fts_weight": fact_fts_weight,
-            "passage_node_weight": passage_node_weight,
-            "fts_weight": fts_weight,
-            "damping": damping,
-            "passage_seed_pool_k": passage_seed_pool_k,
-            "fts_seed_pool_k": fts_seed_pool_k,
-            "graph_activation": graph_activation,
-            "graph_activation_param": graph_activation_param,
-            "graph_activation_renormalize": graph_activation_renormalize,
+        )
+
+    report["evaluation_seconds"] = round(perf_counter() - eval_start, 2)
+    active_queries = sum(1 for ids in retrieved_ids_list if ids)
+    fallback_count = len(records) - active_queries
+    if gold_docs is not None:
+        hipporag_ret: dict[str, Any] = {
+            "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
+            "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
+            "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
+            "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
+            "Recall@20": round(float(np.mean(recalls_20)), 4) if recalls_20 else 0.0,
         }
-        expected_doc_count = (
-            int(report["graph"]["num_passage_nodes"])
-            if int(report["graph"]["num_passage_nodes"]) >= num_docs and num_docs > 0
-            else num_docs
-        )
-        integrity_errors = check_benchmark_integrity(
-            records,
-            report["graph"],
-            expected_doc_count=expected_doc_count,
-            include_qa=include_qa,
-        )
-        report["integrity"] = {"passed": len(integrity_errors) == 0, "errors": integrity_errors}
-        report["evaluation_metrics"] = metrics
-        report["records"] = records
-        print_benchmark_summary(dataset, num_docs, records, metrics)
-    finally:
-        yaw_engine.close()
+        dpr_ret: dict[str, Any] = {
+            "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
+            "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
+            "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
+            "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
+            "Recall@20": round(float(np.mean(dpr_recalls_20)), 4) if dpr_recalls_20 else 0.0,
+        }
+        delta_vs_dpr: dict[str, Any] = {
+            "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
+            "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
+            "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
+            "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
+            "Recall@20": round(hipporag_ret["Recall@20"] - dpr_ret["Recall@20"], 4),
+        }
+    else:
+        hipporag_ret = {}
+        dpr_ret = {}
+        delta_vs_dpr = {}
+
+    metrics: dict[str, Any] = {
+        "hipporag": {
+            "retrieval": hipporag_ret,
+            "qa": qa_metrics,
+        },
+        "standard_dpr": {
+            "retrieval": dpr_ret,
+            "qa": None,
+        },
+        "delta_vs_dpr": delta_vs_dpr,
+        "recognition_memory": {
+            "queries_with_graph_seeds": active_queries,
+            "dpr_fallback_count": fallback_count,
+            "dpr_fallback_rate": round(fallback_count / len(records), 4) if records else 0.0,
+        },
+    }
+    ds_baselines = BASELINES.get(dataset, {})
+    mp = ds_baselines.get("monkeypatched_hipporag")
+    if isinstance(mp, dict):
+        metrics["monkeypatched_hipporag_baseline"] = mp
+        metrics["delta_vs_monkeypatched_hipporag"] = {
+            "Recall@1": (
+                round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4)
+                if "Recall@1" in hipporag_ret and mp.get("Recall@1") is not None
+                else None
+            ),
+            "Recall@2": (
+                round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4)
+                if "Recall@2" in hipporag_ret and mp.get("Recall@2") is not None
+                else None
+            ),
+            "Recall@5": (
+                round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4)
+                if "Recall@5" in hipporag_ret and mp.get("Recall@5") is not None
+                else None
+            ),
+            "ExactMatch": (
+                round(float(qa_metrics["ExactMatch"]) - float(mp["ExactMatch"]), 4)
+                if qa_metrics is not None and mp.get("ExactMatch") is not None
+                else None
+            ),
+            "F1": (
+                round(float(qa_metrics["F1"]) - float(mp["F1"]), 4)
+                if qa_metrics is not None and mp.get("F1") is not None
+                else None
+            ),
+        }
+    paper_baselines = {k: v for k, v in ds_baselines.items() if k != "monkeypatched_hipporag"}
+    if paper_baselines:
+        metrics["paper_baselines"] = paper_baselines
+
+    integrity_errors = check_benchmark_integrity(
+        records,
+        report["graph"],
+        expected_doc_count=num_docs,
+        include_qa=include_qa,
+    )
+    report["integrity"] = {"passed": len(integrity_errors) == 0, "errors": integrity_errors}
+    report["evaluation_metrics"] = metrics
+    report["records"] = records
+    print_benchmark_summary(dataset, num_docs, records, metrics)
     return report
 
 
@@ -596,38 +582,22 @@ def main(
     index_queries: int | None = None,
     full_corpus: bool = False,
     mode: str = "eval",
-    enable_gbnf: bool = False,
     query_offset: int = 0,
-    evolve: str = "none",
-    train_queries: int = 0,
     compiled_program: str | None = None,
-    chat_model: str | None = None,
-    embedding_model: str = MODEL,
-    extraction_model: str = DEFAULT_EXTRACTION_CHAT,
-    qa_model: str = DEFAULT_QA_CHAT,
-    embedding_task_mode: str = "distinct-titled",
+    qa_model: str | None = None,
+    embedding_model: str | None = None,
+    embedding_task_mode: str | None = None,
     fresh_index: bool = False,
-    linking_top_k: int = LINKING_TOP_K,
-    fact_candidate_pool_k: int = FACT_CANDIDATE_POOL_K,
-    fact_fts_pool_k: int = FACT_FTS_POOL_K,
-    fact_rrf_k: int = FACT_RRF_K,
-    fact_fts_weight: float = FACT_FTS_WEIGHT,
-    passage_node_weight: float = PASSAGE_NODE_WEIGHT,
-    fts_weight: float = FTS_WEIGHT,
-    damping: float = DAMPING,
-    passage_seed_pool_k: int = PASSAGE_SEED_POOL_K,
-    fts_seed_pool_k: int = FTS_SEED_POOL_K,
-    graph_activation: str = "scaled_tanh",
-    graph_activation_param: float | None = 5.0,
-    graph_activation_renormalize: bool = False,
-    graph_beta: float = 0.5,
-    graph_dual_weight: float | None = 0.5,
-):
-    if chat_model is not None:
-        extraction_model = chat_model
-        qa_model = chat_model
+    config_path: Path | str | None = None,
+) -> dict[str, Any]:
+    config = load_config(config_path, workspace_override=PROJECT_ROOT if config_path is None else None)
+    config = replace(
+        config,
+        embedding_model=embedding_model if embedding_model is not None else config.embedding_model,
+        qa_model=qa_model if qa_model is not None else config.qa_model,
+        embedding_task_mode=embedding_task_mode if embedding_task_mode is not None else config.embedding_task_mode,
+    )
     include_qa = mode not in ("embeddings", "retrieval")
-    profile = resolve_embedding_profile(embedding_model, embedding_task_mode)
 
     total_needed = None
     if max_queries is not None:
@@ -636,39 +606,30 @@ def main(
             max_queries,
             effective_index_q * 2 if dataset == "popqa" else effective_index_q,
         )
-        total_needed = pool_needed + max(query_offset, train_queries)
+        total_needed = pool_needed + query_offset
 
     samples, corpus = load_dataset_files(
         dataset,
         max_queries=total_needed,
         include_corpus=True,
     )
-
-    train_samples: list[dict] = []
-    eval_offset = query_offset
-    if train_queries > 0 and evolve != "none":
-        train_samples = samples[0:train_queries]
-        if max_queries is not None and train_queries >= max_queries:
-            eval_offset = max(query_offset, train_queries)
-
     docs, queries, gold_docs, gold_answers = build_benchmark_slice(
         dataset,
         samples,
         corpus,
         max_queries=max_queries,
-        query_offset=eval_offset,
+        query_offset=query_offset,
         full_corpus=full_corpus,
         index_queries=index_queries,
     )
-    if train_samples:
-        training_references = {
-            doc for refs in (get_gold_docs(train_samples, dataset, corpus=corpus) or ()) for doc in refs
-        }
-        docs.extend(str(row["idx"]) for row in corpus if f"{row['title']}\n{row['text']}" in training_references)
-        docs = list(dict.fromkeys(docs))
-    corpus_text = {str(row["idx"]): f"{row['title']}\n{row['text']}" for row in corpus}
-    embedding_probe_docs = [corpus_text[document_id] for document_id in docs[:3]]
-    del samples, corpus, corpus_text
+    fields = DATASET_SOURCE_FIELDS.get(dataset, {})
+    id_key = fields.get("id_key", "idx")
+    title_key = str(fields.get("title_key", "title"))
+    body_key = str(fields.get("body_key", "text"))
+    by_id = {document_identity(row, id_key=id_key, title_key=title_key, body_key=body_key): row for row in corpus}
+    selected_corpus = [by_id[did] for did in docs if did in by_id]
+    embedding_probe_docs = [document_text(row, title_key, body_key) for row in selected_corpus[:3]]
+    del samples, corpus, by_id
     gc.collect()
     num_docs = len(docs)
 
@@ -678,128 +639,75 @@ def main(
     run_dir = Path(tempfile.mkdtemp(prefix=f"run-{dataset}-", dir=root))
 
     slice_hash = hashlib.sha256("\n".join(docs).encode("utf-8")).hexdigest()[:10]
-    id_hash = hashlib.sha256(f"yaw|{profile.index_identity}|{extraction_model}".encode()).hexdigest()[:10]
+    cfg_fingerprint = benchmark_config_fingerprint(config)
+    id_hash = hashlib.sha256(
+        f"yaw|{config.embedding_model}|{config.embedding_task_mode}|{cfg_fingerprint}|{config.provider}|{config.base_url}".encode()
+    ).hexdigest()[:10]
     index_dir = run_dir / "index" if fresh_index else root / "indexes" / f"{dataset}_d{num_docs}_{slice_hash}_{id_hash}"
 
     configure_logging(log_file=run_dir / "run.log", max_lines=500)
-    for name in (
-        "httpx",
-        "httpx2",
-        "httpcore",
-        "openai",
-        "urllib3",
-        "litellm",
-        "LiteLLM",
-    ):
-        logging.getLogger(name).setLevel(logging.ERROR)
     report: dict[str, Any] = {
         "status": "running",
         "dataset": dataset,
         "engine": "yaw",
-        "enable_gbnf": enable_gbnf,
-        "query_offset": eval_offset,
-        "evolve": evolve,
-        "train_queries": len(train_samples),
+        "query_offset": query_offset,
         "num_queries": len(queries),
         "index_queries": index_queries,
         "num_docs": num_docs,
         "full_corpus": full_corpus,
-        "embedding_model": profile.model,
-        "checkpoint": profile.checkpoint,
-        "embedding_task_mode": embedding_task_mode,
-        "query_instruction_mode": profile.query_instruction_mode,
-        "parse_document_title": profile.parse_document_title,
-        "extraction_model": extraction_model,
-        "qa_model": qa_model if include_qa else None,
-        "chat_model": (
-            extraction_model if not include_qa or extraction_model == qa_model else f"{extraction_model} -> {qa_model}"
-        ),
-        "base_url": BASE_URL,
-        "index_identity": profile.index_identity,
+        "embedding_model": config.embedding_model,
+        "embedding_task_mode": config.embedding_task_mode,
+        "qa_model": config.qa_model if include_qa else None,
+        "max_output_tokens": config.max_output_tokens,
+        "react_max_iters": config.react_max_iters,
+        "config_fingerprint": cfg_fingerprint,
+        "base_url": config.base_url,
         "index_dir": str(index_dir),
         "run_dir": str(run_dir),
         "mode": mode,
-        "linking_top_k": linking_top_k,
-        "fact_candidate_pool_k": fact_candidate_pool_k,
-        "fact_fts_pool_k": fact_fts_pool_k,
-        "fact_rrf_k": fact_rrf_k,
-        "fact_fts_weight": fact_fts_weight,
-        "passage_node_weight": passage_node_weight,
-        "fts_weight": fts_weight,
-        "damping": damping,
-        "passage_seed_pool_k": passage_seed_pool_k,
-        "fts_seed_pool_k": fts_seed_pool_k,
-        "graph_activation": graph_activation,
-        "graph_activation_param": graph_activation_param,
-        "graph_activation_renormalize": graph_activation_renormalize,
-        "graph_beta": graph_beta,
-        "graph_dual_weight": graph_dual_weight,
     }
     print(
         f"\n[Native YAW] Benchmark run: {run_dir} (dataset={dataset}, queries={len(queries)}, docs={num_docs})",
         flush=True,
     )
     try:
-        report["model_registry"] = preflight(
-            profile,
-            None if mode == "embeddings" else extraction_model,
-            None if not include_qa or qa_model == extraction_model else qa_model,
-        )
+        active_embed = make_dspy_embed_fn(config)
         if mode in ("embeddings", "all"):
-            embed_client = create_dspy_embedder(profile, base_url=BASE_URL)
-            embedder = DSPyEmbeddingAdapter(profile=profile, embedder=embed_client)
-            report["embedding_probes"] = verify_embeddings(embedder, queries, embedding_probe_docs)
-            report["server"] = embedding_evidence(profile)
-            report["index_identity"] = report["server"]["resolved_index_identity"]
+            report["embedding_probes"] = verify_embeddings(
+                active_embed,
+                queries,
+                embedding_probe_docs,
+                task_mode=config.embedding_task_mode,
+            )
             if mode == "embeddings":
                 report["status"] = "passed"
                 return report
-        report["chat_backends"] = {
-            "extraction": chat_evidence(extraction_model),
-            "qa": chat_evidence(qa_model) if include_qa else None,
-        }
-        report["status"] = "passed"
-        return run_yaw_benchmark(
+        result = run_yaw_benchmark(
             dataset=dataset,
             document_ids=docs,
             queries=queries,
             gold_docs=gold_docs,
             gold_answers=gold_answers,
-            train_samples=train_samples,
-            profile=profile,
-            extraction_model=extraction_model,
-            qa_model=qa_model,
+            config=config,
             include_qa=include_qa,
-            enable_gbnf=enable_gbnf,
-            evolve=evolve,
             compiled_program=compiled_program,
             index_dir=index_dir,
             report=report,
-            fact_candidate_pool_k=fact_candidate_pool_k,
-            fact_fts_pool_k=fact_fts_pool_k,
-            fact_rrf_k=fact_rrf_k,
-            fact_fts_weight=fact_fts_weight,
-            linking_top_k=linking_top_k,
-            passage_node_weight=passage_node_weight,
-            fts_weight=fts_weight,
-            damping=damping,
-            passage_seed_pool_k=passage_seed_pool_k,
-            fts_seed_pool_k=fts_seed_pool_k,
-            graph_activation=graph_activation,
-            graph_activation_param=graph_activation_param,
-            graph_activation_renormalize=graph_activation_renormalize,
-            graph_beta=graph_beta,
-            graph_dual_weight=graph_dual_weight,
+            embed_fn=active_embed,
         )
-    except Exception as error:
+        report["status"] = "passed" if result["integrity"]["passed"] else "failed"
+        if not result["integrity"]["passed"]:
+            raise RuntimeError(f"Benchmark integrity failed: {result['integrity']['errors']}")
+        return result
+    except BaseException as error:
         report["status"] = "failed"
-        report["error"] = f"{type(error).__name__}: {error}"
+        report["error"] = redact_secrets(f"{type(error).__name__}: {error}", config.api_key)
         raise
     finally:
         report["elapsed_seconds"] = round(perf_counter() - started, 2)
-        (run_dir / "report.json").write_text(
+        write_text_atomic(
+            run_dir / "report.json",
             json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n",
-            encoding="utf-8",
             newline="\n",
         )
         print(f"\n{report['status'].upper()}: {run_dir / 'report.json'}", flush=True)
@@ -808,6 +716,12 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=DATASETS, default="sample")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Inference and ingestion settings (default: yaw.toml).",
+    )
     parser.add_argument(
         "--max-queries",
         type=int,
@@ -818,8 +732,9 @@ if __name__ == "__main__":
         "--index-queries",
         type=int,
         default=None,
-        help="Number of queries from which to pool candidate passages for indexing (defaults to "
-        "int(max_queries * 1.4)).",
+        help=(
+            "Number of queries from which to pool candidate passages for indexing (defaults to int(max_queries * 1.4))."
+        ),
     )
     parser.add_argument(
         "--full-corpus",
@@ -832,26 +747,13 @@ if __name__ == "__main__":
         default="eval",
         help="Run full benchmark ('eval'), retrieval-only ('retrieval'), include probes ('all'), or probes only.",
     )
-    parser.add_argument(
-        "--chat-model",
-        choices=tuple(CHAT_MODELS),
-        default=None,
-        help="Override both extraction and QA chat models with a single model.",
-    )
-    parser.add_argument("--extraction-model", choices=tuple(CHAT_MODELS), default=DEFAULT_EXTRACTION_CHAT)
-    parser.add_argument("--qa-model", choices=tuple(CHAT_MODELS), default=DEFAULT_QA_CHAT)
-    parser.add_argument("--embedding-model", choices=tuple(PROFILES), default=MODEL)
-    parser.add_argument("--embedding-task-mode", choices=GEMMA_TASK_MODES, default="distinct-titled")
+    parser.add_argument("--qa-model", type=str, default=None)
+    parser.add_argument("--embedding-model", type=str, default=None)
+    parser.add_argument("--embedding-task-mode", choices=_EMBEDDING_TASK_MODES, default=None)
     parser.add_argument(
         "--fresh-index",
         action="store_true",
         help="Force indexing in a fresh disposable directory instead of reusing outputs/benchmarks/indexes.",
-    )
-    parser.add_argument(
-        "--enable-gbnf",
-        action="store_true",
-        default=False,
-        help="Enable pure-JSON GBNF grammar constraints for local llama.cpp GPU worker.",
     )
     parser.add_argument(
         "--query-offset",
@@ -860,145 +762,24 @@ if __name__ == "__main__":
         help="Starting index offset into dataset queries for evaluation.",
     )
     parser.add_argument(
-        "--evolve",
-        choices=("none", "miprov2", "gepa", "hybrid"),
-        default="none",
-        help="Prompt evolution strategy on training slice: 'none', 'miprov2', 'gepa', or 'hybrid'.",
-    )
-    parser.add_argument(
-        "--train-queries",
-        type=int,
-        default=0,
-        help="Number of queries from dataset head reserved for prompt evolution (disjoint from eval).",
-    )
-    parser.add_argument(
         "--compiled-program",
         type=str,
         default=None,
-        help="Path to load or save compiled YawProgram state.",
+        help="Path to load compiled DSPy QA ReAct state.",
     )
-    parser.add_argument(
-        "--linking-top-k",
-        type=int,
-        default=LINKING_TOP_K,
-        help="Top-N fact candidates passed to recognition memory filter (default: 8).",
-    )
-    parser.add_argument(
-        "--fact-candidate-pool-k",
-        type=int,
-        default=FACT_CANDIDATE_POOL_K,
-        help="Dense KNN fact candidate pool size before RRF merge (default: 50).",
-    )
-    parser.add_argument(
-        "--fact-fts-pool-k",
-        type=int,
-        default=FACT_FTS_POOL_K,
-        help="FTS5 BM25 fact candidate pool size before RRF merge (default: 50).",
-    )
-    parser.add_argument(
-        "--fact-rrf-k",
-        type=int,
-        default=FACT_RRF_K,
-        help="RRF smoothing constant k_rrf for reciprocal rank fusion (default: 60).",
-    )
-    parser.add_argument(
-        "--fact-fts-weight",
-        type=float,
-        default=FACT_FTS_WEIGHT,
-        help="Weight applied to FTS5 reciprocal ranks in fact RRF merge (default: 0.2).",
-    )
-    parser.add_argument(
-        "--passage-node-weight",
-        type=float,
-        default=PASSAGE_NODE_WEIGHT,
-        help="Weight applied to passage reset distribution in PPR (default: 0.05).",
-    )
-    parser.add_argument(
-        "--fts-weight",
-        type=float,
-        default=FTS_WEIGHT,
-        help="Weight applied to FTS5 lexical scores in passage reset weights (default: 0.2).",
-    )
-    parser.add_argument(
-        "--damping",
-        type=float,
-        default=DAMPING,
-        help="PPR damping restart probability parameter (default: 0.5).",
-    )
-    parser.add_argument(
-        "--passage-seed-pool-k",
-        type=int,
-        default=PASSAGE_SEED_POOL_K,
-        help="Dense KNN passage candidate pool size (default: 200).",
-    )
-    parser.add_argument(
-        "--fts-seed-pool-k",
-        type=int,
-        default=FTS_SEED_POOL_K,
-        help="FTS5 lexical passage candidate pool size (default: 50).",
-    )
-    parser.add_argument(
-        "--graph-activation",
-        choices=["linear", "scaled_tanh", "hard_tanh", "shifted_tanh", "threshold_relu"],
-        default="scaled_tanh",
-        help="Graph propagation activation (arXiv:2609.32929v1, default: scaled_tanh).",
-    )
-    parser.add_argument(
-        "--graph-activation-param",
-        type=float,
-        default=5.0,
-        help="Optional parameter for graph activation (scale for scaled_tanh, cap for hard_tanh, "
-        "threshold for relu, default: 5.0).",
-    )
-    parser.add_argument(
-        "--graph-activation-renormalize",
-        action="store_true",
-        help="Renormalize L1 mass to 1.0 after non-linear activation at each step (default: False).",
-    )
-    parser.add_argument(
-        "--graph-beta",
-        type=float,
-        default=0.5,
-        help="Normalization exponent beta for W = D^-beta A D^-(1-beta) (arXiv:2609.32929v1: 0.0=random "
-        "walk, 0.5=symmetric GCN, default: 0.5).",
-    )
-    parser.add_argument(
-        "--graph-dual-weight",
-        type=float,
-        default=0.5,
-        help="Weight lambda in [0, 1] for dual combination (1-lambda)*y + lambda*z (arXiv:2609.32929v1, default: 0.5).",
-    )
+
     args = parser.parse_args()
     main(
         dataset=args.dataset,
+        config_path=args.config,
         max_queries=args.max_queries,
         index_queries=args.index_queries,
         full_corpus=args.full_corpus,
         mode=args.mode,
-        enable_gbnf=args.enable_gbnf,
         query_offset=args.query_offset,
-        evolve=args.evolve,
-        train_queries=args.train_queries,
         compiled_program=args.compiled_program,
-        chat_model=args.chat_model,
-        embedding_model=args.embedding_model,
-        extraction_model=args.extraction_model,
         qa_model=args.qa_model,
+        embedding_model=args.embedding_model,
         embedding_task_mode=args.embedding_task_mode,
         fresh_index=args.fresh_index,
-        linking_top_k=args.linking_top_k,
-        fact_candidate_pool_k=args.fact_candidate_pool_k,
-        fact_fts_pool_k=args.fact_fts_pool_k,
-        fact_rrf_k=args.fact_rrf_k,
-        fact_fts_weight=args.fact_fts_weight,
-        passage_node_weight=args.passage_node_weight,
-        fts_weight=args.fts_weight,
-        damping=args.damping,
-        passage_seed_pool_k=args.passage_seed_pool_k,
-        fts_seed_pool_k=args.fts_seed_pool_k,
-        graph_activation=args.graph_activation,
-        graph_activation_param=args.graph_activation_param,
-        graph_activation_renormalize=args.graph_activation_renormalize,
-        graph_beta=args.graph_beta,
-        graph_dual_weight=args.graph_dual_weight,
     )

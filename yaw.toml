@@ -1,69 +1,79 @@
-# YAW Native HippoRAG 2 Daemon Configuration
+# YAW Vector Search & QA Daemon Configuration
 
 [paths]
+# Directory watched and indexed into SQLite.
 corpus_root = "corpus"
+# Primary SQLite database storing sqlite-vec chunks and contentless FTS5 rows.
 db_path = ".yaw/yaw.db"
+# Exclusive file lock guarding daemon and write access to yaw.db.
 lock_path = ".yaw/yaw.db.lock"
-state_dir = ".yaw/coco_state"
+# Persistent CocoIndex LMDB memo state directory.
+state_dir = ".yaw/coco_lmdb"
+# Rotating 500-line FIFO runtime log file.
 log_path = ".yaw/yaw.log"
+# Atomic JSON snapshot of daemon lifecycle and chunk counts.
 status_path = ".yaw/status.json"
+# Optional compiled DSPy QA program JSON path loaded by qa/daemon.
 compiled_program_path = ".yaw/compiled_program.json"
 
 [ingestion]
-included_patterns = ["*.md", "*.txt"]
+# Glob patterns of source files included in live corpus indexing.
+included_patterns = [
+    "*.md", "*.mdx", "*.txt", "*.rst", "*.adoc", "*.org",
+    "*.py", "*.pyi", "*.rs", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs",
+    "*.go", "*.java", "*.kt", "*.kts", "*.c", "*.h", "*.cpp", "*.hpp", "*.cc", "*.cs",
+    "*.rb", "*.php", "*.swift", "*.scala", "*.lua", "*.r", "*.R",
+    "*.sh", "*.bash", "*.zsh", "*.sql", "*.graphql", "*.proto",
+    "*.yaml", "*.yml", "*.toml", "*.json", "*.jsonl", "*.xml", "*.html", "*.css", "*.scss",
+    "*.tex", "*.bib", "*.pas", "*.dpr", "*.f90", "*.sol", "*.dtd",
+]
+# Glob patterns excluded from directory traversal.
 excluded_patterns = [".*", "*/.*", "__pycache__/*"]
-chunk_size = 1200
-chunk_overlap = 120
+# Maximum document chunk body size in UTF-8 bytes; not a token count.
+chunk_size = 1000
+# Byte overlap preserved between adjacent document chunks.
+chunk_overlap = 150
+# Minimum chunk size target passed to the native splitter.
 min_chunk_size = 100
-poll_interval_seconds = 10.0
+# Maximum separate chunk inputs per native CocoIndex/DSPy embedding batch.
+embed_batch_size = 5
 
 [inference]
-base_url = "http://localhost:13305/api/v1"
-api_key = "lemonade"
+# OpenAI-compatible inference base URL for embeddings and QA chat completions.
+base_url = "http://127.0.0.1:8888/v1"
+# Optional bearer key; defaults to UNSLOTH_STUDIO_AUTH_TOKEN or OPENAI_API_KEY env vars (never commit live secrets).
+# api_key = ""
+# DSPy LM provider prefix paired with qa_model and embedding_model.
 provider = "openai"
-embedding_model = "embeddinggemma-300m-qat-q8_0-GGUF-Q8_0"
+# Embedding model identifier served at base_url.
+embedding_model = "embeddinggemma-2"
+# EmbeddingGemma prompt formatting mode ("search", "titled", "qa", "distinct", "distinct-titled", "fact").
 embedding_task_mode = "distinct-titled"
-extraction_model = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-qa_model = "gemma-4-E4B-it-qat-q4_0-gguf-Q4_0"
-# Match the external server's configured serving window, not its advertised maximum.
-context_window_tokens = 131072
-# Omitted budgets follow context capacity: at 128K, output=8192 tokens,
-# reflection input=32768 tokens, and RLM output=20000 characters.
-# Set max_output_tokens, reflection_input_tokens or rlm_max_output_chars to pin a limit.
-# Independent execution budgets; a larger context does not require more tool calls.
-rlm_max_iters = 10
-rlm_max_llm_calls = 20
-# Set only when Lemonade does not advertise the resident llama.cpp backend URL.
-reflection_tokenizer_url = ""
-enable_gbnf = true
-gbnf_max_facts = 4
-
-[graph]
-linking_top_k = 8
-retrieval_top_k = 10
-damping = 0.5
-
-candidate_dense_threshold = 0.8
-candidate_lexical_threshold = 0.625
-auto_merge_threshold = 0.98
-candidate_volume_ratio = 1.0
-embed_batch_size = 64
-# Aggregate formatted-input budget per embedding request; tune for the provider.
-embed_batch_chars = 3500
+# Shared embedding HTTP concurrency across ingestion and queries.
+embed_max_in_flight = 2
+# Chat completion model identifier used by Tier-1 dspy.ReAct QA and GEPA optimization.
+qa_model = "gemma-4-e4b"
+# Optional completion token limit; when omitted, generation capacity is delegated to the endpoint.
+# max_output_tokens = 4096
+# Maximum ReAct tool/thought iterations for both QA agents and GEPA instruction proposal.
+react_max_iters = 6
 
 [runtime]
+# Maximum concurrent in-flight recall/qa queries admitted by the daemon.
 queue_maxsize = 32
+# Loopback host interface bound by the FastMCP Streamable HTTP server.
 http_host = "127.0.0.1"
+# Loopback TCP port bound by the FastMCP Streamable HTTP server.
 http_port = 13306
+# Streamable HTTP mount path served by FastMCP.
 http_path = "/mcp"
 
 [optimization]
+# Default dataset name(s) or bundle paths targeted by `yaw optimize`.
 datasets = ["enterprise_rag_bench"]
-mode = "gepa"
+# Total question count sliced per optimization run.
 max_queries = 162
-train_queries = 135
+# Starting question offset within the selected dataset slice.
 query_offset = 0
+# GEPA auto budget tier ("light", "medium", or "heavy") when max_metric_calls is unset.
 auto = "light"
-sleep_seconds = 0.0
-max_bootstrapped_demos = 1
-max_labeled_demos = 1

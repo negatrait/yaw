@@ -671,7 +671,7 @@ Each unit is executed by delegating to `research` (read-only call-graph/SDK disc
   - Mandatory quality gates: `uv run --locked ty check` (`All checks passed!`), `uv run --locked ruff check --fix` (`All checks passed!`), `uv run --locked ruff format --check` (`174 files already formatted`), `uv run --locked pytest` (`124 passed, 1 deselected in 201.87s`), `git diff --check` (passed).
 - **Discoveries during implementation**:
   - In `cocoindex == 1.1.0` (`cocoindex/_internal/function.py:1463-1465`), `@coco.fn(memo=True)` reserves memos via `core.reserve_memoization_async(parent_ctx._core_processor_ctx, memo_fp)`, keying `TABLES.memoization` by `(app_name, parent_ctx.stable_path, memo_fp)`. Putting `db_identity` inside `coco.component_subpath(...)` changes `parent_ctx.stable_path` between databases and causes `100%` memo misses. Keeping `coco.component_subpath("chunk", ...)` and `coco.component_subpath("publication")` DB-invariant while passing `db_identity` as a component argument causes `TABLES.components` (`fingerprint((StablePath, args))`) to execute component bodies per DB while preserving an identical parent `StablePath` for `TABLES.memoization`.
-  - `SynonymEvidenceBatch.construction_seconds` (`time.perf_counter() - started` in `iter_synonym_evidence`) previously polluted `SemanticAdjudicationInput`'s CocoIndex memo fingerprint on every run, causing `judge_semantics` to miss `TABLES.memoization` across runs until normalized to `0.0` in `SemanticAdjudicationInput.__post_init__`.
+  - `SynonymEvidenceBatch.construction_seconds` (`time.perf_counter() - started` in `iter_semantic_evidence`) previously polluted `SemanticAdjudicationInput`'s CocoIndex memo fingerprint on every run, causing `judge_semantics` to miss `TABLES.memoization` across runs until normalized to `0.0` in `SemanticAdjudicationInput.__post_init__`.
 - **What it does not establish**:
   - Does not retire `CandidateStageCache` / `candidate_stage_cache` (`C5 & I3`), cut over vector tables to `vec0` (`G4-VEC0`), or replace `load_active_chunk_inferences` / `GraphDeltaCoordinator` with direct `coco.use_mount` `ChunkProcessOutput` handoff (`I2 & G3/G4/U5/P1`).
 
@@ -1058,3 +1058,40 @@ This specification remediates the `6` CocoIndex `>= 1.1.0` (`uv.lock:330–331` 
   - Mandatory quality gates: `uv run --locked ty check` (`All checks passed!`), `uv run --locked ruff check --fix` (`All checks passed!`), `uv run --locked ruff format --check` (`174 files already formatted`), `git diff --check` (`0` errors).
 - **What it does not establish**:
   - Does not hot-reload any long-running daemon in memory until restarted; does not complete full-corpus GEPA optimization runs (separate user-initiated command).
+
+### Completed Unit: Checkpoint N6 (2026-11-10): Optimization Sandbox Fresh Lifecycle, Configurable Source Chunking, and Path Matcher Invariants
+
+- **Changed symbols & modules** (governing contracts: [native-cocoindex-indexing.md](../native-cocoindex-indexing.md) and [AGENTS.md](../../AGENTS.md)):
+  - `yaw/daemon/runtime.py`:
+    - In `_create_bound_engine`: constructed `SourceSettings` populated directly from `cfg` (`chunk_size`, `chunk_overlap`, `min_chunk_size`, `included_patterns`, `excluded_patterns`, `json_keys_whitelist`, `json_keys_blacklist`) and passed it to `bind_native_indexing(..., source_settings=src_settings)`.
+  - `yaw/daemon/indexing.py`:
+    - In `bind_native_indexing`: extracted `base_src = source_settings if source_settings is not None else SourceSettings((), ())` and passed `chunk_size`, `chunk_overlap`, `min_chunk_size` into `GraphPlanSettings` so graph planning matches source chunking.
+    - Preserved `included_patterns=("**/*",)` when `eff_included is not None` so explicit target file lists (e.g. dataset bundles) bypass directory pattern exclusions.
+  - `yaw/daemon/ingestion/source_targets.py`:
+    - Fixed `_SelectedFilesPathMatcher`: when `included_files` is specified, `is_file_included(path)` checks `path.as_posix() in self._included_files` directly without redundant pattern rejection; `is_dir_included` allows parent directories and workspace root `.`.
+  - `yaw/daemon/cli.py`:
+    - Added `optimize_coco` cleanup to `_clean_optimization_artifacts` so `--fresh` purges optimization state directories alongside SQLite databases.
+  - `yaw/daemon/graph/engine.py`:
+    - In `_setup_optimization_splits`: added hydration fallback `if not self._opt_chunks_pool and self._opt_indexed_cids: self._hydrate_opt_chunks_pool_from_db()` to ensure bare resume reconstitutes chunk pool metadata.
+  - `yaw/daemon/graph/normalization.py`:
+    - In `normalize_openie_record`: classified scalar literals (`detect_scalar_literal` or `is_scalar_label`) as `is_literal_obj = True` with XSD datatype, preventing raw scalars (e.g. latency durations) from being materialized as `skos:Concept` nodes.
+  - `yaw/daemon/graph/planner.py`:
+    - In `materialize_entities_and_facts`: marked scalar literals as `is_literal_obj = True` to publish `owl:DatatypeProperty` statements with `obj_id = None` and prevent bogus entity generation.
+  - `yaw/daemon/graph/storage/shacl.py`:
+    - In `auto_heal_deterministic_shacl`: allowed `remove_scalar_entity` to literalize scalar fact objects without subject roles, preserving statements as datatype properties while pruning invalid entity nodes.
+  - `tests/daemon/graph/test_indexing_overlap.py`:
+    - Realigned substage progress assertion with `indexing: synonym adjudication (` emitted by planner.
+- **Gate results & evidence paths**:
+  - `uv run ty check` (`All checks passed!`).
+  - `uv run ruff check --fix` and `uv run ruff format` (`All checks passed!`, `187 files left unchanged`).
+  - `uv run pytest --no-testmon tests/daemon/test_runtime.py` (`27 passed in 42.74s`).
+  - `uv run pytest --no-testmon tests/daemon/graph/test_shacl_publication.py` (`19 passed`).
+  - `uv run pytest --no-testmon tests/daemon/graph/test_normalization.py` (`4 passed`).
+  - `uv run pytest --no-testmon tests/daemon/graph/inference/test_parsers.py tests/daemon/graph/inference/test_parsers_shacl_literals.py` (`56 passed`).
+  - `git diff --check` (`0` errors).
+- **Discoveries during implementation**:
+  - `chunk_file_memo` in CocoIndex is keyed on `SourceSettings`. When `runtime._create_bound_engine` omitted `source_settings`, it defaulted to 1200 chars / 100 overlap, preventing user-configured `chunk_size = 1000` from taking effect.
+  - When callers provide `included_files`, `_SelectedFilesPathMatcher` must not conjoin with pattern filters that may only include `*.md`, allowing dataset bundles (`.json`) to be loaded when explicitly requested.
+  - Critic Audit Finding: Resource label SHACL repair actions must remain strictly `{"set_pref_label"}` to preserve three-layer parity with GBNF grammar (`actions == {"set_pref_label"}` activates `value_rule = "label"`). Restored strict mapping.
+- **What it does not establish**:
+  - Full-corpus overnight GEPA optimization run (separate long-running job).

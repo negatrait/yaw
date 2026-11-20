@@ -1,16 +1,105 @@
 #!/usr/bin/env python
-"""Download configured inputs and copy document records into isolated JSON files."""
+"""Download configured inputs and copy document records into native .md document files."""
 
-import argparse
+from __future__ import annotations
+
+import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from yaw.daemon.ingestion import (
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import argparse  # noqa: E402
+
+from yaw.datasets import (  # noqa: E402
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
-    download_dataset_file,
+    HF_BASE_URL,
+    UPSTREAM_DATASET_BASE_URL,
+    allow_upstream_github_fallback,
     load_dataset_bundle,
     prepare_dataset_bundle,
+    resolve_dataset_name,
 )
+
+__all__ = [
+    "DATASET_REGISTRY",
+    "DATASET_SOURCE_FIELDS",
+    "HF_BASE_URL",
+    "UPSTREAM_DATASET_BASE_URL",
+    "allow_upstream_github_fallback",
+    "download_dataset_file",
+    "load_dataset_bundle",
+    "main",
+    "prepare_dataset_bundle",
+    "resolve_dataset_name",
+]
+
+
+def download_dataset_file(
+    filename: str,
+    dest_dir: Path,
+    *,
+    force: bool = False,
+    hf_base_url: str | None = None,
+    upstream_base_url: str | None = None,
+    verbose: bool = False,
+) -> Path:
+    """Download a dataset file from Hugging Face (or GitHub fallback) to `dest_dir`."""
+    if (
+        not filename
+        or "/" in filename
+        or "\\" in filename
+        or Path(filename).is_absolute()
+        or Path(filename).name != filename
+        or filename in {".", ".."}
+    ):
+        raise ValueError(f"Dataset filename must be a single file name: {filename}")
+    target = dest_dir / filename
+    if target.exists() and not force and target.stat().st_size > 0:
+        if verbose:
+            size_mb = target.stat().st_size / (1024 * 1024)
+            print(f"  [cached] {filename} ({size_mb:.2f} MB)")
+        return target
+
+    urls = [f"{hf_base_url or HF_BASE_URL}/{filename}"]
+    if allow_upstream_github_fallback(filename):
+        urls.append(f"{upstream_base_url or UPSTREAM_DATASET_BASE_URL}/{filename}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp_target = dest_dir / f"{filename}.tmp"
+
+    last_error: Exception | None = None
+    for url in urls:
+        try:
+            if verbose:
+                print(f"  Downloading {filename} from {url}...")
+            t0 = time.perf_counter()
+            req = urllib.request.Request(url, headers={"User-Agent": "YAW-DatasetDownloader/1.0"})
+            with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as out_f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+            tmp_target.replace(target)
+            if verbose:
+                dt = time.perf_counter() - t0
+                size_mb = target.stat().st_size / (1024 * 1024)
+                print(f"  -> Saved {filename} ({size_mb:.2f} MB in {dt:.2f}s)")
+            return target
+        except (urllib.error.URLError, OSError, RuntimeError) as exc:
+            last_error = exc
+            if tmp_target.exists():
+                tmp_target.unlink(missing_ok=True)
+            if verbose:
+                print(f"  Failed from {url}: {exc}")
+
+    raise RuntimeError(f"Could not download {filename} from any source: {last_error}") from last_error
 
 
 def main() -> None:

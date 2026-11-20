@@ -1,83 +1,137 @@
-"""Frozen, zero-dependency data contracts and pure coordinate/ID helpers for YAW."""
+"""Canonical typed contracts and pure deterministic helpers for Yaw."""
+
+from __future__ import annotations
 
 import hashlib
-import json
-import math
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal
+
+type EmbedFn = Callable[[list[str]], Any]
 
 ErrorCode = Literal[
-    "INVALID_INPUT",
-    "NOT_READY",
-    "EMPTY_INDEX",
     "BUSY",
-    "MODEL_ERROR",
     "CONSISTENCY_ERROR",
+    "EMPTY_INDEX",
+    "INDEX_NOT_READY",
+    "INVALID_INPUT",
+    "MODEL_ERROR",
+    "NOT_READY",
     "SHUTTING_DOWN",
 ]
 
 
 class YawRuntimeError(RuntimeError):
-    """Structured runtime error carrying a canonical ErrorCode for CLI and MCP transport."""
+    """Structured runtime failure carrying a stable machine-readable error code."""
 
     def __init__(self, code: ErrorCode, message: str) -> None:
         super().__init__(f"[{code}] {message}")
         self.code: ErrorCode = code
-        self.message: str = message
+        self.detail: str = message
 
 
-class FatalGraphPublicationError(BaseException):
-    """Fatal graph publication failure that aborts optimizer execution without being swallowed."""
-
-    def __init__(self, original: BaseException) -> None:
-        self.original = original
-        super().__init__(str(original))
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
+_URL_USERINFO_RE = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
+_API_KEY_KV_RE = re.compile(r"(?i)(api_key\s*[=:]\s*)([^\s,;\"']+)")
 
 
-def json_document_fields(data: object, default_title: str = "") -> tuple[str, str]:
-    """One rendering contract for decoded document objects and projected values."""
-    if isinstance(data, str):
-        return default_title, data
-    if not isinstance(data, dict):
-        raise ValueError("JSON document must be an object or string")
-    title = data.get("title", default_title)
-    if "text" in data:
-        body = data["text"]
-    elif "content" in data:
-        body = data["content"]
-    else:
-        body = json.dumps(data, ensure_ascii=False)
-    if not isinstance(title, str) or not isinstance(body, str):
-        raise ValueError("JSON document title/body must be strings")
-    return title, body
+def redact_secrets(text: str, api_key: str = "") -> str:
+    """Mask configured API keys, Bearer tokens, OpenAI keys, and URL credentials."""
+    if not text:
+        return text
+    cleaned = text
+    if api_key and len(api_key) >= 4:
+        cleaned = cleaned.replace(api_key, "[REDACTED]")
+    cleaned = _BEARER_RE.sub("Bearer [REDACTED]", cleaned)
+    cleaned = _SK_RE.sub("[REDACTED]", cleaned)
+    cleaned = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", cleaned)
+    return _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
 
 
-def render_document_text(title: str, body: str) -> str:
-    """Render source fields once, preserving an already present title line."""
-    if title and body != title and not body.startswith((title + "\n", title + "\r\n")):
-        return f"{title}\n{body}"
-    return body
+def normalize_entity(text: str) -> str:
+    """Normalize an entity mention to lowercase single-spaced form."""
+    return " ".join(text.strip().lower().split())
 
 
-@dataclass(slots=True, frozen=True)
+def canonical_chunk_span_key(
+    rel_path: str, start_line: int, end_line: int, char_start: int = 0, char_end: int = 0, source_hash: str = ""
+) -> str:
+    """Build the canonical provenance span key for deterministic chunk identity."""
+    norm_path = rel_path.replace("\\", "/")
+    base = f"{norm_path}:{int(start_line)}:{int(end_line)}"
+    if char_start or char_end:
+        base = f"{base}:{int(char_start)}:{int(char_end)}"
+    return f"{base}:{source_hash}" if source_hash else base
+
+
+def compute_chunk_int_id(
+    rel_path: str, start_line: int, end_line: int, char_start: int = 0, char_end: int = 0, source_hash: str = ""
+) -> int:
+    """Compute positive signed 63-bit integer primary key from canonical chunk span."""
+    key = canonical_chunk_span_key(rel_path, start_line, end_line, char_start, char_end, source_hash)
+    raw = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
+    return raw if raw != 0 else 1
+
+
+def inclusive_end_line(start_line: int, end_line: int, end_column: int) -> int:
+    """Convert half-open splitter end line/column into 1-indexed inclusive end line."""
+    if end_column == 1 and end_line > start_line:
+        return end_line - 1
+    return max(start_line, end_line)
+
+
+def resolve_corpus_path(corpus_root: Path | str, rel_path: str) -> Path:
+    """Resolve `rel_path` strictly inside `corpus_root`, rejecting traversal or absolute paths."""
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("Relative corpus path must be a non-empty string.")
+    norm = rel_path.replace("\\", "/")
+    raw_rel = Path(norm)
+    if raw_rel.is_absolute() or norm.startswith("/") or (len(norm) >= 2 and norm[1] == ":"):
+        raise ValueError(f"Absolute path not allowed: {rel_path!r}")
+    if ".." in raw_rel.parts:
+        raise ValueError(f"Parent traversal not allowed: {rel_path!r}")
+    root = Path(corpus_root).resolve()
+    resolved = (root / raw_rel).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes corpus root: {rel_path!r}") from exc
+    return resolved
+
+
+@dataclass(frozen=True, slots=True)
 class ChunkPointer:
-    """1-indexed line span pointer to an immutable markdown/text chunk on disk."""
+    """Zero-copy provenance pointer referencing a disk-backed source span."""
 
-    chunk_id: str
-    rel_posix_path: str
+    chunk_id: int
+    rel_path: str
+    source_hash: str
     start_line: int
     end_line: int
+    char_start: int = 0
+    char_end: int = 0
+    ast_island_start: int = 1
+    ast_island_end: int = 1
     title: str = ""
-    ast_island_start: int = 0
-    ast_island_end: int = 0
+
+    @property
+    def rel_posix_path(self) -> str:
+        return self.rel_path.replace("\\", "/")
+
+    @property
+    def span_label(self) -> str:
+        base = f"{self.rel_posix_path}:{self.start_line}-{self.end_line}"
+        if self.char_start or self.char_end:
+            return f"{base}@{self.char_start}-{self.char_end}"
+        return base
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class HydratedPassage:
-    """A passage hydrated on demand from disk with optional stale detection."""
+    """Disk-hydrated passage paired with its provenance pointer and retrieval score."""
 
     pointer: ChunkPointer
     text: str
@@ -85,242 +139,21 @@ class HydratedPassage:
     stale_on_disk: bool = False
 
 
-@dataclass(slots=True, frozen=True)
-class SynonymEvidenceBatch:
-    """A bounded model request with reversible IDs and content-addressed evidence."""
-
-    candidates: tuple[dict[str, Any], ...]
-    payload: str
-    identifiers: dict[str, str]
-    construction_seconds: float = 0.0
-
-    @property
-    def cache_identity(self) -> str:
-        value = ["synonym-evidence-v2", self.payload, self.identifiers, self.candidates]
-        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-
-    def resolve_decisions(self, decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        """Validate exact pair coverage and resolve request-local IDs before graph writes."""
-        pairs = {p["pair_id"] for p in json.loads(self.payload)["pairs"]}
-        seen: set[str] = set()
-        result: list[dict[str, Any]] = []
-        for decision in decisions:
-            pair = str(decision.get("pair_id", "") or "").strip()
-            if not pair or pair not in pairs or pair in seen:
-                raise ValueError(f"Unknown or duplicate synonym pair {pair!r}")
-            if "|" not in pair:
-                raise ValueError(f"Invalid synonym pair ID {pair!r}")
-            a, b = pair.split("|", 1)
-            real_a = self.identifiers.get(a, a)
-            real_b = self.identifiers.get(b, b)
-            resolved_entry: dict[str, Any] = {
-                **decision,
-                "pair_id": f"{real_a}|{real_b}",
-            }
-            if "source_id" in decision and decision["source_id"]:
-                src = str(decision["source_id"])
-                if src not in (a, b):
-                    raise ValueError(f"Invalid source_id {src!r} for synonym pair {pair!r}")
-                resolved_entry["source_id"] = self.identifiers.get(src, src)
-            if "target_id" in decision and decision["target_id"]:
-                tgt = str(decision["target_id"])
-                if tgt not in (a, b):
-                    raise ValueError(f"Invalid target_id {tgt!r} for synonym pair {pair!r}")
-                resolved_entry["target_id"] = self.identifiers.get(tgt, tgt)
-            if "canonical" in decision and decision["canonical"]:
-                canonical = str(decision["canonical"])
-                if canonical not in (a, b):
-                    raise ValueError(f"Invalid canonical ID {canonical!r} for synonym pair {pair!r}")
-                resolved_entry["canonical"] = self.identifiers.get(canonical, canonical)
-            result.append(resolved_entry)
-            seen.add(pair)
-        if seen != pairs:
-            raise ValueError(f"Missing synonym decisions for {sorted(pairs - seen)}")
-        return result
-
-    def subset(self, pair_ids: Collection[str]) -> SynonymEvidenceBatch:
-        """Return a new SynonymEvidenceBatch containing only the requested pair IDs."""
-        target_ids = set(pair_ids)
-        parsed = json.loads(self.payload)
-        all_pairs = parsed.get("pairs", [])
-        filtered_pairs = []
-        for p in all_pairs:
-            alias_pair = p.get("pair_id", "")
-            if "|" in alias_pair:
-                a, b = alias_pair.split("|", 1)
-                real_pair = f"{self.identifiers.get(a, a)}|{self.identifiers.get(b, b)}"
-            else:
-                real_pair = alias_pair
-            if alias_pair in target_ids or real_pair in target_ids:
-                filtered_pairs.append(p)
-
-        filtered_pair_aliases = {p["pair_id"] for p in filtered_pairs}
-        filtered_pair_reals = {
-            f"{self.identifiers.get(p['pair_id'].split('|', 1)[0], p['pair_id'].split('|', 1)[0])}|"
-            f"{self.identifiers.get(p['pair_id'].split('|', 1)[1], p['pair_id'].split('|', 1)[1])}"
-            for p in filtered_pairs
-            if "|" in p.get("pair_id", "")
-        }
-
-        filtered_candidates = [
-            c
-            for c in self.candidates
-            if c.get("pair_id") in filtered_pair_aliases
-            or c.get("pair_id") in filtered_pair_reals
-            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_reals
-            or f"{c.get('entity_a')}|{c.get('entity_b')}" in filtered_pair_aliases
-        ]
-
-        needed_aliases = {
-            part for p in filtered_pairs if "|" in p.get("pair_id", "") for part in p["pair_id"].split("|", 1)
-        }
-        filtered_identifiers = {k: v for k, v in self.identifiers.items() if k in needed_aliases}
-
-        ratio = (len(filtered_pairs) / len(all_pairs)) if all_pairs else 1.0
-        new_construction_seconds = self.construction_seconds * ratio
-
-        new_payload = json.dumps(
-            {
-                "format": "synonym-evidence-v2",
-                "pairs": filtered_pairs,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return SynonymEvidenceBatch(
-            candidates=tuple(filtered_candidates),
-            payload=new_payload,
-            identifiers=filtered_identifiers,
-            construction_seconds=new_construction_seconds,
-        )
-
-
-@dataclass(slots=True, frozen=True)
-class StructuredTriple:
-    """An OpenIE relation triple enriched with inline subject, object, and statement definitions."""
-
-    subj: str
-    subj_def: str = ""
-    pred: str = ""
-    obj: str = ""
-    obj_def: str = ""
-    spo_def: str = ""
-    obj_kind: Literal["entity", "literal"] = "entity"
-    obj_datatype: str = ""
-    obj_lang: str = ""
-    llm_prob: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.llm_prob is not None and (not math.isfinite(self.llm_prob) or not 0 <= self.llm_prob <= 1):
-            raise ValueError("Invalid triple model probability")
-
-    @property
-    def subject(self) -> str:
-        return self.subj
-
-    @property
-    def predicate(self) -> str:
-        return self.pred
-
-    @property
-    def object(self) -> str:
-        return self.obj
-
-    def as_tuple(self) -> tuple[str, str, str]:
-        return (self.subj, self.pred, self.obj)
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "subj": self.subj,
-            "subj_def": self.subj_def,
-            "pred": self.pred,
-            "obj": self.obj,
-            "obj_def": self.obj_def,
-            "spo_def": self.spo_def,
-        }
-        if self.obj_kind != "entity" or self.obj_datatype or self.obj_lang:
-            d["obj_kind"] = self.obj_kind
-            d["obj_datatype"] = self.obj_datatype
-            d["obj_lang"] = self.obj_lang
-        if self.llm_prob is not None:
-            d["llm_prob"] = self.llm_prob
-        return d
-
-
-@dataclass(slots=True, frozen=True)
-class RelationTraversalPolicy:
-    """Relation-aware directed Markov transition multipliers for Personalized PageRank."""
-
-    passage: float = 1.0
-    fact_forward: float = 1.0
-    fact_reverse: float = 1.0
-    skos_related: float = 1.0
-    skos_broader_up: float = 1.0
-    skos_broader_down: float = 0.5
-    owl_different_from: float = 0.0
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(slots=True, frozen=True)
-class OpenIERecord:
-    """NER entities and relation triples extracted from a single chunk."""
-
-    chunk_id: str
-    entities: tuple[str, ...]
-    triples: tuple[tuple[str, str, str], ...]
-    structured_triples: tuple[StructuredTriple, ...] = ()
-    entity_definitions: tuple[tuple[str, str], ...] = ()
-    entity_probabilities: tuple[tuple[str, str, float | None], ...] = ()
-
-    def __post_init__(self) -> None:
-        if any(p is not None and (not math.isfinite(p) or not 0 <= p <= 1) for _, _, p in self.entity_probabilities):
-            raise ValueError("Invalid NER model probability")
-
-
-@dataclass(slots=True, frozen=True)
-class SHACLViolation:
-    """Closed-world SHACL validation report item on the SQLite knowledge graph."""
-
-    shape: str
-    focus_node: str
-    result_path: str
-    message: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(slots=True, frozen=True)
-class RetrievalResult:
-    """Retrieved top-k hydrated passages and optional generated answer."""
+@dataclass(frozen=True, slots=True)
+class QAResult:
+    """Grounded question-answering output with provenance citations."""
 
     question: str
-    passages: tuple[HydratedPassage, ...]
-    answer: str | None = None
+    answer: str
+    citations: tuple[str, ...] = ()
+    passages: tuple[HydratedPassage, ...] = ()
+    latency_ms: float = 0.0
+    turns: int = 0
 
 
-@dataclass(slots=True, frozen=True)
-class IndexStats:
-    """Cached non-blocking graph index statistics and configuration fingerprint."""
-
-    chunks: int = 0
-    entities: int = 0
-    facts: int = 0
-    edges: int = 0
-    config_fingerprint: str = ""
-    openie_checkpoints: int = 0
-    entity_labels: int = 0
-    shacl_conforms: bool = True
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class DaemonStatus:
-    """Cached non-blocking daemon lifecycle, provider health, and worker queue snapshot."""
+    """Non-blocking daemon lifecycle, sync state, and chunk count snapshot."""
 
     lifecycle: str = "stopped"
     provider_ready: bool = False
@@ -330,209 +163,73 @@ class DaemonStatus:
     last_error: str | None = None
     last_sync_at: float | None = None
     pid: int | None = None
+    num_chunks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def compute_mdhash_id(content: str, prefix: str = "") -> str:
-    """Compute the MD5 hash of the given content string and optionally prepend a prefix."""
-    return prefix + hashlib.md5(content.encode("utf-8")).hexdigest()
+_ALREADY_PREFIXED_DOC_RE = re.compile(r"^title: (?:none|[^\r\n]+?) \| text: ")
+_MAX_EMBED_TITLE_CHARS = 256
+_QUERY_PREFIXES: dict[str, str] = {
+    "search": "task: search result | query: ",
+    "titled": "task: search result | query: ",
+    "qa": "task: question answering | query: ",
+    "distinct": "task: question answering | query: ",
+    "distinct-titled": "task: question answering | query: ",
+    "fact": "task: fact checking | query: ",
+}
+_DOCUMENT_PREFIX = "title: none | text: "
 
 
-@overload
-def text_processing(text: list[Any]) -> list[Any]: ...
+def render_document_text(title: str, body: str) -> str:
+    """Render benchmark dataset fields once, preserving an already present title line."""
+    if title and body != title and not body.startswith((title + "\n", title + "\r\n")):
+        return f"{title}\n{body}"
+    return body
 
 
-@overload
-def text_processing(text: Any) -> str: ...
+def format_query_for_embedding(query: str, task_mode: str = "distinct-titled") -> str:
+    """Format a query string using the EmbeddingGemma task prefix configured for Yaw."""
+    if not isinstance(query, str):
+        raise TypeError("Embedding query must be a string.")
+    if task_mode not in _QUERY_PREFIXES:
+        raise ValueError(f"Unsupported embedding task_mode: {task_mode!r}")
+    if any(query.startswith(prefix) for prefix in set(_QUERY_PREFIXES.values())):
+        raise ValueError("Pass raw query text, not an already prefixed embedding input.")
+    return _QUERY_PREFIXES[task_mode] + query
 
 
-def text_processing(text: Any) -> str | list[Any]:
-    """Normalize entity/fact text to lowercase tokens while preserving significant technical punctuation."""
-    if isinstance(text, list):
-        return [text_processing(t) for t in text]
+def format_doc_for_embedding(text: str, title: str = "", task_mode: str = "distinct-titled") -> str:
+    """Wrap passage `text` with an explicit known `title`, or `title: none` when unknown."""
     if not isinstance(text, str):
-        text = str(text)
-    folded = text.casefold()
-    n = len(folded)
-    out: list[str] = []
-    for i, ch in enumerate(folded):
-        if (
-            ch.isalnum()
-            or ch.isspace()
-            or (ch in "+#%" and i > 0 and (folded[i - 1].isalnum() or (out and out[-1] in "+#%")))
-            or (ch in "./:" and 0 < i < n - 1 and folded[i - 1].isalnum() and folded[i + 1].isalnum())
-            or (
-                ch == "-"
-                and 0 < i < n - 1
-                and folded[i - 1].isalnum()
-                and folded[i + 1].isalnum()
-                and (folded[i - 1].isdigit() or folded[i + 1].isdigit())
-            )
-        ):
-            out.append(ch)
-        else:
-            out.append(" ")
-    return " ".join("".join(out).split())
+        raise TypeError("Embedding document text must be a string.")
+    if task_mode not in _QUERY_PREFIXES:
+        raise ValueError(f"Unsupported embedding task_mode: {task_mode!r}")
+    if text.startswith(_DOCUMENT_PREFIX) or _ALREADY_PREFIXED_DOC_RE.match(text):
+        raise ValueError("Pass raw document text, not an already prefixed embedding input.")
+    if task_mode in ("titled", "distinct-titled") and title:
+        clean_title = " ".join(title.split()).replace(" | text: ", " - text: ")
+        if clean_title and len(clean_title) <= _MAX_EMBED_TITLE_CHARS:
+            return f"title: {clean_title} | text: {text}"
+    return _DOCUMENT_PREFIX + text
 
 
-def is_resource_label(label: str) -> bool:
-    """A NER resource label has lexical content: an ASCII letter or any non-ASCII character.
-
-    Mirrors the GBNF NER `label` rule (GBNF has no Unicode categories, so every non-ASCII
-    character counts). Punctuation, numbers, dates and other data values are literals.
-    """
-    return any(ch.isalpha() or not ch.isascii() for ch in label)
-
-
-def is_scalar_label(label: str) -> bool:
-    """Whether a label's normalized form is an XSD scalar literal.
-
-    The single downstream classification of NER labels: normalization, materialization and
-    evidence binding must agree on which labels bind as resources (native graph spec §5.3).
-    """
-    return detect_scalar_literal(text_processing(label))[0]
-
-
-def clean_surface_label(raw: str) -> str:
-    """Strip whitespace and stray leading/trailing clause delimiters (:;,)."""
-    return raw.strip().strip(":;,").strip()
-
-
-def is_irreflexive_statement(
-    subj: str,
-    pred: str,
-    obj: str,
-    subj_def: str = "",
-    obj_def: str = "",
-    obj_kind: str = "entity",
-) -> bool:
-    """Return True iff the statement does not relate a resource sense to itself or repeat subj as a literal."""
-    s_norm = str(text_processing(subj))
-    o_norm = str(text_processing(obj))
-    if not s_norm or not o_norm:
-        return False
-    if obj_kind == "literal":
-        if s_norm == o_norm:
-            return False
-        p_norm = str(text_processing(pred))
-        sd_norm = str(text_processing(subj_def))
-        return not (p_norm and sd_norm and p_norm == sd_norm)
-    return not (
-        s_norm == o_norm
-        and (not subj_def.strip() or not obj_def.strip() or subj_def.strip().casefold() == obj_def.strip().casefold())
-    )
-
-
-def compute_chunk_id(rel_posix_path: str, start_line: int, end_line: int, text: str) -> str:
-    """Compute deterministic canonical chunk ID from relative path, line span, and slice text."""
-    payload = f"{rel_posix_path}:{start_line}:{end_line}:{text}"
-    return compute_mdhash_id(payload, prefix="chunk-")
-
-
-def inclusive_end_line(start_line: int, end_line: int, end_column: int) -> int:
-    """Convert half-open coordinate (end_line, end_column) to 1-indexed inclusive end line."""
-    if end_column == 1 and end_line > start_line:
-        return end_line - 1
-    return end_line
-
-
-def resolve_corpus_path(corpus_root: Path, rel_posix_path: str) -> Path:
-    """Resolve a relative POSIX path against a corpus root, rejecting path traversals."""
-    root_resolved = corpus_root.resolve()
-    target_path = (root_resolved / rel_posix_path).resolve()
-    if not target_path.is_relative_to(root_resolved):
-        raise ValueError(f"Path traversal detected: {rel_posix_path!r} resolves outside corpus root {corpus_root}")
-    return target_path
-
-
-_XSD_BOOLEAN_RE = re.compile(r"^(?:true|false)$", re.IGNORECASE)
-_XSD_INTEGER_RE = re.compile(r"^[+-]?\d+$")
-_XSD_DECIMAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
-_XSD_DATETIME_RE = re.compile(
-    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$",
-    re.IGNORECASE,
-)
-_XSD_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
-_XSD_TIME_RE = re.compile(
-    r"^(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?|(?:1[0-2]|0?[1-9]):[0-5]\d(?::[0-5]\d)?\s*(?:am|pm))$",
-    re.IGNORECASE,
-)
-_XSD_DURATION_RE = re.compile(
-    r"^-?P(?=\d|T\d)(?:(?:\d+Y)?(?:\d+M)?(?:\d+D)?)(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?$",
-    re.IGNORECASE,
-)
-_CURRENCY_PREFIX_RE = re.compile(
-    r"^[\$€£¥]\s*\d+(?:\.\d+)?(?:\s*[kKmMbBtT]|(?:\s*(?:thousand|million|billion|trillion)))?$",
-    re.IGNORECASE,
-)
-_CURRENCY_SUFFIX_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:USD|EUR|GBP|JPY|cents?|dollars?)$", re.IGNORECASE)
-_DURATION_LATENCY_RE = re.compile(
-    r"^(?:p\d+\s+)?\d+(?:\.\d+)?\s*(?:ns|µs|us|ms|s|sec|seconds?|min|minutes?|h|hours?|days?)$",
-    re.IGNORECASE,
-)
-_PERCENT_STORAGE_RE = re.compile(r"^\d+(?:\.\d+)?\s*(?:%|MB|GB|KB|TB|PB|bytes?)$", re.IGNORECASE)
-_QUANTIFIED_COUNT_RE = re.compile(r"^\d+\s+(?:events?|requests?|tokens?|queries|pods?|nodes?)$", re.IGNORECASE)
-
-
-def detect_scalar_literal(text: str, definition: str = "") -> tuple[bool, str]:
-    """Classify clear-cut scalar literals into W3C XSD datatypes; default rdfs:Literal fallback is xsd:string."""
-    _ = definition
-    if not isinstance(text, str):
-        return (False, "xsd:string")
-    val = text.strip()
-    if not val:
-        return (False, "xsd:string")
-    if _XSD_BOOLEAN_RE.match(val):
-        return (True, "xsd:boolean")
-    if _XSD_INTEGER_RE.match(val):
-        return (True, "xsd:integer")
-    if _XSD_DECIMAL_RE.match(val):
-        return (True, "xsd:decimal")
-    if _XSD_DATETIME_RE.match(val):
-        return (True, "xsd:dateTime")
-    if _XSD_DATE_RE.match(val):
-        return (True, "xsd:date")
-    if _XSD_TIME_RE.match(val):
-        return (True, "xsd:time")
-    if _XSD_DURATION_RE.match(val) or _DURATION_LATENCY_RE.match(val):
-        return (True, "xsd:duration")
-    if (
-        _CURRENCY_PREFIX_RE.match(val)
-        or _CURRENCY_SUFFIX_RE.match(val)
-        or _PERCENT_STORAGE_RE.match(val)
-        or _QUANTIFIED_COUNT_RE.match(val)
-    ):
-        return (True, "xsd:string")
-    return (False, "xsd:string")
-
-
-def pool_confidences(*signals: float | None, eps: float = 1e-6) -> float | None:
-    """Logarithmic Opinion Pool (Geometric Mean) over non-None signals in [eps, 1 - eps], or None if all None.
-
-    Invariant: pool_confidences(p, p) == p, pool_confidences(p, None) == p,
-    pool_confidences(None, None) is None.
-    """
-    valid = [float(s) for s in signals if s is not None]
-    if not valid:
-        return None
-    clamped = [min(1.0 - eps, max(eps, s)) for s in valid]
-    log_sum = sum(math.log(s) for s in clamped)
-    return float(math.exp(log_sum / len(clamped)))
-
-
-def bayesian_noisy_or(confidences: Sequence[float | None], *, eps: float = 1e-6) -> float | None:
-    """Compute 1 - prod(1 - c_i) over non-None observations in [eps, 1 - eps], or None if all None.
-
-    Each observation contributes additive Shannon evidence: -log(1 - c_i).
-    """
-    valid = [float(c) for c in confidences if c is not None]
-    if not valid:
-        return None
-    clamped = [min(1.0 - eps, max(eps, c)) for c in valid]
-    prod_complement = 1.0
-    for c in clamped:
-        prod_complement *= 1.0 - c
-    res = 1.0 - prod_complement
-    return float(min(1.0 - eps, max(eps, res)))
+__all__ = [
+    "ChunkPointer",
+    "DaemonStatus",
+    "EmbedFn",
+    "ErrorCode",
+    "HydratedPassage",
+    "QAResult",
+    "YawRuntimeError",
+    "canonical_chunk_span_key",
+    "compute_chunk_int_id",
+    "format_doc_for_embedding",
+    "format_query_for_embedding",
+    "inclusive_end_line",
+    "normalize_entity",
+    "redact_secrets",
+    "render_document_text",
+    "resolve_corpus_path",
+]

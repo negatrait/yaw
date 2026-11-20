@@ -1,5 +1,7 @@
 # Technical Specification: W3C Semantic Cascade & Active EDC Canonicalization (`docs/w3c-improvements.md`)
 
+> **2026-11-13 P2 update:** The former three-stage identity/hierarchy/related cascade described below is historical where it conflicts with this paragraph. Active adjudication uses `JudgeLabels` followed by one `JudgeRelations` enum decision for distinct pairs. A direct fact bypasses identity; direct/shared-role fact evidence constrains the relation to broader, narrower, or related before sampling. BroaderG, broaderI and architectural broaderP remain valid. No post-hoc model token rewrite or synthetic confidence vote is permitted. See [P2 review](reviews/prompt-context-integrity.md) for implementation evidence and remaining gates.
+
 Current scope, 2026-11-08: sections 12 and 13 govern strict `JudgeLabels` identity
 equivalence (`W1`), the Canonical Gemma 4 3-stage cascade without Python token
 overrides or cross-label auto-merge gates (`W2`), universal statement irreflexivity
@@ -11,7 +13,7 @@ time and graph gates. Sections 1–11 retain earlier slice history; graph-wide s
 multi-hop `broader_tc` closure, or Python token-override instructions there are
 superseded by sections 12–13 and the native graph contract. Pinned code: `c98aebe`.
 
-- Controls: [types.py](../yaw/core/types.py), [__init__.py](../yaw/core/__init__.py), [config.py](../yaw/core/config.py), [planner.py](../yaw/daemon/graph/planner.py), [normalization.py](../yaw/daemon/graph/normalization.py), [engine.py](../yaw/daemon/graph/engine.py), [prompts.py](../yaw/daemon/graph/inference/prompts.py), [grammars.py](../yaw/daemon/graph/inference/grammars.py), [adapter.py](../yaw/daemon/graph/inference/adapter.py), [parsers.py](../yaw/daemon/graph/inference/parsers.py), [program.py](../yaw/daemon/graph/inference/program.py), [invariants.py](../yaw/daemon/graph/inference/invariants.py), [components.py](../yaw/daemon/graph/inference/components.py), [evidence.py](../yaw/daemon/graph/storage/evidence.py), [graph_ops.py](../yaw/daemon/graph/storage/graph_ops.py), [shacl.py](../yaw/daemon/graph/storage/shacl.py), [rows.py](../yaw/daemon/graph/storage/rows.py), [synonyms.py](../yaw/daemon/graph/storage/synonyms.py), [__init__.py](../yaw/daemon/graph/storage/__init__.py), [indexing.py](../yaw/daemon/indexing.py), [runtime.py](../yaw/daemon/runtime.py) ([test_architecture.py](../tests/core/test_architecture.py))
+- Controls: [types.py](../yaw/core/types.py), [__init__.py](../yaw/core/__init__.py), [config.py](../yaw/core/config.py), [pipeline.py](../yaw/pipeline.py), [retrieval.py](../yaw/retrieval.py), [runtime.py](../yaw/runtime.py), [test_architecture.py](../tests/core/test_architecture.py) *(historical `yaw/daemon/...` OpenIE/W3C/SHACL modules retired in [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md))*
 - Depends on: [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [graph-storage.md](../.agents/rules/graph-storage.md), [inference.md](../.agents/rules/inference.md), [native-cocoindex-graph.md](native-cocoindex-graph.md), [epistemic-confidence-spec.md](epistemic-confidence-spec.md)
 - Updated with: [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](native-cocoindex-graph.md), [epistemic-confidence-spec.md](epistemic-confidence-spec.md), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md)
 
@@ -19,7 +21,7 @@ superseded by sections 12–13 and the native graph contract. Pinned code: `c98a
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
 | Rules | [graph-storage.md](../.agents/rules/graph-storage.md): `yaw/daemon/graph/*.py`, `yaw/daemon/graph/storage/*.py`; [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
-| Owns code | `yaw/daemon/graph/storage/synonyms.py`, `yaw/daemon/graph/storage/graph_ops.py:canonicalize_entity_labels_edc`, `yaw/daemon/graph/inference/prompts.py:JudgeLabels`, `yaw/daemon/graph/inference/prompts.py:JudgeHierarchy`, `yaw/daemon/graph/inference/prompts.py:JudgeRelated` |
+| Owns code | `yaw/daemon/graph/storage/synonyms.py`, `yaw/daemon/graph/storage/graph_ops.py:canonicalize_entity_labels_edc`, `yaw/daemon/graph/inference/prompts.py:JudgeLabels`, `yaw/daemon/graph/inference/prompts.py:JudgeRelations` |
 | Peers | [native-cocoindex-graph.md](native-cocoindex-graph.md): owns native CocoIndex graph publication, closed-world resource/statement boundary (`§4`), and the paired `64 + 64` vs. `128` acceptance gate; [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk micro-batch source scheduling and runtime lifecycle; [epistemic-confidence-spec.md](epistemic-confidence-spec.md): owns `pool_confidences`, `bayesian_noisy_or`, and `1`-hop S27 confidence resolution; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture; [Epic 3](epic-3-performance.md): owns post-Epic 2 `owl:FunctionalProperty` / `owl:InverseFunctionalProperty` candidate mining, non-transitive `skos:related` walk barriers, and `prov:wasDerivedFrom` co-provenance reinforcement |
 | References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
 | Supersedes / superseded by | Supersedes `synonym-evidence-v1`, single-shot `JudgeSynonyms`, `skos:ConceptScheme` membership, `equivalent: false, alt_label/hidden_label: true` merge branches, `planner.py` Python token overrides (`is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `_is_acronym`) and cross-label auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`), and multi-hop `broader_tc` / `query_broader_tc` / `ConceptShape/broaderTransitiveCapExceeded`; graph-wide staging instructions in §§1–11 are superseded by [native-cocoindex-graph.md](native-cocoindex-graph.md) and §§12–13 |
@@ -74,7 +76,7 @@ All modifications strictly obey the domain containment tree enforced by [`tests/
 ### 3.1 Denormalized Evidence Packet (`yaw/daemon/graph/storage/synonyms.py` & `yaw/core/types.py`)
 
 ```python
-# JSON schema emitted by iter_synonym_evidence ("format": "synonym-evidence-v2"):
+# JSON schema emitted by iter_semantic_evidence ("format": "synonym-evidence-v2"):
 # {
 #   "format": "synonym-evidence-v2",
 #   "pairs": [
@@ -301,13 +303,13 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Scope**:
   1. Refactor [`_Packet`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/daemon/graph/storage/synonyms.py#L19-L197) in `yaw/daemon/graph/storage/synonyms.py` to emit `"format": "synonym-evidence-v2"` containing only `"pairs": [...]` with inline `entity_a`, `entity_b`, `direct_facts` (Rule W1), and `shared_role_facts` (Rule W2: shared `(pred, obj_id)` or `(subj_id, pred)` in `facts`). *(Note: `broader_tc` / `query_broader_tc` was retired on `2026-11-08` under Invariant `W5` in §13 because W3C SKOS `skos:broader` is strictly `1`-hop non-transitive.)*
   2. Update [`SynonymEvidenceBatch.resolve_decisions`](file:///c:/Users/Harri.Ahokas/Documents/yaw/yaw/core/types.py#L204-L242) to resolve alias IDs (`e0`, `e1`) into real `entity_id` values directly from `source_id`/`target_id` or `pair_id` without requiring a `"canonical"` field, and add `SynonymEvidenceBatch.subset(pair_ids)` so downstream cascade stages receive filtered `SynonymEvidenceBatch` packets containing only unresolved pairs.
-  3. Default `iter_synonym_evidence` micro-batch size to `batch_size: int = 6` so each stage prompt stays compact.
+  3. Default `iter_semantic_evidence` micro-batch size to `batch_size: int = 6` so each stage prompt stays compact.
 - **Verifiable Goal**:
   - `uv run --no-sync pytest tests/daemon/graph/storage/test_storage.py -k "synonym" --no-testmon -q` passes 100%, verifying that `"synonym-evidence-v2"` contains zero top-level `"entities"`, `"facts"`, or `"sources"` pointer tables and populates `direct_facts` and `shared_role_facts` (with `"broader_tc"` absent).
 - **Critic Round**:
-  - Delegate to `critic`: verify zero N+1 SQLite queries inside `_Packet` when computing `shared_role_facts`, and verify context-budget halving in `iter_synonym_evidence` preserves all pair fields.
+  - Delegate to `critic`: verify zero N+1 SQLite queries inside `_Packet` when computing `shared_role_facts`, and verify context-budget halving in `iter_semantic_evidence` preserves all pair fields.
 - **Simplification Round**:
-  - Delegate to `simplifier`: remove `_Packet.fact()`, `_Packet.source()`, `_Packet.facts`, `_Packet.sources`, and `_Packet.spans` indirection methods.
+  - Delegate to `implementer`: remove `_Packet.fact()`, `_Packet.source()`, `_Packet.facts`, `_Packet.sources`, and `_Packet.spans` indirection methods.
 - **Deprecated Code Removal**:
   - `git grep -w "synonym-evidence-v1"` returns `0` matches across `yaw/` and `tests/`.
 
@@ -331,7 +333,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: verify `canonicalize_entity_labels_edc` runs inside `write_tx(conn)`, handles entities with only 1 label safely (never leaving an entity with 0 `skos:prefLabel` rows), and introduces zero SHACL S13 regressions.
 - **Simplification Round**:
-  - Delegate to `simplifier`: streamline SQL aggregation of `chunk_count` and `chunks.title` into a single batched query.
+  - Delegate to `implementer`: streamline SQL aggregation of `chunk_count` and `chunks.title` into a single batched query.
 - **Deprecated Code Removal**:
   - Remove redundant post-merge label fixup branches superseded by `canonicalize_entity_labels_edc`.
 
@@ -358,7 +360,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: verify that the GBNF grammars strictly constrain `"reasoning"` before the boolean fields, reject empty reasoning strings (`char{1,360}`), and wire all three signatures cleanly in `YawGBNFAdapter` and `invariants.py`.
 - **Simplification Round**:
-  - Delegate to `simplifier`: ensure all three GBNF functions share `_build_pair_boolean_grammar` (~25 lines total) and all three parser functions share common `pair_id` + `reasoning` validation.
+  - Delegate to `implementer`: ensure all three GBNF functions share `_build_pair_boolean_grammar` (~25 lines total) and all three parser functions share common `pair_id` + `reasoning` validation.
 - **Deprecated Code Removal**:
   - Remove `JudgeSynonyms`, `DSPY_SEMANTIC_JUDGE_GBNF_GRAMMAR`, `build_dspy_semantic_judge_grammar`, `parse_synonym_decisions`, and `semantic_judge_tokens` from `prompts.py`, `grammars.py`, `parsers.py`, `adapter.py`, `invariants.py`, and `__init__.py`.
 
@@ -398,7 +400,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 - **Critic Round**:
   - Delegate to `critic`: audit the end-to-end cascade in `program.py`, `diagnostics.py`, `optimizer.py`, `engine.py`, and `planner.py` for short-circuit completeness, per-stage cache isolation, GEPA predictor registration, per-stage audit trails/tokens, and domain boundary compliance.
 - **Simplification Round**:
-  - Delegate to `simplifier`: remove all legacy `"canonical"` string matching branches and unify per-stage execution/caching into a single clean helper.
+  - Delegate to `implementer`: remove all legacy `"canonical"` string matching branches and unify per-stage execution/caching into a single clean helper.
 - **Deprecated Code Removal**:
   - Verify `git grep -w` returns `0` matches across the entire repository (`yaw/`, `tests/`, `scripts/`) for all retired symbols in the Oblivion Demolition Table below.
 
@@ -428,7 +430,7 @@ Each slice below is scoped to 1–3 production files so a `flash` model can impl
 For each slice (`Slice 1` $\to$ `Slice 2` $\to$ `Slice 3` $\to$ `Slice 4`):
 1. **Implementer (`flash` subagent)**: Writes real-substrate tests (`tmp_path`, real SQLite `yaw.db`) and minimal implementation for that slice's files.
 2. **Critic (`critic` subagent)**: Audits the slice against W3C SKOS/OWL invariants, GEPA predictor registration, per-stage cache/trail isolation, domain boundaries, and zero fallbacks.
-3. **Simplifier (`simplifier` subagent)**: Resolves all Critic findings, removes dead code, and verifies the slice's Oblivion Gate (`git grep -w` == 0).
+3. **Implementer (`implementer` subagent)**: Resolves all Critic findings, removes dead code, and verifies the slice's Oblivion Gate (`git grep -w` == 0).
 
 ### Mandatory Quality Gates (End of Each Slice & Final Completion)
 ```powershell
@@ -625,7 +627,7 @@ Empirical audit of `.yaw/yaw_optimize_20261107_110501.db` (`703` published chunk
 
 | Behavior relied on | Locked version | Probe | Pass criterion | Stop rule |
 | --- | --- | --- | --- | --- |
-| `CG-W3C-1`: `build_dspy_label_judge_grammar` (`max_reasoning_chars=360` `[target]`) and `parse_label_decisions` enforce `merge(A, B) <=> equivalent=true` without exceeding `SynonymRequestBudget` | `dspy == 3.1.2` `[measured: uv.lock, c98aebe]` | `tests/daemon/graph/inference/test_parsers.py::test_label_judge_grammar_and_parser_forbid_non_equivalent_merges` | Grammar requires `"equivalent": false` to close immediately without `alt_label`/`hidden_label` and `"equivalent": true` to include `"definition"` and `"hidden_label"`; parser maps `equivalent=False` to `relation=None`; `SynonymRequestBudget` reserves `360`-char `[target]` reasoning per pair | Stop and amend this spec with the evidence |
+| `CG-W3C-1`: `build_dspy_label_judge_grammar` (`max_reasoning_chars=360` `[target]`) and `parse_label_decisions` enforce `merge(A, B) <=> equivalent=true` under the configured semantic pair-count limit | `dspy == 3.1.2` `[measured: uv.lock, c98aebe]` | `tests/daemon/graph/inference/test_parsers.py::test_label_judge_grammar_and_parser_forbid_non_equivalent_merges` | Grammar requires `"equivalent": false` to close immediately without `alt_label`/`hidden_label` and `"equivalent": true` to include `"definition"` and `"hidden_label"`; parser maps `equivalent=False` to `relation=None`; judgment grammar bounds reasoning to `360` characters per pair; the provider enforces actual token capacity | Stop and amend this spec with the evidence |
 | `CG-W3C-2`: Tier `3` `[target]` deterministic synthesis in `canonicalize_fact_definitions` + irreflexive literal filtering + `1`-hop non-transitive `ConceptShape/S27-disjointBroaderRelated` heals `.yaw/yaw_optimize_20261107_110501.db` (`703` `[observed: .yaw/yaw_optimize_20261107_110501.db, 50be17d]` chunks) with `0` `[target]` SHACL violations and `0` `[target]` LLM healer calls | `sqlite-vec == 0.1.9`, `cocoindex == 1.1.0` `[measured: uv.lock, c98aebe]` | `tests/daemon/graph/test_evidence_revisions.py::test_deterministic_fact_definition_synthesis_and_irreflexive_literal_pruning` | `lint_graph_shacl(mem_conn) == []`, `validate_graph_state(mem_conn)` passes, `15` `[target]` pseudo-reflexive literal facts are pruned from `facts` with `fact_assertions.fact_id IS NULL` preserved, `2`-hop `skos:broader` + `skos:related` chains produce `0` `[target]` S27 violations, and `0` `[target]` `heal_shacl_violations` calls are triggered on endpoint-duplicating `spo_def` | Stop and amend this spec with the evidence |
 
 | Retired item | Location (`c98aebe`) | Replacement or "none" | Exit check |

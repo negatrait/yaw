@@ -1,35 +1,44 @@
-"""Unit tests for yaw.core.types frozen dataclasses and pure coordinate/ID helpers."""
+"""Unit tests for yaw.core.types frozen dataclasses, live ErrorCode, and pure ID/formatting helpers."""
+
+from __future__ import annotations
 
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
+import yaw.core.types as core_types
 from yaw.core.types import (
     ChunkPointer,
+    DaemonStatus,
+    ErrorCode,
     HydratedPassage,
-    OpenIERecord,
-    RetrievalResult,
-    compute_chunk_id,
-    compute_mdhash_id,
-    detect_scalar_literal,
+    QAResult,
+    YawRuntimeError,
+    canonical_chunk_span_key,
+    compute_chunk_int_id,
+    format_doc_for_embedding,
+    format_query_for_embedding,
     inclusive_end_line,
+    normalize_entity,
+    redact_secrets,
+    render_document_text,
     resolve_corpus_path,
-    text_processing,
 )
 
 
 class TypesTests(unittest.TestCase):
     def test_chunk_pointer_invariants(self):
         pointer = ChunkPointer(
-            chunk_id="chunk-1",
-            rel_posix_path="docs/sample.md",
+            chunk_id=1,
+            rel_path="docs/sample.md",
+            source_hash="hash",
             start_line=1,
             end_line=25,
             title="Sample Title",
         )
-        self.assertEqual(pointer.chunk_id, "chunk-1")
+        self.assertEqual(pointer.chunk_id, 1)
         self.assertEqual(pointer.rel_posix_path, "docs/sample.md")
         self.assertEqual(pointer.start_line, 1)
         self.assertEqual(pointer.end_line, 25)
@@ -37,15 +46,16 @@ class TypesTests(unittest.TestCase):
 
         # Frozen contract
         with self.assertRaises((FrozenInstanceError, AttributeError)):
-            pointer.start_line = 2  # type: ignore
+            cast(Any, pointer).start_line = 2
 
         # Slots contract (no __dict__)
         self.assertFalse(hasattr(pointer, "__dict__"))
 
         # Value equality & hashing
         pointer2 = ChunkPointer(
-            chunk_id="chunk-1",
-            rel_posix_path="docs/sample.md",
+            chunk_id=1,
+            rel_path="docs/sample.md",
+            source_hash="hash",
             start_line=1,
             end_line=25,
             title="Sample Title",
@@ -55,7 +65,7 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(len({pointer, pointer2}), 1)
 
     def test_hydrated_passage_invariants(self):
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
+        pointer = ChunkPointer(1, "p.md", "hash", 1, 10, title="Title")
         passage = HydratedPassage(pointer=pointer, text="Hello world", score=0.95)
         self.assertEqual(passage.pointer, pointer)
         self.assertEqual(passage.text, "Hello world")
@@ -66,124 +76,119 @@ class TypesTests(unittest.TestCase):
         self.assertTrue(stale_passage.stale_on_disk)
 
         with self.assertRaises((FrozenInstanceError, AttributeError)):
-            passage.score = 1.0  # type: ignore
+            cast(Any, passage).score = 1.0
         self.assertFalse(hasattr(passage, "__dict__"))
 
-    def test_openie_record_invariants(self):
-        record = OpenIERecord(
-            chunk_id="c1",
-            entities=("Apple", "California"),
-            triples=(("Apple", "headquartered in", "California"),),
-        )
-        self.assertEqual(record.chunk_id, "c1")
-        self.assertEqual(record.entities, ("Apple", "California"))
-        self.assertEqual(record.triples, (("Apple", "headquartered in", "California"),))
-
-        with self.assertRaises((FrozenInstanceError, AttributeError)):
-            record.chunk_id = "c2"  # type: ignore
-        self.assertFalse(hasattr(record, "__dict__"))
-
-    def test_retrieval_result_invariants(self):
-        pointer = ChunkPointer("c1", "p.md", 1, 10, "Title")
+    def test_qa_result_and_daemon_status_contracts(self):
+        pointer = ChunkPointer(1, "p.md", "hash", 1, 10)
         passage = HydratedPassage(pointer=pointer, text="Hello world", score=0.95)
-        result = RetrievalResult(question="What is this?", passages=(passage,))
-        self.assertEqual(result.question, "What is this?")
+        result = QAResult("What is this?", "A greeting.", ("p.md:1-10",), (passage,))
+        self.assertEqual(result.citations, ("p.md:1-10",))
         self.assertEqual(result.passages, (passage,))
-        self.assertIsNone(result.answer)
+        status = DaemonStatus(lifecycle="ready", provider_ready=True, num_chunks=2)
+        self.assertEqual(status.to_dict()["num_chunks"], 2)
 
-        result_with_answer = RetrievalResult(question="What is this?", passages=(passage,), answer="This is a test.")
-        self.assertEqual(result_with_answer.answer, "This is a test.")
-
-        with self.assertRaises((FrozenInstanceError, AttributeError)):
-            result.answer = "mutated"  # type: ignore
-        self.assertFalse(hasattr(result, "__dict__"))
-
-    def test_compute_mdhash_id_and_chunk_id(self):
-        content = "test text"
-        raw_hash = compute_mdhash_id(content)
-        self.assertEqual(len(raw_hash), 32)
-        prefixed = compute_mdhash_id(content, prefix="entity-")
-        self.assertTrue(prefixed.startswith("entity-"))
-        self.assertEqual(prefixed, f"entity-{raw_hash}")
-
-        chunk_id = compute_chunk_id("doc.md", 1, 10, content)
-        self.assertTrue(chunk_id.startswith("chunk-"))
-        self.assertEqual(len(chunk_id), 38)  # len("chunk-") + 32 hex
+    def test_chunk_int_ids_are_deterministic_and_include_source_coordinates(self):
+        cid = compute_chunk_int_id("doc.md", 1, 10, source_hash="hash")
+        self.assertEqual(cid, compute_chunk_int_id("doc.md", 1, 10, source_hash="hash"))
+        self.assertNotEqual(cid, compute_chunk_int_id("doc.md", 2, 10, source_hash="hash"))
+        self.assertNotEqual(cid, compute_chunk_int_id("doc.md", 1, 10, char_start=1, char_end=5, source_hash="hash"))
+        self.assertTrue(0 < cid < (1 << 63))
+        self.assertEqual(canonical_chunk_span_key("a\\b.md", 1, 3, 2, 10, "h"), "a/b.md:1:3:2:10:h")
 
     def test_inclusive_end_line(self):
-        # When end_column == 1 and end_line > start_line, slice ended at trailing newline
         self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=1), 4)
-        # When end_line == start_line, never decrement below start_line
         self.assertEqual(inclusive_end_line(start_line=1, end_line=1, end_column=1), 1)
-        # When end_column > 1, slice ended midway on end_line
         self.assertEqual(inclusive_end_line(start_line=1, end_line=5, end_column=15), 5)
 
-    def test_resolve_corpus_path_and_to_rel_posix_path(self):
+    def test_resolve_corpus_path_and_rejection(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir).resolve()
             sub = root / "nested" / "doc.md"
             sub.parent.mkdir(parents=True)
             sub.write_text("content", encoding="utf-8")
 
-            # Valid resolution
             resolved = resolve_corpus_path(root, "nested/doc.md")
             self.assertEqual(resolved, sub)
 
-            # Traversal attempt rejection
             with self.assertRaises(ValueError):
                 resolve_corpus_path(root, "../outside.txt")
 
-    def test_text_processing(self):
-        self.assertEqual(text_processing("Apple Inc."), "apple inc")
-        self.assertEqual(text_processing("Radio-City (FM Station) #1!"), "radio city fm station 1")
-        self.assertEqual(text_processing("   Multiple   Spaces   and   Tabs\t\n"), "multiple spaces and tabs")
-        self.assertEqual(text_processing("123 numbers & Symbols_underscore"), "123 numbers symbols underscore")
-        self.assertEqual(text_processing("C++"), "c++")
-        self.assertEqual(text_processing("C#"), "c#")
-        self.assertEqual(text_processing("F#"), "f#")
-        self.assertEqual(text_processing("#1!"), "1")
-        self.assertEqual(text_processing("Python 3.10"), "python 3.10")
-        self.assertEqual(text_processing("19.5.1995"), "19.5.1995")
-        self.assertEqual(text_processing("2026-10-25"), "2026-10-25")
-        self.assertEqual(text_processing("99.9%"), "99.9%")
-        self.assertEqual(text_processing("8080/tcp"), "8080/tcp")
-        self.assertEqual(text_processing("12:30:00"), "12:30:00")
-        self.assertEqual(text_processing("skos:broader"), "skos:broader")
-        self.assertEqual(text_processing("UTF-8"), "utf-8")
-        self.assertEqual(text_processing("ISO-8601"), "iso-8601")
-        self.assertEqual(text_processing("v1.2-beta"), "v1.2-beta")
-        self.assertEqual(text_processing("Node.js"), "node.js")
-        self.assertEqual(text_processing(""), "")
-        self.assertEqual(text_processing(42), "42")
+    def test_live_error_codes_redaction_and_embedding_formatters(self):
+        codes = set(get_args(ErrorCode))
         self.assertEqual(
-            text_processing(["Apple Inc.", "Google LLC", "C++", "C#"]),
-            ["apple inc", "google llc", "c++", "c#"],
+            codes,
+            {
+                "BUSY",
+                "CONSISTENCY_ERROR",
+                "EMPTY_INDEX",
+                "INDEX_NOT_READY",
+                "INVALID_INPUT",
+                "MODEL_ERROR",
+                "NOT_READY",
+                "SHUTTING_DOWN",
+            },
         )
+        err = YawRuntimeError("INVALID_INPUT", "bad input")
+        self.assertEqual(str(err), "[INVALID_INPUT] bad input")
 
-    def test_detect_scalar_literal_xsd_datatypes(self):
-        self.assertEqual(detect_scalar_literal("true"), (True, "xsd:boolean"))
-        self.assertEqual(detect_scalar_literal("FALSE"), (True, "xsd:boolean"))
-        self.assertEqual(detect_scalar_literal("8080"), (True, "xsd:integer"))
-        self.assertEqual(detect_scalar_literal("-42"), (True, "xsd:integer"))
-        self.assertEqual(detect_scalar_literal("+100"), (True, "xsd:integer"))
-        self.assertEqual(detect_scalar_literal("3.14159"), (True, "xsd:decimal"))
-        self.assertEqual(detect_scalar_literal("-0.5"), (True, "xsd:decimal"))
-        self.assertEqual(detect_scalar_literal("2026-10-25"), (True, "xsd:date"))
-        self.assertEqual(detect_scalar_literal("2026-10-25T12:30:00Z"), (True, "xsd:dateTime"))
-        self.assertEqual(detect_scalar_literal("2026-10-25 12:30:00+02:00"), (True, "xsd:dateTime"))
-        self.assertEqual(detect_scalar_literal("12:30:00"), (True, "xsd:time"))
-        self.assertEqual(detect_scalar_literal("12:30:00Z"), (True, "xsd:time"))
-        self.assertEqual(detect_scalar_literal("12:30:00+02:00"), (True, "xsd:time"))
-        self.assertEqual(detect_scalar_literal("14:30"), (True, "xsd:time"))
-        self.assertEqual(detect_scalar_literal("2:30 pm"), (True, "xsd:time"))
-        self.assertEqual(detect_scalar_literal("15ms"), (True, "xsd:duration"))
-        self.assertEqual(detect_scalar_literal("10s"), (True, "xsd:duration"))
-        self.assertEqual(detect_scalar_literal("2 min"), (True, "xsd:duration"))
-        self.assertEqual(detect_scalar_literal("PT15M"), (True, "xsd:duration"))
-        self.assertEqual(detect_scalar_literal("P1D"), (True, "xsd:duration"))
-        self.assertEqual(detect_scalar_literal("v1.2.3"), (False, "xsd:string"))
-        self.assertEqual(detect_scalar_literal("99.9%"), (True, "xsd:string"))
-        self.assertEqual(detect_scalar_literal("NetSuite"), (False, "xsd:string"))
-        self.assertEqual(detect_scalar_literal(""), (False, "xsd:string"))
-        non_str: Any = None
-        self.assertEqual(detect_scalar_literal(non_str), (False, "xsd:string"))
+        self.assertEqual(normalize_entity("  New   York "), "new york")
+        masked = redact_secrets(
+            "Bearer abc123 sk-secret123456 https://user:pass@host/api api_key=tok_99 my-raw-secret",
+            "my-raw-secret",
+        )
+        self.assertNotIn("abc123", masked)
+        self.assertNotIn("sk-secret123456", masked)
+        self.assertNotIn("user:pass", masked)
+        self.assertNotIn("tok_99", masked)
+        self.assertNotIn("my-raw-secret", masked)
+
+        self.assertEqual(render_document_text("Doc", "Body"), "Doc\nBody")
+        self.assertEqual(format_query_for_embedding("who?"), "task: question answering | query: who?")
+        self.assertEqual(format_doc_for_embedding("Body", title="Doc"), "title: Doc | text: Body")
+
+    def test_retired_legacy_types_removed(self):
+        expected_all = [
+            "ChunkPointer",
+            "DaemonStatus",
+            "EmbedFn",
+            "ErrorCode",
+            "HydratedPassage",
+            "QAResult",
+            "YawRuntimeError",
+            "canonical_chunk_span_key",
+            "compute_chunk_int_id",
+            "format_doc_for_embedding",
+            "format_query_for_embedding",
+            "inclusive_end_line",
+            "normalize_entity",
+            "redact_secrets",
+            "render_document_text",
+            "resolve_corpus_path",
+        ]
+        self.assertEqual(core_types.__all__, expected_all)
+        for retired in (
+            "json_document_fields",
+            "FatalGraphPublicationError",
+            "TextChunk",
+            "Entity",
+            "Triple",
+            "Quad",
+            "ExtractionRecord",
+            "DropReason",
+            "PassMetrics",
+            "AxiomViolation",
+            "ValidationSummary",
+            "ManifoldDiagnostics",
+            "OntologySummary",
+            "PipelineResult",
+            "DatasetStats",
+            "ChunkMetadata",
+            "RecallHit",
+            "RecallResult",
+            "EvalQuestionResult",
+            "EvalAggregate",
+            "compute_chunk_id",
+            "stable_hash_id",
+        ):
+            self.assertFalse(hasattr(core_types, retired), f"Retired symbol {retired} still present")

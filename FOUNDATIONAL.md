@@ -2,120 +2,54 @@
 
 ## 1. Purpose
 
-YAW is a native HippoRAG 2-style retrieval engine built around a single SQLite database.
+`yaw` is a local, zero-LLM-index multi-hop retrieval engine and QA runtime built on SQLite (`sqlite-vec` + contentless `FTS5`).
 
-The project exists to reproduce or exceed HippoRAG 2 retrieval quality with a smaller, inspectable, locally operable architecture. YAW owns its ingestion, storage, retrieval, graph traversal, inference orchestration, and source hydration.
+- **Tier 0 — Primary Librarian Surface (`recall`):** Queries local corpora with **zero generative LLM dependency** (`yaw/retrieval.py`), returning verified disk spans, multi-hop entity/AST evidence routes, and SHA-256 staleness flags (`VectorSearch`).
+- **Tier 1 — Benchmark QA Harness (`qa`, `optimize dspy`, `optimize optuna`):** Optional local SLM reader (`dspy.ReAct` + `dspy.GEPA`, `temperature=1.0` unconditionally) and `optuna` hyperparameter tuner used for academic EM/F1 benchmarking (`PopQA`, `MuSiQue`, `HotpotQA`, `2WikiMultiHopQA`) and interactive multi-hop synthesis (`yaw/qa.py`, `yaw/optimize.py`).
 
-YAW is not a wrapper around HippoRAG. Upstream HippoRAG is a behavioral and benchmark reference only.
+Upstream `HippoRAG 2` and `Youtu-GraphRAG` are external benchmark baselines only (`0` `hipporag` imports anywhere in `yaw/`, `scripts/`, or `tests/`).
 
-## 2. Success Criteria
+## 2. Non-Goals & Retired Stack
 
-YAW succeeds only when it demonstrates all of the following:
+`yaw` does **not** provide backward-compatibility shims, multi-backend storage abstractions, imperative SQLite bypass writers, speculative configuration knobs, wrapper subclasses (`dspy.Module`, `dspy.BaseLM`, `dspy.Adapter`), or fallback retrieval paths.
 
-1. **Retrieval quality**
-   - Tier 1 benchmark parity during Epic 1 development.
-   - Tier 2 full-corpus parity or better before Epic 1 acceptance.
-2. **Native implementation**
-   - No `hipporag` imports in production code, benchmarks, scripts, or tests.
-   - No hidden delegation to an upstream HippoRAG runtime.
-3. **Architectural containment**
-   - Each domain owns its implementation and internal dependencies.
-   - Shared code is limited to genuinely domain-neutral primitives in `yaw.core`.
-   - Cross-domain imports are rejected by automated tests.
-4. **Operational simplicity**
-   - One runtime.
-   - One authoritative database.
-   - One database writer.
-   - Explicit failures instead of silent degradation.
-5. **Traceable evidence**
-   - Evaluation records distinguish setup success from retrieval and inference correctness.
-   - Acceptance claims are supported by reproducible benchmark outputs.
-   - Architectural and schema cutovers are complete only when all runtime lifecycles, callers, and telemetry consumers (`scripts/watchdog.py`) are wired to the active schema and verified end-to-end.
+The following remain permanently retired unless controlled benchmarks prove material gains justifying their dependency weight:
+`rdflib`, OWL 2 RL, `pySHACL`, LLM OpenIE triple/ontology extraction, GBNF grammars, `skos:ConceptScheme`, `dspy.RLM` / Deno WASM REPL, and legacy `yaw/daemon/**`. *(Note: `spacy` with `en_core_web_sm` remains active for noun-phrase bridging in `yaw/retrieval.py` until superseded by the post-`CS-6` sprint.)*
 
-Passing unit tests alone does not establish benchmark parity or system acceptance.
+## 3. Package Boundaries
 
-## 3. Non-Goals
-
-YAW does not aim to provide:
-
-- Backward compatibility with abandoned internal APIs.
-- A compatibility layer for HippoRAG.
-- A general-purpose ontology platform.
-- Multiple interchangeable storage backends.
-- Distributed ingestion or storage.
-- Silent fallbacks between retrieval or inference paths.
-- Abstractions created only for possible future use.
-
-The following technologies remain retired unless controlled benchmarks demonstrate a material improvement:
-
-- `rdflib`
-- OWL 2 RL
-- `pySHACL`
-- spaCy-based ontology processing
-
-A benchmark improvement must justify the additional dependency, complexity, runtime cost, and maintenance burden.
-
-## 4. System Model
-
-YAW consists of five conceptual capabilities:
-
-1. **Ingestion**
-   - Observes corpus changes through OS event-driven CocoIndex (`localfs.walk_dir(..., live=True)`).
-   - Streams ingestion and candidate indexing in dataset-agnostic, bounded micro-batches (`64` chunks per `app.update()` cycle) so heap/VRAM usage stays flat and `yaw.db` publishes incremental graph state every 64 chunks. Never encode benchmark presets or train/val splits in production ingestion.
-   - Persists CocoIndex LMDB memoization state (`coco.Settings(db_path=...)`) in a shared, content-addressed cache across runs—never tied to transient per-run database filenames.
-2. **Storage**
-   - Incremental publication reuses unchanged validated contributions and evidence-keyed adjudications. Its input checkpoint commits with the graph; unresolved SHACL violations abort publication. For fixed evidence, 64+64 and 128 chunks must yield the same canonical graph with comparable cumulative compute, as specified in [native graph publication](docs/native-cocoindex-graph.md). Existing graph-wide staging is an unfinished cutover, not accepted target behavior.
-   - Persists source metadata, text, graph data, vectors, and lexical indexes in `yaw.db`.
-   - Declares every SQLite table and `sqlite-vec` `vec0` index through typed CocoIndex targets (`TableSchema.from_class`), with one writer and no competing imperative `upsert_*` sinks.
-3. **Retrieval & Ontology**
-   - Produces lexical, vector, and graph-derived evidence using sparse CSR matrices and Forward-Push Personalized PageRank.
-   - Maintains closed-world W3C concept/entity semantics, source-supported facts and relations, and revisable canonical identities across documents and ingestion batches. Legitimate semantic islands are allowed; incomplete documents are not reported as semantically complete.
-   - Removes `skos:ConceptScheme` and all scheme clustering, storage, inference, embeddings and retrieval/QA/telemetry consumers from the current implementation target. Reintroduction requires a separate experiment proving held-out Recall@N, EM or F1 improvement against the scheme-free baseline with acceptable compute, memory and other quality metrics.
-4. **Inference**
-   - NER alone discovers and defines resources: particular `owl:NamedIndividual` instances and general `skos:Concept` categories. Resource labels require lexical content (letters); pure numbers, codes, dates, and scalar measurements remain literals (`rdfs:Literal`).
-   - Triple extraction selects existing NER resources as subjects/resource objects and discovers literal objects while expressing passage-supported `rdf:Statement` facts. Triples may point to literals as objects (`owl:DatatypeProperty`), but `rdf:subject` can never be a literal. Statements are strictly irreflexive per resource sense.
-   - Three-layer parity: GBNF grammar, extraction parsers, and SQLite SHACL shapes enforce identical resource and statement contracts. Every parser-accepted record must normalize, bind, and publish without dropped statements.
-   - Uses native DSPy interfaces (`dspy.LM`, `dspy.Embedder`, `dspy.Signatures`, `dspy.RLM`, `dspy.GEPA`) and treats model services as external dependencies.
-   - Defaults LLM extraction and reasoning admission strictly to `parallel = 1` (`Semaphore(1)`) to respect local `llama.cpp` single-slot VRAM bounds, while batching dense embeddings (`max_batch_size = 64`).
-   - Enforces sampling temperatures $\ge 0.3$ (defaulting to $0.35$ for extraction and QA, up to $0.7$–$0.8$ for reflection) on small local models to avoid looping; temperatures below $0.3$ are prohibited.
-5. **Runtime**
-   - Coordinates ingestion, retrieval, inference, and source hydration in `yaw/daemon/runtime.py`.
-   - Exposes one application-level API used by transports and evaluation.
-
-Transport adapters do not contain application logic.
-
-## 5. Repository Boundaries
-
-The implementation is contained within:
+All production code lives inside a flat 14-file boundary:
 
 ```text
-
 yaw/
-
-├── core/
-└── daemon/
-    ├── ingestion/
-    └── graph/
-        ├── storage/
-        └── inference/
-
+├── core/        # __init__.py, config.py, logger.py, types.py (Python stdlib only; 0 ML/DB imports)
+└── *.py         # __init__, __main__, cli, datasets, mcp_server, optimize, pipeline, qa, retrieval, runtime
 ```
 
-## 6. Failure Policy
+- Modules never import another module's `_private` symbols or access foreign `_` attributes.
+- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic; `mcp_server.py` serves Streamable HTTP on loopback `127.0.0.1:13306/mcp` with `/healthz`, `/readyz`, pre-dispatch `Host`/`Origin` `403`, and exact `3` read-only tools (`recall`, `qa`, `daemon_status`).
+- `cli.py` lazy-imports `optimize.py` inside optimization subcommands so Tier-0 commands run standalone outside a git checkout.
 
-Until YAW is feature complete, every failure is a hard failure.
+## 4. System Invariants
 
-- DSPy's native retry policy is the only retry mechanism for transient model-service errors.
-- When those retries are exhausted, or a model service is unavailable, the operation aborts with the original error. Nothing is skipped, defaulted or degraded.
-- Graph publication failures abort immediately: during optimization, publication errors escape evaluation wrappers (`FatalGraphPublicationError` subclasses `BaseException`) and abort the optimizer with the original exception rather than looping or repeatedly retrying failed indexing.
-- Fallbacks, degraded modes and recovery paths are out of scope until the core pipeline is complete. Each is then introduced as an explicit, scoped decision, with tests that exercise the failure it handles.
+1. **Declarative Ingestion (`yaw/pipeline.py`):**
+   - Sole writer to `.yaw/yaw.db` via event-driven CocoIndex (`localfs.walk_dir(..., live=live)`), per-`db_path` `app_name`, native `CodeSource`/`RecursiveSplitter` (`included_patterns` / `chunk_size` UTF-8 byte cap), configurable `embed_batch_size` + `embed_max_in_flight`, and persistent content-addressed `.yaw/coco_lmdb` memoization.
+   - Mounts `chunks` (`vec0` cosine KNN + source spans + token/entity metadata, `0` raw chunk text) and contentless `chunk_fts` (`fts5` via `_FtsTableHandler`). Native dataset bundles export directly to `.md` files (`<idx>.md`, `# Title` headings) and index without duplicate JSON-to-text re-staging.
+2. **Pointer-Only Disk Hydration (`yaw/retrieval.py`):**
+   - `yaw.db` stores 1-indexed `(rel_posix_path, start_line, end_line)`, character offsets `(char_start, char_end)`, and SHA-256 `source_hash`—never authoritative copies of corpus text.
+   - Passages hydrate pure line/character spans uniformly from disk at query time (`max_chars=None` uncropped by default, `pool_k = max(top_k * 4, 50)` before span deduplication, zero serde JSON reparsing): missing or hash-mismatched files return `stale_on_disk = True` with `text = ""`.
+3. **Zero-LLM Hybrid Ranking (`yaw/retrieval.py`):**
+   - Combines `sqlite-vec` dense KNN, `FTS5` `ORDER BY bm25(...) ASC LIMIT ?`, and SciPy entity-chunk PPR (`VectorSearch`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), hot-swapping outside `index_lock` via `PRAGMA data_version`.
+4. **Runtime Concurrency & Native Tool Calling (`yaw/runtime.py`, `yaw/qa.py`, `yaw/optimize.py`):**
+   - `recall` runs under `BoundedSemaphore(32)` over `?mode=ro` SQLite connections with zero LM endpoint dependency.
+   - Bare `dspy.ReAct` QA and `dspy.GEPA` instruction proposal declare `ProviderDefinition.chat` (`ModelSupport(function_calling=True)`) via `dspy.lm15.register_provider`, enforce `tool_choice="required"`, serialize under `Semaphore(1)`, run student and GEPA reflection at `temperature=1.0` unconditionally, and validate inline `[chunk_id=<int>]` citations strictly against non-`submit` tool observations (`0` SQLite writes during QA).
 
-At this stage a fallback hides defects and corrupts benchmark evidence. A visible failure is more useful than a run that completes.
+## 5. Failure Policy & Acceptance Criteria
 
-## 7. Further Context
+- **Fail-Fast Semantics:** Transient model-service retries use `dspy.LM(num_retries=...)` exclusively. Exhausted retries, SQLite operational errors, invalid TOML config, or invariant violations abort immediately with the original exception or typed `YawRuntimeError("[CODE]", ...)`—zero silent catch-and-continue, negative clamping, or degraded fallback loops.
+- **Evidence-Gated Acceptance:** Unit/integration tests exercise real SQLite/CocoIndex/FastMCP/filesystem substrates without mocks. Cutovers are complete only when callers, CLI/MCP surfaces, and telemetry (`scripts/watchdog.py`) pass whole-repo quality gates cleanly.
 
-- [HippoRAG (`2405.14831v3`)](docs/arxiv-2405.14831v3-hipporag.md)
-- [HippoRAG 2 (`2502.14802v1`)](docs/arxiv-2502.14802v1-hipporag2.md)
-- [Epic 1: Native `yaw.db` Engine & CocoIndex Daemon](docs/epic-1-hipporag-daemon.md) — Core engine & clean-slate 7-dataset slice-based paper parity decision gate
-- [Epic 2: FastMCP Streamable HTTP Adapter](docs/epic-2-fastmcp-http.md) — Feature completion (Streamable HTTP transport, daemon lifespan, 5 MCP tools, source freshness citations)
-- [Epic 3: Performance, Symbolic Pruning & Full-Corpus Scale](docs/epic-3-performance.md) — Post-Epic 2 W3C/OWL/SKOS/PROV-O symbolic distractor pruning, novel DSPy retrieval/QA experiments, demoscene execution speed, radical codebase reduction, and full-corpus multi-day holdout benchmarks
+## 6. Governing Specs
+
+- Active clean-slate sprint ledger (`CS-0`..`CS-6`): [docs/reviews/bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) *(queued post-`CS-6` next sprint: [docs/reviews/mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md))*
+- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where older epic text references pre-cutover OpenIE/SHACL/PPR details, §§1–5 above take precedence)*.

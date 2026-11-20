@@ -611,6 +611,12 @@ Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM o
 
 ## 34. Evidence-driven native GEPA reflection replacement (2026-10-23)
 
+Historical evidence below describes the former tokenizer guard. As of 2026-11-13,
+`reflection_input_chars` bounds formatted requests (65536 characters by default),
+semantic packets use configured pair limits, and provider context errors abort.
+Serving tokenizer discovery and its injection APIs are retired. Current evidence
+is recorded in [the backend review](reviews/inference-backend.md).
+
 Implemented the accepted replacement: original training traces stay in the RLM
 sandbox; the selector returns validated example/field/span references and a short
 diagnosis; DSPy's native `InstructionProposer` is the sole instruction writer.
@@ -1006,7 +1012,7 @@ Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `
   - `select_pareto_frontier_programs` filters strictly non-dominated candidates from `compiled.detailed_results`, deduplicates by query-time predictors (`query_intent`, `triple_filter`, `qa.predict`), and assigns Slot 0 (`best_candidate`), Slot 1 (`recall@N` Pareto leader), and Slot 2 (`QA (F1, EM)` Pareto leader), falling back to `<stem>_telemetry/pareto_member_*.json` when loaded from disk.
   - `reduce_pareto_predictions` delegates directly to `dspy.majority(list(predictions))` when any prediction has a non-empty `answer`, and fuses retrieval rankings via `rrf_fuse_passage_lists` (`1 / (60 + r)` + min-max normalized PPR scores) when all predictions have `answer == ""` (`retrieve_only=True`).
   - `compile_pareto_ensemble` unconditionally returns `dspy.Ensemble(reduce_fn=reduce_pareto_predictions).compile(programs)`.
-  - `promote_compiled_program` and `sync_pareto_telemetry_siblings` atomically synchronize `<stem>_telemetry/pareto_member_*.json` and `pareto_frontier_manifest.json` across `evolve_prompts` and `yaw dspy load-program`.
+  - `promote_compiled_program` and `sync_pareto_telemetry_siblings` atomically synchronize `<stem>_telemetry/pareto_member_*.json` and `pareto_frontier_manifest.json` across `evolve_prompts` and `yaw dspy load`.
   - `evaluate_program` evaluates `compile_pareto_ensemble(program)` and attaches `recall_at_k` (`1, 2, 5, 10, 20`) alongside `em`, `f1`, and `score`.
 - **Read-only graph index & retrieval memoization (`yaw/daemon/graph/engine.py`, `yaw/daemon/runtime.py`)**: `YawGraphEngine._canonical_retrieval_hook` memoizes post-optimization query retrievals by `(question, k, query_retrieval_fingerprint(active_program))` while replaying extraction traces when `_in_optimization` or `item_docs` is active. `YawRuntime._run_retrieve`, `YawRuntime._run_qa`, and `YawRuntime.benchmark` route unconditionally through `engine.ensemble`.
 

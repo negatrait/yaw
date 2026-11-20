@@ -1,265 +1,148 @@
-"""Native dashboard parsing and rendering against real audit and SVG files."""
+"""Edge-case and resilience tests for the clean-slate YAW watchdog monitor."""
+
+from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from xml.etree import ElementTree
 
+import filelock
 import pytest
 
 import scripts.watchdog as watchdog
 
 
-def audit_file(tmp_path, monkeypatch, payload, tag: str = "canonical"):
-    monkeypatch.setattr(watchdog, "WORKSPACE_ROOT", tmp_path)
-    folder = tmp_path / ".yaw"
-    folder.mkdir(exist_ok=True)
-    name = "optimize_program_audit.json" if tag in {"", "canonical"} else f"optimize_program_{tag}_audit.json"
-    path = folder / name
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
+def test_empty_workspace_handles_missing_dbs_locks_and_artifacts(tmp_path: Path) -> None:
+    out_dir = tmp_path / "dashboard"
+    snap = watchdog.run_once(artifact_dir=out_dir, workspace_root=tmp_path)
 
+    for db_name in ("yaw.db", "optimize_yaw.db", "optuna_index.db"):
+        info = snap["databases"][db_name]
+        assert info["exists"] is False
+        assert info["chunks"] is None
+        assert info["tables"] == []
+        assert "error" not in info
 
-def test_candidate_audit_keeps_run_identity_and_last_good_snapshot_on_torn_reads(tmp_path, monkeypatch):
-    path = audit_file(
-        tmp_path,
-        monkeypatch,
-        {
-            "candidate_records": [
-                {"cand": 2, "n": 4, "score": 0.7, "val_score": 0.5, "is_best": True},
-                {"cand": 1, "n": 2, "score": 0.6},
-                None,
-            ]
-        },
-    )
-    assert watchdog.load_candidate_records({}) == ([], 0)
-    assert watchdog.load_candidate_records({"datestamp": "missing"}) == ([], 0)
-    rows, evaluations = watchdog.load_candidate_records({"datestamp": "canonical"})
-    assert evaluations == 6
-    assert [row["cand"] for row in rows] == [1, 2]
-    assert [row["eff_score"] for row in rows] == [0.6, 0.5]
-    assert [row["best_so_far"] for row in rows] == [0.6, 0.6]
-    assert watchdog.load_candidate_records({"datestamp": "canonical"}) == (rows, evaluations)
-    for malformed in ("invalid JSON", "[]"):
-        path.write_text(malformed, encoding="utf-8")
-        assert watchdog.load_candidate_records({"datestamp": "canonical"}) == (rows, evaluations)
-    path.write_text(json.dumps({"eval_records": [{"score": 0.4}, "bad", {"score": 0.8}]}), encoding="utf-8")
-    assert watchdog.load_candidate_records({"datestamp": "canonical"}) == ([], 0)
-    audit_file(
-        tmp_path,
-        monkeypatch,
-        {"candidate_records": [{"cand": 1, "n": 3, "score": 0.8}]},
-        tag="custom",
-    )
-    custom_rows, custom_evals = watchdog.load_candidate_records({"datestamp": "custom"})
-    assert len(custom_rows) == 1 and custom_evals == 3
-
-
-def test_pool_telemetry_uses_observed_progress_and_labels_missing_values_honestly():
-    empty = watchdog.PoolTelemetry.from_sandbox({})
-    assert empty.velocity is None and empty.val_eta_min is None
-    assert empty.frac(None, None) == "n/a"
-    assert empty.frac(1, 0) == "n/a"
-    assert empty.duration(None) == "n/a"
-    assert empty.duration(125.5) == "2h 5m"
-    assert "STOPPED" in empty.badge(0, 0, False)[0]
-    assert "RUNNING" in empty.badge(0, 0, True, "Indexing")[0]
-    assert "STOPPED" in empty.badge(2, 10, False)[0]
-    assert len(empty.badge(2, 10, True, "x" * 100)[0]) <= 96
-    telemetry = watchdog.PoolTelemetry.from_sandbox(
-        {
-            "counts": {"chunk_inference": 11},
-            "indexed_chunk_ids": {"a", "b"},
-            "pools": {"val_chunk_ids": ["a", "c", "d"], "train_chunk_ids": ["b"], "train_queries": 150},
-            "timeseries_samples": [{"time_sec": 0, "passages": 1}, {"time_sec": 600, "passages": 11}],
-        }
-    )
-    assert telemetry.val_done == 1 and telemetry.val_pool == 3
-    assert telemetry.train_done == 1 and telemetry.train_pool == 1
-    assert telemetry.train_queries == 150 and telemetry.val_queries is None
-    assert telemetry.velocity == 1.0 and telemetry.sec_per_chunk == 60.0
-    assert telemetry.val_eta_min == 2.0
-
-
-def test_individual_evaluations_update_within_the_same_candidate(tmp_path, monkeypatch):
-    payload = {
-        "candidate_records": [
-            {"cand": 1, "n": 20, "score": 0.45},
-            {"cand": 2, "n": 2, "score": 0.5},
-        ],
-        # A bounded audit tail need not start at evaluation 1 or contain every candidate.
-        "eval_records": [
-            {"eval": 21, "cand": 2, "score": 0.2},
-            {"eval": 22, "cand": 2, "score": 0.8},
-        ],
+    assert snap["locks"] == {
+        "yaw.db.lock": False,
+        "optimize_yaw.db.lock": False,
+        "optuna_index.db.lock": False,
     }
-    audit = audit_file(tmp_path, monkeypatch, payload)
-    rows, total = watchdog.load_candidate_records({"datestamp": "canonical"})
-    assert total == 22
-    assert rows[0]["evaluations"] == []
-    assert rows[1]["evaluations"] == [
-        {"eval": 21, "score": 0.2},
-        {"eval": 22, "score": 0.8},
-    ]
-    path = tmp_path / "scores.svg"
-    watchdog.generate_candidate_score_svg(path, rows, ("TEST", "#38bdf8"), {})
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    assert "eval #22" in text and "candidate #2" in text
-    assert "score 80.0%" in text and "mean 50.0%" in text
-    assert "Individual evaluation score" in text
-    assert "Current candidate mean (all its evals)" in text
-    assert "recent 2 recorded" in text
+    assert not any((tmp_path / ".yaw").glob("*.lock")) if (tmp_path / ".yaw").exists() else True
+    assert snap["llm_metrics"] is None
+    for key in ("status", "dspy_status", "dspy_gepa_audit", "optuna_status", "optuna_best_params"):
+        assert snap[key] is None
 
-    payload["candidate_records"][1].update(n=3, score=0.4)
-    payload["eval_records"].append({"eval": 23, "cand": 2, "score": 0.2})
-    audit.write_text(json.dumps(payload), encoding="utf-8")
-    rows, total = watchdog.load_candidate_records({"datestamp": "canonical"})
-    assert len(rows) == 2 and total == 23
-    watchdog.generate_candidate_score_svg(path, rows, ("TEST", "#38bdf8"), {})
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    assert "eval #23" in text and "score 20.0%" in text and "mean 40.0%" in text
-    assert "recent 3 recorded" in text
+    svg_root = ElementTree.fromstring((out_dir / "score_progress.svg").read_text(encoding="utf-8"))
+    assert "Waiting for optimization scores..." in " ".join(svg_root.itertext())
+    assert not watchdog.plt.get_fignums()
+
+    md_text = (out_dir / "benchmark_mobile_report.md").read_text(encoding="utf-8")
+    assert "![Score Progress](score_progress.svg)" in md_text
+    assert "`n/a` chunks" in md_text
+
+
+def test_sqlite_missing_chunks_table_and_corrupt_db_file(tmp_path: Path) -> None:
+    yaw_dir = tmp_path / ".yaw"
+    yaw_dir.mkdir(parents=True)
+
+    with closing(sqlite3.connect(str(yaw_dir / "yaw.db"))) as conn:
+        conn.execute("CREATE TABLE other_meta (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    (yaw_dir / "optimize_yaw.db").write_bytes(b"corrupt sqlite bytes")
+
+    snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
+    yaw_info = snap["databases"]["yaw.db"]
+    assert yaw_info["exists"] is True
+    assert yaw_info["tables"] == ["other_meta"]
+    assert yaw_info["chunks"] is None
+    assert "error" not in yaw_info
+
+    opt_info = snap["databases"]["optimize_yaw.db"]
+    assert opt_info["exists"] is True
+    assert opt_info["chunks"] is None
+    assert opt_info["tables"] == []
+    assert "error" in opt_info
+
+
+def test_torn_invalid_and_nondict_json_resilience(tmp_path: Path) -> None:
+    yaw_dir = tmp_path / ".yaw"
+    yaw_dir.mkdir(parents=True)
+
+    (yaw_dir / "status.json").write_text('{"lifecycle": "ready"', encoding="utf-8")
+    (yaw_dir / "dspy_status.json").write_text("[1, 2, 3]", encoding="utf-8")
+    (yaw_dir / "dspy_gepa_audit.json").write_bytes(b"\xff\xfe{")
+    (yaw_dir / "optuna_status.json").write_text('"scalar"', encoding="utf-8")
+    (yaw_dir / "optuna_best_params.json").write_text(
+        json.dumps({"best_score": 0.9125, "total_trials": 8}), encoding="utf-8"
+    )
+
+    snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
+    assert snap["status"] is None
+    assert snap["dspy_status"] is None
+    assert snap["dspy_gepa_audit"] is None
+    assert snap["optuna_status"] is None
+    assert snap["optuna_best_params"] == {"best_score": 0.9125, "total_trials": 8}
+
+    svg_path = tmp_path / "optuna_best.svg"
+    watchdog.generate_score_svg(svg_path, snap)
+    svg_text = " ".join(ElementTree.fromstring(svg_path.read_text(encoding="utf-8")).itertext())
+    assert "0.9125" in svg_text
     assert not watchdog.plt.get_fignums()
 
 
-def test_native_gepa_chart_uses_validation_coverage_and_exact_membership(tmp_path, monkeypatch):
-    payload = {
-        "gepa_progress": {
-            "version": 1,
-            "phase": "reflecting / generating instructions",
-            "iteration": 3,
-            "phase_evaluations": 0,
-            "phase_expected": None,
-            "validation": [
-                {"candidate_idx": 0, "score": 0.0, "evaluated": 10, "total": 10},
-                {"candidate_idx": 1, "score": 0.4, "evaluated": 10, "total": 10},
-                {"candidate_idx": 2, "score": 0.9, "evaluated": 2, "total": 10},
-            ],
-            "frontier": [1, 2],
-            "frontier_history": [
-                {"event": 1, "members": [0], "added": [0], "removed": []},
-                {"event": 2, "members": [1, 2], "added": [1, 2], "removed": [0]},
-            ],
+def test_score_svg_filters_invalid_values_and_closes_figure_on_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snap = {
+        "dspy_gepa_audit": {
+            "val_aggregate_scores": [True, "bad", float("nan"), float("inf"), 0.5, 0.75],
         }
     }
-    audit = audit_file(tmp_path, monkeypatch, payload)
-    path = tmp_path / "native.svg"
-    sandbox = {"datestamp": "canonical", "optimizer_alive": True}
-    # No dashboard candidate aggregates are needed, including after checkpoint restoration.
-    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), sandbox)
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    for expected in (
-        "Seed baseline (0.0%)",
-        "Best full-validation score (40.0%)",
-        "Partial validation (not comparable)",
-        "10/10",
-        "2/10",
-        "Current native frontier: 1, 2",
-        "Displaced",
-        "reflecting / generating instructions",
-        "iteration 3",
-    ):
-        assert expected in text
-    assert "Latency" not in text and "GM quality" not in text and "Archive size" not in text
-    payload["gepa_progress"].update(phase="minibatch evaluation", phase_evaluations=2, phase_expected=10)
-    audit.write_text(json.dumps(payload), encoding="utf-8")
-    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), sandbox)
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    assert "Metric evaluations since phase began: 2/10" in text
+    svg_path = tmp_path / "filtered.svg"
+    watchdog.generate_score_svg(svg_path, snap)
+    svg_text = " ".join(ElementTree.fromstring(svg_path.read_text(encoding="utf-8")).itertext())
+    assert "0.7500" in svg_text
+    assert not watchdog.plt.get_fignums()
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(watchdog, "write_text_atomic", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        watchdog.generate_score_svg(tmp_path / "fail.svg", snap)
     assert not watchdog.plt.get_fignums()
 
 
-def test_gepa_chart_does_not_invent_native_frontier_for_older_audits(tmp_path, monkeypatch):
-    audit_file(tmp_path, monkeypatch, {"candidate_records": [{"cand": 1, "n": 10, "score": 0.9}]})
-    path = tmp_path / "old.svg"
-    watchdog.generate_pareto_svg(path, [], ("TEST", "#38bdf8"), {"datestamp": "canonical"})
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    assert "Native GEPA telemetry unavailable" in text
-    assert "cannot reconstruct GEPA's frontier" in text
+def test_file_lock_lifecycle_and_config_error_resilience(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    missing_lock = tmp_path / "missing.lock"
+    assert watchdog.is_file_locked(missing_lock) is False
+    assert not missing_lock.exists()
 
+    lock_path = tmp_path / "active.lock"
+    lock_path.write_text("", encoding="utf-8")
+    lock = filelock.FileLock(str(lock_path), timeout=0)
+    lock.acquire()
+    try:
+        assert watchdog.is_file_locked(lock_path) is True
+    finally:
+        lock.release()
+    assert watchdog.is_file_locked(lock_path) is False
 
-def test_candidate_plots_render_real_audit_metrics_and_close_figures(tmp_path, monkeypatch):
-    candidates = [
-        {
-            "cand": 1,
-            "n": 2,
-            "score": 0.3,
-            "score_min": 0.1,
-            "score_max": 0.5,
-            "val_score": 0.4,
-            "is_best": True,
-            "s_per_it": 2.0,
-            "r1": 0.2,
-            "r2": 0.3,
-            "r5": 0.4,
-            "r10": 0.5,
-            "r20": 0.6,
-            "em": 0.2,
-            "f1": 0.3,
-        },
-        {"cand": 2, "n": 3, "score": 0.6, "s_per_it": 3.0},
-        {"cand": 3, "n": 1, "score": 0.2, "s_per_it": 5.0},
-    ]
-    audit_file(tmp_path, monkeypatch, {"candidate_records": candidates})
-    rows, _ = watchdog.load_candidate_records({"datestamp": "canonical"})
-    for render in (
-        watchdog.generate_candidate_score_svg,
-        watchdog.generate_candidate_quality_svg,
-        watchdog.generate_pareto_svg,
-    ):
-        path = tmp_path / f"{render.__name__}.svg"
-        render(path, rows, ("TEST", "#38bdf8"), {})
-        root = ElementTree.parse(path).getroot()
-        text = " ".join(root.itertext())
-        assert "Fig." in text and "TEST" in text
-        assert root.findall(".//{http://www.w3.org/2000/svg}path")
-    assert not watchdog.plt.get_fignums()
+    (tmp_path / "yaw.toml").write_text("[invalid toml", encoding="utf-8")
+    snap_bad_cfg = watchdog.get_active_snapshot(tmp_path)
+    assert snap_bad_cfg["llm_metrics"] == {"server_up": False}
 
+    (tmp_path / "yaw.toml").write_text('[inference]\nbase_url = "http://127.0.0.1:9/v1"\n', encoding="utf-8")
+    snap_down = watchdog.get_active_snapshot(tmp_path)
+    assert snap_down["llm_metrics"] == {"server_up": False}
 
-@pytest.mark.parametrize("sandbox", [{}, {"db_name": "run.db"}, {"db_name": "run.db", "optimizer_alive": True}])
-def test_missing_candidates_render_honest_status_placeholders(tmp_path, sandbox):
-    for render in (
-        watchdog.generate_candidate_score_svg,
-        watchdog.generate_candidate_quality_svg,
-        watchdog.generate_pareto_svg,
-    ):
-        path = tmp_path / f"{render.__name__}.svg"
-        render(path, [], ("TEST", "#38bdf8"), sandbox)
-        text = " ".join(ElementTree.parse(path).getroot().itertext())
-        assert "No optimization sandbox" in text if not sandbox else "candidate" in text.lower()
+    custom_dir = tmp_path / "custom_art"
+    monkeypatch.setenv("YAW_ARTIFACT_DIR", str(custom_dir))
+    assert watchdog._resolve_artifact_dir() == custom_dir
 
-
-@pytest.mark.parametrize("populated", [False, True])
-def test_indexing_dashboard_renders_measured_throughput_and_empty_state(tmp_path, populated):
-    sandbox = {}
-    if populated:
-        sandbox = {
-            "counts": {"chunk_inference": 11},
-            "kg_metrics": {"total_entities": 20, "total_triples": 15},
-            "indexed_chunk_ids": {"a"},
-            "pools": {"val_chunk_ids": ["a", "b"], "corpus_chunk_ids": ["a", "b", "c"]},
-            "lemonade_metrics": {"server_up": True, "llm_tps": 20.0},
-            "timeseries_samples": [
-                {
-                    "time_sec": 0,
-                    "time_hours": 0,
-                    "passages": 1,
-                    "entities": 2,
-                    "triples": 1,
-                    "rolling_velocity": None,
-                    "rolling_latency": None,
-                },
-                {
-                    "time_sec": 600,
-                    "time_hours": 1 / 6,
-                    "passages": 11,
-                    "entities": 20,
-                    "triples": 15,
-                    "rolling_velocity": 1.0,
-                    "rolling_latency": 60.0,
-                },
-            ],
-        }
-    path = tmp_path / "indexing.svg"
-    watchdog.generate_kg_dashboard_svg(path, sandbox)
-    text = " ".join(ElementTree.parse(path).getroot().itertext())
-    assert "Fig. 1" in text
-    assert "Val-pool projection" in text if populated else "Not enough samples yet" in text
+    with pytest.raises(SystemExit) as exc_info:
+        watchdog.main(["--watch", "0"])
+    assert exc_info.value.code == 2

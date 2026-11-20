@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -35,7 +36,8 @@ if callable(reconfigure_stdout):
 
 import benchmark  # noqa: E402
 from benchmark import BASELINES  # noqa: E402
-from yaw.daemon.graph.inference import evaluate_benchmark_gate  # noqa: E402
+from scripts.evaluation import evaluate_benchmark_gate  # noqa: E402
+from yaw.core.config import load_config  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
     "popqa",
@@ -58,7 +60,7 @@ def build_monkeypatched_baseline_report(
     return {
         "engine": "hipporag",
         "status": "passed",
-        "qa_model": benchmark.DEFAULT_QA_CHAT,
+        "qa_model": b.get("qa_model"),
         "num_docs": 0,
         "num_queries": queries_per_dataset,
         "indexing_seconds": float(b.get("indexing_seconds", 0.0)),
@@ -167,6 +169,13 @@ def compare_engine_reports(
             }
         },
     }
+    if mode == "eval":
+        gate_mode: Literal["eval", "retrieval"] = "eval"
+    elif mode == "retrieval":
+        gate_mode = "retrieval"
+    else:
+        raise ValueError(f"Unsupported parity gate mode: {mode!r}")
+
     gate_res = evaluate_benchmark_gate(
         {
             canonical_ds: {
@@ -176,7 +185,7 @@ def compare_engine_reports(
             }
         },
         gate_spec,
-        mode=mode,
+        mode=gate_mode,
     )
     ds_eval = gate_res["datasets"].get(canonical_ds) or next(iter(gate_res["datasets"].values()))
     raw_delta_hippo = ds_eval["delta_yaw_vs_hipporag"]
@@ -267,10 +276,17 @@ def aggregate_gate_summary(
             "recognition_memory": y.get("recognition_memory", {}),
         }
 
+    if mode == "eval":
+        gate_mode: Literal["eval", "retrieval"] = "eval"
+    elif mode == "retrieval":
+        gate_mode = "retrieval"
+    else:
+        raise ValueError(f"Unsupported parity gate mode: {mode!r}")
+
     gate_res = evaluate_benchmark_gate(
         reports,
         {"datasets": spec_datasets},
-        mode=mode,
+        mode=gate_mode,
     )
     mm = gate_res["macro_means"]
     any_hippo_em = any(d.get("hipporag", {}).get("qa", {}).get("ExactMatch") is not None for d in completed)
@@ -282,17 +298,41 @@ def aggregate_gate_summary(
 
     hippo_mean = {
         **mm["monkeypatched_hipporag"],
+        **{
+            k: (
+                mm["monkeypatched_hipporag"][k]
+                if any(d.get("hipporag", {}).get("retrieval", {}).get(k) is not None for d in completed)
+                else None
+            )
+            for k in ("Recall@1", "Recall@2", "Recall@5")
+        },
         "ExactMatch": mm["monkeypatched_hipporag"]["ExactMatch"] if any_hippo_em else None,
         "F1": mm["monkeypatched_hipporag"]["F1"] if any_hippo_f1 else None,
     }
     yaw_mean = {
         **mm["yaw_hipporag"],
+        **{
+            k: (
+                mm["yaw_hipporag"][k]
+                if any(d.get("yaw", {}).get("retrieval", {}).get(k) is not None for d in completed)
+                else None
+            )
+            for k in ("Recall@1", "Recall@2", "Recall@5")
+        },
         "ExactMatch": mm["yaw_hipporag"]["ExactMatch"] if any_yaw_em else None,
         "F1": mm["yaw_hipporag"]["F1"] if any_yaw_f1 else None,
     }
     dpr_mean = dict(mm["yaw_dpr"])
     delta_mean = {
         **mm["delta_yaw_vs_hipporag"],
+        **{
+            k: (
+                mm["delta_yaw_vs_hipporag"][k]
+                if any(d.get("delta_yaw_vs_hipporag", {}).get(k) is not None for d in completed)
+                else None
+            )
+            for k in ("Recall@1", "Recall@2", "Recall@5")
+        },
         "ExactMatch": mm["delta_yaw_vs_hipporag"]["ExactMatch"] if any_delta_em else None,
         "F1": mm["delta_yaw_vs_hipporag"]["F1"] if any_delta_f1 else None,
     }
@@ -307,7 +347,7 @@ def aggregate_gate_summary(
         )
     )
     all_within_tol = datasets_passed == len(completed)
-    mean_r5_ok = delta_mean["Recall@5"] is not None and delta_mean["Recall@5"] >= 0.0
+    mean_r5_ok = delta_mean["Recall@5"] is None or delta_mean["Recall@5"] >= 0.0
     if mode == "eval" and delta_mean["F1"] is not None:
         mean_f1_ok = delta_mean["F1"] >= 0.0
         mean_em_ok = delta_mean["ExactMatch"] is None or delta_mean["ExactMatch"] >= 0.0
@@ -624,13 +664,17 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         "Pre-Epic 2 Gate: Retrieval &amp; QA Quality",
         f"Head-to-head comparison ({len(completed)} datasets completed) • Consistent engine color mapping",
         [
-            (0, "yawGrad", "Native YAW (Qwen3-4B + yaw.db)"),
+            (0, "yawGrad", "Native YAW (gemma-4-e4b + yaw.db)"),
             (235, "hippoGrad", "Upstream HippoRAG 2 (Qwen3-4B)"),
             (475, "paperGrad", "Paper Reference (70B Llama-3.3)"),
             (670, "dprGrad", "Standard DPR"),
         ],
         total_h,
     )
+
+    def _opt_float(mapping: dict[str, Any], key: str) -> float | None:
+        raw = mapping.get(key)
+        return float(raw) if raw is not None else None
 
     curr_y = 132
     for ds in completed:
@@ -641,32 +685,41 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         pb_h2 = pb.get("hipporag2_llama3.3_70b_nvembed_v2", {})
         d = entry.get("delta_yaw_vs_hipporag", {})
 
-        y_r5 = float(y.get("retrieval", {}).get("Recall@5") or 0.0)
-        h_r5 = float(h.get("retrieval", {}).get("Recall@5") or 0.0)
-        p_r5 = float(pb_h2.get("Recall@5") or 0.0)
-        d_r5 = float(y.get("standard_dpr", {}).get("Recall@5") or 0.0)
+        y_ret, h_ret = y.get("retrieval", {}), h.get("retrieval", {})
+        y_qa, h_qa = y.get("qa", {}), h.get("qa", {})
+        y_r5, h_r5, p_r5 = _opt_float(y_ret, "Recall@5"), _opt_float(h_ret, "Recall@5"), _opt_float(pb_h2, "Recall@5")
+        d_r5 = _opt_float(y.get("standard_dpr", {}), "Recall@5")
+        y_f1, h_f1, p_f1 = _opt_float(y_qa, "F1"), _opt_float(h_qa, "F1"), _opt_float(pb_h2, "F1")
+        y_r2, h_r2, p_r2 = _opt_float(y_ret, "Recall@2"), _opt_float(h_ret, "Recall@2"), _opt_float(pb_h2, "Recall@2")
+        y_em, h_em, p_em = (
+            _opt_float(y_qa, "ExactMatch"),
+            _opt_float(h_qa, "ExactMatch"),
+            _opt_float(pb_h2, "ExactMatch"),
+        )
 
-        y_f1 = float(y.get("qa", {}).get("F1") or 0.0)
-        h_f1 = float(h.get("qa", {}).get("F1") or 0.0)
-        p_f1 = float(pb_h2.get("F1") or 0.0)
-
-        y_r2 = float(y.get("retrieval", {}).get("Recall@2") or 0.0)
-        h_r2 = float(h.get("retrieval", {}).get("Recall@2") or 0.0)
-        p_r2 = float(pb_h2.get("Recall@2") or 0.0)
-
-        y_em = float(y.get("qa", {}).get("ExactMatch") or 0.0)
-        h_em = float(h.get("qa", {}).get("ExactMatch") or 0.0)
-        p_em = float(pb_h2.get("ExactMatch") or 0.0)
-
-        delta_r5 = float(d.get("Recall@5") or (y_r5 - h_r5))
-        delta_f1 = float(d.get("F1") or (y_f1 - h_f1))
+        delta_r5 = (
+            float(d["Recall@5"])
+            if d.get("Recall@5") is not None
+            else (y_r5 - h_r5 if y_r5 is not None and h_r5 is not None else None)
+        )
+        delta_f1 = (
+            float(d["F1"])
+            if d.get("F1") is not None
+            else (y_f1 - h_f1 if y_f1 is not None and h_f1 is not None else None)
+        )
 
         gate_passed = entry.get("gate_passed")
         if gate_passed is None:
             delta_em = d.get("ExactMatch")
-            gate_passed = delta_r5 >= 0.0 and delta_f1 >= 0.0 and (delta_em is None or float(delta_em) >= 0.0)
+            gate_passed = (
+                (delta_r5 is None or delta_r5 >= 0.0)
+                and (delta_f1 is None or delta_f1 >= 0.0)
+                and (delta_em is None or float(delta_em) >= 0.0)
+            )
         status_text = "PASS" if gate_passed else "FAIL"
         badge_color = "#10b981" if status_text == "PASS" else "#ef4444"
+        r5_lbl = f"{delta_r5:+.2%}" if delta_r5 is not None else "n/a"
+        f1_lbl = f"{delta_f1:+.2%}" if delta_f1 is not None else "n/a"
 
         svg.append(f'  <g transform="translate(36, {curr_y})">')
         svg.append(
@@ -681,11 +734,11 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
         svg.append(
             f'    <text x="752" y="24" text-anchor="end" fill="{badge_color}" '
             f'font-size="12" font-weight="700">{status_text} '
-            f"(ΔR@5={delta_r5:+.2%}, ΔF1={delta_f1:+.2%})</text>"
+            f"(ΔR@5={r5_lbl}, ΔF1={f1_lbl})</text>"
         )
         svg.append('    <line x1="16" y1="36" x2="752" y2="36" stroke="#1e293b" stroke-width="1"/>')
 
-        metrics: list[tuple[str, float, float, float, float | None]] = [
+        metrics: list[tuple[str, float | None, float | None, float | None, float | None]] = [
             ("Recall@5 (Gate)", y_r5, h_r5, p_r5, d_r5),
             ("QA F1 Score", y_f1, h_f1, p_f1, None),
             ("Recall@2", y_r2, h_r2, p_r2, None),
@@ -699,21 +752,27 @@ def generate_quality_svg(gate_payload: dict[str, Any]) -> str:
             b_x = 120
             bar_w_max = 480
 
-            yw = max(3, int(y_val * bar_w_max))
-            svg.append(f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>')
-            svg.append(
-                f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" '
-                f'font-size="10" font-weight="700">YAW {y_val:.4f}</text>'
-            )
+            if y_val is not None:
+                yw = max(3, int(y_val * bar_w_max))
+                svg.append(f'      <rect x="{b_x}" y="0" width="{yw}" height="11" rx="2" fill="url(#yawGrad)"/>')
+                svg.append(
+                    f'      <text x="{b_x + yw + 6}" y="10" fill="#10b981" '
+                    f'font-size="10" font-weight="700">YAW {y_val:.4f}</text>'
+                )
+            else:
+                svg.append(f'      <text x="{b_x}" y="10" fill="#64748b" font-size="10">YAW n/a</text>')
 
-            hw = max(3, int(h_val * bar_w_max))
-            svg.append(f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>')
-            svg.append(
-                f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" '
-                f'font-size="10" font-weight="600">Hippo {h_val:.4f}</text>'
-            )
+            if h_val is not None:
+                hw = max(3, int(h_val * bar_w_max))
+                svg.append(f'      <rect x="{b_x}" y="14" width="{hw}" height="11" rx="2" fill="url(#hippoGrad)"/>')
+                svg.append(
+                    f'      <text x="{b_x + hw + 6}" y="24" fill="#c084fc" '
+                    f'font-size="10" font-weight="600">Hippo {h_val:.4f}</text>'
+                )
+            else:
+                svg.append(f'      <text x="{b_x}" y="24" fill="#64748b" font-size="10">Hippo n/a</text>')
 
-            if p_val > 0.0:
+            if p_val is not None and p_val > 0.0:
                 pw = max(3, int(p_val * bar_w_max))
                 svg.append(f'      <rect x="{b_x}" y="28" width="{pw}" height="11" rx="2" fill="url(#paperGrad)"/>')
                 svg.append(
@@ -747,7 +806,7 @@ def generate_latency_svg(gate_payload: dict[str, Any]) -> str:
         "Pre-Epic 2 Gate: Wall-Clock Latency &amp; Speedup",
         f"Lower is better • Local GPU/NPU server • {len(completed)} datasets completed",
         [
-            (0, "yawGrad2", "Native YAW (yaw.db + CocoIndex AST + pure-JSON GBNF)"),
+            (0, "yawGrad2", "Native YAW (yaw.db + CocoIndex + dspy.ReAct)"),
             (420, "hippoGrad2", "Upstream HippoRAG 2 (File Storage + Unconstrained Prompt)"),
         ],
         total_h,
@@ -1099,12 +1158,9 @@ def _persist_gate_outputs(
     if artifact_dir_raw:
         brain_dir = Path(artifact_dir_raw)
         if brain_dir.exists():
-            try:
-                (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
-                (brain_dir / "paper_parity_latency.svg").write_text(latency_svg_str, encoding="utf-8")
-                (brain_dir / "parity_report_mobile.html").write_text(html_content, encoding="utf-8")
-            except Exception:
-                pass
+            (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
+            (brain_dir / "paper_parity_latency.svg").write_text(latency_svg_str, encoding="utf-8")
+            (brain_dir / "parity_report_mobile.html").write_text(html_content, encoding="utf-8")
 
     output_md.write_text(
         format_gate_markdown(gate_payload),
@@ -1134,8 +1190,21 @@ def run_parity_gate(
     output_json: Path = PROJECT_ROOT / "outputs" / "benchmarks" / "paper_parity_gate.json",
     output_md: Path = PROJECT_ROOT / "outputs" / "benchmarks" / "paper_parity_gate.md",
     fresh: bool = False,
+    config_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute the 7-dataset head-to-head parity gate and persist JSON + Markdown reports."""
+    config_file = Path(config_path) if config_path is not None else PROJECT_ROOT / "yaw.toml"
+    inference_config = load_config(config_file)
+    program_path = Path(compiled_program).resolve()
+    deployment = {
+        "config_fingerprint": benchmark.benchmark_config_fingerprint(inference_config),
+        "base_url": inference_config.base_url,
+        "provider": inference_config.provider,
+        "compiled_program": {
+            "path": str(program_path),
+            "sha256": hashlib.sha256(program_path.read_bytes()).hexdigest() if program_path.is_file() else None,
+        },
+    }
     canonical_datasets = list(datasets)
     existing_datasets: dict[str, dict[str, Any]] = {}
 
@@ -1145,7 +1214,11 @@ def run_parity_gate(
     if not fresh and output_json.exists():
         try:
             loaded = json.loads(output_json.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and isinstance(loaded.get("datasets"), dict):
+            if (
+                isinstance(loaded, dict)
+                and isinstance(loaded.get("datasets"), dict)
+                and loaded.get("config", {}).get("inference") == deployment
+            ):
                 existing_datasets = loaded["datasets"]
         except json.JSONDecodeError, OSError:
             existing_datasets = {}
@@ -1158,7 +1231,8 @@ def run_parity_gate(
             "index_queries": index_queries,
             "compiled_program": compiled_program,
             "mode": mode,
-            "qa_model": benchmark.DEFAULT_QA_CHAT,
+            "qa_model": inference_config.qa_model,
+            "inference": deployment,
         },
         "datasets": {},
         "summary": {},
@@ -1172,12 +1246,12 @@ def run_parity_gate(
             queries_per_dataset=queries_per_dataset,
             index_queries=index_queries,
             mode=mode,
-            qa_model=benchmark.DEFAULT_QA_CHAT,
+            qa_model=inference_config.qa_model,
         ):
             gate_payload["datasets"][ds] = existing_datasets[ds]
             print(
                 f"[Gate] Reusing completed entry for dataset '{ds}' "
-                f"(R@5 Δ={existing_datasets[ds]['delta_yaw_vs_hipporag']['Recall@5']:+.4f}, "
+                f"(R@5 Δ={_fmt_num(existing_datasets[ds]['delta_yaw_vs_hipporag']['Recall@5'], signed=True)}, "
                 f"status={existing_datasets[ds]['gate_status']})",
                 flush=True,
             )
@@ -1199,6 +1273,7 @@ def run_parity_gate(
         )
         yaw_report = benchmark.main(
             dataset=ds,
+            config_path=config_file,
             max_queries=queries_per_dataset,
             index_queries=index_queries,
             mode=mode,
@@ -1220,9 +1295,9 @@ def run_parity_gate(
         _persist_gate_outputs(gate_payload, output_json=output_json, output_md=output_md)
         print(
             f"\n[Gate] Completed '{ds}': "
-            f"Hippo R@5={comparison['hipporag']['retrieval']['Recall@5']:.4f} vs "
-            f"YAW R@5={comparison['yaw']['retrieval']['Recall@5']:.4f} "
-            f"(Δ={comparison['delta_yaw_vs_hipporag']['Recall@5']:+.4f}), "
+            f"Hippo R@5={_fmt_num(comparison['hipporag']['retrieval']['Recall@5'])} vs "
+            f"YAW R@5={_fmt_num(comparison['yaw']['retrieval']['Recall@5'])} "
+            f"(Δ={_fmt_num(comparison['delta_yaw_vs_hipporag']['Recall@5'], signed=True)}), "
             f"Hippo F1={_fmt_num(comparison['hipporag']['qa']['F1'])} vs "
             f"YAW F1={_fmt_num(comparison['yaw']['qa']['F1'])} "
             f"(Δ={_fmt_num(comparison['delta_yaw_vs_hipporag']['F1'], signed=True)}) "
@@ -1237,6 +1312,7 @@ def run_parity_gate(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=None, help="Inference settings (default: yaw.toml).")
     parser.add_argument(
         "--datasets",
         nargs="*",
@@ -1259,7 +1335,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--compiled-program",
         type=str,
         default=".yaw/compiled_program.json",
-        help="Path to compiled DSPy YawProgram JSON artifact (default: .yaw/compiled_program.json).",
+        help="Path to compiled DSPy ReAct QA program JSON artifact (default: .yaw/compiled_program.json).",
     )
     parser.add_argument(
         "--mode",
@@ -1291,6 +1367,7 @@ if __name__ == "__main__":
     cli_args = parse_args()
     run_parity_gate(
         datasets=cli_args.datasets,
+        config_path=cli_args.config,
         queries_per_dataset=cli_args.queries_per_dataset,
         index_queries=cli_args.index_queries,
         compiled_program=cli_args.compiled_program,

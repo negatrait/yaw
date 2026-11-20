@@ -1,5 +1,7 @@
 """Configuration and logging failures against real files and native contracts."""
 
+from __future__ import annotations
+
 import importlib
 import json
 import logging
@@ -8,7 +10,14 @@ import sys
 
 import pytest
 
-from yaw.core import SHACLViolation, StructuredTriple, YawConfig, YawRuntimeError, load_config
+from yaw.core import (
+    DEFAULT_EXCLUDED_PATTERNS,
+    DEFAULT_INCLUDED_PATTERNS,
+    DaemonStatus,
+    YawConfig,
+    YawRuntimeError,
+    load_config,
+)
 from yaw.core.logger import FIFOLineRotatingHandler, SuppressThirdPartyInfoFilter
 
 
@@ -16,14 +25,19 @@ from yaw.core.logger import FIFOLineRotatingHandler, SuppressThirdPartyInfoFilte
     ("section", "key", "value", "message"),
     [
         ("runtime", "queue_maxsize", "0", "queue_maxsize"),
+        ("runtime", "http_port", "0", "http_port"),
+        ("runtime", "http_path", '"mcp"', "http_path"),
         ("ingestion", "chunk_size", "0", "chunk_size"),
-        ("inference", "max_context_chars", "0", "max_context_chars"),
-        ("graph", "max_context_chars", "0", "max_context_chars"),
-        ("inference", "rlm_max_llm_calls", "0", "rlm_max_llm_calls"),
-        ("inference", "rlm_max_output_chars", "0", "rlm_max_output_chars"),
-        ("inference", "reflection_input_tokens", "0", "reflection_input_tokens"),
-        ("optimization", "mode", '"unknown"', "optimize_mode"),
+        ("ingestion", "chunk_overlap", "1000", "chunk_overlap"),
+        ("ingestion", "min_chunk_size", "0", "min_chunk_size"),
+        ("ingestion", "embed_batch_size", "0", "embed_batch_size"),
+        ("inference", "embed_max_in_flight", "0", "embed_max_in_flight"),
+        ("inference", "react_max_iters", "0", "react_max_iters"),
+        ("inference", "max_output_tokens", "0", "max_output_tokens"),
+        ("inference", "embedding_task_mode", '"bogus"', "embedding_task_mode"),
         ("optimization", "auto", '"unknown"', "optimize_auto"),
+        ("optimization", "max_queries", "0", "optimize_max_queries"),
+        ("optimization", "query_offset", "-1", "optimize_query_offset"),
     ],
 )
 def test_invalid_toml_settings_fail_before_runtime_start(tmp_path, section, key, value, message):
@@ -34,24 +48,10 @@ def test_invalid_toml_settings_fail_before_runtime_start(tmp_path, section, key,
     assert error.value.code == "INVALID_INPUT"
 
 
-def test_native_data_contract_aliases_and_json():
-    triple = StructuredTriple("Ada", "A mathematician", "wrote", "Note G", "An algorithm", "Ada wrote Note G.")
-    assert (triple.subject, triple.predicate, triple.object) == triple.as_tuple() == ("Ada", "wrote", "Note G")
-    assert json.loads(json.dumps(triple.to_dict())) == {
-        "subj": "Ada",
-        "subj_def": "A mathematician",
-        "pred": "wrote",
-        "obj": "Note G",
-        "obj_def": "An algorithm",
-        "spo_def": "Ada wrote Note G.",
-    }
-    violation = SHACLViolation("ConceptShape", "Ada", "skos:definition", "Missing definition")
-    assert violation.to_dict() == {
-        "shape": "ConceptShape",
-        "focus_node": "Ada",
-        "result_path": "skos:definition",
-        "message": "Missing definition",
-    }
+def test_daemon_status_json_keeps_lifecycle_and_chunk_count():
+    status = DaemonStatus(lifecycle="ready", provider_ready=True, num_chunks=3)
+    payload = json.loads(json.dumps(status.to_dict()))
+    assert (payload["lifecycle"], payload["provider_ready"], payload["num_chunks"]) == ("ready", True, 3)
 
 
 def test_empty_and_unwritable_fifo_paths_preserve_the_log_buffer(tmp_path):
@@ -91,7 +91,7 @@ def test_third_party_info_is_filtered_but_warnings_and_yaw_logs_remain():
     litellm_info = logging.LogRecord("litellm.router", logging.INFO, __file__, 2, "Router trace", (), None)
     real_warning = logging.LogRecord("litellm.router", logging.WARNING, __file__, 3, "Provider warning", (), None)
     real_error = logging.LogRecord("httpx.transport", logging.ERROR, __file__, 4, "Provider disconnected", (), None)
-    yaw_info = logging.LogRecord("yaw.daemon", logging.INFO, __file__, 5, "Daemon started", (), None)
+    yaw_info = logging.LogRecord("yaw.runtime", logging.INFO, __file__, 5, "Daemon started", (), None)
     assert not filtering.filter(informational)
     assert not filtering.filter(litellm_info)
     assert filtering.filter(real_warning)
@@ -100,7 +100,7 @@ def test_third_party_info_is_filtered_but_warnings_and_yaw_logs_remain():
 
 
 def test_all_leaf_facades_advertise_and_resolve_their_public_exports():
-    for name in ("yaw.core", "yaw.daemon.graph.inference", "yaw.daemon.graph.storage", "yaw.daemon.ingestion"):
+    for name in ("yaw.core",):
         module = importlib.import_module(name)
         names = dir(module)
         assert names
@@ -120,8 +120,8 @@ def test_python_module_entrypoint_exits_successfully_for_help(monkeypatch, capsy
 
 
 def test_dynamic_config_normalization_retains_defaults_for_missing_sequences(tmp_path):
-    raw = json.loads('{"optimize_datasets": null, "json_keys_whitelist": null, "json_keys_blacklist": null}')
+    raw = json.loads('{"optimize_datasets": null, "included_patterns": null, "excluded_patterns": null}')
     config = YawConfig(workspace_root=tmp_path, **raw)
-    assert config.optimize_datasets == ("2wikimultihopqa",)
-    assert config.json_keys_whitelist == ("*",)
-    assert config.json_keys_blacklist == ()
+    assert config.optimize_datasets == ("enterprise_rag_bench",)
+    assert config.included_patterns == DEFAULT_INCLUDED_PATTERNS
+    assert config.excluded_patterns == DEFAULT_EXCLUDED_PATTERNS

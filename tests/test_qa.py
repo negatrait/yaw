@@ -1,0 +1,904 @@
+"""Unmocked integration tests for bare dspy.ReAct QA tools, grounding, and error boundaries."""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import hashlib
+import json
+import re
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, cast
+
+import dspy
+import numpy as np
+import pytest
+from dspy.utils.callback import BaseCallback
+from dspy.utils.exceptions import LMServerError
+from numpy.typing import NDArray
+
+from yaw.core import EmbedFn, YawConfig, YawRuntimeError
+from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
+from yaw.qa import (
+    QASignature,
+    build_qa_agent,
+    create_lm,
+    extract_inline_chunk_ids,
+    make_qa_tools,
+    strip_inline_citations,
+)
+from yaw.qa import ask_question as run_qa
+from yaw.retrieval import build_vector_search, open_readonly_db
+
+_CID_IN_PROMPT_RE = re.compile(r"\[chunk_id=(\d+)\]")
+
+
+def _topic_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
+    topics = (
+        ("apollo", "lunar", "moon", "armstrong", "commander"),
+        ("instrument", "xylophone", "zither", "music", "wapakoneta", "childhood"),
+        ("orbital", "booster", "valve", "specification", "stage"),
+        ("longsection", "chronicle", "paragraph", "archive"),
+    )
+    rows = np.zeros((len(texts), dim), dtype=np.float32)
+    for row_idx, text in enumerate(texts):
+        low = text.lower()
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        base = (np.frombuffer(digest * 2, dtype=np.uint8)[:dim].astype(np.float32) - 127.5) * 0.05
+        for t_idx, kws in enumerate(topics):
+            for kw in kws:
+                if kw in low:
+                    base[t_idx] += 2.0
+        rows[row_idx] = base / max(float(np.linalg.norm(base)), 1e-12)
+    return rows
+
+
+def _make_cfg(root: Path, *, chunk_size: int = 1500, chunk_overlap: int = 0, min_chunk_size: int = 20) -> YawConfig:
+    return YawConfig(
+        workspace_root=root,
+        corpus_root=root / "corpus",
+        db_path=root / ".yaw" / "yaw.db",
+        lock_path=root / ".yaw" / "yaw.db.lock",
+        state_dir=root / ".yaw" / "coco_lmdb",
+        log_path=root / ".yaw" / "yaw.log",
+        status_path=root / ".yaw" / "status.json",
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        min_chunk_size=min_chunk_size,
+    )
+
+
+def _index_qa_corpus(root: Path, *, single_doc: bool = False) -> YawConfig:
+    cfg = _make_cfg(root)
+    assert cfg.corpus_root is not None
+    cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+    if single_doc:
+        (cfg.corpus_root / "solo.md").write_text(
+            "# Solo Note\nNeil Armstrong was the Apollo 11 lunar module commander.\n",
+            encoding="utf-8",
+        )
+    else:
+        (cfg.corpus_root / "alpha.md").write_text(
+            "# Apollo 11 Mission\nNeil Armstrong served as the Apollo 11 Lunar Module commander on the Moon.\n",
+            encoding="utf-8",
+        )
+        para_a = " ".join(
+            f"Sentence {i}: Neil Armstrong grew up in Ohio (WapakonetaArchiveAlpha)." for i in range(1, 21)
+        )
+        para_b = "Neil Armstrong played the XylophoneZither during childhood in Ohio. " + " ".join(
+            f"Music note {i} from childhood collection." for i in range(1, 28)
+        )
+        (cfg.corpus_root / "bridge.md").write_text(
+            f"# Wapakoneta Musician\n{para_a}\n\n{para_b}\n",
+            encoding="utf-8",
+        )
+        multi_paras = [
+            f"Section {k}: " + " ".join(f"Orbital booster calibration item {k}_{j}." for j in range(1, 30))
+            for k in range(1, 8)
+        ]
+        (cfg.corpus_root / "multi.json").write_text(
+            json.dumps({"title": "Booster Manual", "text": "\n\n".join(multi_paras)}),
+            encoding="utf-8",
+        )
+        (cfg.corpus_root / "booster_backup.md").write_text(
+            "# Booster Backup\nOrbital booster backup valve specification for emergency stage separation.\n",
+            encoding="utf-8",
+        )
+
+    session = start_pipeline(cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    try:
+        update_pipeline_once(session)
+    finally:
+        close_pipeline(session)
+    return cfg
+
+
+def _start_loopback_chat_server(
+    responder: Any,
+    *,
+    delay_sec: float = 0.0,
+) -> tuple[ThreadingHTTPServer, list[dict[str, Any]], dict[str, int]]:
+    requests_seen: list[dict[str, Any]] = []
+    concurrency = {"in_flight": 0, "max_in_flight": 0}
+    lock = threading.Lock()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            with lock:
+                concurrency["in_flight"] += 1
+                concurrency["max_in_flight"] = max(concurrency["max_in_flight"], concurrency["in_flight"])
+                turn_idx = len(requests_seen)
+                requests_seen.append(payload)
+            try:
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+                status_code, content = responder(turn_idx, payload)
+                if status_code != 200:
+                    raw = json.dumps({"error": {"message": str(content)}}).encode("utf-8")
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                body = {
+                    "id": f"chatcmpl-{turn_idx}",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": payload.get("model", "gemma-4-e4b"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": content
+                            if isinstance(content, dict)
+                            else {"role": "assistant", "content": content},
+                            "finish_reason": "tool_calls" if isinstance(content, dict) else "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+                raw = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            finally:
+                with lock:
+                    concurrency["in_flight"] -= 1
+
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, requests_seen, concurrency
+
+
+def _make_loopback_lm(server: ThreadingHTTPServer) -> dspy.LM:
+    return dspy.LM(
+        model="openai/gemma-4-e4b",
+        model_type="chat",
+        api_base=f"http://127.0.0.1:{server.server_port}/v1",
+        api_key="test",
+        temperature=1.0,
+        cache=False,
+        num_retries=0,
+    )
+
+
+def _xml_tool_reply(thought: str, calls: list[dict[str, Any]]) -> str:
+    return f"<next_thought>{thought}</next_thought>\n<tool_calls>{json.dumps({'tool_calls': calls})}</tool_calls>"
+
+
+def ask_question(agent, question, *, lm, lm_sem, **kwargs):
+    with lm_sem, dspy.context(lm=lm):
+        return run_qa(question, agent=agent, **kwargs)
+
+
+def test_qa_module_isolation_and_zero_wrappers() -> None:
+    qa_path = Path(__file__).resolve().parent.parent / "yaw" / "qa.py"
+    src = qa_path.read_text(encoding="utf-8")
+    low = src.lower()
+    assert "manifold" not in low
+    assert "hmm" not in low
+    assert "hipporag" not in low
+
+    tree = ast.parse(src, filename=str(qa_path))
+    class_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    assert class_names <= {"QASignature"}
+    assert issubclass(QASignature, dspy.Signature)
+    assert not issubclass(QASignature, dspy.Module)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith(("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy"))
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            assert not mod.startswith(("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy"))
+
+    def _dummy_tool(query: str) -> str:
+        return query
+
+    agent = build_qa_agent([_dummy_tool])
+    assert type(agent) is dspy.ReAct
+    assert agent.max_iters == 6
+    assert set(agent.tools) == {"_dummy_tool", "submit"}
+    assert EmbedFn is not None
+
+
+def test_local_alias_uses_native_tools_and_saved_lm_cannot_override_deployment(tmp_path: Path) -> None:
+    calls_seen: list[str] = []
+
+    def search_passages(query: str) -> str:
+        """Find evidence in the test corpus."""
+        calls_seen.append(query)
+        return "NATIVE-TOOLS-OK"
+
+    def responder(turn: int, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        assert {tool["function"]["name"] for tool in payload["tools"]} == {"search_passages", "submit"}
+        assert "max_tokens" not in payload and "max_completion_tokens" not in payload
+        if turn == 0:
+            name, args = "search_passages", {"query": "protocol evidence"}
+        else:
+            assert any(
+                msg.get("role") == "tool" and "NATIVE-TOOLS-OK" in str(msg.get("content"))
+                for msg in payload["messages"]
+            )
+            name, args = "submit", {"answer": "NATIVE-TOOLS-OK"}
+        return 200, {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"native_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        }
+
+    saved = tmp_path / "compiled.json"
+    old = build_qa_agent([search_passages])
+    old.set_lm(dspy.LM("openai/obsolete-alias", api_base="http://127.0.0.1:1/v1", max_tokens=11))
+    old.save(str(saved))
+    srv, requests, _ = _start_loopback_chat_server(responder)
+    try:
+        cfg = YawConfig(workspace_root=tmp_path, base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        lm = create_lm(cfg)
+        assert lm.supports_function_calling
+        agent = build_qa_agent([search_passages], artifact_path=saved)
+        assert agent.react.lm is None
+        with dspy.context(lm=lm):
+            prediction = agent(question="Find protocol evidence.")
+        assert prediction.answer == "NATIVE-TOOLS-OK"
+        assert prediction.termination_reason == "submit"
+        assert calls_seen == ["protocol evidence"]
+        assert len(requests) == 2
+        assert all(request["model"] == cfg.qa_model for request in requests)
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("max_iters", [1, 2])
+def test_native_react_requires_a_tool_instead_of_allowing_prose_completion(tmp_path: Path, max_iters: int) -> None:
+    executed: list[str] = []
+
+    def read_evidence() -> str:
+        """Read evidence needed to answer the question."""
+        executed.append("read")
+        return "The evidence token is NATIVE-TOOLS-OK."
+
+    def responder(turn: int, payload: dict[str, Any]) -> tuple[int, str | dict[str, Any]]:
+        choice = payload.get("tool_choice", "auto")
+        if choice == "auto":
+            # Valid native Chat response, but not a valid ReAct action.
+            return 200, "I have gathered sufficient information to answer the question."
+        has_evidence = any(message["role"] == "tool" for message in payload["messages"])
+        if choice == "required" and not has_evidence:
+            name, args = "read_evidence", {}
+        else:
+            name, args = "submit", {"answer": "NATIVE-TOOLS-OK"}
+        return 200, {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"required_{turn}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }
+            ],
+        }
+
+    srv, requests, _ = _start_loopback_chat_server(responder)
+    try:
+        cfg = YawConfig(workspace_root=tmp_path, base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        lm = create_lm(cfg)
+        agent = build_qa_agent([read_evidence], max_iters=max_iters)
+        # A saved, older program may carry the permissive default explicitly.
+        agent.react.update_config(tool_choice="auto")
+        path = tmp_path / "permissive.json"
+        agent.save(str(path))
+        agent = build_qa_agent([read_evidence], max_iters=max_iters, artifact_path=path)
+        with dspy.context(lm=lm):
+            prediction = agent(question="Read the evidence and report its token.")
+        assert prediction.termination_reason == ("submit" if max_iters == 2 else "forced_submit")
+        assert prediction.answer == "NATIVE-TOOLS-OK"
+        assert executed == ["read"]
+        assert len(requests) == 2
+        assert requests[0]["tool_choice"] == "required"
+        assert requests[1]["tool_choice"] == (
+            "required" if max_iters == 2 else {"type": "function", "function": {"name": "submit"}}
+        )
+    finally:
+        srv.shutdown()
+
+
+def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
+    cfg = _index_qa_corpus(tmp_path / "main")
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    embed_calls: list[list[str]] = []
+
+    def tracked_embed(texts: list[str]) -> NDArray[np.float32]:
+        embed_calls.append(list(texts))
+        return _topic_embed(texts, dim=16)
+
+    with open_readonly_db(cfg.db_path) as conn:
+        vs = build_vector_search(conn)
+        assert vs.size >= 10
+        search_passages, lexical_grep, expand_neighbors, read_chunk = (
+            tool.func for tool in make_qa_tools(vs, cfg.corpus_root, tracked_embed, conn)
+        )
+
+        # Blank/non-string queries and invalid top_k fail fast without invoking embedder
+        for bad_q in ("", "   "):
+            with pytest.raises(ValueError, match="query"):
+                search_passages(bad_q)
+            with pytest.raises(ValueError, match="query"):
+                lexical_grep(bad_q)
+        assert len(embed_calls) == 0
+
+        # MaxP pooling must pass pool_k >= 50 so multi.json (7 chunks) does not starve booster_backup.md
+        booster_out = search_passages("orbital booster", top_k=2)
+        assert len(embed_calls) == 1
+        assert "multi.json" in booster_out
+        assert len(set(_CID_IN_PROMPT_RE.findall(booster_out))) == 2
+
+        # Reject invalid top_k and return uncropped passage for valid top_k
+        for bad_k in (0, -1, True):
+            with pytest.raises(ValueError, match="top_k"):
+                search_passages("WapakonetaArchiveAlpha", top_k=bad_k)
+            with pytest.raises(ValueError, match="top_k"):
+                lexical_grep("WapakonetaArchiveAlpha", top_k=bad_k)
+
+        alpha_search = search_passages("WapakonetaArchiveAlpha", top_k=1)
+        assert len(_CID_IN_PROMPT_RE.findall(alpha_search)) == 1
+        assert "[... cropped ...]" not in alpha_search
+
+        # lexical_grep must invoke ZERO embed calls, respect large top_k without clamping, and return uncropped text
+        calls_before_grep = len(embed_calls)
+        assert lexical_grep("DefinitelyAbsentTokenZeta999", top_k=5) == "No matching passages found."
+        grep_hit = lexical_grep("XylophoneZither", top_k=5)
+        assert len(embed_calls) == calls_before_grep
+        assert "bridge.md" in grep_hit and "XylophoneZither" in grep_hit
+
+        with pytest.raises(ValueError, match="top_k"):
+            lexical_grep("WapakonetaArchiveAlpha", top_k=99)
+        grep_long = lexical_grep("WapakonetaArchiveAlpha", top_k=25)
+        assert len(embed_calls) == calls_before_grep
+        assert "[... cropped ...]" not in grep_long
+        assert len(_CID_IN_PROMPT_RE.findall(grep_long)) >= 1
+
+        # Identify chunk 1 and chunk 2 of bridge.md to verify expand_neighbors and read_chunk
+        bridge_cids = [int(p.chunk_id) for p in vs.pointers if p.rel_posix_path == "bridge.md"]
+        assert len(bridge_cids) >= 2
+        long_cid = int(_CID_IN_PROMPT_RE.findall(grep_long)[0])
+
+        with pytest.raises(ValueError, match="999999"):
+            expand_neighbors(999999)
+        with pytest.raises(ValueError, match="chunk_id"):
+            expand_neighbors(cast(Any, True))
+        for bad_k in (0, True):
+            with pytest.raises(ValueError, match="top_k"):
+                expand_neighbors(long_cid, top_k=bad_k)
+        nbr_out = expand_neighbors(long_cid, top_k=3)
+        assert "[... cropped ...]" not in nbr_out
+        nbr_cids = [int(x) for x in _CID_IN_PROMPT_RE.findall(nbr_out)]
+        assert long_cid not in nbr_cids
+        assert any(cid in nbr_cids for cid in bridge_cids if cid != long_cid)
+
+        # read_chunk respects score=1.000 header, raises on invalid IDs, and returns full uncropped passage
+        with pytest.raises(ValueError, match="-1"):
+            read_chunk(-1)
+        with pytest.raises(ValueError, match="999999"):
+            read_chunk(999999)
+        with pytest.raises(ValueError, match="chunk_id"):
+            read_chunk(cast(Any, True))
+        chunk_plain = read_chunk(long_cid)
+        assert f"[chunk_id={long_cid}]" in chunk_plain and "score=1.000:" in chunk_plain
+
+    # Solo 1-chunk VectorSearch returns No matching passages on expand_neighbors
+    solo_cfg = _index_qa_corpus(tmp_path / "solo", single_doc=True)
+    assert solo_cfg.corpus_root is not None and solo_cfg.db_path is not None
+    with open_readonly_db(solo_cfg.db_path) as s_conn:
+        s_vs = build_vector_search(s_conn)
+        assert s_vs.size == 1
+        solo_tools = make_qa_tools(s_vs, solo_cfg.corpus_root, tracked_embed, s_conn)
+        assert solo_tools[2](chunk_id=int(s_vs.chunk_ids[0])) == "No matching passages found."
+        with pytest.raises(ValueError, match="top_k"):
+            solo_tools[2](chunk_id=int(s_vs.chunk_ids[0]), top_k=0)
+
+    # Verify top_k > 10 is honored without clamping to 10 across search_passages, lexical_grep, and expand_neighbors
+    many_cfg = _make_cfg(tmp_path / "many")
+    assert many_cfg.corpus_root is not None and many_cfg.db_path is not None
+    many_cfg.corpus_root.mkdir(parents=True)
+    for i in range(13):
+        (many_cfg.corpus_root / f"doc_{i:02d}.md").write_text(
+            f"# ManyDoc {i}\nSharedManyToken document body number {i}.\n",
+            encoding="utf-8",
+        )
+    many_sess = start_pipeline(many_cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    try:
+        update_pipeline_once(many_sess)
+    finally:
+        close_pipeline(many_sess)
+    with open_readonly_db(many_cfg.db_path) as m_conn:
+        m_vs = build_vector_search(m_conn)
+        m_search, m_grep, m_expand, _ = make_qa_tools(m_vs, many_cfg.corpus_root, tracked_embed, m_conn)
+        assert len(_CID_IN_PROMPT_RE.findall(m_search(query="SharedManyToken", top_k=12))) == 12
+        assert len(_CID_IN_PROMPT_RE.findall(m_grep(query="SharedManyToken", top_k=12))) == 12
+        assert len(_CID_IN_PROMPT_RE.findall(m_expand(chunk_id=int(m_vs.chunk_ids[0]), top_k=12))) == 12
+
+
+def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None:
+    cfg = _index_qa_corpus(tmp_path)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+
+    with open_readonly_db(cfg.db_path) as conn:
+        vs = build_vector_search(conn)
+        ver_before = conn.execute("PRAGMA data_version").fetchone()[0]
+        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        agent = build_qa_agent(tools, max_iters=6)
+
+        observed_cids: list[int] = []
+
+        def responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            prompt_blob = json.dumps(payload.get("messages", []))
+            for raw_cid in _CID_IN_PROMPT_RE.findall(prompt_blob):
+                cid = int(raw_cid)
+                if cid not in observed_cids:
+                    observed_cids.append(cid)
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Search Apollo mission and grep unique instrument",
+                    [
+                        {"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 3}},
+                        {"name": "lexical_grep", "args": {"query": "XylophoneZither", "top_k": 2}},
+                    ],
+                )
+            if turn_idx == 1:
+                seed_cid = observed_cids[0]
+                return 200, _xml_tool_reply(
+                    "Expand neighbors and read sibling context",
+                    [
+                        {"name": "expand_neighbors", "args": {"chunk_id": seed_cid, "top_k": 2}},
+                        {"name": "read_chunk", "args": {"chunk_id": seed_cid}},
+                    ],
+                )
+            c1, c2 = observed_cids[0], observed_cids[1]
+            return 200, _xml_tool_reply(
+                "Submit multi-hop grounded answer",
+                [
+                    {
+                        "name": "submit",
+                        "args": {"answer": f"Neil Armstrong played XylophoneZither [chunk_id={c1}] [chunk_id={c2}]."},
+                    }
+                ],
+            )
+
+        captured_preds: list[dspy.Prediction] = []
+
+        class _CapturePred(BaseCallback):
+            def on_module_end(self, call_id: str, outputs: Any | None, exception: BaseException | None = None) -> None:
+                _ = (call_id, exception)
+                if isinstance(outputs, dspy.Prediction) and hasattr(outputs, "answer") and hasattr(outputs, "history"):
+                    captured_preds.append(outputs)
+
+        server, requests_seen, _ = _start_loopback_chat_server(responder)
+        try:
+            lm = _make_loopback_lm(server)
+            with dspy.context(callbacks=[_CapturePred()]):
+                res = ask_question(
+                    agent,
+                    "What unusual instrument did the Apollo 11 commander play?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=lm,
+                    lm_sem=threading.Semaphore(1),
+                )
+        finally:
+            server.shutdown()
+
+        ver_after = conn.execute("PRAGMA data_version").fetchone()[0]
+        assert ver_before == ver_after
+
+    assert len(captured_preds) == 1
+    tool_results = [
+        r
+        for msg in captured_preds[0].history.messages
+        if isinstance(msg, dict) and (tc := msg.get("tool_calls")) is not None
+        for r in (getattr(getattr(tc, "tool_call_results", None), "tool_call_results", None) or ())
+    ]
+    assert len(tool_results) >= 5
+    assert all(not getattr(r, "is_error", False) for r in tool_results)
+    assert len(requests_seen) == 3
+    assert all(req.get("temperature") == 1.0 for req in requests_seen)
+    assert res.turns == 3
+    assert len(res.passages) == 2
+    assert {int(c.pointer.chunk_id) for c in res.passages} == set(observed_cids[:2])
+    assert all(not c.stale_on_disk and c.text for c in res.passages)
+
+
+def test_forced_submit_unannotated_citations_and_semaphore_serialization(tmp_path: Path) -> None:
+    cfg = _index_qa_corpus(tmp_path)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+
+    with open_readonly_db(cfg.db_path) as conn:
+        vs = build_vector_search(conn)
+        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        agent_1 = build_qa_agent(tools, max_iters=1)
+
+        def forced_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            _ = payload
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Retrieve passages first",
+                    [{"name": "lexical_grep", "args": {"query": "XylophoneZither", "top_k": 4}}],
+                )
+            return 200, _xml_tool_reply(
+                "Submit concise unannotated answer",
+                [{"name": "submit", "args": {"answer": "XylophoneZither"}}],
+            )
+
+        srv1, _, _ = _start_loopback_chat_server(forced_responder)
+        try:
+            res = ask_question(
+                agent_1,
+                "What instrument did he play?",
+                corpus_root=cfg.corpus_root,
+                vs=vs,
+                lm=_make_loopback_lm(srv1),
+                lm_sem=threading.Semaphore(1),
+                max_citations=2,
+            )
+        finally:
+            srv1.shutdown()
+        assert res.turns == 2
+        assert 1 <= len(res.passages) <= 2
+        assert any("XylophoneZither" in c.text for c in res.passages)
+
+        # Verify Semaphore(1) serializes concurrent ask_question calls strictly to max_in_flight == 1
+        agent_conc = build_qa_agent(tools, max_iters=1)
+
+        def quick_submit(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            _ = (turn_idx, payload)
+            return 200, _xml_tool_reply(
+                "Direct insufficient answer",
+                [{"name": "submit", "args": {"answer": "Insufficient references in corpus"}}],
+            )
+
+        srv2, _, concurrency = _start_loopback_chat_server(quick_submit, delay_sec=0.04)
+        try:
+            lm2 = _make_loopback_lm(srv2)
+            shared_sem = threading.Semaphore(1)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futs = [
+                    pool.submit(
+                        ask_question,
+                        agent_conc,
+                        f"Question {i}?",
+                        corpus_root=cfg.corpus_root,
+                        vs=vs,
+                        lm=lm2,
+                        lm_sem=shared_sem,
+                    )
+                    for i in range(4)
+                ]
+                results = [f.result() for f in futs]
+        finally:
+            srv2.shutdown()
+
+    assert len(results) == 4
+    assert all(r.citations == () for r in results)
+    assert concurrency["max_in_flight"] == 1
+
+
+def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path) -> None:
+    cfg = _index_qa_corpus(tmp_path)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+
+    with open_readonly_db(cfg.db_path) as conn:
+        vs = build_vector_search(conn)
+        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        agent = build_qa_agent(tools, max_iters=2)
+
+        def unused_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            _ = (turn_idx, payload)
+            return 200, _xml_tool_reply("Unused", [{"name": "submit", "args": {"answer": "unused"}}])
+
+        srv_unused, reqs_unused, _ = _start_loopback_chat_server(unused_responder)
+        try:
+            lm_unused = _make_loopback_lm(srv_unused)
+            sem = threading.Semaphore(1)
+
+            with pytest.raises(YawRuntimeError) as exc_blank:
+                ask_question(agent, "   ", corpus_root=cfg.corpus_root, vs=vs, lm=lm_unused, lm_sem=sem)
+            assert exc_blank.value.code == "INVALID_INPUT"
+
+            with pytest.raises(YawRuntimeError) as exc_mc:
+                ask_question(
+                    agent,
+                    "Valid question?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=lm_unused,
+                    lm_sem=sem,
+                    max_citations=0,
+                )
+            assert exc_mc.value.code == "INVALID_INPUT"
+
+            with contextlib.closing(sqlite3.connect(":memory:")) as empty_conn:
+                empty_vs = build_vector_search(empty_conn)
+            with pytest.raises(YawRuntimeError) as exc_empty:
+                ask_question(agent, "Valid?", corpus_root=cfg.corpus_root, vs=empty_vs, lm=lm_unused, lm_sem=sem)
+            assert exc_empty.value.code == "EMPTY_INDEX"
+            assert reqs_unused == []
+        finally:
+            srv_unused.shutdown()
+
+        # Non-existent chunk_id citation -> MODEL_ERROR
+        srv_bad_id, _, _ = _start_loopback_chat_server(
+            lambda _i, _p: (
+                200,
+                _xml_tool_reply("Invent id", [{"name": "submit", "args": {"answer": "Claim [chunk_id=777777]"}}]),
+            )
+        )
+        try:
+            with pytest.raises(YawRuntimeError) as exc_bad_id:
+                ask_question(
+                    agent,
+                    "Who commanded?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_bad_id),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_bad_id.value.code == "MODEL_ERROR"
+        finally:
+            srv_bad_id.shutdown()
+
+        # Real chunk_id present in vs.id_to_pos & mentioned in next_thought, but NEVER returned by a tool -> MODEL_ERROR
+        real_unseen_cid = int(vs.chunk_ids[0])
+
+        def hallucinated_real_id(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    f"Thinking about [chunk_id={real_unseen_cid}] without reading it",
+                    [{"name": "read_chunk", "args": {"chunk_id": 999999}}],
+                )
+            return 200, _xml_tool_reply(
+                f"Still referencing unseen [chunk_id={real_unseen_cid}]",
+                [{"name": "submit", "args": {"answer": f"Grounded? [chunk_id={real_unseen_cid}]"}}],
+            )
+
+        srv_unseen, _, _ = _start_loopback_chat_server(hallucinated_real_id)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_unseen:
+                ask_question(
+                    agent,
+                    "Test ungrounded real id",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_unseen),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_unseen.value.code == "MODEL_ERROR"
+        finally:
+            srv_unseen.shutdown()
+
+        # Comma-joined multi-ID citation with one unseen/ungrounded ID -> MODEL_ERROR
+        def mixed_comma_citation(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Read first", [{"name": "read_chunk", "args": {"chunk_id": real_unseen_cid}}]
+                )
+            return 200, _xml_tool_reply(
+                "Cite seen and ungrounded id together",
+                [{"name": "submit", "args": {"answer": f"Grounded [chunk_id={real_unseen_cid}, chunk_id=999999]."}}],
+            )
+
+        srv_comma, _, _ = _start_loopback_chat_server(mixed_comma_citation)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_comma:
+                ask_question(
+                    agent,
+                    "Test comma-joined ungrounded citation",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_comma),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_comma.value.code == "MODEL_ERROR"
+        finally:
+            srv_comma.shutdown()
+
+        # Whitespace-only submitted answer -> MODEL_ERROR
+        srv_ws, _, _ = _start_loopback_chat_server(
+            lambda _i, _p: (200, _xml_tool_reply("Empty", [{"name": "submit", "args": {"answer": "   "}}]))
+        )
+        try:
+            with pytest.raises(YawRuntimeError) as exc_ws:
+                ask_question(
+                    agent,
+                    "Empty answer test?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_ws),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_ws.value.code == "MODEL_ERROR"
+        finally:
+            srv_ws.shutdown()
+
+        # Unparseable LM output on all turns -> MODEL_ERROR
+        srv_garbage, _, _ = _start_loopback_chat_server(lambda _i, _p: (200, "not valid xml or json at all"))
+        try:
+            with pytest.raises(YawRuntimeError) as exc_parse:
+                ask_question(
+                    agent,
+                    "Malformed output test?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_garbage),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_parse.value.code == "MODEL_ERROR"
+        finally:
+            srv_garbage.shutdown()
+
+        # Stale/mutated cited file -> CONSISTENCY_ERROR
+        alpha_cid = next(int(p.chunk_id) for p in vs.pointers if p.rel_posix_path == "alpha.md")
+
+        def stale_responder(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply("Read alpha", [{"name": "read_chunk", "args": {"chunk_id": alpha_cid}}])
+            (cfg.corpus_root / "alpha.md").write_text("# Mutated\nChanged after read!\n", encoding="utf-8")
+            return 200, _xml_tool_reply(
+                "Cite alpha", [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={alpha_cid}]"}}]
+            )
+
+        srv_stale, _, _ = _start_loopback_chat_server(stale_responder)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_stale:
+                ask_question(
+                    agent,
+                    "Who commanded Apollo 11?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_stale),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_stale.value.code == "CONSISTENCY_ERROR"
+        finally:
+            srv_stale.shutdown()
+
+        # Verify dspy.ReAct catches tool argument errors natively and records is_error=True in history.messages
+        def invalid_tool_then_submit(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Invoke tools with invalid args",
+                    [
+                        {"name": "read_chunk", "args": {"chunk_id": 999999}},
+                        {"name": "search_passages", "args": {"query": "", "top_k": 0}},
+                    ],
+                )
+            return 200, _xml_tool_reply(
+                "Submit after observing native tool errors",
+                [{"name": "submit", "args": {"answer": "Insufficient references in corpus"}}],
+            )
+
+        srv_react_err, _, _ = _start_loopback_chat_server(invalid_tool_then_submit)
+        try:
+            with dspy.context(lm=_make_loopback_lm(srv_react_err)):
+                pred_err = agent(question="Test native tool errors")
+            tool_results = [
+                res
+                for msg in pred_err.history.messages
+                if isinstance(msg, dict) and (tc := msg.get("tool_calls")) is not None
+                for res in (getattr(getattr(tc, "tool_call_results", None), "tool_call_results", None) or ())
+            ]
+            err_results = [r for r in tool_results if getattr(r, "is_error", False)]
+            assert len(err_results) == 2
+            assert all("[INVALID" not in str(getattr(r, "value", "")) for r in err_results)
+            assert any("Unknown chunk_id=999999" in str(getattr(r, "value", "")) for r in err_results)
+            assert any("non-empty string" in str(getattr(r, "value", "")) for r in err_results)
+        finally:
+            srv_react_err.shutdown()
+
+        # Forced-submit ValueError (max_iters=1, forced turn emits non-submit call) -> MODEL_ERROR
+        forced_agent = build_qa_agent(tools, max_iters=1)
+
+        def forced_non_submit(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            _ = payload
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Search once",
+                    [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}],
+                )
+            return 200, _xml_tool_reply(
+                "Refuse to submit",
+                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 1}}],
+            )
+
+        srv_forced_err, _, _ = _start_loopback_chat_server(forced_non_submit)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_forced_val:
+                ask_question(
+                    forced_agent,
+                    "Who commanded Apollo 11?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_forced_err),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_forced_val.value.code == "MODEL_ERROR"
+        finally:
+            srv_forced_err.shutdown()
+
+        # Non-submit termination_reason -> MODEL_ERROR
+        class _BadTerminationModule(dspy.Module):
+            def forward(self, question: str) -> dspy.Prediction:
+                _ = question
+                return dspy.Prediction(answer="Armstrong", termination_reason="max_iters")
+
+        with pytest.raises(YawRuntimeError) as exc_term:
+            run_qa("Who commanded Apollo 11?", vs=vs, corpus_root=cfg.corpus_root, agent=_BadTerminationModule())
+        assert exc_term.value.code == "MODEL_ERROR"
+
+        # HTTP 500 server error must propagate unmasked (LMServerError), NOT be wrapped or swallowed
+        srv_500, _, _ = _start_loopback_chat_server(lambda _i, _p: (500, "backend exploded"))
+        try:
+            with pytest.raises(LMServerError):
+                ask_question(
+                    agent,
+                    "Server down test?",
+                    corpus_root=cfg.corpus_root,
+                    vs=vs,
+                    lm=_make_loopback_lm(srv_500),
+                    lm_sem=threading.Semaphore(1),
+                )
+        finally:
+            srv_500.shutdown()
+
+
+def test_inline_citation_extract_and_strip_handles_multi_id_and_preserves_brackets() -> None:
+    sample = "Phoolwari [chunk_id=10, chunk_id=20] beats Foo [chunk_id=10, 30; chunk_id=40] [note]."
+    assert extract_inline_chunk_ids(sample) == [10, 20, 30, 40]
+    assert extract_inline_chunk_ids("Plain [chunk_id=7]") == [7]
+    assert strip_inline_citations("Phoolwari [chunk_id=1, chunk_id=2].") == "Phoolwari."
+    assert strip_inline_citations("Bar [note] [chunk_id=1, 2; chunk_id=3] , ok !") == "Bar [note], ok!"

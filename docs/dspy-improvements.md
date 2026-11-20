@@ -12,7 +12,7 @@ Practical design patterns, lessons learned, and future architecture investigatio
 - **SIMBA Counterfactual Delta Reward & Checkpoint State**: Native DSPy SIMBA instruction evaluation scores candidates on the first two training queries using the bounded delta reward:
   $$\text{reward} = 0.5 + 0.5 \cdot \frac{\Delta}{1 + |\Delta|}$$
   and persists worker state (version 2) and counterfactual task-score cache entries atomically in `yaw.db` metadata.
-- **Reflection Serving Tokenizer Budget**: Reflection requests (`training traces -> sandbox evidence selection -> native DSPy InstructionProposer -> downstream task scoring`) measure the complete rendered prompt against `inference.reflection_input_tokens` using the resident llama.cpp chat template and `/tokenize` endpoint (`ServingTokenCounter`).
+- **Bounded reflection requests**: Reflection requests (`training traces -> sandbox evidence selection -> native DSPy InstructionProposer -> downstream task scoring`) bound the complete formatted request with `inference.reflection_input_chars` (65,536 characters by default). Providers enforce token overflow; native DSPy usage reports actual tokens after calls. No serving tokenizer or approximate token counts.
 - **Native `YawGBNFAdapter` & Deployment-Owned LM Binding**: Task predictors bind their actual `dspy.LM` directly (no `BaseLM` proxy). `YawGBNFAdapter` subclasses `dspy.JSONAdapter` without custom fallback parsing shims and fails hard on missing/invalid fields. Loading a compiled program JSON preserves deployment-owned endpoints, credentials, and context capacities rather than letting serialized prompt metadata overwrite them.
 - **The Rule**: Always set `max_bootstrapped_demos = 0` and `max_labeled_demos = 0` in `yaw.toml`. Optimize pure instructions zero-shot.
 - **Fresh program policy (2026-10-24)**: Task and reflection constructors default to `include_demos=False`, so a fresh GEPA-only run also starts without fixed examples. Existing example sets require explicit opt-in; loaded compiled demonstrations are preserved. Their generalization has not been established by a paired benchmark.
@@ -166,3 +166,143 @@ The real leverage of `dspy.Flex` is **arbitrary code and tool execution**, not p
   - Which parts of the current `YawProgram` could be replaced by `dspy.Flex` + Python tools?
   - What is the highest leverage MVP, the "ask question" part of the retrieval pipeline (F1, EM scores) or the recall pipeline (Recall@N scores)?
   - How does this tie in into the existing `dspy.RLM` modules, what is the scope of refactoring and removal?
+
+---
+
+## 6. Inference Backend Contract: DSPy `lm15`, Zero Provider Plumbing
+
+| Relation | Links |
+| --- | --- |
+| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md) (Prime Directive: no fallbacks, no degraded modes) |
+| Rules | [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py` |
+| Owns code | `inference/chat.py:create_dspy_lm`, `inference/models.py`, `inference/embedding.py:create_dspy_embedder`, `inference/reflection.py`, `inference/confidence.py`, `inference/adapter.py`, `benchmark.py` preflight, `scripts/watchdog.py:get_lemonade_server_metrics` |
+| Peers | [model-evaluation.md](model-evaluation.md): hardware profiles (Lemonade-specific today, superseded for serving parameters by this section); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): `ChunkInference` memo identity consumes program identity; [w3c-improvements.md](w3c-improvements.md): three-layer parity depends on §6.4 decision |
+| References | [DSPy lm15 migration guide](https://dspy.ai/current/community/normalized-lm-api-migration/), [Unsloth API](https://unsloth.ai/docs/basics/api) |
+| Records | [docs/reviews/inference-backend.md](reviews/inference-backend.md) (created before the first code edit) |
+
+Pinned state: HEAD `7fbec2b` on `dev`; `dspy 3.4.1`, `litellm 1.106.0` [measured: `uv run --locked python`, 7fbec2b]. The working tree holds uncommitted user edits to `adapter.py`, `grammars.py`, `models.py` that this spec does not depend on.
+
+### 6.1 Scope and non-goals
+
+- **Goal**: swap the inference backend (local Unsloth Studio, vLLM, paid OpenAI API) by configuration only, using DSPy's normalized `dspy.LM` / `dspy.lm15` contract. YAW writes no provider adapters, no HTTP clients, no tokenizer or registry plumbing of its own.
+- **Non-goals**: benchmarking quality across backends; supporting backends that lack an OpenAI-compatible `/v1/chat/completions`; changing signatures, metrics or GEPA behavior.
+
+### 6.2 Problem, with evidence
+
+- YAW talks to Lemonade-only endpoints: `/health` `all_models_loaded` + `launch_command` (`models.py:embedding_evidence`, `chat_evidence`, `check_registry`), llama-server `/props`, `/apply-template`, `/tokenize` (`reflection.py:ServingTokenCounter`), `/metrics` (`scripts/watchdog.py:get_lemonade_server_metrics`). Unsloth Studio answers `/health` with 404 and has no `/tokenize` [measured: unauthenticated probe of 127.0.0.1:8888, 7fbec2b].
+- **Unsloth `/v1/chat/completions` rejects `logprobs`** (the `/v1/completions` route accepts them, see below) with HTTP 400 `unsupported_parameter` [measured: `docs/reviews/inference-backend-probes/probe_unsloth2.py`, Unsloth Studio on 127.0.0.1:8888, model `gemma-4-e4b`, 2026-11-13]. YAW requests logprobs for extraction confidence (`program.py` `collect_logprobs=True`, `confidence.py:extraction_logprob_votes`, `judge_logprob_votes`).
+- **On `/v1/chat/completions` a custom top-level `grammar` field is accepted but not enforced**: output was free text while `grammar = root ::= "yes" | "no"` was sent [measured: `docs/reviews/inference-backend-probes/probe_unsloth2.py`, same conditions]. The same holds for `extra_body.grammar` and `guided_json` [measured: `docs/reviews/inference-backend-probes/probe_unsloth3.py`].
+- **`response_format = {type: json_schema, strict: true}` is honored**: the reply used exactly the schema's keys (`zzname`, `zzlives`) [measured: `docs/reviews/inference-backend-probes/probe_unsloth3.py`]. This is the OpenAI-standard structured-output parameter that `dspy.JSONAdapter` emits natively.
+- **`POST /v1/completions` on the same Unsloth server supports both missing features** (user-supplied route, probed 2026-11-13): `logprobs = 3` returns `choices[0].logprobs.content[i].top_logprobs[{id, token, logprob}]`; a top-level `grammar` field **is enforced** (`root ::= "yes" | "no"` produced `"yes"`; the reported `top_logprobs` still show the unconstrained distribution, e.g. `"Hello"` at -0.68 while the forced token `"y"` shows -12.56); `response_format` is **not** enforced on this route (free text returned) [measured: `docs/reviews/inference-backend-probes/probe_unsloth_completions.py`, Unsloth Studio, `system_fingerprint = b12284-77bf94e7c`]. The response carries llama.cpp `timings`, so this route is the llama-server passthrough.
+- **`dspy.LM("openai/gemma-4-e4b", model_type="text", api_base=..., api_key=...)` reaches that route and surfaces the logprobs** (`TextCompletionResponse`, `Logprobs.content[i]['top_logprobs']`) [measured: `docs/reviews/inference-backend-probes/probe_lm15_completions.py`]. This text path is DSPy's legacy completion client, not an `lm15.Request`; `lm15.Config(logprobs=True)` raises `TypeError: logprobs must be an int` client-side [measured: same].
+- **The served Gemma model thinks by default**: `reasoning_content` is filled and consumes `max_tokens`; with 80 tokens several replies had empty `content` and `finish_reason = length` [measured: `docs/reviews/inference-backend-probes/probe_unsloth3.py`].
+- **DSPy 3.4.1 already routes `dspy.LM("openai/<alias>", api_base=..., api_key=...)` through lm15** against Unsloth: an explicit `Request(Config(max_tokens=...))` returned a `Response` with `Usage(input_tokens=22, output_tokens=3, ...)`, and `dspy.Predict` under `JSONAdapter` returned a typed `Prediction`; `lm.history[-1]['usage']` carries `prompt_tokens` [measured: `docs/reviews/inference-backend-probes/probe_lm15_unsloth.py`]. `lm15.Config` exposes `max_tokens, temperature, top_p, top_k, stop, response_format, seed, logprobs, probabilities, extensions` [measured: same].
+- **Unsloth publishes model aliases and context lengths** in `GET /v1/models` (`gemma-4-e4b`: `context_length = 131072`; `embeddinggemma-2`: `context_length = 8192`, `loaded = true`) [measured: `docs/reviews/inference-backend-probes/probe_unsloth.py`]. This is Unsloth-specific metadata, not a portable contract.
+- **Unsloth `count_tokens` equals the response's `prompt_tokens`** for one short chat (22 and 22) [observed: single probe; Unsloth-specific endpoint].
+- Unknown: embedding vector dimension via `/v1/embeddings` at the aliased model, `lm15.OpenAIChatLM.list_models` behavior against a compatible endpoint, whether `lm15.Config.logprobs` yields `Response.logprobs` on OpenAI/vLLM, and ContextLengthError normalization on Unsloth/vLLM.
+
+### 6.3 Goals as falsifiable acceptance
+
+**G1. Config-only backend swap.**
+- **Measure**: files changed to move the same program from Unsloth to another OpenAI-compatible endpoint.
+- **Reference**: `yaw.toml` plus one environment variable only.
+- **Passes when**: `grep` finds zero provider/endpoint names (`lemonade`, `13305`, `unsloth`, `llama-server`, `/tokenize`, `/props`, `/health`, `all_models_loaded`) in `yaw/` and `benchmark.py` outside tests and docs [target].
+- **Fails if / does not count**: an `if provider == ...` branch, a dormant Lemonade path, or an adapter class reimplementing lm15.
+
+**G2. Structured output uses one declared parameter (Route A: `response_format`; Route B: `grammar` on text completions).**
+- **Measure**: request bodies produced by every direct-LM predictor against a loopback capture server.
+- **Reference**: `response_format` of type `json_schema` produced by DSPy's `JSONAdapter`.
+- **Passes when**: under Route A no request carries `grammar`, `guided_json` or `extra_body` keys; under Route B every request is a text completion carrying `grammar` and no chat route is used for extraction [target].
+- **Fails if**: the custom GBNF path survives as a second path after the gate.
+
+**G3. Fail fast, no silent degrade.**
+- **Measure**: behavior when the backend lacks a required capability (logprobs) or the prompt overflows.
+- **Passes when**: the original provider exception (`lm15` error or HTTP 400) propagates and aborts the run with no retry-without-feature and no default confidence value [target].
+- **Fails if**: a `try/except` substitutes a constant confidence, or removes `logprobs` from the request and continues.
+
+**G4. Live acceptance on real silicon.**
+- **Measure**: one end-to-end `uv run yaw dspy optimize --fresh` indexing batch of 64 chunks against Unsloth.
+- **Passes when**: the batch publishes with zero raised errors and the config fingerprint matches the new defaults [target].
+- **Does not count**: fake-provider tests (orchestration only, per `AGENTS.md`).
+
+Thresholds are not loosened after seeing a run.
+
+### 6.4 Semantics and decisions to settle before code
+
+- **Single client path**: every LM call is `dspy.LM(f"openai/{model}", api_base=base_url, api_key=os.environ[api_key_env])`; direct calls use `lm15.Request`/`Config`/`Response`. The API key is read from the environment variable named by `api_key_env` (default `UNSLOTH_STUDIO_AUTH_TOKEN`) and a missing variable raises at startup. It never appears in `yaw.toml`, logs, tests or docs.
+- **Context window**: single owner `inference.context_window_tokens` in config (already present). Overflow surfaces as the provider's error through lm15 (`ContextLengthError`) and is never caught.
+- **Token counting**: pre-call exact counting is retired. Real counts come from native DSPy response usage after each call. Semantic packets use the configured pair limit and a character memory bound; `ReflectionLM` checks `reflection_input_chars` without claiming token equivalence. Provider overflow propagates through DSPy with the original lm15 exception retained as the cause.
+- **Embeddings**: `dspy.Embedder` (LiteLLM-backed in 3.4.1; lm15 has no embeddings API) with `openai/<alias>`; unchanged call shape.
+- **Open: structured-output and logprob route.** Constraint: three-layer parity (grammar, parser, SHACL) must keep every parser-accepted record publishable; confidence needs logprobs; no silent default; one path. Facts: on Unsloth chat completions `grammar` is ignored, `logprobs` is rejected and `response_format` json_schema is enforced; on Unsloth `/v1/completions` `grammar` is enforced, `logprobs` works and `response_format` is ignored (§6.2). Portability of each parameter [assumption, probe on vLLM and OpenAI]: `logprobs` on completions is part of the OpenAI completions API and vLLM; `grammar` is a llama.cpp field (vLLM names it differently, OpenAI has none); `response_format` json_schema is OpenAI/vLLM standard.
+  - **Route A (chat + JSON Schema)**: retire GBNF; JSON Schema (`maxItems`, label `enum`, `maxLength`) carries what it can, parsers and SHACL carry cross-field rules (irreflexivity). Logprob confidence is unavailable on Unsloth chat: fail fast or retire it.
+  - **Route B (text completions, `model_type="text"`)**: keeps GBNF and logprobs on Unsloth/llama.cpp, so parity and confidence survive; costs: YAW renders the chat template itself (unprobed: how DSPy's text path turns adapter messages into a prompt for Gemma), `grammar` is not portable to OpenAI, so G1 holds only for llama.cpp-class backends.
+  - **Route C (hybrid by capability)**: violates G1/G2 (two paths); not proposed.
+  Resolved by: user decision plus two probes (DSPy text-path prompt rendering for Gemma; `logprobs` and grammar-equivalent on vLLM). No recommendation yet: A is portable but drops logprob confidence on Unsloth, B preserves today's behavior but ties the contract to llama.cpp.
+- **Open: reasoning mode.** Constraint: extraction roles must not spend `max_tokens` on thinking. Probe: `lm15.Config.reasoning` against Unsloth for `gemma-4-e4b`, pass criterion `reasoning_tokens == 0` and non-empty `content` for 20 consecutive extraction calls [target].
+- **Pre-call sizing, resolved 2026-11-13**: fixed `semantic_adjudication_batch_size` pair packets, no tokenizer fit check, provider overflow fails fast; reflection requests use explicit `reflection_input_chars` (default 65536). Live workload capacity remains unverified.
+- **Open: model identity and preflight.** Lemonade checkpoint/launch-flag verification has no portable equivalent. Candidate: `GET /v1/models` membership (an OpenAI-standard route, `lm15.OpenAIChatLM.list_models`) and an embedding-dimension probe. Resolved by: probe `list_models` against Unsloth.
+
+### 6.5 Capability gates
+
+| Reliance | Version | Probe | Pass criterion | Stop rule |
+| --- | --- | --- | --- | --- |
+| `dspy.LM` + lm15 against OpenAI-compatible `api_base` | dspy 3.4.1 | `docs/reviews/inference-backend-probes/probe_lm15_unsloth.py` | `Response.usage.input_tokens > 0`, JSONAdapter `Prediction` typed | already passing at 7fbec2b |
+| `response_format` json_schema enforced | Unsloth Studio (version unrecorded) | `docs/reviews/inference-backend-probes/probe_unsloth3.py` | reply keys equal schema keys | passing; re-run on vLLM and OpenAI before claiming portability |
+| Logprobs through `dspy.LM(model_type="text")` | dspy 3.4.1 | `probe_lm15_completions.py` | `Logprobs.content[0]['top_logprobs']` non-empty | passing on Unsloth completions; unverified on vLLM and OpenAI |
+| `lm15.Config.logprobs` on chat | dspy 3.4.1 | `probe_lm15_completions.py` | `Response.logprobs` non-empty | fails client-side (`TypeError: logprobs must be an int`) and Unsloth chat returns HTTP 400: follow the §6.4 decision, do not catch |
+| `ContextLengthError` normalization | dspy 3.4.1 | send an over-window prompt per backend | `lm15.ContextLengthError` raised | amend spec with the observed exception type |
+| `OpenAIChatLM.list_models` | dspy 3.4.1 | call against Unsloth | returns aliases | amend spec; no hand-rolled `GET /v1/models` |
+
+### 6.6 Removal inventory
+
+| Retired item | Location | Replacement | Exit check |
+| --- | --- | --- | --- |
+| `ServingTokenCounter`, `reflection_tokenizer_url` | `reflection.py`, `config.py`, `yaw.toml`, `program.py`, `optimizer.py` | usage-based accounting (per §6.4 Open items) | `git grep -n "ServingTokenCounter\|reflection_tokenizer_url"` returns nothing |
+| Lemonade registry/evidence | `models.py:check_registry,preflight,embedding_evidence,chat_evidence,select_model,get_json,canonical` | `list_models`-based identity (Open) | `git grep -n "all_models_loaded\|launch_command"` returns nothing in `yaw/` |
+| Recipe/`flm`/`ollama` branches | `chat.py:create_dspy_lm`, `embedding.py:create_dspy_embedder`, `ChatProfile.recipe` | single `openai/` path | `git grep -n "ollama\|flm\|recipe"` returns nothing in `yaw/` |
+| Watchdog Lemonade metrics | `scripts/watchdog.py:get_lemonade_server_metrics`, `lemonade_metrics` keys, process-name match | tokens/s from YAW usage telemetry | `git grep -n "lemonade\|13305" scripts yaw` returns nothing |
+| Custom GBNF transport (only if §6.4 Route A) | `adapter.py`, `grammars.py`, `lm_supports_gbnf`, `enable_gbnf`, `gbnf_*` config | JSON Schema via `JSONAdapter` | `git grep -n "gbnf\|GBNF"` returns nothing outside docs and negative tests |
+| Docs and tests naming Lemonade | `README.md`, `model-evaluation.md`, `docs/**`, `tests/**` | provider-neutral wording | the same greps over `docs` and `tests` |
+
+### 6.7 Checkpoints
+
+| ID | Slice | Pipeline | Exit gate |
+| --- | --- | --- | --- |
+| B0 (Route chosen: B) | Review record created; resolve the four Open items with the user and the capability probes | `research` → parent | Decisions recorded verbatim in §6.8 |
+| B1 | Client path: `create_dspy_lm`/`create_dspy_embedder` reduced to `dspy.LM("openai/...")` + `dspy.Embedder`; `api_key_env` | `implementer` → `critic (flash)` | G1 greps for chat/embedding code; unit tests on a loopback server |
+| B2 | Retire `ServingTokenCounter` and registry evidence; usage-based accounting | `implementer` → `critic (flash)` | removal-inventory greps; full suite |
+| B3 | Structured output and logprobs per §6.4 decisions | `ontologist` → `implementer` → `critic (flash)` | G2/G3 loopback capture fixtures; parity tests green |
+| B4 | Watchdog telemetry from usage; docs and test sweep | `implementer` → `critic (flash)` | G1 grep over repo |
+| B5 | Live acceptance (G4) on Unsloth | parent | `--fresh` batch of 64 chunks published; evidence in the review record |
+
+### 6.8 Verification
+
+| Fixture | Required result |
+| --- | --- |
+| Loopback OpenAI-compatible server capturing request bodies | Route A: every predictor sends `response_format` json_schema and no `grammar`/`guided_json`/`extra_body` keys; Route B: every extraction predictor posts to `/v1/completions` with `grammar` |
+| Missing `UNSLOTH_STUDIO_AUTH_TOKEN` | startup raises, nothing is sent |
+| Loopback server returning HTTP 400 for `logprobs` | the run aborts with the original error; no retry without the field |
+| Loopback server returning a context-overflow body | `lm15.ContextLengthError` propagates uncaught |
+| Real Unsloth, 64-chunk indexing batch | zero errors; `lm.history` usage totals recorded in the review record |
+| `git grep` removal patterns | zero matches outside docs, tests asserting absence |
+
+Quality gates: `uv run ty check`, `uv run ruff check --fix`, `uv run ruff format`, `uv run pytest`, `git diff --check`, plus the mandatory `critic` audit per unit (`AGENTS.md`).
+
+### Decisions
+
+- 2026-11-12, user: "use lm15 (https://dspy.ai/current/community/normalized-lm-api-migration/) and zero custom plumbing! Spec it."
+- 2026-11-12, user: "Would maybe be nice to have a solution that allows changing the inference [...] what if, at some stage, I want to use OpenAI paid API to run yaw? And production usually likes vLLM?"
+- 2026-11-12, user: inference backend is Unsloth at `http://127.0.0.1:8888/v1`, aliases `embeddinggemma-2` and `gemma-4-e4b` (implemented in commit `7fbec2b`).
+- 2026-11-13, user (pointing at the completions endpoint): "You get logprobs by calling the OpenAI-compatible **completions** endpoint with the `logprobs` parameter, then reading `response.choices[0].logprobs.content[0][\"top_logprobs\"]`."
+- 2026-11-13, user: Route B, minimal code change for now. The 150 tok/s average compared to 60 tok/s on lemonade is what I need right now, to be able to pass the epic 1 gates in reasonable time. Might be worth revisiting when epic 1 is officially closed. You'll also need to check the embeddinggemma-2 embedder. Also: The gemma-4 thinking contract requires the <|think|> token as the first token, see the model card.\n- Resolved by the 2026-11-13 decision: structured-output and logprob route is Route B (text completions). Implemented in inference/completions.py:GemmaCompletionsEngine (a dspy.LM(engine=...) that renders the Gemma 4 turn format and posts grammar + integer logprobs to /v1/completions); worker roles only, orchestrator roles keep the chat path. Revisit Route A after Epic 1 closes.\n- Still pending: reasoning mode for orchestrator roles on the chat route, registry preflight (§6.4 Open items). Pre-call sizing was resolved by the bounded-batch decision below.
+
+- 2026-11-13, wiring audit user decision: "Apply the spec’s bounded-batch approach".
+  Pre-call exact token counting is retired. Semantic packets use
+  `semantic_adjudication_batch_size` pairs. Reflection final formatted requests use
+  the explicit `reflection_input_chars` cap (default 65536 characters), without
+  claiming equivalence to tokens. Native provider context errors propagate. Actual
+  token usage comes only from DSPy response usage; no surrogate tokenizer.
+
+### Generation capacity ownership
+
+Omitted `max_output_tokens` imposes no YAW generation-token limit. DSPy and both completion transports must omit the outbound token-limit field, leaving available context and generation capacity to the endpoint. Only explicit positive output limits are validated against active context and transmitted. This supersedes automatic output-token scaling; RLM tool-output character safeguards remain separate.
