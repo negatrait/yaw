@@ -1,6 +1,6 @@
-# Benchmark-Gated Evaluation of Parameter-Free Converged Citation Diffusion (`M_PURE_0P`) and Ablation History (`EVAL-0`–`EVAL-3`)
+# Benchmark-Gated Evaluation of Parameter-Free 1-Bit Tangent-Steered Citation Diffusion (`M_FINAL_1B`) and Full Ablation History (`EVAL-0`–`EVAL-3f`)
 
-**Status:** Confirmatory Experiments Complete — **Conditional Promotion Decision Required Before `EVAL-5`** (`0` edits to `yaw/**`, `pyproject.toml`, `yaw.toml`, [FOUNDATIONAL.md](../../FOUNDATIONAL.md), or [AGENTS.md](../../AGENTS.md) on `dev`)
+**Status:** `EVAL-3f` Confirmatory Holdout Complete — **`M_FINAL_1B` User-Approved for `EVAL-5` Production Cutover** (`EVAL-4` Manuscript Update Pending Whole-Repo Gates & Flash Critic; `0` edits to `yaw/**`, `pyproject.toml`, `yaw.toml`, [FOUNDATIONAL.md](../../FOUNDATIONAL.md), or [AGENTS.md](../../AGENTS.md) on `dev`)
 
 | Relation | Reference |
 | --- | --- |
@@ -9,32 +9,32 @@
 | Specification & Ledger | [mdl-dag-sprint.md](mdl-dag-sprint.md) (`Rev 4`) |
 | Evaluation Ledgers | [evaluation.md](../evaluation.md), [evaluation-graph-storage.md](../evaluation-graph-storage.md) |
 | Peer Specs | [bare-bones-replacement-sprint.md](bare-bones-replacement-sprint.md), [epic-3-fts-vec-graph-experiment.md](epic-3-fts-vec-graph-experiment.md), [substate-manifold-shootout.md](substate-manifold-shootout.md) |
-| Code Provenance | Pinned `dev` baseline: `3cd3952` (`66e9a9e` `EVAL-0`); isolated lab: branch `exp/mdl-dag-ablation` @ commit `032fe2d` |
+| Code Provenance | Pinned `dev` baseline: `3cd3952` (`66e9a9e` `EVAL-0`, `9078d18` initial `M_PURE_0P` `EVAL-4`); isolated lab: branch `exp/mdl-dag-ablation` @ `5b58ada` (`032fe2d` `EVAL-3`, `325eea3` `EVAL-3b`, `d29531a` `EVAL-3c`–`3e`, `5b58ada` `EVAL-3f`) |
 
 ---
 
 ## 1. Abstract & Executive Gate Verdict
 
-We evaluate whether a zero-LLM, zero-tunable-hyperparameter graph-diffusion retriever (**`M_PURE_0P`**) built over committed SQLite chunks (`37,570` documents / `52,959` chunks across 5 benchmarks) outperforms YAW's unmodified clean-slate baseline (`B3_CS6`, [retrieval.py](../../yaw/retrieval.py) at `3cd3952`) under preregistered confirmatory gates `P0`–`P5` while removing all `optuna` tuning and `spaCy` runtime dependencies.
+We evaluate a zero-LLM, zero-tunable-hyperparameter graph-diffusion retrieval architecture across six iterative and confirmatory stages (`EVAL-0`..`EVAL-3f`) over `37,570` documents (`52,959` chunks across five benchmarks) against YAW's unmodified clean-slate baseline (`B3_CS6`, [retrieval.py](../../yaw/retrieval.py) at `3cd3952`) under preregistered gates `P0`–`P5`, targeting atomic elimination of `sqlite-vec`/`vec0`, `optuna`, and `spacy`/`en-core-web-sm`.
 
-An intermediate de-parameterized hybrid (`M_WIN_0P`, fusing finite-horizon `L <= 3` simple-path Gibbs with 3-hop Entity-HMM BMA) passed Tier B discovery and Tier C retrieval (`Pool R@5 = 0.8123` vs `0.6547`), yet **failed sealed Tier C** on reject calibration (`P4`: `Reject AUROC = 0.6432 < 0.70 < top1_cosine 0.6804`) and component necessity (`P5`: `7/21 PASS`). Stripping every remaining depth, budget, and scalar-weight heuristic yielded **`M_PURE_0P`**: a single factored $O(\text{nnz})$ operator combining directed forward title ownership, exact Bayesian reverse citations, and self-loop-cancelled 1-bit PMI co-occurrence under converged geometric-restart ($\rho_{\text{stop}} = 0.5$) diffusion on a full-corpus 4-bit RaBitQ field.
-
-On the **untouched disjoint confirmatory split (`Tier D`, `N = 492` retrieval-scorable queries, `200` reject labels, `n = 100` paired `gemma-4-e4b` `dspy.ReAct` QA queries)**:
-
-- **`M_PURE_0P` clears `P0`, `P1`, `P2`, `P3`, and `P4`:** `Pool Recall@5 = 0.8010` vs `B3_CS6 0.6627` (`+0.1382`, $p_{\text{Holm}} = 0.0004$), `Multi-Hop All-Hops@5 = 0.7033` vs `0.4233` (`+0.2800`, $p_{\text{Holm}} = 0.0004$), `Reject AUROC = 0.7976` vs `top1_cosine 0.7387` (`0` masked leaks), `VectorSearch RAM = 25.45 MiB` (`4.32x` below `B3_CS6 110.04 MiB`), `p50/95 = 35.1 / 86.2 ms`, `0` 16-thread concurrency errors, and paired `dspy.ReAct` QA `EM = 0.3800` vs `0.3300` (`+0.0500`) / `F1 = 0.5615` vs `0.5235` (`+0.0379`).
-- **Overall Gate Verdict (`P5 = FAIL`, `5/8 PASS`):** While 5 core mechanisms pass LOO (`AP1` 4-bit RaBitQ `2.25x` RAM, `AP4` diffusion `+0.0716 R@5 / +0.1967 MH AH@5`, `AP5` title citations `+0.0632 / +0.1367`, `AP7` conditional Noisy-OR `+0.0152 / +0.0533`, `AP8` MaxP deferral `+0.0080 R@5`), **`AP3_UNICODE61_LEX`** (incumbent `unicode61` FTS5 tokenizer) outperformed `trigram` tokenization on both Tier D (`0.8098 vs 0.8010 R@5`, `-0.0088 [-0.0160, -0.0019]`, `p95 = 64.5 ms vs 86.2 ms`) and Tier C comparison (`0.8039 vs 0.7913 R@5`, `p95 = 63.7 ms vs 89.0 ms`). Additionally `AP6_NO_PMI_CHAN` and `AP2_1BIT_RABITQ` missed strict Tier D 95% CIs. Conditional user sign-off is required before `EVAL-5` (§9).
+1. **Pre-`3b` Trajectory (`M_FULL` $\to$ `M_WIN` $\to$ `M_WIN_0P` $\to$ `M_PURE_0P`):** An intermediate finite-horizon hybrid (`M_WIN_0P`) passed Tier B discovery yet **failed sealed Tier C** on reject calibration (`P4`: `0.6432 < 0.70 < top1 0.6804`) and component necessity (`P5`: `7/21 PASS`). Pivoting to parameter-free converged geometric-restart ($\rho_{\text{stop}} = 0.5$) citation + 1-bit PMI diffusion over 4-bit RaBitQ (**`M_PURE_0P`**) passed `P0`–`P4` on untouched disjoint `Tier D` (`N = 492`, `Pool R@5 = 0.8010`, `MH AH@5 = 0.7033`, `Rej = 0.7976`, `n = 100` `P3` QA `EM = 0.3800 vs 0.3300`), yet failed `P5` (`5/8 PASS`) because incumbent `unicode61` FTS5 tokenization (`AP3_UNICODE61_LEX`) outperformed `trigram` on Tier D (`0.8098 vs 0.8010`, `p95 = 64.5 vs 86.2 ms`) and Tier C (`0.8039 vs 0.7913`) while `trigram` inflated `chunk_fts_data` `5.61x` (`256.59` vs `45.76 MiB`).
+2. **`EVAL-3b` Fair Tokenizer Shootout & 1-Bit SoA Pivot (`exp/mdl-dag-ablation` @ `325eea3`):** Harmonizing Unicode word/sentence regexes, unified decompounding (`_run_decomp_for_word`), and non-overlapping CJK bigram PMI across both tokenizers, and building bloat-free `candidate_unicode61.db` (`246.43 MiB` total 5-corpus DB footprint; `chunk_fts_data = 43.56 MiB`, **`5.89x` smaller** than `candidate_trigram.db` `256.59 MiB`), yielded 1-bit SoA RaBitQ **`M_PURE_U61_1B`**: `Tier D Pool R@5 = 0.8128`, `4-DS H4 = 0.7890`, `MH AH@5 = 0.7133`, `Rej = 0.7855`, `RAM = 22.55 MiB`, `p50/p95 = 23.1 / 44.3 ms`. However, `P5` (`6/8 PASS`) and paired `n = 100` `dspy.ReAct` QA (`P3 = FAIL`, `EM 0.3900 vs 0.4000`) motivated dual-operator discovery.
+3. **`EVAL-3c`–`3e` Dualities, 16-Arm Factorial Lattice & Optimization (`exp/mdl-dag-ablation` @ `d29531a`):** Testing 13 parameter-free 1-bit dualities on `tier_b_dev` (`N = 243`) and running the full $2^4 = 16$-arm factorial lattice over `{F1, E1A, E3A, F4B}` identified `#1 C2_F1_E1A` (`Pool R@5 = 0.8155 [+0.0003, +0.0329]`, `4-DS H4 = 0.8000`, `MH AH@5 = 0.7200`, `ERB = 0.8878`, `PopQA = 0.6100`). Replacing query-time `betainc`/CSR rebuilds with static CSR buffers + a `16,384`-bin piecewise-linear `z = sqrt(-log1p(-c^2))` Beta-tail LUT sped up `C2_F1_E1A` `1.45x / 1.63x` (`37.51 / 83.47 -> 25.91 / 51.12 ms`) with `0` `Recall@{1,2,5,10}` / `AH@5` diffs, freezing **`M_FINAL_1B`** (`1-bit RaBitQ + Tangent-Steered Cyclic Diffusion + 1-bit DPP`).
+4. **Untouched Disjoint `Tier E` Holdout (`EVAL-3f`, `exp/mdl-dag-ablation` @ `5b58ada`, `4` Public Datasets / `36,262` Docs / `40,157` Chunks, `N = 400`, `200` Reject Labels, `n = 200` Paired `P3` QA, Plus 5-Corpus `52,959`-Chunk IEEE `float16 -> float32` Parity):**
+   - **`M_FINAL_1B` clears `P0`, `P1`, `P2`, `P3`, and `P4`:** `4-DS H4 = Pool R@5 = 0.8006` vs `B3_CS6 0.6208` (`+0.1798 [+0.1552, +0.2048]`, $p_{\text{Holm}} = 0.0004$), `MH AH@5 = 0.7100` vs `0.4067` (`+0.3033 [+0.2500, +0.3600]`, $p_{\text{Holm}} = 0.0004$), `MuSiQue = 0.7175 / 0.4100`, `Reject AUROC = 0.7068 >= 0.70 > top1_cosine 0.6345` (`0` masked leaks), `maxRAM / maxTM = 24.73 / 78.73 MiB` (`3.78x` below `B3_CS6 93.55 MiB`), `p50/p95 = 22.1 / 38.8 ms`, `0` concurrency errors, and **paired `n = 200` `gemma-4-e4b` `dspy.ReAct` QA (`0` errors across `400` runs): `EM = 0.4500 vs 0.4100` (`+4.00 pp`), `F1 = 0.6219 vs 0.5569` (`+6.50 pp`, $p_{\text{perm}} = 0.0022$, $d_z = +0.2117$)**.
+   - **`P5` (`5/10 PASS`) & `float16` Parity:** Core diffusion (`AF3 +0.1163/+0.2300`), title citations (`AF4 +0.0981/+0.1667`), 1-bit PMI (`AF5 +0.0154/+0.0400`), conditional Noisy-OR (`AF6 +0.0163/+0.0367`), and MaxP deferral (`AF7 +0.0054/+0.0133`) clear `P5`, while `AF1_NO_RABITQ_EXACT` (`float32` outperformed 1-bit by `+0.0225 AH@5` at `2.39x` RAM), `AF2`, `AF8`, `AF9`, and `AF10` miss standalone `N = 400` LOO thresholds (`Tier E` evaluates the `4` public datasets [`36,262` docs / `40,157` chunks], excluding `ERB` whose `150` queries were exhausted in `Tiers A–D`). Across all `5` full corpora (`37,570` docs / `52,959` chunks), IEEE `<f2>` (`float16`) storage causes only `0.01057%` (`4,298 / 40,672,512`) 1-bit RaBitQ flips and **`0.0000` `Tier E` `4-DS H4` / `MH AH@5` diff**. Post-freeze Tier D & C runs confirm `ERB = 0.9152` and `Tier D Pool R@5 = 0.8149` (`4-DS H4 = 0.7919`). **The user approved `M_FINAL_1B` for the `EVAL-5` production cutover (§9.2).**
 
 ### Executive Gate Matrix (`P0`–`P5`)
 
-| Gate | Requirement Summary | `M_WIN_0P` *(Tier C, Superseded)* | `M_PURE_0P` *(Tier D, Untouched)* | `M_PURE_0P` *(Tier C Comparison)* |
-| :--- | :--- | :---: | :---: | :---: |
-| **`P0`** | `0` Class-1 tunable retrieval hyperparameters | **PASS** *(0 scalars; kept `horizon=3`, `L<=3`)* | **PASS** *(0 scalars, 0 depth/budget caps)* | **PASS** *(0 scalars, 0 depth/budget caps)* |
-| **`P1`** | Beat `B5S` & `B5A` on `R@5` & `AH@5` ($p_{\text{Holm}} < 0.01$, CI $> 0$) | **PASS** (`p_holm = 0.0008`) | **PASS** (`p_holm = 0.0008`) | **PASS** (`p_holm = 0.0008`) |
-| **`P2`** | `MH AH@5` $\Delta \ge +0.030$, `macro R@5` $\Delta \ge +0.020$, non-inf | **PASS** (`+0.2800` / `+0.1576`) | **PASS** (`+0.2800` / `+0.1382`, all DS $>0$) | **PASS** (`+0.2700` / `+0.1366`) |
-| **`P3`** | Paired `n=100` `dspy.ReAct` QA non-regression vs `B3_CS6` | `NOT_RUN` | **PASS** (`EM +0.0500`, `F1 +0.0379`, `0` errs) | `NOT_RUN` |
-| **`P4`** | RAM $\le$ `B3_CS6`, `p95 <= lat_cap`, `0` conc errs, `Rej >= 0.70` & $>$ `top1` | **FAIL** (`Rej 0.6432 < 0.6804`) | **PASS** (`25.45 MiB`, `86.2 ms`, `0.7976 > 0.7387`) | **PASS** (`26.02 MiB`, `89.0 ms`, `0.7731 > 0.6807`) |
-| **`P5`** | Every component justified by LOO (Occam's razor) | **FAIL** (`7/21 PASS`) | **FAIL** (`5/8 PASS`; `AP3` > `trigram`) | **FAIL** (`5/8 PASS`; `AP3` > `trigram`) |
-| **Overall** | Strict conjunction (`P0..P5`) | **REJECT / SUPERSEDED** | **PARTIAL (`P0–P4 PASS`, `P5 FAIL`)** | **PARTIAL (`P0–P4 PASS`, `P5 FAIL`)** |
+| Gate | Requirement Summary | `M_WIN_0P` *(Tier C, Superseded)* | `M_PURE_0P` *(Tier D, Superseded)* | `M_PURE_U61_1B` *(Tier D, `EVAL-3b`)* | **`M_FINAL_1B`** *(`Untouched Tier E`, Frozen)* | **`M_FINAL_1B`** *(`Post-Freeze Tier D / Tier C`)* |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`P0`** | `0` Class-1 tunable retrieval hyperparameters | **PASS** *(0 scalars; kept `L<=3`)* | **PASS** *(0 scalars, 0 depth/budget)* | **PASS** *(0 scalars, 1-bit `u61`)* | **PASS** *(0 scalars, 0 caps)* | **PASS** *(0 scalars, 0 caps)* |
+| **`P1`** | Beat `B5S` & `B5A` on `R@5` & `AH@5` ($p_{\text{Holm}} < 0.01$, CI $> 0$) | **PASS** (`p_holm = 0.0008`) | **PASS** (`p_holm = 0.0008`) | **PASS** (`p_holm = 0.0008`) | **PASS** (`p_holm = 0.0008`) | *comp* (`0` leaks) |
+| **`P2`** | `MH AH@5` $\Delta \ge +0.030$, `macro R@5` $\Delta \ge +0.020$, non-inf | **PASS** (`+0.2800` / `+0.1576`) | **PASS** (`+0.2800` / `+0.1382`) | **PASS** (`+0.2900` / `+0.1501`) | **PASS** (`+0.3033` / `+0.1798`, all DS $> 0$) | *comp* (`D: 0.8149`, `C: 0.7980`) |
+| **`P3`** | Paired `dspy.ReAct` QA non-regression vs `B3_CS6` | `NOT_RUN` | **PASS** (`n=100`: `+0.0500` EM) | **FAIL** (`n=100`: `-0.0100` EM) | **PASS** (`n=200`: `EM +0.0400`, **`F1 +0.0650`**, `p=0.0022`) | *covered in Tier D/E QA* |
+| **`P4`** | RAM $\le$ `B3_CS6`, `p95 <= cap`, `0` conc errs, `Rej >= 0.70` & $>$ `top1` | **FAIL** (`0.6432 < 0.6804`) | **PASS** (`25.45 MiB`, `86.2 ms`, `0.7976`) | **PASS** (`22.55 MiB`, `44.3 ms`, `0.7855`) | **PASS** (`24.73 MiB`, `38.8 ms`, `0.7068 > 0.6345`) | **PASS** (`25.34 MiB`, `50.0 / 51.6 ms`, `0.7855 / 0.7703`) |
+| **`P5`** | Every component justified by LOO (Occam's razor) | **FAIL** (`7/21 PASS`) | **FAIL** (`5/8 PASS`; `AP3` $>$ `tri`) | **FAIL** (`6/8 PASS`; `A1B2`/`A1B8`) | **FAIL** (`5/10 PASS`: `AF3`–`AF7` PASS; `AF1` `sys_win=False`) | *comp only* |
+| **Overall** | Strict conjunction / Cutover disposition | **REJECT / SUPERSEDED** | **SUPERSEDED BY `3b`–`3f`** | **INTERMEDIATE STEP** | **`P0`–`P4` PASS (`P5` `5/10`) -> USER-APPROVED FOR `EVAL-5`** | **CONFIRMED PARITY** |
 
 ---
 
@@ -71,9 +71,24 @@ Under the user's strict mandate removing all arbitrary depth, budget, and weight
    $$a_{\text{next}} = \frac{\text{step}(a_{\text{cur}}) \odot l_{\text{vec}}}{\|\text{step}(a_{\text{cur}}) \odot l_{\text{vec}}\|_1}, \qquad p \leftarrow p + w_h \, a_{\text{next}}.$$
    Upon fixed-point convergence $\|a_{\text{next}} - a_{\text{cur}}\|_\infty \le 10^{-9}$, add the exact closed-form geometric series tail $\sum_{k \ge 1} 0.5^k w_h a_{\text{next}} = w_h a_{\text{next}}$ and halt, renormalizing $p$. When $|T_q| \ge 2$ query title entities exist, each entity group $g$ diffuses from its semantic-only seed weighted by $w_g = \sigma(\max_{u \in g} s_{\text{sem}}(u) - \ln(N_{\text{eff}}+1))$ via Bayesian Noisy-OR $p_{\text{post}} = 1 - (1 - p)\prod_g (1 - w_g p_g)$. Finally, candidates sorted by `(-post[u], -cos[u], chunk_id)` emit one top chunk per distinct relative file path first (MaxP deferral) before remaining intra-document chunks.
 
-### 2.3 Gate `P0` Zero-Hyperparameter Audit
+### 2.3 Bloat-Free 1-Bit `unicode61` & Frozen `M_FINAL_1B` Extensions (`EVAL-3b`–`EVAL-3e`)
 
-`M_PURE_0P` eliminates every Class-1 tunable scalar from the system (`0` scoring weights, `0` blend weights, `0` column weights, `0` clone Jaccard thresholds, `0` Wave/Hop/subgraph caps, `0` Optuna parameters). Only Class-2 canonical identities ($\rho_{\text{stop}} = 0.5$, $\ge 1$-bit PMI $2\,\text{df}_1\text{df}_2$, Jeffreys $+0.5$), FTS5 trigram structural minima, and numerical/hardware constants (`rabitq_bits=4`, `_RABITQ_SEED=0x594157`, $\ell_\infty = 10^{-9}$) remain.
+Following `EVAL-3`'s finding that `unicode61` outperformed `trigram` while cutting `chunk_fts_data`, `EVAL-3b`–`EVAL-3e` refined `M_PURE_0P` into **`M_FINAL_1B`** (`exp/mdl-dag-ablation` @ `d29531a`) with zero Class-1 tunable hyperparameters:
+
+1. **1-Bit SoA Extended Rotated RaBitQ (`rabitq_bits = 1`, `M_PURE_U61_1B`):**
+   Each unit vector $y_i = R\hat{v}_i$ is quantized purely to packed 1-bit sign codes $\bar{x}_i \in \{\pm 1/\sqrt{D}\}^D$ plus one `float32` scaling norm $s_i = \langle \bar{x}_i, y_i \rangle$ (`ip_norm`), reducing Stage-1 vector memory below 4-bit AoS while estimating unbiased query cosine via $\hat{c}(q, v_i) = \langle \bar{x}_i, R\hat{q} \rangle / \max(s_i, 10^{-6})$. Document sign centroids (`doc_codes`, `0.0` ties broken by the first eligible chunk) permit exact bitwise Hamming edge angles $\theta_{ud} = \pi h_{ud} / D$ and spherical edge cosines $c_{ud} = \cos\theta_{ud}$ (`_compute_edge_ham_cos`).
+2. **Fair Script-Aware `unicode61` FTS5 + Shared Morphology (`candidate_unicode61.db`):**
+   Harmonized Unicode word/sentence regexes, consolidated Koehn–Knight compound splitting (`_run_decomp_for_word`), and non-overlapping CJK bigram PMI equally across tokenizers; `candidate_unicode61.db` uses contentless `fts5(..., tokenize='unicode61 remove_diacritics 1')` normalized with `.casefold()` + overlapping CJK bigrams (`_normalize_fts_unicode61`), persistent `chunk_vocab` (`fts5vocab`), and native `stem*` prefix seeks.
+3. **Query-Tangent Steered Cyclic Diffusion (`F1_TANGENT_STEER` + `16,384`-bin Beta-LUT):**
+   For every forward chunk $\to$ document title-reference edge $(u \to d)$, clipped edge cosine $c_{ud} = \operatorname{clip}(\cos\theta_{ud}, \pm 0.999)$ and query alignments $c_{qd} = \operatorname{clip}((D_{\text{own}}^\top c_q)_d, \pm 0.9999)$ and $c_{qu} = \operatorname{clip}(c_{q,u}, \pm 0.9999)$ determine directional partial correlations orthogonal to the starting point (`_apply_tangent_steer_ops`):
+   $$\rho_{\text{fwd}}(u \to d \mid q) = \operatorname{clip}\!\left(\frac{c_{qd} - c_{qu} c_{ud}}{\sqrt{(1 - c_{qu}^2)(1 - c_{ud}^2)}},\, \pm 0.999\right), \qquad \rho_{\text{rev}}(d \to u \mid q) = \operatorname{clip}\!\left(\frac{c_{qu} - c_{qd} c_{ud}}{\sqrt{(1 - c_{qd}^2)(1 - c_{ud}^2)}},\, \pm 0.999\right).$$
+   Signed surprisal nats $\operatorname{sgn}(\rho)\, I_{\text{null}}(|\rho|;\, D_{\text{eff}} - 1) / T_{\text{path}}$ are evaluated via a `16,384`-bin piecewise-linear lookup table parameterized by $z = \sqrt{-\ln(1 - \rho^2)}$ (`max abs err < 1e-6`, replacing per-query `scipy.special.betainc`) and row/column softmax-normalized over pre-built static CSR index buffers (`edge_fwd_indptr`, `edge_t_order`, `edge_t_indptr`, `edge_t_indices`, `edge_inv_s_ud`) to rewire $M_{\text{fwd}}^\top$ and $R_{\text{rev}}$ per query with zero COO->CSR allocations.
+4. **Exact Rank-1 Cholesky Greedy L-Ensemble 1-Bit DPP (`E1A_DPP_1BIT`):**
+   Over the top-$m_{\text{pool}} = \min(n_{\text{distinct}}, m_{\text{law}})$ distinct-document MaxP-deferred candidates with $m_{\text{law}} = \lceil 2\ln(N_{\text{eff}} + 1) \rceil$ (selected from candidate buffer $k_{\text{pool}} = \min(N_{\text{elig}}, \max(m_{\text{target}} \cdot 8, 256))$ guarded by `p_cut` dominance), `dpp_1bit` locks $d_1 = \arg\max p$, forms the 1-bit Gram matrix $G = \bar{X}_{\text{pool}}\bar{X}_{\text{pool}}^\top$, initializes marginal gains $d_i = 1$, and iteratively picks $\arg\max_i \ln(1 + N_{\text{eff}}\,p_i\,d_i)$ followed by exact rank-1 Cholesky diagonal downdate $d_j \leftarrow \max(0, d_j - c_j^2)$.
+
+### 2.4 Gate `P0` Zero-Hyperparameter Audit
+
+Both `M_PURE_0P` and frozen **`M_FINAL_1B`** eliminate every Class-1 tunable scalar from the system (`0` scoring weights, `0` blend weights, `0` column weights, `0` clone Jaccard thresholds, `0` Wave/Hop/subgraph caps, `0` Optuna parameters). Only Class-2 canonical identities ($\rho_{\text{stop}} = 0.5$, $\ge 1$-bit PMI $2\,\text{df}_1\text{df}_2$, Jeffreys $+0.5$, scale laws $d_{\text{bridge}}, d_{\text{query}}, m_{\text{law}} = \lceil 2\ln(N_{\text{eff}}+1) \rceil$), FTS5 structural minima, and numerical/hardware constants (`rabitq_bits=1`, `_RABITQ_SEED=0x594157`, `16,384` LUT bins, $\ell_\infty = 10^{-9}$) remain.
 
 ---
 
@@ -87,39 +102,41 @@ Under the user's strict mandate removing all arbitrary depth, budget, and weight
 
 ### 3.2 Full-Corpus Paired Indexes (`37,570` `.md` Docs / `52,959` Chunks)
 
-Paired single-App CocoIndex `1.2.0` ingestion shared `@coco.fn(memo=True)` `_embed_chunk` across both targets so `incumbent_unicode61.db` (`tokens_json`/`entities_json` via `spaCy` for `B3_CS6`) and `candidate_trigram.db` (zero `spaCy`, `yaw_stage1` 4-bit AoS RaBitQ + compressed `entity_graph_blob`, `0` sidecar files) hold bit-identical chunk spans:
+Paired CocoIndex `1.2.0` ingestion shared `@coco.fn(memo=True)` `_embed_chunk` across all DB targets (`EVAL-0` initial paired build generated `incumbent_unicode61.db` + `candidate_trigram.db`; `EVAL-3b` added the decoupled Stage-A/Stage-B writer producing bloat-free `candidate_unicode61.db` alongside refreshed `candidate_trigram.db` carrying `yaw_stage1`) so all schemas hold bit-identical chunk spans:
 
-| Corpus | Unique `.md` Docs | Chunks (`vec0`) | `incumbent_unicode61.db` (`MiB` / `MB`) | `candidate_trigram.db` (`MiB` / `MB`) |
-| :--- | ---: | ---: | :---: | :---: |
-| `2wikimultihopqa` | `6,119` | `6,980` | `32.98` / `34.59` | `55.97` / `58.69` |
-| `musique` | `11,656` | `12,512` | `62.95` / `66.00` | `108.78` / `114.06` |
-| `hotpotqa` | `9,811` | `10,785` | `55.15` / `57.83` | `97.44` / `102.17` |
-| `popqa` | `8,676` | `9,880` | `49.65` / `52.06` | `83.18` / `87.22` |
-| `enterprise_rag_bench` | `1,308` | `12,802` | `73.73` / `77.32` | `142.05` / `148.95` |
-| **Total File Size (`os.stat`)** | **`37,570`** | **`52,959`** | **`274.46` / `287.80`** | **`487.42` / `511.09`** |
+| Corpus | Unique `.md` Docs | Chunks | `incumbent_unicode61.db` (`MiB` / `MB`) | `candidate_trigram.db` (`EVAL-0` -> `EVAL-3b` `MiB`) | **`candidate_unicode61.db`** (`MiB` / `MB`) |
+| :--- | ---: | ---: | :---: | :---: | :---: |
+| `2wikimultihopqa` | `6,119` | `6,980` | `32.98` / `34.59` | `55.97` -> `56.65` | **`31.01` / `32.52`** |
+| `musique` | `11,656` | `12,512` | `62.95` / `66.00` | `108.78` -> `110.08` | **`58.12` / `60.95`** |
+| `hotpotqa` | `9,811` | `10,785` | `55.15` / `57.83` | `97.44` -> `98.59` | **`50.02` / `52.45`** |
+| `popqa` | `8,676` | `9,880` | `49.65` / `52.06` | `83.18` -> `84.47` | **`44.80` / `46.98`** |
+| `enterprise_rag_bench` | `1,308` | `12,802` | `73.73` / `77.32` | `142.05` -> `142.82` | **`62.48` / `65.51`** |
+| **Total File Size (`os.stat`)** | **`37,570`** | **`52,959`** | **`274.46` / `287.80`** | **`487.42` -> `492.61` (`516.54 MB`)** | **`246.43` / `258.40`** |
 
-#### Exact SQLite `dbstat` Component Allocation Across All 5 Full-Corpus Paired DBs
+#### Exact SQLite `dbstat` Component Allocation Across All 5 Full-Corpus DBs
 
-| SQLite Component (`dbstat` Sum) | `incumbent_unicode61.db` (`MiB`) | `candidate_trigram.db` (`MiB`) | Schema / Tokenizer Attribution |
-| :--- | :---: | :---: | :--- |
-| `chunks_vector_chunks00` | `162.23` | `162.23` | Bit-identical shared `768d` embeddings (`vec0`) |
-| `chunks_auxiliary` | `62.52` | `6.65` | Incumbent carries `spaCy` `tokens_json`/`entities_json` (`-55.87 MiB` in candidate) |
-| `chunk_fts_data` (`chunk_fts_*` total) | `45.76` (`47.12`) | `256.59` (`258.18`) | Pure FTS5 payload: **`5.61x`** larger for `trigram` vs `unicode61` |
-| `yaw_stage1` | `0.00` | `31.92` | Persisted 4-bit AoS RaBitQ + compressed `entity_graph_blob` (absent in incumbent DB) |
-| `chunk_vocab` + remaining metadata | `1.63` | `1.70` | Virtual `fts5vocab` reads `chunk_fts` dynamically (`0.00 MiB`); `rowids`/`chunks`/`info` |
-| **Total `dbstat` Allocated Pages (`File Size`)** | **`273.57` (`274.46`)** | **`460.69` (`487.42`)** | Unconfounded `spaCy`-free `unicode61 + yaw_stage1` estimated `~250.5 MiB` `dbstat` *(unbuilt/untested)* |
+| SQLite Component (`dbstat` Sum) | `incumbent_unicode61.db` (`MiB`) | `candidate_trigram.db` (`EVAL-3b` `MiB`) | **`candidate_unicode61.db` (`MiB`)** | Schema / Tokenizer Attribution |
+| :--- | :---: | :---: | :---: | :--- |
+| `chunks_vector_chunks00` | `162.23` | `162.23` | `162.23` | Bit-identical shared `768d` embeddings (`vec0`) |
+| `chunks_auxiliary` | `62.52` | `6.65` | **`5.93`** | Incumbent carries `spaCy` `tokens_json`/`entities_json` (`-56.59 MiB` in `candidate_unicode61.db`) |
+| `chunk_fts_data` (`chunk_fts_*` total) | `45.76` (`47.12`) | `256.59` (`258.18`) | **`43.56` (`44.73`)** | Pure FTS5 payload: **`5.89x`** smaller for `candidate_unicode61.db` vs `trigram` (`5.77x` total `chunk_fts_*`) |
+| `yaw_stage1` | `0.00` | `31.94` | `31.94` | Persisted RaBitQ + compressed `entity_graph_blob` (`31.92 MiB` pre-`3b`; absent in incumbent DB) |
+| `chunk_vocab` + remaining metadata | `1.63` | `1.71` | **`1.60`** | Virtual `fts5vocab` reads `chunk_fts` dynamically (`0.00 MiB`); `rowids`/`chunks`/`info` |
+| **Total `dbstat` Allocated Pages (`File Size`)** | **`273.57` (`274.46`)** | **`460.71` (`492.61`)** | **`246.43` (`246.43`)** | `candidate_unicode61.db` beats even `incumbent_unicode61.db` by **`-28.03 MiB`** (`-10.2%`) and `candidate_trigram.db` by **`2.00x`** |
 
 ### 3.3 Split Manifests, Reject Probes & Statistical Protocol
 
 1. **Disjoint Immutable Split Manifests (`0` question-ID overlap enforced automatically by `load_and_verify_splits`):**
    - `outputs/mdl-dag-eval/manifests/splits_v1.json`:
      - **Tier A (`tier_a_anchor`, `tier_a_sha256: e8c848e2ba0d4158c416ec0fb013fa01b9bee320383564bc79b1e594af2c361d`):** Offsets `[0, 10)` across 4 public datasets (`total=40`, `scorable=40`), anchoring `CS-5` continuity.
-     - **Tier B (`tier_b_dev`, `tier_b_sha256: 14adc8c1293fc71805a38b815a203cad302270120b4ff6fa16f0b439b0e23814`):** Offsets `[30, 80)` across 4 public datasets (`200`; `musique` `2h: 21, 3h: 17, 4h: 12`) + `erb train[0:50]` (`43` scorable + `1` `"High Level"` empty-gold + `6` `"Info Not Found"`) -> `250` total (`243` retrieval-scorable) + `50` `musique[30:80)` paired hop-1 bridge-masked probes (`150` reject labels total).
-     - **Tier C (`tier_c_sealed_holdout`, `tier_c_sha256: 4289edbc286d190e1125852b4888cf86fe2da4389684441d4ee714b2f80e0fb5`):** Offsets `[100, 200)` (`400`; `musique` `2h: 55, 3h: 28, 4h: 17`) + `erb val[150:250]` (`90` scorable + `4` `"High Level"` empty-gold + `6` `"Info Not Found"`) -> `500` total (`490` retrieval-scorable) + `50` `musique[100:150)` bridge-masked probes (`200` reject labels total). Consumed cleanly once for `M_WIN_0P`; subsequently used as a post-freeze simplification comparison benchmark for `M_PURE_0P` (NOT an untouched holdout for `M_PURE_0P`).
+     - **Tier B (`tier_b_dev`, `tier_b_sha256: 14adc8c1293fc71805a38b815a203cad302270120b4ff6fa16f0b439b0e23814`):** Offsets `[30, 80)` across 4 public datasets (`200`; `musique` `2h: 21, 3h: 17, 4h: 12`) + `erb train[0:50]` (`43` scorable + `1` `"High Level"` empty-gold + `6` `"Info Not Found"`) -> `250` total (`243` retrieval-scorable) + `50` `musique[30:80)` paired hop-1 bridge-masked probes (`150` reject labels total). Used for Waves 1–3 (`EVAL-3c`–`EVAL-3e`).
+     - **Tier C (`tier_c_sealed_holdout`, `tier_c_sha256: 4289edbc286d190e1125852b4888cf86fe2da4389684441d4ee714b2f80e0fb5`):** Offsets `[100, 200)` (`400`; `musique` `2h: 55, 3h: 28, 4h: 17`) + `erb val[150:250]` (`90` scorable + `4` `"High Level"` empty-gold + `6` `"Info Not Found"`) -> `500` total (`490` retrieval-scorable) + `50` `musique[100:150)` bridge-masked probes (`200` reject labels total). Consumed cleanly once for `M_WIN_0P`; subsequently used as a post-freeze comparison benchmark for `M_PURE_0P`, `M_PURE_U61_1B`, and `M_FINAL_1B` (NOT an untouched holdout after `M_WIN_0P`).
    - `outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json`:
-     - **Tier D (`tier_d_confirmatory`, `tier_d_sha256: 0ae4fa1a343a9c6c9964b51f4808b30ca462cadd79b6280d73fd6b94fab3e4ff`):** Untouched disjoint offsets `[200, 300)` (`400`; `musique` `2h: 58, 3h: 29, 4h: 13`) + `erb[50:150)` (`92` scorable + `5` `"High Level"` empty-gold + `3` `"Info Not Found"`) -> `500` total (`492` retrieval-scorable) + `50/50` unique `musique[200:250)` hop-1 bridge-masked probes (`200` reject labels total) + `n = 100` (`[200, 225)` × 4 public datasets) paired `dspy.ReAct` QA. Executed **once** after `M_PURE_0P` freeze.
-2. **Reject Calibration (`P4`):** ERB labels unanswerability strictly on `question_type == "Info Not Found"` (`3` Tier D / `6` Tier C / `6` Tier B vs remaining ERB queries). Each `MuSiQue` probe masks **all** chunks sharing the hop-1 `masked_doc_path` across dense vectors, postings, DF tables, FTS5 `MATCH`, and `CitationDiffusionOps` (`masked_leaks = 0` verified across all runs).
-3. **Statistical Inference:** `10,000`-resample dataset-stratified bootstrap 95% CIs (`seed = 0x594157`), two-sided paired sample permutation tests ($n_{\text{perm}} = 10{,}000$), two-sided Wilcoxon signed-rank tests, Cohen's $d_z$, and exact Holm–Bonferroni FWER step-down. Null controls `B5S_RAND_SEEDS` / `B5A_RAND_WALK` average `20` seeded random draws per query into `1` paired observation/query (`n = 243 / 490 / 492`).
+     - **Tier D (`tier_d_confirmatory`, `tier_d_sha256: 0ae4fa1a343a9c6c9964b51f4808b30ca462cadd79b6280d73fd6b94fab3e4ff`):** Disjoint offsets `[200, 300)` (`400`; `musique` `2h: 58, 3h: 29, 4h: 13`) + `erb[50:150)` (`92` scorable + `5` `"High Level"` empty-gold + `3` `"Info Not Found"`) -> `500` total (`492` retrieval-scorable) + `50/50` unique `musique[200:250)` hop-1 bridge-masked probes (`200` reject labels total) + `n = 100` (`[200, 225)` × 4 public datasets) paired `dspy.ReAct` QA. Executed cleanly once after `M_PURE_0P` freeze; subsequently reused as a non-confirmatory comparison benchmark for `M_PURE_U61_1B` (`EVAL-3b`) and `M_FINAL_1B` (`EVAL-3f`).
+   - `outputs/mdl-dag-eval/manifests/splits_tier_e_confirmatory.json` (`schema_version: 3`, `pinned_commit: 3cd3952`):
+     - **Tier E (`tier_e_confirmatory`, `tier_sha256: fe1449a26a5d99ef289c99bca15167af4e34743c10c61072796dd4672fdefeee`):** Previously untouched disjoint offsets `[300, 400)` across `{2wikimultihopqa, musique, hotpotqa, popqa}` (`100` each across `36,262` full-corpus docs; `musique` `2-hop: 48, 3-hop: 36, 4-hop: 16`; `enterprise_rag_bench` omitted as its `150` queries were exhausted across Tiers A–D) -> `400` scorable queries + `200` paired `musique[300:400)` hop-1 bridge-masked reject probes (`100` intact vs `100` masked) + **`n = 200` (`[300, 350)` × 4)** paired `dspy.ReAct` QA. Executed **once** after freezing `M_FINAL_1B` (`EVAL-3f`).
+2. **Reject Calibration (`P4`):** ERB labels unanswerability strictly on `question_type == "Info Not Found"` (`3` Tier D / `6` Tier C / `6` Tier B vs remaining ERB queries). Each `MuSiQue` probe masks **all** chunks sharing the hop-1 `masked_doc_path` across dense vectors, postings, DF tables, FTS5 `MATCH`, and `CitationDiffusionOps` (`masked_leaks = 0` verified across all runs). On `Tier E` (`200` probes), reject evaluation tests the `100` intact vs `100` hop-1 bridge-masked `MuSiQue` pairs cleanly without ERB contamination.
+3. **Statistical Inference:** `10,000`-resample dataset-stratified bootstrap 95% CIs (`seed = 0x594157`), two-sided paired sample permutation tests ($n_{\text{perm}} = 10{,}000$), two-sided Wilcoxon signed-rank tests, Cohen's $d_z$, and exact Holm–Bonferroni FWER step-down. Null controls `B5S_RAND_SEEDS` / `B5A_RAND_WALK` average `20` seeded random draws per query into `1` paired observation/query (`n = 243 / 490 / 492 / 400`).
 
 ---
 
@@ -246,6 +263,127 @@ Reports `eval3_tier_c_retrieval.json` (verbatim sealed record for `M_WIN_0P`) an
 | `AP3_UNICODE61_LEX` *(LOO)* | `0.8039` | `0.7765` | `0.6933` | `0.9325/0.8300` | `0.6383/0.3700` | `0.9400/0.8800` | `0.5950/0.2000` | `0.9257/0.8778` | `0.7641` (`0.6807`) | `26.05` | `32.7 / 63.7` |
 
 Additional Tier C `M_PURE_0P` telemetry: `R@{1,2,10,20} = 0.4218 / 0.6425 / 0.8949 / 0.9319`, `AH@{2,5,10} = 0.3939 / 0.6061 / 0.8000`, `MRR = 0.8724`, `NDCG@5 = 0.7680`, `P1 = PASS` (`p_holm = 0.0008`), `P2 = PASS` (`MH AH@5 +0.2700 [+0.2167, +0.3233]`, `macro R@5 +0.1366 [+0.1144, +0.1596]`, `p_holm = 0.0004`), `Reject ERB = 0.8138` / `MuSiQue = 0.6792` vs `M_WIN_0P ERB = 0.8440` / `MuSiQue = 0.6536`. On Tier C, `M_PURE_0P` repaired `M_WIN_0P`'s `P4` failure (`+0.1299` `Reject AUROC`), matched `MH AH@5` within `1.0 pp` (`0.6800 vs 0.6900`), and cut median latency **`2.59x`** (`34.9 ms vs 90.3 ms`).
+
+### 4.5 `EVAL-3b`: Fair `unicode61` vs `trigram` Shootout & 1-Bit SoA `M_PURE_U61_1B` (`325eea3`)
+
+To resolve `EVAL-3` Path A rigorously, `EVAL-3b` corrected two pre-shootout tokenization asymmetries (unified Unicode word/sentence regexes + consolidated `_run_decomp_for_word` prefix-stemming/Koehn–Knight compound splitting + equal CJK non-overlapping bigram PMI across both tokenizers), added Stage-A/Stage-B decoupled CocoIndex `1.2.0` indexing producing bloat-free **`candidate_unicode61.db`** (`246.43 MiB`, `5.89x` smaller `chunk_fts_data` than `trigram` — see §3.2), and ran paired Tiers D & C comparisons (`eval3b_tier_d_shootout.json`, `eval3b_tier_c_shootout.json`, `eval3b_tier_d_1bit.json`, `eval3b_tier_c_1bit.json`, `eval3b_tier_d_1bit_qa.json`):
+
+| Tier / Arm | Pool `R@5` | 4-DS `H4` | `MH AH@5` | `2Wiki` `R5/AH5` | `MuSiQue` `R5/AH5` (`2h / 3h / 4h`) | `HotpotQA` `R5/AH5` | `PopQA` `R5/AH5` | `ERB` `R5/AH5` | `R@10 / R@20` | `Rej AUROC` (`top1`) | `TM` (`MiB`) | `p50 / p95` (`ms`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `Tier D` `B3_CS6` | `0.6627` | `0.6248` | `0.4233` | `0.7650/0.5200` | `0.4542/0.1000` (`0.4828/0.1552` / `0.4368/0.0345` / `0.3654/0.0000`) | `0.8150/0.6500` | `0.4650/0.0000` | `0.8277/0.7609` | `0.7444/0.7908` | `0.5000` (`0.5000`) | `211.08` *(RAM `110.05`)* | `79.7 / 100.6` |
+| `Tier D` `M_PURE_0P` | `0.8010` | `0.7746` | `0.7033` | `0.9475/0.8500` | `0.6158/0.3400` (`0.7155/0.5345` / `0.5287/0.1034` / `0.3654/0.0000`) | `0.9600/0.9200` | `0.5750/0.1500` | `0.9158/0.8587` | `0.9025/0.9361` | `0.7976` (`0.7387`) | `75.92` *(RAM `25.46`)* | `35.8 / 89.3` |
+| `Tier D` `M_PURE_U61` | `0.8118` | `0.7883` | `0.7167` | `0.9600/0.8700` | `0.6433/0.3400` (`0.7155/0.5172` / `0.5632/0.1034` / `0.5000/0.0769`) | `0.9700/0.9400` | `0.5800/0.1600` | `0.9140/0.8478` | `0.9031/0.9382` | `0.7941` (`0.7387`) | `75.87` *(RAM `25.41`)* | `25.3 / 48.8` |
+| **`Tier D` `M_PURE_U61_1B`** | **`0.8128`** | **`0.7890`** | **`0.7133`** | **`0.9650/0.8800`** | **`0.6408/0.3200` (`0.7155/0.5172` / `0.5632/0.0345` / `0.4808/0.0769`)** | **`0.9700/0.9400`** | **`0.5800/0.1600`** | **`0.9165/0.8478`** | **`0.9095/0.9383`** | **`0.7855` (`0.7291`)** | **`73.27` *(RAM `22.55`)*** | **`23.1 / 44.3`** |
+| `Tier C` `B3_CS6` | `0.6547` | `0.6098` | `0.4100` | `0.6850/0.4100` | `0.4742/0.1700` (`0.5636/0.2545` / `0.4167/0.1071` / `0.2794/0.0000`) | `0.8000/0.6500` | `0.4800/0.0000` | `0.8542/0.7556` | `0.7404/0.7887` | `0.5000` (`0.5000`) | `211.08` *(RAM `110.05`)* | `81.2 / 108.4` |
+| `Tier C` `M_PURE_0P` | `0.7913` | `0.7688` | `0.6800` | `0.9250/0.8100` | `0.6450/0.3900` (`0.7909/0.6364` / `0.5357/0.1429` / `0.3529/0.0000`) | `0.9200/0.8400` | `0.5850/0.1800` | `0.8916/0.8333` | `0.8949/0.9319` | `0.7731` (`0.6807`) | `76.50` *(RAM `26.04`)* | `37.3 / 97.7` |
+| `Tier C` `M_PURE_U61` | `0.8056` | `0.7785` | `0.6967` | `0.9325/0.8300` | `0.6467/0.3800` (`0.7818/0.6182` / `0.5595/0.1429` / `0.3529/0.0000`) | `0.9400/0.8800` | `0.5950/0.2000` | `0.9257/0.8778` | `0.9037/0.9364` | `0.7767` (`0.6807`) | `75.87` *(RAM `25.40`)* | `25.8 / 49.4` |
+| **`Tier C` `M_PURE_U61_1B`** | **`0.8028`** | **`0.7775`** | **`0.6867`** | **`0.9350/0.8300`** | **`0.6300/0.3500` (`0.7727/0.6182` / `0.5357/0.0357` / `0.3235/0.0000`)** | **`0.9400/0.8800`** | **`0.6050/0.2200`** | **`0.9152/0.8556`** | **`0.8989/0.9385`** | **`0.7703` (`0.6783`)** | **`73.27` *(RAM `22.55`)*** | **`27.6 / 50.5`** |
+
+- **Key `EVAL-3b` Outcome:** Under 100% fair tokenization, `M_PURE_U61_1B` (`1-bit` SoA RaBitQ) matched `M_PURE_U61` (`Pool R@5 = 0.8128 vs 0.8118` on Tier D; `R@{1,2} = 0.4507 / 0.6858`, `AH@{2,5,10} = 0.4451 / 0.6260 / 0.8089`, `MRR = 0.9083`, `NDCG@5 = 0.8034`) while reducing `VectorSearch` RAM **`4.88x`** (`22.55` vs `110.05 MiB`) and median latency to `23.1 ms` (`p95 = 44.3 ms`, `p99 = 53.6 ms`, `0` masked leaks, `0` concurrency errors). It cleared `P1` (`p_holm = 0.0008`), `P2` (`MH AH@5 +0.2900 [+0.2367, +0.3467]`, `macro R@5 +0.1501 [+0.1276, +0.1727]`, `p_holm = 0.0004` on Tier D), and `P4` (`0.7855` Tier D / `0.7703` Tier C), while failing `P5` (`6/8 PASS`, §5.3) and **`P3` (`eval3b_tier_d_1bit_qa.json`, `n = 100`, `0` model errors): `M_PURE_U61_1B` (`EM = 0.3900`, `F1 = 0.5786`; MH `0.5067/0.6523`, `2Wiki 0.5200/0.7243`, `MuSiQue 0.3200/0.4650`, `HotpotQA 0.6800/0.7674`, `PopQA 0.0400/0.3578`) vs `B3_CS6` (`EM = 0.4000`, `F1 = 0.5902`; MH `0.4667/0.6219`, `2Wiki 0.4800/0.6960`, `MuSiQue 0.3200/0.4823`, `HotpotQA 0.6000/0.6874`, `PopQA 0.2000/0.4950`), `dEM = -0.0100 [-0.0800, +0.0600]` (`p_perm = 1.0`), `dF1 = -0.0115 [-0.0785, +0.0575]` (`p_perm = 0.7447`)** — motivating the algebraic duality discovery waves (`EVAL-3c`–`EVAL-3e`).
+
+### 4.6 `EVAL-3c / EVAL-3d / EVAL-3e`: Dualities, $2^4 = 16$-Arm Factorial Lattice & Frozen `M_FINAL_1B` (`d29531a`)
+
+All Stage 1–3 discovery experiments executed strictly on `tier_b_dev` (`N = 243` scorable, `N = 250` latency, `150` reject probes, `top1_cosine AUROC = 0.6837`, `0` masked leaks):
+
+#### Stage 1 & Stage 2: Parameter-Free Dualities (Waves 1 & 2, `eval3c_tier_b_wave1.json` & `eval3d_tier_b_wave2.json`)
+
+| Wave / Arm (`tier_b_dev`, `N = 243`) | Pool `R@5` | $\Delta$ `R@5` `[95% CI]` (`W/L`, `p_perm`) | 4-DS `H4` | `MH AH@5` | `ERB R5` | `Rej AUROC` | `TM` (`MiB`) | `p50 / p95` (`ms`) | Disposition |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| `Base` `M_PURE_U61_1B` *(W1 & W2 bit-exact)* | `0.7994` | *control* | `0.7854` | `0.7067` | `0.8645` | `0.7382` | `73.27` | `22.08 / 45.71` | Baseline |
+| **W1: `E1A_DPP_1BIT`** *(1-bit Rank-1 Cholesky DPP)* | **`0.8083`** | **`+0.0089 [+0.0021, +0.0171]`** (`5W/0L`, `0.0602`) | **`0.7963`** | **`0.7200`** | `0.8645` | `0.7382` | `72.37` | `26.47 / 48.87` | **Advance** (`PopQA 0.6200`) |
+| W1: `E1B_RESIDUAL_COV` *(residualized coverage)* | `0.7393` | `-0.0601 [-0.0931, -0.0273]` (`26W/53L`, `0.0008`) | `0.7583` | `0.5400` | `0.6510` | `0.7382` | `72.37` | `51.15 / 79.23` | **Falsified** (ERB/MH collapse) |
+| W1: `E2A_DYN_RESID_UNIT` *(unit residual query)* | `0.8007` | `+0.0013 [-0.0192, +0.0215]` (`16W/16L`, `0.9257`) | `0.7900` | `0.6600` | `0.8503` | `0.7382` | `72.37` | `128.96 / 333.33` | **Falsified** (`-4.67 pp` MH, `7.3x p95`) |
+| W1: `E2B_DYN_RESID_PROJ` *(centroid projection)* | `0.7983` | `-0.0011 [-0.0217, +0.0194]` (`16W/17L`, `0.9173`) | `0.7863` | `0.6467` | `0.8542` | `0.7382` | `72.70` | `126.95 / 328.86` | **Falsified** (centroid smear, `7.2x p95`) |
+| W1: `E3A_NB_HASHIMOTO` *(non-backtracking CSR)* | `0.8011` | `+0.0017 [-0.0106, +0.0154]` (`5W/5L`, `0.8591`) | `0.7825` | `0.6933` | **`0.8878`** | `0.7382` | `74.64` | `24.63 / 51.42` | **Advance** (ERB `+2.33 pp`) |
+| W1: `E3B_SEM_BONF` *(dense semantic edges)* | `0.7749` | `-0.0245 [-0.0381, -0.0123]` (`1W/16L`, `0.0006`) | `0.7571` | `0.6600` | `0.8578` | `0.7382` | `207.84` | `28.03 / 54.02` | **Falsified** (`-2.45 pp`, `2.8x TM`) |
+| W1: `E3C_SEM_MKNN` *(mutual-kNN semantic)* | `0.7741` | `-0.0253 [-0.0434, -0.0077]` (`4W/22L`, `0.0056`) | `0.7517` | `0.6400` | `0.8784` | `0.7382` | `219.73` | `25.59 / 50.32` | **Falsified** (`-2.53 pp`, `3.0x TM`) |
+| **W2: `F1_TANGENT_STEER`** *(tangent residual Beta)* | **`0.8128`** | **`+0.0134 [-0.0003, +0.0281]`** (`9W/3L`, `0.0868`) | **`0.7967`** | **`0.7267`** | **`0.8878`** | `0.7382` | `79.00` | `33.00 / 78.34` | **Advance** (`Hotpot 0.9800/0.9600`, `MUS 0.6717`) |
+| W2: `F2_WORMHOLE_COND` *(rare-token wormholes)* | `0.8015` | `+0.0021 [+0.0000, +0.0062]` (`1W/0L`, `0.9815`) | `0.7879` | `0.7067` | `0.8645` | `0.7382` | `78.73` | `22.25 / 47.04` | Marginal (`PopQA +1.0 pp` only) |
+| W2: `F3A_LOCAL_ENT_RERANK` *(local-density rerank)* | `0.8001` | `+0.0007 [-0.0089, +0.0103]` (`3W/3L`, `0.9847`) | `0.7862` | `0.7067` | `0.8645` | `0.7382` | `72.37` | `23.44 / 44.79` | Neutral |
+| W2: `F3B_LOCAL_ENT_REJECT` *(local-KL reject)* | `0.7994` | `+0.0000` (`0W/0L`, `1.0000`, bit-exact) | `0.7854` | `0.7067` | `0.8645` | **`0.5161`** | `72.37` | `23.11 / 44.58` | **Falsified** (inverted: `11.85` vs `9.16` nats) |
+| W2: `F4A_BRIDGE_PURE` *(pure backward bridge)* | `0.7792` | `-0.0202 [-0.0401, -0.0007]` (`7W/17L`, `0.0486`) | `0.7650` | `0.7000` | `0.8452` | `0.7382` | `75.32` | `37.97 / 63.78` | **Falsified** (`PopQA 0.5300`, `p = 0.0486`) |
+| W2: `F4B_BRIDGE_NOISYOR` *(forward Noisy-OR bridge)* | `0.8011` | `+0.0017 [-0.0058, +0.0096]` (`3W/2L`, `0.8093`) | `0.7875` | `0.7067` | `0.8645` | `0.7382` | `74.99` | `38.06 / 64.99` | **Advance** (to lattice) |
+
+- **Why `F3B_LOCAL_ENT_REJECT` Collapsed:** Unanswerable probes (e.g., bridge-ablated `MuSiQue` still matching the remaining surface entities tightly in one coherent distractor neighborhood) yielded *higher* mean local submatrix coherence KL (`11.85` vs `9.16` nats), inverting calibration (`0.7382 -> 0.5161`). Global corpus Bayes-factor evidence `raw_log_bf` remained strictly superior.
+
+#### Stage 3: Complete $2^4 = 16$-Arm Factorial Lattice over `{F1, E1A, E3A, F4B}` (`eval3e_tier_b_lattice.json`)
+
+Fixed pipeline execution order inside `_solve_pure_diffusion`: **`F1` (`edge_weight_mode`) $\to$ `E3A` (`non_backtracking`, wired to also step in `F4B`'s backward walk) $\to$ `F4B` (`bridge_mode`) $\to$ `E1A` (`rerank_mode`)**. All 16 configurations produced `0` masked leaks and invariant `Rej AUROC = 0.7382`:
+
+| Factorial Arm (`F1, E1A, E3A, F4B`) | Pool `R@5` | $\Delta$ `R@5` `[95% CI]` (`W/L`, `p_perm`) | 4-DS `H4` | `MH AH@5` | `2Wiki` `R5/AH5` | `MuSiQue` `R5/AH5` | `HotpotQA` `R5/AH5` | `PopQA` `R5/AH5` | `ERB` `R5/AH5` | `TM` (`MiB`) | `p50 / p95` (`ms`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `M_PURE_U61_1B` (`0,0,0,0`) | `0.7994` | *control* | `0.7854` | `0.7067` | `0.9450/0.8600` | `0.6367/0.3400` | `0.9600/0.9200` | `0.6000/0.2000` | `0.8645/0.7674` | `73.27` | `22.08 / 45.71` |
+| `F1_TANGENT_STEER` (`1,0,0,0`) | `0.8128` | `+0.0134 [-0.0003, +0.0281]` (`9W/3L`, `0.0868`) | `0.7967` | **`0.7267`** | `0.9450/0.8600` | `0.6717/0.3600` | **`0.9800/0.9600`** | `0.5900/0.1800` | `0.8878/0.7907` | `79.00` | `33.00 / 78.34` |
+| `E1A_DPP_1BIT` (`0,1,0,0`) | `0.8083` | `+0.0089 [+0.0021, +0.0171]` (`5W/0L`, `0.0602`) | `0.7963` | `0.7200` | `0.9450/0.8600` | `0.6600/0.3800` | `0.9600/0.9200` | `0.6200/0.2400` | `0.8645/0.7674` | `72.37` | `26.47 / 48.87` |
+| `E3A_NB_HASHIMOTO` (`0,0,1,0`) | `0.8011` | `+0.0017 [-0.0106, +0.0154]` (`5W/5L`, `0.8591`) | `0.7825` | `0.6933` | `0.9250/0.8200` | `0.6350/0.3400` | `0.9600/0.9200` | `0.6100/0.2200` | `0.8878/0.7907` | `74.64` | `24.63 / 51.42` |
+| `F4B_BRIDGE_NOISYOR` (`0,0,0,1`) | `0.8011` | `+0.0017 [-0.0058, +0.0096]` (`3W/2L`, `0.8093`) | `0.7875` | `0.7067` | `0.9450/0.8600` | `0.6450/0.3400` | `0.9600/0.9200` | `0.6000/0.2000` | `0.8645/0.7674` | `74.99` | `38.06 / 64.99` |
+| **`C2_F1_E1A` (`1,1,0,0`, #1)** | **`0.8155`** | **`+0.0161 [+0.0003, +0.0329]`** (`11W/4L`, `0.0608`) | **`0.8000`** | `0.7200` | `0.9450/0.8600` | `0.6650/0.3400` | **`0.9800/0.9600`** | `0.6100/0.2200` | `0.8878/0.7907` | `79.00` | `37.51 / 83.47` |
+| `C2_F1_E3A` (`1,0,1,0`) | `0.7980` | `-0.0014 [-0.0168, +0.0147]` (`7W/9L`, `0.9111`) | `0.7788` | `0.7000` | `0.9300/0.8200` | `0.6550/0.3600` | `0.9600/0.9200` | `0.5700/0.1400` | `0.8878/0.7907` | `78.73` | `36.81 / 79.61` |
+| `C2_F1_F4B` (`1,0,0,1`) | `0.8059` | `+0.0065 [-0.0075, +0.0216]` (`8W/6L`, `0.4220`) | `0.7883` | `0.7133` | `0.9450/0.8600` | `0.6483/0.3400` | `0.9700/0.9400` | `0.5900/0.1800` | `0.8878/0.7907` | `78.73` | `49.70 / 98.87` |
+| `C2_E1A_E3A` (`0,1,1,0`) | `0.8073` | `+0.0079 [-0.0055, +0.0223]` (`8W/4L`, `0.3148`) | `0.7892` | `0.7000` | `0.9250/0.8200` | `0.6517/0.3600` | `0.9600/0.9200` | `0.6200/0.2400` | `0.8917/0.7907` | `74.64` | `26.92 / 51.56` |
+| `C2_E1A_F4B` (`0,1,0,1`) | `0.8094` | `+0.0099 [+0.0007, +0.0216]` (`6W/1L`, `0.0790`) | `0.7967` | **`0.7267`** | `0.9450/0.8600` | `0.6617/0.3800` | `0.9700/0.9400` | `0.6100/0.2200` | `0.8684/0.7674` | `75.32` | `40.74 / 69.63` |
+| `C2_E3A_F4B` (`0,0,1,1`) | `0.8011` | `+0.0017 [-0.0123, +0.0168]` (`7W/7L`, `0.8727`) | `0.7825` | `0.6867` | `0.9250/0.8200` | `0.6450/0.3400` | `0.9500/0.9000` | `0.6100/0.2200` | `0.8878/0.7907` | `77.26` | `40.40 / 68.71` |
+| `C3_F1_E1A_E3A` (`1,1,1,0`) | `0.8028` | `+0.0034 [-0.0130, +0.0213]` (`10W/9L`, `0.7289`) | `0.7837` | `0.7000` | `0.9300/0.8200` | `0.6550/0.3600` | `0.9600/0.9200` | `0.5900/0.1800` | **`0.8917/0.7907`** | `78.73` | `44.67 / 88.40` |
+| `C3_F1_E1A_F4B` (`1,1,0,1`) | `0.8107` | `+0.0113 [-0.0058, +0.0298]` (`11W/7L`, `0.2350`) | `0.7933` | `0.7200` | `0.9450/0.8600` | `0.6583/0.3600` | `0.9700/0.9400` | `0.6000/0.2000` | `0.8917/0.7907` | `78.73` | `60.24 / 127.89` |
+| `C3_F1_E3A_F4B` (`1,0,1,1`) | `0.8001` | `+0.0007 [-0.0144, +0.0165]` (`8W/9L`, `0.9725`) | `0.7812` | `0.7067` | `0.9300/0.8200` | `0.6550/0.3600` | `0.9700/0.9400` | `0.5700/0.1400` | `0.8878/0.7907` | `79.33` | `60.33 / 119.47` |
+| `C3_E1A_E3A_F4B` (`0,1,1,1`) | `0.8118` | `+0.0123 [-0.0024, +0.0291]` (`10W/4L`, `0.1424`) | `0.7946` | `0.7133` | `0.9250/0.8200` | **`0.6733/0.4000`** | `0.9600/0.9200` | **`0.6200/0.2400`** | **`0.8917/0.7907`** | `77.26` | `44.09 / 70.41` |
+| `C4_F1_E1A_E3A_F4B` (`1,1,1,1`) | `0.8035` | `+0.0041 [-0.0137, +0.0230]` (`10W/10L`, `0.6881`) | `0.7846` | `0.7067` | `0.9300/0.8200` | `0.6583/0.3800` | `0.9600/0.9200` | `0.5900/0.1800` | **`0.8917/0.7907`** | `79.26` | `53.61 / 103.30` |
+
+- **Factorial Attribution & Functional Interference Discovery:** Across all 8 combinatorial backgrounds on `Pool R@5`: main effects / Shapley values are **`E1A = +0.622 / +0.620 pp`**, **`F1 = +0.124 / +0.169 pp`**, `F4B = -0.021 / +0.026 pp`, and `E3A = -0.467 / -0.403 pp`. Pairwise interaction contrasts prove strong destructive anti-interference **`I(F1, E3A) = -1.089 pp`** (`C3_F1_E1A_E3A - C2_F1_E1A = -0.0127 [-0.0247, -0.0021]`, `p_perm = 0.0408`) alongside `I(F1, E1A) = -0.454 pp`, `I(F1, F4B) = -0.403 pp`, `I(E3A, F4B) = +0.403 pp`, `I(E1A, F4B) = +0.111 pp`, and `I(E1A, E3A) = +0.009 pp`. Mechanistically, **`F1`'s query-tangent steering amplifies cyclic $A \leftrightarrow B$ mutual-citation pairs between two on-topic gold hops (`1 - (1-\rho)^2` closed-loop resonance)**, whereas `E3A`'s non-backtracking Hashimoto matrix explicitly forbids those 2-cycles (`A -> B -> A` masked), stripping gold mass while `F4B` adds `+44.4 ms` `p95` overhead (`C3_F1_E1A_F4B`).
+- **Frozen `M_FINAL_1B` Systems Engineering (`eval3e_tier_b_mfinal_opt.json`):** Replacing query-time `scipy.special.betainc` + COO->CSR rebuild + `.T.tocsr()` inside `F1` with a static `16,384`-bin piecewise-linear `z = sqrt(-log1p(-c^2))` Beta-tail LUT (`max abs err < 1e-6`) and persisted static forward/transpose CSR arrays cut uncontended `tier_b_dev` latency by **`1.45x` median (`37.51 -> 25.91 ms`) and `1.63x` `p95` (`83.47 -> 51.12 ms`)** (`2Wiki` `16.60/24.48`, `MuSiQue` `32.01/50.44`, `HotpotQA` `26.83/38.86`, `PopQA` `20.66/25.83`, `ERB` `43.52/58.74 ms`, `RAM / maxTM = 25.35 / 79.00 MiB`) with **`0` diffs vs pre-optimization `C2_F1_E1A`** on `Recall@1/2/5/10` (`0.4169 / 0.6479 / 0.8155 / 0.9184`), `All-Hops@2/5` (`0.4074 / 0.6296`, `MH AH@5 = 0.7200`), `MRR` (`0.8959`), `NDCG@5` (`0.7925`), and `Rej AUROC` (`0.7382`).
+
+### 4.7 `EVAL-3f`: Untouched `Tier E` Confirmatory Proof, `n = 200` `P3` QA, Post-Freeze Tiers C/D & `float16` Parity (`5b58ada`)
+
+#### 1. Untouched `Tier E` Retrieval (`eval3f_tier_e_retrieval.json`, `[300, 400)`, `N = 400` + `200` Reject Probes, `0` Leaks)
+
+| Tier E Arm (`N = 400`) | Pool `R@5` | 4-DS `H4` | `MH AH@5` | `2Wiki` `R5/AH5` | `MuSiQue` `R5/AH5` (`2h / 3h / 4h`) | `HotpotQA` `R5/AH5` | `PopQA` `R5/AH5` | `R@10 / R@20` | `MRR / NDCG@5` | `Rej AUROC` (`top1`) | `TM` (`RAM MiB`) | `p50 / p95` (`ms`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `B3_CS6` (incumbent) | `0.6208` | `0.6208` | `0.4067` | `0.6800/0.3600` | `0.5333/0.2000` (`0.6875/0.4167` / `0.4259/0.0000` / `0.3125/0.0000`) | `0.8100/0.6600` | `0.4600/0.0000` | `0.6992/0.7550` | `0.7492 / 0.5833` | `0.5000` (`0.5000`) | `190.94` (`93.55`) | `78.9 / 100.9` |
+| `B5S_RAND_SEEDS` | `0.3493` | `0.3493` | `0.0172` | `0.3845/0.0185` | `0.3048/0.0065` (`0.4141/0.0135` / `0.2134/0.0000` / `0.1828/0.0000`) | `0.4502/0.0265` | `0.2575/0.0040` | `0.3664/0.3804` | `0.7323 / 0.4309` | `0.5000` (`0.5000`) | `55.08` (`6.88`) | `771.3 / 1125.2` |
+| `B5A_RAND_WALK` | `0.3552` | `0.3552` | `0.0232` | `0.3914/0.0320` | `0.3046/0.0050` (`0.4130/0.0104` / `0.2125/0.0000` / `0.1867/0.0000`) | `0.4527/0.0325` | `0.2720/0.0040` | `0.3689/0.3947` | `0.7360 / 0.4355` | `0.5000` (`0.5000`) | `55.08` (`6.88`) | `689.8 / 951.8` |
+| `M_PURE_U61_1B` | `0.8023` | `0.8023` | `0.7067` | `0.9550/0.8700` | `0.6892/0.3600` (`0.8229/0.6667` / `0.6296/0.1111` / `0.4219/0.0000`) | `0.9450/0.8900` | `0.6200/0.2400` | `0.9006/0.9329` | `0.9089 / 0.7819` | `0.7068` (`0.6345`) | `72.41` (`21.95`) | `21.5 / 37.0` |
+| **`M_FINAL_1B`** | **`0.8006`** | **`0.8006`** | **`0.7100`** | **`0.9450/0.8500`** | **`0.7175/0.4100` (`0.8438/0.7083` / `0.6667/0.1944` / `0.4531/0.0000`)** | **`0.9350/0.8700`** | **`0.6050/0.2100`** | **`0.8992/0.9258`** | **`0.9059 / 0.7810`** | **`0.7068` (`0.6345`)** | **`78.73` (`24.73`)** | **`22.1 / 38.8`** |
+
+- **`Tier E` Confirmatory Gate Contrasts (`M_FINAL_1B`):**
+  - **`P0 = PASS`:** `0` Class-1 tunable retrieval hyperparameters (`zero_magic_quotas=True`, `pure_diffusion=True`, `lexical_mode="pure_idf"`, `clone_dedup_mode="none"`, `rerank_mode="dpp_1bit"`, `edge_weight_mode="tangent_steer"`).
+  - **`P1 = PASS` (`p_holm = 0.0008`):** `vs B5S_RAND_SEEDS`: `R@5 +0.4514 [+0.4269, +0.4759]`, `AH@5 +0.5711 [+0.5336, +0.6103]`; `vs B5A_RAND_WALK`: `R@5 +0.4454 [+0.4211, +0.4702]`, `AH@5 +0.5666 [+0.5291, +0.6055]`.
+  - **`P2 = PASS` (`p_holm = 0.0004` vs `B3_CS6`):** Primary `MH AH@5 = +0.3033 [+0.2500, +0.3600]` (`0.7100 vs 0.4067`, $+74.6\%$ relative) and `macro R@5 = +0.1798 [+0.1552, +0.2048]` (`0.8006 vs 0.6208`, $d_z = +0.6811$). On `MuSiQue`, `M_FINAL_1B` lifted overall `AH@5` by `+21.0 pp` (`0.4100 vs 0.2000`, `2-hop 0.7083 vs 0.4167`, `3-hop 0.1944 vs 0.0000`) and `+5.0 pp` over `M_PURE_U61_1B` (`0.4100 vs 0.3600`). Every dataset (`2Wiki +0.2650 [+0.2175, +0.3125]`, `MuSiQue +0.1842 [+0.1317, +0.2367]`, `HotpotQA +0.1250 [+0.0700, +0.1800]`, `PopQA +0.1450 [+0.1000, +0.1900]`) and cutoff `Recall@{1,2,5,10,20}` (`+0.1079`, `+0.1890`, `+0.1798`, `+0.2000`, `+0.1708`) had strictly positive `ci_low > 0`.
+  - **`P4 = PASS`:** `maxRAM = 24.73 MiB` (`3.78x` smaller than `B3_CS6` `93.55 MiB`), pooled `p50/p95 = 22.1 / 38.8 ms <= 151.35 ms` (`lat_cap_ms`), `conc_ok = True` (`0` concurrency errors across 16 worker threads), `Reject AUROC = 0.7068 >= 0.70 > top1_cosine 0.6345` (`0` masked leaks). (`P5 = FAIL`, `5/10 PASS` — §5.4.)
+
+#### 2. Untouched `Tier E` Paired `P3` `dspy.ReAct` QA (`eval3f_tier_e_qa_n200.json`, `n = 200`, `50/DS`, `gemma-4-e4b`)
+
+| Dataset (`n` / arm) | `B3_CS6` `R5 / AH5` | `B3_CS6` `EM / F1` | **`M_FINAL_1B` `R5 / AH5`** | **`M_FINAL_1B` `EM / F1`** | $\Delta$ `EM` / $\Delta$ `F1` (`M_FINAL_1B - B3_CS6`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `2wikimultihopqa` (`50`) | `0.7050 / 0.4000` | `0.5600 / 0.6129` | `0.9350 / 0.8400` | **`0.6400 / 0.7205`** | `+0.0800 / +0.1076` |
+| `musique` (`50`) | `0.5383 / 0.2200` | `0.3400 / 0.4036` | `0.7283 / 0.4400` | **`0.3600 / 0.4893`** | `+0.0200 / +0.0857` |
+| `hotpotqa` (`50`) | `0.8300 / 0.6600` | `0.5400 / 0.7095` | `0.9300 / 0.8600` | **`0.6200 / 0.7837`** | `+0.0800 / +0.0742` |
+| `popqa` (`50`) | `0.4600 / 0.0000` | `0.2000 / 0.5015` | `0.6000 / 0.2000` | `0.1800 / 0.4941` | `-0.0200 / -0.0074` |
+| `3-DS Multi-Hop` (`150`) | — | `0.4800 / 0.5753` | — | **`0.5400 / 0.6645`** | `+0.0600 / +0.0892` |
+| **Total (`200`, `0` model errors)** | `0.6333 / 0.3200` | `0.4100 / 0.5569` | **`0.7983 / 0.5850`** | **`0.4500 / 0.6219`** | **`P3 = PASS` (`F1 +0.0650 [+0.0240, +0.1088]`, `p_perm = 0.0022`)** |
+
+Exact `P3` statistical contrasts (`n = 200`, `400` paired ReAct episodes, `temperature = 1.0`, `0` model errors): **`ExactMatch = +0.0400 [-0.0100, +0.0900]`** (`p_perm = 0.1682`, `p_wilcoxon = 0.1167`, $d_z = +0.1113$); **`F1 = +0.0650 [+0.0240, +0.1088]`** (`p_perm = 0.0022`, `p_wilcoxon = 0.0072`, $d_z = +0.2117$).
+
+#### 3. Post-Freeze Tiers C & D Comparison (`eval3f_tier_c_mfinal.json` & `eval3f_tier_d_mfinal.json`, Non-Confirmatory)
+
+| Tier / Arm | Pool `R@5` | 4-DS `H4` | `MH AH@5` | `2Wiki` `R5/AH5` | `MuSiQue` `R5/AH5` (`2h / 3h / 4h`) | `HotpotQA` `R5/AH5` | `PopQA` `R5/AH5` | `ERB` `R5/AH5` | `R@10 / R@20` | `Rej AUROC` (`top1`) | `TM` (`RAM MiB`) | `p50 / p95` (`ms`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`Tier C` `M_FINAL_1B`** | `0.7980` | `0.7717` | `0.6733` | `0.9275/0.8000` | `0.6292/0.3400` (`0.7455/0.5636` / `0.5952/0.1071` / `0.3088/0.0000`) | `0.9400/0.8800` | `0.5900/0.1900` | `0.9152/0.8556` | `0.8920/0.9261` | `0.7703` (`0.6783`) | `79.00` (`25.34`) | `26.7 / 51.6` |
+| **`Tier D` `M_FINAL_1B`** | **`0.8149`** | **`0.7919`** | **`0.7167`** | `0.9625/0.8700` | **`0.6550/0.3500` (`0.7241/0.5000` / `0.5862/0.1379` / `0.5000/0.1538`)** | `0.9650/0.9300` | `0.5850/0.1700` | **`0.9152/0.8478`** | `0.8966/0.9294` | `0.7855` (`0.7291`) | `79.00` (`25.34`) | `25.7 / 50.0` |
+
+Additional `M_FINAL_1B` telemetry: Tier C (`R@1/2 = 0.4189 / 0.6442`, `AH@5 = 0.6082`, `MRR = 0.8666`, `NDCG@5 = 0.7701`, `0` leaks); Tier D (`R@1/2 = 0.4476 / 0.6867`, `AH@5 = 0.6301`, `MRR = 0.9045`, `NDCG@5 = 0.8029`, `0` leaks).
+
+#### 4. Full 5-Corpus IEEE `float16 -> float32` Storage & `Tier E` Retrieval Parity (`eval3f_f16_parity.json`)
+
+| Corpus (`dim = 768`) | Chunks | `cos_dist` Max (`Mean`) | `l2_err` Max (`p99`) | 1-Bit RaBitQ Flips (`Rate`) | `ip_norm` Max Rel Diff | `d_eff` Abs Diff (`f32 -> f16`) |
+| :--- | ---: | :---: | :---: | :---: | :---: | :---: |
+| `2wikimultihopqa` | `6,980` | `1.439e-07` (`7.531e-09`) | `2.621e-04` (`2.415e-04`) | `552 / 5,360,640` (`1.030e-04`) | `3.607e-05` | `2.630e-04` (`232.6885 -> 232.6887`) |
+| `musique` | `12,512` | `1.107e-07` (`7.348e-09`) | `2.703e-04` (`2.407e-04`) | `997 / 9,609,216` (`1.038e-04`) | `3.490e-05` | `2.097e-04` (`282.4618 -> 282.4620`) |
+| `hotpotqa` | `10,785` | `1.340e-07` (`7.167e-09`) | `2.694e-04` (`2.417e-04`) | `834 / 8,282,880` (`1.007e-04`) | `3.905e-05` | `2.467e-04` (`281.4019 -> 281.4021`) |
+| `popqa` | `9,880` | `1.245e-07` (`7.338e-09`) | `2.776e-04` (`2.414e-04`) | `772 / 7,587,840` (`1.017e-04`) | `3.375e-05` | `2.239e-04` (`258.9727 -> 258.9725`) |
+| `enterprise_rag_bench` | `12,802` | `1.195e-07` (`7.858e-09`) | `2.717e-04` (`2.502e-04`) | `1,143 / 9,831,936` (`1.163e-04`) | `5.234e-05` | `2.635e-05` (`198.0119 -> 198.0118`) |
+| **Pooled `5` Corpora** | **`52,959`** | **`1.439e-07` (`7.457e-09`)** | **`2.776e-04` (`2.444e-04`)** | **`4,298 / 40,672,512` (`0.01057%`)** | **`5.234e-05`** | **`Tier E` Parity: `4-DS H4 diff = 0.0000`, `MH AH@5 diff = 0.0000`** |
+
+On `Tier E` (`N = 400` + `200` reject probes), replacing `float32` SQLite blobs with compressed IEEE `float16` (`<f2>`) vectors produced **`0` diffs on `Recall@1`, `Recall@5`, `Recall@10`, and `All-Hops@5`** across all `400` queries (`1` `Recall@2` diff on `PopQA`, `1` `Recall@20` diff on `MuSiQue`, `7` `top5_ids` swaps `[3, 2, 0, 2]`, `max |delta log_bf| = 0.1422`), `reject_auroc = 0.7068 (f32) vs 0.7065 (f16)` (`diff = -0.0003`), and `0` masked leaks — justifying `float16` persistence in plain SQLite (`chunks`) while halving vector disk size (`~81.1 MiB` vs `162.23 MiB` `vec0` chunks across `52,959` chunks).
 
 ---
 
@@ -377,6 +515,52 @@ On Tier B (`N=243`), `AP1` (`2.20x` RAM), `AP3` (`-0.0027` non-inferior on Tier 
 | `AZ20_NO_ENTITY_HMM` | `+0.0047` `[-0.0065, +0.0164]` | `+0.0100` | `-0.0001` | `0.86x` | `1.00x` | **FAIL** |
 | `AZ21_NO_PRED_ROUTING` | `+0.0014` `[-0.0037, +0.0065]` | `+0.0033` | `-0.0041` | `0.99x` | `0.84x` | **FAIL** |
 
+### 5.3 `EVAL-3b` Single-Toggle LOO Matrices (`AU1`–`AU9` & `A1B1`–`A1B8`, `P5 = FAIL`)
+
+Contrasts report `(Candidate - Ablation)` across `eval3b_tier_d_shootout.json`, `eval3b_tier_d_1bit.json`, and `eval3b_tier_c_1bit.json`:
+
+| Tier D `M_PURE_U61` (`AU1`–`AU9`, `N = 492`, `7/9 PASS`) | $\Delta$ Pool `R@5` `[95% CI]` | $\Delta$ `MH AH@5` `[95% CI]` | $\Delta$ `ERB R@5` | $\Delta$ `Rej AUROC` | `RAM` (`Abl/Cand`) | `p95` (`Abl/Cand`) | Harness `P5` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `AU1_NO_RABITQ_EXACT` | `-0.0009` `[-0.0042, +0.0021]` | `-0.0033` `[-0.0100, +0.0000]` | `-0.0012` | `+0.0008` | `2.25x` | `0.79x` | **PASS** |
+| `AU2_1BIT_RABITQ` | `-0.0010` `[-0.0081, +0.0058]` | `+0.0033` `[-0.0167, +0.0233]` | `-0.0026` | `+0.0086` | `0.86x` | `0.94x` | **FAIL** |
+| `AU3_TRIGRAM_LEX` | `+0.0108` `[+0.0039, +0.0182]` | `+0.0133` `[-0.0033, +0.0333]` | `-0.0018` | `-0.0035` | `1.01x` | `1.76x` | **PASS** |
+| `AU4_NO_DIFFUSION` | `+0.0847` `[+0.0670, +0.1025]` | `+0.2233` `[+0.1733, +0.2733]` | `-0.0171` | `+0.0000` | `1.00x` | `0.83x` | **PASS** |
+| `AU5_NO_TITLE_CIT` | `+0.0723` `[+0.0578, +0.0876]` | `+0.1533` `[+0.1133, +0.1933]` | `+0.0024` | `+0.0042` | `0.78x` | `0.89x` | **PASS** |
+| `AU6_NO_PMI_CHAN` | `+0.0189` `[+0.0067, +0.0315]` | `+0.0300` `[+0.0000, +0.0633]` | `+0.0430` | `-0.0055` | `0.95x` | `0.90x` | **PASS** |
+| `AU7_NO_NOISYOR` | `+0.0183` `[+0.0112, +0.0259]` | `+0.0533` `[+0.0300, +0.0800]` | `+0.0000` | `+0.0000` | `1.01x` | `1.02x` | **PASS** |
+| `AU8_NO_MAXP` | `+0.0104` `[+0.0054, +0.0163]` | `+0.0033` `[+0.0000, +0.0100]` | `+0.0319` | `+0.0000` | `1.00x` | `1.03x` | **PASS** |
+| `AU9_NO_DECOMPOUND` | `+0.0020` `[+0.0000, +0.0047]` | `+0.0033` `[+0.0000, +0.0100]` | `+0.0000` | `+0.0036` | `1.00x` | `1.20x` | **FAIL** |
+
+On Tier C (`eval3b_tier_c_shootout.json`), `M_PURE_U61` similarly passed `7/9` (`AU3_TRIGRAM_LEX` `+0.0143` `R@5` / `1.96x` `p95`; `AU2` and `AU9` failed). Moving `M_PURE_U61` to 1-bit SoA RaBitQ (`M_PURE_U61_1B`, `A1B1`–`A1B8`, `6/8 PASS` on both Tier D and Tier C):
+
+| `M_PURE_U61_1B` (`A1B1`–`A1B8`) | Tier D $\Delta$ `R@5` `[95% CI]` | Tier D $\Delta$ `MH AH@5` | Tier D `RAM/p95` (`P5`) | Tier C $\Delta$ `R@5` `[95% CI]` | Tier C $\Delta$ `MH AH@5` | Tier C `RAM/p95` (`P5`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `A1B1_NO_RABITQ_EXACT` | `+0.0001` `[-0.0069, +0.0072]` | `-0.0067` | `2.54x / 0.84x` (**PASS**) | `-0.0030` `[-0.0116, +0.0055]` | `-0.0100` | `2.54x / 0.74x` (**FAIL**) |
+| `A1B2_TRIGRAM_LEX` | `+0.0080` `[+0.0007, +0.0154]` | `+0.0167` | `0.97x / 1.87x` (**FAIL**) | `+0.0085` `[+0.0007, +0.0171]` | `+0.0067` | `1.00x / 2.03x` (**PASS**) |
+| `A1B3_NO_DIFFUSION` | `+0.0839` `[+0.0658, +0.1021]` | `+0.2200` | `0.97x / 0.81x` (**PASS**) | `+0.0905` `[+0.0716, +0.1094]` | `+0.2233` | `0.97x / 0.85x` (**PASS**) |
+| `A1B4_NO_TITLE_CIT` | `+0.0725` `[+0.0576, +0.0879]` | `+0.1400` | `0.72x / 0.90x` (**PASS**) | `+0.0840` `[+0.0679, +0.1009]` | `+0.1833` | `0.72x / 0.90x` (**PASS**) |
+| `A1B5_NO_PMI_CHAN` | `+0.0249` `[+0.0121, +0.0379]` | `+0.0500` | `0.91x / 0.87x` (**PASS**) | `+0.0205` `[+0.0065, +0.0351]` | `+0.0233` | `0.91x / 0.89x` (**PASS**) |
+| `A1B6_NO_NOISYOR` | `+0.0185` `[+0.0113, +0.0261]` | `+0.0533` | `0.97x / 1.00x` (**PASS**) | `+0.0194` `[+0.0117, +0.0276]` | `+0.0667` | `0.97x / 0.86x` (**PASS**) |
+| `A1B7_NO_MAXP` | `+0.0113` `[+0.0059, +0.0173]` | `+0.0033` | `0.97x / 1.00x` (**PASS**) | `+0.0169` `[+0.0096, +0.0254]` | `+0.0100` | `0.97x / 0.89x` (**PASS**) |
+| `A1B8_NO_DECOMPOUND` | `+0.0030` `[-0.0010, +0.0075]` | `+0.0033` | `1.00x / 0.96x` (**FAIL**) | `+0.0031` `[+0.0000, +0.0071]` | `+0.0100` | `1.00x / 0.85x` (**FAIL**) |
+
+### 5.4 `EVAL-3f` Complete Untouched `Tier E` `AF1`–`AF10` Matrix (`N = 400`, `M_FINAL_1B`, `P5 = 5/10 PASS`)
+
+| Ablation (`M_FINAL_1B` minus 1 toggle) | $\Delta$ Pool `R@5` `[95% CI]` | $\Delta$ Pool `AH@5` `[95% CI]` | $\Delta$ `MH AH@5` `[95% CI]` | $\Delta$ `Rej AUROC` (`CI_low`) | `RAM` (`MiB`, `Abl/Cand`) | `p95` (`ms`, `Abl/Cand`) | Harness `P5` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `AF1_NO_RABITQ_EXACT` | `-0.0108` `[-0.0221, +0.0000]` | `-0.0225` `[-0.0450, -0.0025]` | `-0.0267` `[-0.0500, -0.0033]` | `+0.0008` `(-0.0143)` | `59.03` (`2.39x`) | `33.0` (`0.85x`) | **FAIL** |
+| `AF2_TRIGRAM_LEX` | `+0.0073` `[-0.0013, +0.0167]` | `+0.0050` `[-0.0100, +0.0200]` | `+0.0000` `[-0.0200, +0.0200]` | `+0.0105` `(-0.0065)` | `24.73` (`1.00x`) | `57.9` (`1.49x`) | **FAIL** |
+| `AF3_NO_DIFFUSION` | `+0.1163` `[+0.0938, +0.1388]` | `+0.2250` `[+0.1800, +0.2700]` | `+0.2300` `[+0.1767, +0.2833]` | `+0.0000` `(+0.0000)` | `24.73` (`1.00x`) | `25.0` (`0.64x`) | **PASS** |
+| `AF4_NO_TITLE_CIT` | `+0.0981` `[+0.0779, +0.1185]` | `+0.1725` `[+0.1350, +0.2125]` | `+0.1667` `[+0.1233, +0.2133]` | `+0.0296` `(+0.0133)` | `16.34` (`0.66x`) | `27.5` (`0.71x`) | **PASS** |
+| `AF5_NO_PMI_CHAN` | `+0.0154` `[+0.0010, +0.0302]` | `+0.0200` `[-0.0100, +0.0500]` | `+0.0400` `[+0.0067, +0.0733]` | `+0.0121` `(-0.0133)` | `23.39` (`0.95x`) | `33.8` (`0.87x`) | **PASS** |
+| `AF6_NO_NOISYOR` | `+0.0163` `[+0.0081, +0.0256]` | `+0.0275` `[+0.0100, +0.0475]` | `+0.0367` `[+0.0133, +0.0633]` | `+0.0000` `(+0.0000)` | `24.79` (`1.00x`) | `36.8` (`0.95x`) | **PASS** |
+| `AF7_NO_MAXP` | `+0.0054` `[+0.0013, +0.0108]` | `+0.0100` `[+0.0025, +0.0200]` | `+0.0133` `[+0.0033, +0.0267]` | `+0.0000` `(+0.0000)` | `24.82` (`1.00x`) | `39.0` (`1.01x`) | **PASS** |
+| `AF8_NO_DECOMPOUND` | `+0.0010` `[-0.0019, +0.0044]` | `+0.0000` `[-0.0075, +0.0075]` | `+0.0000` `[-0.0100, +0.0100]` | `+0.0082` `(-0.0013)` | `24.73` (`1.00x`) | `38.3` (`0.99x`) | **FAIL** |
+| `AF9_NO_TANGENT_STEER` | `-0.0046` `[-0.0125, +0.0027]` | `-0.0100` `[-0.0250, +0.0050]` | `+0.0000` `[-0.0167, +0.0167]` | `+0.0000` `(+0.0000)` | `21.91` (`0.89x`) | `36.0` (`0.93x`) | **FAIL** |
+| `AF10_NO_DPP_1BIT` | `-0.0004` `[-0.0071, +0.0063]` | `-0.0025` `[-0.0150, +0.0100]` | `-0.0033` `[-0.0200, +0.0133]` | `+0.0000` `(+0.0000)` | `24.73` (`1.00x`) | `40.3` (`1.04x`) | **FAIL** |
+
+The core diffusion, title citation, 1-bit PMI, conditional Noisy-OR, and MaxP operators (`AF3`–`AF7`) all pass strictly (`ci_low > 0`), proving zero redundant core machinery; `AF1` (`float32` exact) confirms the small accuracy–memory frontier (`+2.25 pp AH@5` at `2.39x` RAM / `4.36x` peak `tracemalloc`: `59.03 / 343.31 MiB` vs `24.73 / 78.73 MiB`), while `AF2` confirms `1.49x` faster `p95` under `unicode61` and `AF9`/`AF10` preserve `F1 + E1A`'s `+0.3033 MH AH@5` and `+21.0 pp MuSiQue AH@5` generalization on unseen data.
+
 ---
 
 ## 6. Systems Telemetry, `BnB` Fetch Ratios & Indexing Speed
@@ -402,7 +586,25 @@ All memory measurements report exact `bytes / 1048576.0` (`MiB`) per [mdl-dag-sp
 | `AP8_NO_MAXP` | `35.6` | `84.8` | `110.3` | `25.38` | `75.85` | `136.80` | `0.0` (`0.00%`) | — |
 
 - **Paired Full-Corpus Indexing Speed Disclosure:** Paired CocoIndex `1.2.0` ingestion wall-clock times across the `37,570`-doc / `52,959`-chunk build were **not persisted inside `outputs/mdl-dag-eval/reports/*.json`** (the harness builds/opens cached DBs prior to measurement without emitting ingestion-time fields). The only persisted indexing-speed benchmark on disk is the `[0, 10)` `CS-5` clean-slate reference run (`12.39 s` across `563` docs / `628` chunks vs `HippoRAG 2,605.34 s`; [evaluation.md](../evaluation.md#2026-11-20-cs-5-live-silicon-evaluation--paired-cs-6-control-baseline)).
-- **Cold-Open Memory Note:** `AP3_UNICODE61_LEX` measured `maxTM = 252.19 MiB` and `maxRSSd = 188.97 MiB` in the isolated harness when opening `incumbent_unicode61.db` (which retains `spaCy` `tokens_json`/`entities_json` columns and omits persisted `yaw_stage1`). Cold-open `tracemalloc` and RAM on a `spaCy`-free `unicode61 + yaw_stage1` schema remain unmeasured.
+- **Cold-Open Memory Note (Resolved in `EVAL-3b` / `EVAL-3f`):** Earlier `AP3_UNICODE61_LEX` (`M_PURE_0P` LOO) measured `maxTM = 252.19 MiB` and `maxRSSd = 188.97 MiB` only because it opened legacy `incumbent_unicode61.db` (`spaCy` `tokens_json`/`entities_json` + missing persisted `yaw_stage1`, forcing full in-memory RaBitQ/CSR rebuild). On the clean `EVAL-3b` `candidate_unicode61.db` schema (`246.43 MiB` total disk footprint across 5 corpora), cold-open peak `tracemalloc` drops **`3.20x`** (`252.19 -> 78.73 MiB` for `Tier E` `M_FINAL_1B`; `72.41 MiB` for `M_PURE_U61_1B`; `79.00 MiB` on `Tiers B/C/D`), with `Max VectorSearch RAM = 24.73 MiB` on `Tier E` (`25.34–25.35 MiB` on `Tiers B/C/D` including `ERB`):
+
+| `Tier E` System Arm (`N = 400`, `eval3f_tier_e_retrieval.json`) | `p50` (`ms`) | `p95` (`ms`) | `p99` (`ms`) | Max `VectorSearch` RAM (`MiB`) | Max Peak `tracemalloc` (`MiB`) | Max RSS Delta (`MiB`) | Mean `BnB` Ratio | 16-Thread Conc. Errs |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |
+| `B3_CS6` (incumbent) | `78.9` | `100.9` | `113.3` | `93.55` | `190.94` | `79.71` | `0.00%` | — |
+| `B5S_RAND_SEEDS` | `771.3` | `1,125.2` | `1,471.8` | `6.88` | `55.08` | `84.38` | `0.00%` | — |
+| `B5A_RAND_WALK` | `689.8` | `951.8` | `1,095.4` | `6.88` | `55.08` | `84.48` | `0.00%` | — |
+| `M_PURE_U61_1B` | `21.5` | `37.0` | `46.2` | `21.95` | `72.41` | `103.84` | `0.00%` | — |
+| **`M_FINAL_1B`** *(per-DS RAM `13.74/24.73/20.67/20.26`)* | **`22.1`** | **`38.8`** | **`50.6`** | **`24.73`** | **`78.73`** | `105.07` | **`0.00%`** | **`0`** |
+| `AF1_NO_RABITQ_EXACT` | `18.3` | `33.0` | `45.3` | `59.03` | `343.31` | `140.69` | `0.00%` | — |
+| `AF2_TRIGRAM_LEX` | `28.1` | `57.9` | `67.8` | `24.73` | `78.73` | `106.93` | `0.00%` | — |
+| `AF3_NO_DIFFUSION` | `13.2` | `25.0` | `30.8` | `24.73` | `78.73` | `85.98` | `0.00%` | — |
+| `AF4_NO_TITLE_CIT` | `15.7` | `27.5` | `30.5` | `16.34` | `67.55` | `96.43` | `0.00%` | — |
+| `AF5_NO_PMI_CHAN` | `18.4` | `33.8` | `40.6` | `23.39` | `78.73` | `106.07` | `0.00%` | — |
+| `AF6_NO_NOISYOR` | `22.2` | `36.8` | `41.8` | `24.79` | `78.73` | `107.08` | `0.00%` | — |
+| `AF7_NO_MAXP` | `23.3` | `39.0` | `50.5` | `24.82` | `78.73` | `107.77` | `0.00%` | — |
+| `AF8_NO_DECOMPOUND` | `22.8` | `38.3` | `51.0` | `24.73` | `78.73` | `106.72` | `0.00%` | — |
+| `AF9_NO_TANGENT_STEER` | `20.3` | `36.0` | `44.4` | `21.91` | `72.37` | `104.67` | `0.00%` | — |
+| `AF10_NO_DPP_1BIT` | `22.4` | `40.3` | `54.1` | `24.73` | `78.73` | `106.81` | `0.00%` | — |
 
 ---
 
@@ -455,39 +657,74 @@ On untouched Tier D (`eval3_tier_d_retrieval.json`), `M_PURE_0P` eliminates almo
 2. **Same-Topic PopQA Occupation Distractors (`PopQA`: `85/100` `AH@5 < 1`, `R@5 = 0.5750`, `AH@5 = 0.1500`):** Biographical queries in `PopQA` require returning both entity biography chunks; diffusion pulls structurally related occupation/nationality neighbors slightly ahead of a second biographical passage (`0` complete misses `R@5 == 0`, while `M_PURE_0P` beats `B3_CS6` by `+0.1100 R@5` and `+0.1500 AH@5`).
 3. **Trigram Substring Noise vs `unicode61` Word-Token Precision (`AP3_UNICODE61_LEX`):** On Tier D (`N = 492`), keeping `unicode61` instead of `trigram` improved `Recall@5` on `17` queries vs `5` (`+0.0088`), notably lifting `MuSiQue 4-hop AH@5` (`0.0000 -> 0.0769`, `R@5 0.3654 -> 0.5000`), `2Wiki` (`0.9475 -> 0.9600`), and `HotpotQA` (`0.9600 -> 0.9700`), and on Tier C (`N = 490`) beating `trigram` `18` to `4` (including `ERB 0.9257 vs 0.8916`).
 
+### 7.3 `M_FINAL_1B` Error Breakdown on Untouched `Tier E` (`N = 400`) & Post-Freeze Tiers C/D
+
+On untouched `Tier E` (`eval3f_tier_e_retrieval.json`, `N = 400`), `M_FINAL_1B` slashes complete zero-recall misses (`Recall@5 == 0`) by **`10.5x`** compared with `B3_CS6` (`2 / 400` total [`0` `2Wiki`, `2` `MuSiQue`, `0` `HotpotQA`, `0` `PopQA`] vs `21 / 400` [`0 / 9 / 4 / 8`]), improving on even `M_PURE_U61_1B` (`3 / 400`):
+
+1. **Multi-Hop `MuSiQue` Hop Strata (`48 / 36 / 16`):** `M_FINAL_1B` reaches `2-hop = 0.8438 / 0.7083` (`R@5 / AH@5`, vs `B3_CS6 0.6875 / 0.4167`), `3-hop = 0.6667 / 0.1944` (`B3_CS6 0.4259 / 0.0000`, `M_PURE_U61_1B 0.6296 / 0.1111`), and `4-hop = 0.4531 / 0.0000` (`B3_CS6 0.3125 / 0.0000`; `0.5000 / 0.1538` on post-freeze `Tier D` `eval3f_tier_d_mfinal.json` where `R@5 == 0` is `7 / 492`, and `12 / 490` on `Tier C`, both retaining `ERB R@5 = 0.9152`). Remaining `4-hop` `AH@5` deficits stem from unbridged 4th-hop paraphrases below the top-5 slot ceiling (`Tier E` `All-Hops@10 = 0.7775` vs `AH@5 = 0.5850`) where `EVAL-6` query-time scout hops act.
+2. **`PopQA` Entity-Biography vs Tier-1 QA (`Tier E` `n = 200`):** Standalone `PopQA` `R@5 = 0.6050` (`AH@5 = 0.2100`, `0` complete misses) puts `M_FINAL_1B` ahead of `B3_CS6` (`0.4600 / 0.0000`, `8` misses), while on multi-hop QA (`n = 150` across `2Wiki/MuSiQue/HotpotQA`) `M_FINAL_1B` lifts `dspy.ReAct` by `+6.00 pp EM` (`0.5400 vs 0.4800`) and `+8.92 pp F1` (`0.6645 vs 0.5753`) alongside `+6.50 pp` overall `F1` (`p_perm = 0.0022`).
+
 ---
 
 ## 8. Threats to Validity, Negative Results & Explicit Non-Claims
 
-1. **100% English Real-Corpus Scope:** All five full-corpus datasets (`37,570` docs) are English. Non-English capabilities (`DE` decompounding / `ß <-> ss` casefolding, `ZH` 2-char EOF CJK seeks, `FI` inflections) are verified solely via adversarial real-SQLite/FTS5 lab unit tests in `tests/test_mdl_dag_lab.py` (`exp/mdl-dag-ablation@032fe2d`), NOT live non-English QA corpora. Switching to `unicode61` sacrifices trigram CJK substring matching unless supplemented explicitly.
-2. **Tier C vs Tier D Confirmatory Boundary:** Only `M_WIN_0P` consumed Tier C (`4289edbc...`) as an untouched holdout (and failed `P4`/`P5`). `M_PURE_0P` was tested **once** on the newly generated disjoint `Tier D` holdout (`0ae4fa1a...`); Tier C results for `M_PURE_0P` (`eval3_tier_c_mpure0p_comparison.json`) serve purely as a post-freeze simplification comparison against `M_WIN_0P`. Similarly, `AP3_UNICODE61_LEX` appeared as an LOO arm inside `Tier D` and `Tier C` runs rather than a separately preregistered primary candidate.
-3. **`P3` Statistical Power (`n = 100`):** On `100` paired `dspy.ReAct` QA queries (`25` per public dataset), `M_PURE_0P` outperformed `B3_CS6` by `+5.00 pp EM` and `+3.79 pp F1` and cleanly cleared the preregistered non-regression gate (`ci_high >= -0.015`, `mean_diff >= 0.0`), while individual per-query variance keeps two-sided $p_{\text{perm}} \approx 0.26$ (`0` model errors across all `200` runs). Uncompiled zero-shot `dspy.ReAct` QA still trails full `dspy.GEPA`-compiled upstream `70B` systems on `PopQA` (`EM = 0.0400 / 0.0800`).
-4. **Falsified / Negative Results Recorded Verbatim:** Early `M_FULL` unnormalized linear path-marginal Gibbs (`eval2c_mfull_loo.json`: `P5 = 2/9`, `Rej = 0.6227`), Marchenko–Pastur bulk whitening (`H1_MP_WHITEN`: `eval2b_frontier.json`, `Pool R@5 = 0.6492`, `p95 = 2,017.8 ms`), scalar multi-branch NNLS decode (`H2_MULTI_BRANCH`: `PopQA 0.4300`, `p95 = 1,631.5 ms`), empirical quantile tails (`H4_EMPIRICAL_TAIL`: `Pool R@5 = 0.5868`), `M_WIN_0P`'s finite-horizon Entity-HMM + Gibbs BMA (`eval3_tier_c_retrieval.json`: Tier C `P4` `Reject AUROC = 0.6432 < 0.70`, `P5 = 7/21`), and `trigram` outperforming `unicode61` (`AP3_UNICODE61_LEX` falsified that hypothesis on both Tier D and Tier C).
+1. **100% English Real-Corpus Scope:** All five full-corpus datasets (`37,570` docs) are English. Non-English capabilities (`DE` decompounding / `ß <-> ss` casefolding, `ZH` overlapping CJK bigrams, `FI` inflections) are verified solely via real-SQLite/FTS5 lab unit tests in ``tests/test_mdl_dag_lab.py`` (`exp/mdl-dag-ablation@5b58ada`), NOT live non-English QA corpora. Choosing `unicode61` + `.casefold()` + overlapping CJK bigrams supports CJK 2-char phrases cleanly without `trigram`'s `5.89x` index bloat, while sacrificing arbitrary `<3`-char non-CJK infix substring lookups that lack word boundaries.
+2. **Tier C / Tier D / Tier E Confirmatory Boundary:** Only `M_WIN_0P` consumed `Tier C` (`4289edbc...`) as an untouched holdout (and failed `P4`/`P5`), only `M_PURE_0P` consumed `Tier D` (`0ae4fa1a...`) as an untouched holdout (`P5 = FAIL`), and **`M_FINAL_1B`** consumed newly minted disjoint **`Tier E`** (`fe1449a2...`, `[300, 400)`, `N = 400` + `200` reject probes + `n = 200` paired QA) **once** after freeze. All `EVAL-3b` (`M_PURE_U61_1B`) and `EVAL-3f` (`M_FINAL_1B`) evaluations on `Tier C` (`eval3b_tier_c_*.json`, `eval3f_tier_c_mfinal.json`) and `Tier D` (`eval3b_tier_d_*.json`, `eval3f_tier_d_mfinal.json`) are non-confirmatory comparison benchmarks; `enterprise_rag_bench` is absent from `Tier E` because its `150` queries were exhausted across `Tiers A–D` (`M_FINAL_1B` achieves `ERB = 0.9152 / 0.8556` on `Tier C` and `0.9152 / 0.8478` on `Tier D`).
+3. **`P3` Statistical Power (`Tier D n = 100` vs `Tier E n = 200`):** On Tier D `n = 100` (`25` per public dataset), `M_PURE_0P` outperformed `B3_CS6` by `+5.00 pp EM` and `+3.79 pp F1` (`P3 = PASS`) whereas `M_PURE_U61_1B` scored `-0.0100 EM` / `-0.0115 F1` (`P3 = FAIL`) partly due to `+7.00 pp EM` sampling variance on `B3_CS6` under `gemma-4-e4b` (`temperature = 1.0`). Expanding to `Tier E n = 200` (`50/dataset`, `400` episodes, `0` errors) yielded unambiguous **`P3 = PASS`** (`EM +0.0400`, `F1 +0.0650 [+0.0240, +0.1088]`, `p_perm = 0.0022`). Uncompiled zero-shot `dspy.ReAct` leaves PopQA headroom (`EM = 0.1800`) pending `EVAL-6` Graph Scout and `dspy.GEPA` compilation.
+4. **Falsified / Negative Results Recorded Verbatim:** Early `M_FULL` unnormalized linear path-marginal Gibbs (`eval2c_mfull_loo.json`: `P5 = 2/9`, `Rej = 0.6227`); Marchenko–Pastur bulk whitening (`H1_MP_WHITEN`: `0.6492`, `p95 = 2,017.8 ms`); scalar multi-branch NNLS decode (`H2_MULTI_BRANCH`: `PopQA 0.4300`, `p95 = 1,631.5 ms`); empirical quantile tails (`H4_EMPIRICAL_TAIL`: `0.5868`); `M_WIN_0P` finite-horizon Entity-HMM + Gibbs BMA (`eval3_tier_c_retrieval.json`: `Rej = 0.6432 < 0.70`, `P5 = 7/21`); `trigram` beating `unicode61` (`AU3`/`A1B2` falsified across Tiers D/C/E); `M_PURE_U61_1B` on `n = 100` `P3` (`eval3b_tier_d_1bit_qa.json`: `-1.00 pp EM`); `E1B_RESIDUAL_COV` (`0.7393`, `MHAH5 = 0.5400`); `E2A_DYN_RESID_UNIT` / `E2B_DYN_RESID_PROJ` (`~7x p95`, `-4.7 / -6.0 pp MH AH@5`); `E3B_SEM_BONF` / `E3C_SEM_MKNN` (`-2.45 / -2.53 pp`, `2.8x–3.0x maxTM`); `E3A_NB_HASHIMOTO` paired with `F1_TANGENT_STEER` (`I(F1, E3A) = -1.089 pp` gold 2-cycle suppression); `F4A_BRIDGE_PURE` (`0.7792`, `p = 0.0486`); `F3B_LOCAL_ENT_REJECT` (inverted calibration `Rej 0.5161 < 0.7382`); and strict univariate `P5` on `Tier E` (`5/10 PASS`: `AF1` `float32` gains `+0.0225 AH@5` at `2.39x` RAM / `4.36x` `maxTM`).
 
 ---
 
-## 9. Reproducibility & Explicit `EVAL-5` Decision Options
+## 9. Reproducibility & Explicit EVAL-5 Decision Options
 
-### 9.1 Reproducibility Commands (`exp/mdl-dag-ablation` @ `032fe2d`)
+### 9.1 Reproducibility Commands (`exp/mdl-dag-ablation` @ `5b58ada`)
 
 ```powershell
-# 1. Verify full test suite + architecture gates on isolated lab branch
+# 1. Verify full isolated lab test suite + architecture containment gates (434 passed on exp/mdl-dag-ablation@5b58ada)
 git checkout exp/mdl-dag-ablation
+uv run --offline --locked ty check
+uv run --offline --locked ruff check
 uv run --offline --locked pytest -o addopts=""
 
-# 2. Verify Tier B discovery + Tier D untouched confirmatory + P3 QA + Tier C comparison
-uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier b --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_0P AP1_NO_RABITQ_EXACT AP2_1BIT_RABITQ AP3_UNICODE61_LEX AP4_NO_DIFFUSION AP5_NO_TITLE_CIT AP6_NO_PMI_CHAN AP7_NO_NOISYOR AP8_NO_MAXP --output outputs/mdl-dag-eval/reports/eval2e_mpure0p_loo.json
-uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --arms B0_DPR B1_FTS_UNI B2_FTS_TRI B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_0P AP1_NO_RABITQ_EXACT AP2_1BIT_RABITQ AP3_UNICODE61_LEX AP4_NO_DIFFUSION AP5_NO_TITLE_CIT AP6_NO_PMI_CHAN AP7_NO_NOISYOR AP8_NO_MAXP --output outputs/mdl-dag-eval/reports/eval3_tier_d_retrieval.json
-uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --include-qa --arms B3_CS6 M_PURE_0P --output outputs/mdl-dag-eval/reports/eval3_tier_d_qa.json
-uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier c --confirm-sealed-tier-c --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_0P AP1_NO_RABITQ_EXACT AP2_1BIT_RABITQ AP3_UNICODE61_LEX AP4_NO_DIFFUSION AP5_NO_TITLE_CIT AP6_NO_PMI_CHAN AP7_NO_NOISYOR AP8_NO_MAXP --output outputs/mdl-dag-eval/reports/eval3_tier_c_mpure0p_comparison.json
+# 2. EVAL-3b shootout & 1-bit Tier D / C benchmarks + n=100 QA (isolated --cache-dir outputs/mdl-dag-eval/cache_eval3b)
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --cache-dir outputs/mdl-dag-eval/cache_eval3b --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_0P M_PURE_U61 AP1_NO_RABITQ_EXACT AP2_1BIT_RABITQ AP3_UNICODE61_LEX AP4_NO_DIFFUSION AP5_NO_TITLE_CIT AP6_NO_PMI_CHAN AP7_NO_NOISYOR AP8_NO_MAXP AU1_NO_RABITQ_EXACT AU2_1BIT_RABITQ AU3_TRIGRAM_LEX AU4_NO_DIFFUSION AU5_NO_TITLE_CIT AU6_NO_PMI_CHAN AU7_NO_NOISYOR AU8_NO_MAXP AU9_NO_DECOMPOUND --output outputs/mdl-dag-eval/reports/eval3b_tier_d_shootout.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier c --confirm-sealed-tier-c --cache-dir outputs/mdl-dag-eval/cache_eval3b --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_0P M_PURE_U61 AP1_NO_RABITQ_EXACT AP2_1BIT_RABITQ AP3_UNICODE61_LEX AP4_NO_DIFFUSION AP5_NO_TITLE_CIT AP6_NO_PMI_CHAN AP7_NO_NOISYOR AP8_NO_MAXP AU1_NO_RABITQ_EXACT AU2_1BIT_RABITQ AU3_TRIGRAM_LEX AU4_NO_DIFFUSION AU5_NO_TITLE_CIT AU6_NO_PMI_CHAN AU7_NO_NOISYOR AU8_NO_MAXP AU9_NO_DECOMPOUND --output outputs/mdl-dag-eval/reports/eval3b_tier_c_shootout.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --cache-dir outputs/mdl-dag-eval/cache_eval3b --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_U61_1B A1B1_NO_RABITQ_EXACT A1B2_TRIGRAM_LEX A1B3_NO_DIFFUSION A1B4_NO_TITLE_CIT A1B5_NO_PMI_CHAN A1B6_NO_NOISYOR A1B7_NO_MAXP A1B8_NO_DECOMPOUND --output outputs/mdl-dag-eval/reports/eval3b_tier_d_1bit.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier c --confirm-sealed-tier-c --cache-dir outputs/mdl-dag-eval/cache_eval3b --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_U61_1B A1B1_NO_RABITQ_EXACT A1B2_TRIGRAM_LEX A1B3_NO_DIFFUSION A1B4_NO_TITLE_CIT A1B5_NO_PMI_CHAN A1B6_NO_NOISYOR A1B7_NO_MAXP A1B8_NO_DECOMPOUND --output outputs/mdl-dag-eval/reports/eval3b_tier_c_1bit.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --cache-dir outputs/mdl-dag-eval/cache_eval3b --include-qa --qa-per-dataset 25 --arms B3_CS6 M_PURE_U61_1B --output outputs/mdl-dag-eval/reports/eval3b_tier_d_1bit_qa.json
+
+# 3. EVAL-3c / 3d / 3e Tier B waves, 16-arm factorial lattice & static-CSR/Beta-LUT M_FINAL_1B check (isolated --cache-dir outputs/mdl-dag-eval/cache_eval3c)
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier b --cache-dir outputs/mdl-dag-eval/cache_eval3c --arms M_PURE_U61_1B E1A_DPP_1BIT E1B_RESIDUAL_COV E2A_DYN_RESID_UNIT E2B_DYN_RESID_PROJ E3A_NB_HASHIMOTO E3B_SEM_BONF E3C_SEM_MKNN --output outputs/mdl-dag-eval/reports/eval3c_tier_b_wave1.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier b --cache-dir outputs/mdl-dag-eval/cache_eval3c --arms M_PURE_U61_1B F1_TANGENT_STEER F2_WORMHOLE_COND F3A_LOCAL_ENT_RERANK F3B_LOCAL_ENT_REJECT F4A_BRIDGE_PURE F4B_BRIDGE_NOISYOR --output outputs/mdl-dag-eval/reports/eval3d_tier_b_wave2.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier b --cache-dir outputs/mdl-dag-eval/cache_eval3c --arms M_PURE_U61_1B F1_TANGENT_STEER E1A_DPP_1BIT E3A_NB_HASHIMOTO F4B_BRIDGE_NOISYOR C2_F1_E1A C2_F1_E3A C2_F1_F4B C2_E1A_E3A C2_E1A_F4B C2_E3A_F4B C3_F1_E1A_E3A C3_F1_E1A_F4B C3_F1_E3A_F4B C3_E1A_E3A_F4B C4_F1_E1A_E3A_F4B --output outputs/mdl-dag-eval/reports/eval3e_tier_b_lattice.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier b --cache-dir outputs/mdl-dag-eval/cache_eval3c --arms M_FINAL_1B --output outputs/mdl-dag-eval/reports/eval3e_tier_b_mfinal_opt.json
+
+# 4. EVAL-3f untouched Tier E confirmatory retrieval + n=200 paired P3 QA + post-freeze Tiers C/D (isolated --cache-dir outputs/mdl-dag-eval/cache_eval3f)
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier e --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_e_confirmatory.json --confirm-sealed-tier-e --cache-dir outputs/mdl-dag-eval/cache_eval3f --arms B3_CS6 B5S_RAND_SEEDS B5A_RAND_WALK M_PURE_U61_1B M_FINAL_1B AF1_NO_RABITQ_EXACT AF2_TRIGRAM_LEX AF3_NO_DIFFUSION AF4_NO_TITLE_CIT AF5_NO_PMI_CHAN AF6_NO_NOISYOR AF7_NO_MAXP AF8_NO_DECOMPOUND AF9_NO_TANGENT_STEER AF10_NO_DPP_1BIT --output outputs/mdl-dag-eval/reports/eval3f_tier_e_retrieval.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier e --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_e_confirmatory.json --confirm-sealed-tier-e --cache-dir outputs/mdl-dag-eval/cache_eval3f --include-qa --qa-per-dataset 50 --arms B3_CS6 M_FINAL_1B --output outputs/mdl-dag-eval/reports/eval3f_tier_e_qa_n200.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier c --confirm-sealed-tier-c --cache-dir outputs/mdl-dag-eval/cache_eval3f --arms M_FINAL_1B --output outputs/mdl-dag-eval/reports/eval3f_tier_c_mfinal.json
+uv run --offline --locked python -m scripts.mdl_dag_lab.eval_harness --tier d --manifest-path outputs/mdl-dag-eval/manifests/splits_tier_d_confirmatory.json --confirm-sealed-tier-d --cache-dir outputs/mdl-dag-eval/cache_eval3f --arms M_FINAL_1B --output outputs/mdl-dag-eval/reports/eval3f_tier_d_mfinal.json
+
+# 5. Offline IEEE <f2> roundtrip parity provenance: outputs/mdl-dag-eval/reports/eval3f_f16_parity.json
+#    Produced by an offline <f2> (float16 -> float32) roundtrip parity script (not an eval_harness CLI flag) over the 5 full candidate_unicode61.db databases (37,570 docs / 52,959 chunks) + Tier E (4 public datasets, N = 400 scorable + 200 reject probes).
 ```
 
-### 9.2 Decision Matrix for Conditional `EVAL-5` Promotion (Blocked Under Strict `P5 = FAIL`)
+### 9.2 Approved `EVAL-5` Production Cutover Specification & Post-Merge `EVAL-6` Scope
 
-Under [mdl-dag-sprint.md §4](mdl-dag-sprint.md#4-subagent-execution-checkpoints--implementation-ledger), **`M_PURE_0P` clears `P0`–`P4` while failing strict `P5` (`5/8 PASS`)** because incumbent `AP3_UNICODE61_LEX` outperformed `trigram` on English and `AP6`/`AP2` missed strict 95% CIs. Consequently, **`EVAL-5` is blocked by default and MUST NOT begin until the user explicitly chooses one of three disposition paths:**
+With **`M_FINAL_1B`** clearing every untouched confirmatory retrieval and QA gate on `Tier E` (`P0–P4 = PASS`: `H4 = 0.8006`, `MH AH@5 = 0.7100 [+0.3033]`, `QA EM = 0.4500`, `QA F1 = 0.6219 [+0.0650, p = 0.0022]`, `RAM = 24.73 MiB` [`3.78x` reduction], `p50/p95 = 22.1 / 38.8 ms`, `Rej AUROC = 0.7068`) plus `float16` parity (`4-DS H4 diff = 0.0000`, `MH AH@5 diff = 0.0000`), **`EVAL-5`** is explicitly approved by the user on `2026-11-22` ([epic-3-performance.md#decisions](../epic-3-performance.md#decisions), waiving univariate `P5 = 5/10`) to execute the following clean-slate cutover onto `dev` (implementing **only** what was verified, with zero `M_PURE_0P` Path-B compromises and zero legacy shims):
 
-| Disposition | What Happens Next Before/During `EVAL-5` | Trade-Off & Evidence Status | Dependencies Deleted |
-| :--- | :--- | :--- | :--- |
-| **Path A (Option A)** *(Recommended — Requires Intermediate `EVAL-3b` First)* | **Run intermediate `EVAL-3b`** in `exp/mdl-dag-ablation` for `spaCy`-free `unicode61 + yaw_stage1` (plus user choice on keeping vs pruning `AP6` PMI and `4-bit` vs `1-bit` RaBitQ), measure cold-open `tracemalloc`/RAM + fresh disjoint holdout + `P3` `n=100` `dspy.ReAct` QA, and only then execute `EVAL-5`. | `AP3_UNICODE61_LEX` achieved top Tier D (`0.8098 R@5`, `0.7858 H4`, `0.7133 MH AH@5`, `64.5 ms p95`, `Rej 0.7887`) & Tier C (`0.8039 R@5`, `63.7 ms p95`) results, using `5.61x` smaller `chunk_fts_data` (`45.76 vs 256.59 MiB`). **Currently unmeasured:** `~250.5 MiB` estimated `dbstat` for `spaCy`-free `unicode61 + yaw_stage1` (`AP3` opened `incumbent_unicode61.db` at `maxTM = 252.19 MiB` in memory), its cold-open RAM, and `AP3` `P3` QA (`eval3_tier_d_qa.json` ran only `B3_CS6` and `M_PURE_0P`). Sacrifices native `<3`-char CJK `trigram` matching. | **`optuna`** + **`spacy`** / `en-core-web-sm` *(after `EVAL-3b`)* |
-| **Path B (Option B)** *(Requires Explicit User `P5` Override)* | **With explicit user waiver of `P5 = 5/8 FAIL`,** promote **exact Tier-D `M_PURE_0P`** (`trigram` + 4-bit RaBitQ + 1-bit PMI + converged diffusion + conditional Noisy-OR + MaxP) into `dev` with zero post-holdout modifications. | Preserves strict post-holdout freeze (`Tier D P0–P4 PASS`: `0.8010 R@5 / 86.2 ms`, `EM +0.0500`, CJK/DE trigram support intact); accepts `P5 = 5/8` (`unicode61` faster/higher on English) and larger `487.42 MiB` DB footprint (`256.59 MiB` `chunk_fts_data`). | **`optuna`** + **`spacy`** / `en-core-web-sm` |
-| **Path C (Option C)** *(Clean Rejection)* | **Reject promotion (`0` edits to `yaw/**`)** | Retains unmodified `3cd3952` `yaw/retrieval.py` (`B3_CS6`: `0.6627 R@5`, `0.4233 MH AH@5`, `110.04 MiB`) + `optuna`/`spacy`; archives `exp/mdl-dag-ablation` cleanly on its branch. | None |
+1. **Frozen Production Algorithm (`M_FINAL_1B`):**
+   - `1-bit Extended Rotated SoA RaBitQ` + `Tangent-Steered Cyclic Citation Diffusion` (forward/reverse title-ref + self-loop-cancelled 1-bit PMI channels, conditional Noisy-OR edge weighting, static forward/transpose CSR + `16,384`-bin `z = sqrt(-log1p(-c^2))` Beta-tail LUT [`max abs err < 1e-6`], zero Class-1 tunable retrieval hyperparameters) + `Rank-1 Cholesky Greedy L-Ensemble 1-bit DPP` + `MaxP Deferral`.
+2. **Plain SQLite Persistent Schema (`yaw.db`, Zero `sqlite-vec` / `vec0`):**
+   - **`chunks`:** Plain SQLite ROWID table persisting `<f2>` (IEEE `float16`) vector BLOBs + immutable pointer metadata (`rel_path`, `source_hash`, `start_line`, `end_line`, `char_start`, `char_end`, `ast_island_start`, `ast_island_end`, `title`) — **zero raw chunk text**, **zero `tokens_json` / `entities_json`**, **zero `vec0` virtual tables**.
+   - **`chunk_fts` + `chunk_vocab`:** Contentless `fts5(title, body, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 1')` fed via `.casefold()` + overlapping CJK bigrams, paired with `chunk_vocab` (`fts5vocab(chunk_fts, 'row')`) for query-time prefix/Koehn–Knight decompounding (`_run_decomp_for_word`).
+   - **`rabitq_index`:** Single-row persisted 1-bit SoA RaBitQ `codes_blob`, `ip_norm_blob`, centroid `mean_blob`, `d_eff_shannon`, and chunk/embedding identity fingerprints (`n_chunks`, `dim`, `embedding_model`, `task_mode`, `vec_sha256`, `source_sha256`).
+   - **`citation_graph`:** Persisted `doc_titles` + compressed bipartite CSR adjacency (`fwd`/`rev` title-ref CSR, doc-owned chunk CSR `dc`, chunk<->PMI-phrase bipartite CSR + `pmi_terms`, and `prop_nouns`) used to build static forward/transpose diffusion operators.
+3. **Self-Documenting Naming Migration (`yaw/**`):**
+   - Replace experimental lab names and legacy retrieval types cleanly in place with idiomatic production symbols: **`RetrievalIndex`**, **`CitationGraph`**, **`DiffusionOperators`**, **`SearchResult`**, **`search_index`**, and **`expand_citation_neighbors`**.
+4. **Atomic Dependency & Dead-Code Purge (`EVAL-5` Same-Commit Deletion):**
+   - Remove **`sqlite-vec` / `vec0`**, **`optuna`**, and **`spacy` / `en-core-web-sm`** cleanly from `pyproject.toml`, `uv.lock`, `yaw/**`, `FOUNDATIONAL.md`, `.agents/rules/*.md`, and `tests/**`.
+   - Delete superseded tuning infrastructure atomically: **`SearchParams`**, **`resolve_retrieval_params`**, **`optimize_optuna`**, `yaw optimize optuna` CLI subcommand, and all Optuna watchdog/DB telemetry hooks across `yaw/**`, `scripts/watchdog.py`, and `tests/**`.
+5. **Post-Merge `EVAL-6` Scope (Strictly Deferred Until After `EVAL-5` Lands):**
+   - **`SearchResult.completeness`:** Native MDL / Bayes-factor completeness indicator exposed on `SearchResult` once the `EVAL-5` schema is live.
+   - **Lazy `.yaw/wiki/` Graph Scout:** Bounded zero-LLM-bloat graph scout layer built cleanly atop `RetrievalIndex` and `CitationGraph` after `EVAL-5` gates are green on `dev`.
