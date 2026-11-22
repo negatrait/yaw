@@ -56,3 +56,28 @@ Live-silicon verification of the `CS-4`/`CS-5` clean-slate `14`-file architectur
   - `G1` (clean 14-file `<= 5,500` LOC package, zero wrappers), `G2` (declarative CocoIndex SQLite indexing with `0` LLM calls), `G4` (**`EM = 0.4750 > 0.1250`, `F1 = 0.6001 > 0.2482`** at `temperature=1.0`, `0` SQLite writes during QA, strict tool-observation citation grounding), and `G5` (`FastMCP` HTTP + CLI) pass.
   - `G3` untuned `yaw/retrieval.py` `R@5 = 0.7417` sits below Pass-4 Optuna `0.8146` (while beating Pass-4 on `musique`: `0.6667` vs `0.6333`), and is **explicitly accepted without throwaway `Optuna` tuning sweeps** as the paired `CS-6` control baseline under user-approved Option B and [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md) (originally Rev-3 `§0.1`/`MDL-1`; revised in Rev-4 `§0` item 5 to conditional `EVAL-5` removal of `optuna`, `spacy`, `optimize_optuna`, `SearchParams`, and `resolve_retrieval_params` only after Gates `P1`–`P5` pass).
   - **Does not establish:** Upstream HippoRAG 2 parity (`overall_gate_status = "FAIL"` in `cs5_4ds_10q_gate.json`), multi-dataset compiled GEPA generalization (`n=2` smoke only), or post-`CS-6` `mdl-dag-sprint` retrieval improvements.
+
+---
+
+## 2026-11-22: MDL-DAG Ablation & Parameter-Free Diffusion Confirmatory Evaluation (`EVAL-0`..`EVAL-4`)
+
+Full isolated full-corpus (`37,570` `.md` docs / `52,959` chunks, live `embeddinggemma-2` + `gemma-4-e4b` `temperature = 1.0`, `0` edits to `yaw/**`) benchmark-gated evaluation across Tier A (`n = 40`), Tier B (`N = 243` scorable + `150` reject labels), superseded Tier C (`N = 490` + `200` reject labels), and untouched disjoint Tier D (`N = 492` scorable + `200` reject labels + `n = 100` paired `dspy.ReAct` QA). Full tables, exact CIs, mathematical specification, LOO matrices (`AP1`–`AP8`, `AZ1`–`AZ21`, `AW1`–`AW13`), and error taxonomy live in [mdl-dag-experiment-report.md](reviews/mdl-dag-experiment-report.md) and [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md).
+
+### Untouched Disjoint Tier D Confirmatory Verdict (`N = 492`, `n = 100` QA)
+
+| System (`Tier D`, `N = 492`) | Pool `R@5` | `4-DS H4` | `MH AH@5` | `2Wiki / MuSiQue / HotpotQA / PopQA / ERB` (`R@5`) | Paired QA `EM / F1` (`n = 100`) | `Reject AUROC` (`top1`) | `RAM` (`MiB`) | `p50 / p95` (`ms`) |
+| :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: |
+| `B0_DPR` | `0.6815` | `0.6498` | `0.4833` | `0.7000 / 0.4942 / 0.9000 / 0.5050 / 0.8194` | — | `0.5000` (`0.7402`) | `7.65` | `125.7 / 248.1` |
+| `B3_CS6` (`3cd3952` incumbent) | `0.6627` | `0.6248` | `0.4233` | `0.7650 / 0.4542 / 0.8150 / 0.4650 / 0.8277` | `0.3300 / 0.5235` | `0.5000` (`0.5000`) | `110.04` | `79.1 / 96.2` |
+| **`M_PURE_0P`** *(Primary Candidate)* | **`0.8010`** | **`0.7746`** | **`0.7033`** | **`0.9475 / 0.6158 / 0.9600 / 0.5750 / 0.9158`** | **`0.3800 / 0.5615`** | **`0.7976`** (`0.7387`) | **`25.45`** | **`35.1 / 86.2`** |
+| `AP3_UNICODE61_LEX` *(LOO arm)* | `0.8098` | `0.7858` | `0.7133` | `0.9600 / 0.6333 / 0.9700 / 0.5800 / 0.9140` | — | `0.7887` (`0.7387`) | `26.05` | `31.6 / 64.5` |
+
+- **Gate Disposition (`M_PURE_0P`):**
+  - **`P0 = PASS`:** `0` Class-1 tunable retrieval hyperparameters (zero horizon, budget, quota, or blend-weight parameters).
+  - **`P1 = PASS`:** Beats `B5S_RAND_SEEDS` (`+0.3896 R@5`, `+0.5005 AH@5`, `p_holm = 0.0008`) and `B5A_RAND_WALK` (`+0.3860 R@5`, `+0.4981 AH@5`, `p_holm = 0.0008`).
+  - **`P2 = PASS`:** Multi-hop `All-Hops@5 +0.2800 [+0.2267, +0.3333]`, macro `Recall@5 +0.1382 [+0.1156, +0.1615]` (`p_holm = 0.0004`); strictly positive 95% CIs across all 5 datasets and `Recall@{1,2,5,10,20}`.
+  - **`P3 = PASS`:** Paired uncompiled `gemma-4-e4b` (`temperature = 1.0`, `0` model errors across 200 episodes) `EM +0.0500 [-0.0200, +0.1200]`, `F1 +0.0379 [-0.0269, +0.1060]`.
+  - **`P4 = PASS`:** `4.32x` RAM reduction (`25.45` vs `110.04 MiB`), `p95 = 86.2 ms <= 144.3 ms`, `0` 16-thread concurrency errors, `Reject AUROC = 0.7976 >= 0.70 > top1 0.7387` (`0` masked leaks).
+  - **`P5 = FAIL` (`5/8 PASS` on Tier D & Tier C):** `AP1`, `AP4`, `AP5`, `AP7`, `AP8` pass cleanly, whereas incumbent `unicode61` FTS5 tokenization (`AP3_UNICODE61_LEX`) outperformed `trigram` on Tier D (`-0.0088 [-0.0160, -0.0019] R@5`, `p95 64.5 vs 86.2 ms`) and Tier C comparison (`-0.0126 [-0.0224, -0.0036] R@5`, `p95 63.7 vs 89.0 ms`), and `AP6` / `AP2` missed strict 95% CI bounds.
+- **Negative Result (`M_WIN_0P`):** Superseded zero-scalar `M_WIN_0P` failed sealed Tier C `P4` (`Reject AUROC = 0.6432 < 0.70 < top1 0.6804`) and `P5` (`7/21 PASS`); Tier C `M_PURE_0P` comparison fixed calibration (`0.7731`) and sped up median latency `2.59x` (`34.9 vs 90.3 ms`).
+- **Explicit Non-Claims & Next Action:** `0` changes made to `yaw/**`, `pyproject.toml`, or `yaw.toml` on `dev`. Real-corpus benchmarks are `100%` English (`DE`/`ZH`/`FI` tested solely in isolated lab unit tests). `EVAL-5` is blocked under strict `P5 = FAIL` pending explicit user choice between Option A (requires intermediate `EVAL-3b` build + cold-open RAM + `P3` QA validation of `spaCy`-free `unicode61 + yaw_stage1`), Option B (explicit user `P5` waiver to promote exact Tier-D `M_PURE_0P`), or Option C (reject promotion) in [mdl-dag-experiment-report.md §9](reviews/mdl-dag-experiment-report.md#9-reproducibility--explicit-eval-5-decision-options).
