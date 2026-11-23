@@ -41,13 +41,13 @@ EmbeddingGemma-2/multimodal work is **deferred**: no exact compatible checkpoint
 ## Commands available now
 
 ```powershell
-uv run --locked python benchmark.py --dataset sample --mode all
-uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
-uv run --locked python benchmark.py --dataset musique --max-queries 5
-uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10
-uv run --locked python benchmark.py --dataset sample --extraction-model Phi-4-mini-instruct-GGUF --qa-model Mistral-7B-Instruct-v0.3-Hybrid
-uv run --locked python benchmark.py --dataset sample --chat-model gemma4-it-12b-FLM --embedding-model embeddinggemma-300m-GGUF
-uv run --locked python benchmark.py --dataset sample --chat-model gemma4-it-12b-FLM --embedding-model Qwen3-Embedding-0.6B-GGUF
+uv run --locked python -m scripts.benchmark --dataset sample --mode all
+uv run --locked python -m scripts.benchmark --dataset 2wikimultihopqa --max-queries 10
+uv run --locked python -m scripts.benchmark --dataset musique --max-queries 5
+uv run --locked python -m scripts.benchmark --dataset hotpotqa --max-queries 10
+uv run --locked python -m scripts.benchmark --dataset sample --extraction-model Phi-4-mini-instruct-GGUF --qa-model Mistral-7B-Instruct-v0.3-Hybrid
+uv run --locked python -m scripts.benchmark --dataset sample --chat-model gemma4-it-12b-FLM --embedding-model embeddinggemma-300m-GGUF
+uv run --locked python -m scripts.benchmark --dataset sample --chat-model gemma4-it-12b-FLM --embedding-model Qwen3-Embedding-0.6B-GGUF
 ```
 
 `--mode embeddings` exercises only embeddings, with five batch/single/reordered repeats per active role and cosine >= 0.999. `--mode eval` performs extraction, graph indexing, HippoRAG 2 retrieval/QA (`retrieve` + `qa`), and StandardRAG DPR baseline comparison (`retrieve_dpr` + `qa`) against the selected dataset and prints gold Recall@1/@2/@5 and QA ExactMatch/F1 alongside the HippoRAG 2 paper's reference numbers. `--extraction-model` and `--qa-model` default to `Qwen3-4B-Instruct-2507-GGUF` and `Mistral-7B-Instruct-v0.3-Hybrid`; passing `--chat-model` overrides both with a single model.
@@ -60,11 +60,11 @@ Lemonade and model profile settings for these installed models are CUDA/NPU and 
 
 Restart/reload an already loaded backend after a settings change; saving options alone need not change a running backend. Do not silently change its pooling in response to a failed test.
 
-## Real benchmark harness (`benchmark.py`)
+## Real benchmark harness (`scripts/benchmark.py`)
 
-`benchmark.py` and `tests/test_benchmark.py` implement the upstream HippoRAG 2 benchmark harness against pinned revision `d5c8329422e0a0b834a15874545cb6a74b4f9b26` (`reproduce/dataset` corpora and query files for **`sample`, `2wikimultihopqa`, `musique`, and `hotpotqa`**):
+`scripts/benchmark.py` and `tests/test_benchmark.py` implement the upstream HippoRAG 2 benchmark harness against pinned revision `d5c8329422e0a0b834a15874545cb6a74b4f9b26` (`reproduce/dataset` corpora and query files for **`sample`, `2wikimultihopqa`, `musique`, and `hotpotqa`**):
 
-1. Reads explicitly prepared bundles from `outputs/datasets/<dataset>/`. Prepare these first with `scripts/download-datasets.py`; benchmark execution does not download or rewrite inputs. Evaluation adapters resolve original QA references through manifest document identities.
+1. Reads explicitly prepared bundles from `outputs/datasets/<dataset>/`. Prepare these first with `python -m scripts.download_datasets`; benchmark execution does not download or rewrite inputs. Evaluation adapters resolve original QA references through manifest document identities.
 2. Supports Tier 0 (`--dataset sample`), the documented Tier 1 candidate-pool policies (`--max-queries N`, `--index-queries N`), Tier 2 full-corpus runs (`--full-corpus`) and retrieval-only runs (`--mode retrieval`). Subsets select document IDs from the complete manifest; original QA records remain outside ingestion.
 3. Obtains complete snapshots from persistent CocoIndex per-file memo results and indexes native YAW SQLite graphs under `outputs/benchmarks/indexes/`. Unchanged source scans do not require parsing or target callbacks to rerun. Existing OpenIE and inference caches/checkpoints remain responsible for expensive model work. Compare native retrieval and QA against both frozen reference targets; no upstream engine executes.
 

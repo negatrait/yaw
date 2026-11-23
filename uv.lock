@@ -2297,15 +2297,15 @@ dependencies = [
     { name = "dspy", extra = ["openai"] },
     { name = "fastmcp" },
     { name = "filelock" },
-    { name = "matplotlib" },
     { name = "numpy" },
-    { name = "psutil" },
     { name = "scipy" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "coverage" },
+    { name = "matplotlib" },
+    { name = "psutil" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-testmon" },
@@ -2315,19 +2315,19 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cocoindex", specifier = ">=1.1.0" },
+    { name = "cocoindex", specifier = ">=1.2.0" },
     { name = "dspy", extras = ["openai"], specifier = ">=3.5.0" },
     { name = "fastmcp", specifier = ">=4.2.0" },
     { name = "filelock", specifier = ">=3.32.7" },
-    { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "numpy", specifier = ">=2.5.4" },
-    { name = "psutil", specifier = ">=7.2.2" },
     { name = "scipy", specifier = ">=1.18.1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "coverage", specifier = ">=7.17.0" },
+    { name = "matplotlib", specifier = ">=3.11.2" },
+    { name = "psutil", specifier = ">=7.2.2" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-cov", specifier = ">=7.0.0" },
     { name = "pytest-testmon", specifier = ">=2.2.0" },

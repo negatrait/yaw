@@ -1,7 +1,6 @@
 [run]
 source =
     yaw
-    benchmark
     scripts
 parallel = True
 patch = subprocess

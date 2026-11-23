@@ -7,13 +7,14 @@ import json
 import re
 import tempfile
 import unittest
+from importlib import resources
 from pathlib import Path
 from typing import Any, override
 
 import numpy as np
 from numpy.typing import NDArray
 
-from benchmark import (
+from scripts.benchmark import (
     BASELINES,
     DATASET_REGISTRY,
     DATASETS,
@@ -461,8 +462,7 @@ class DatasetSliceTests(unittest.TestCase):
             self.assertGreater(entry["evaluation_seconds"], 0.0)
             self.assertGreater(entry["elapsed_seconds"], 0.0)
 
-        spec_path = Path(__file__).resolve().parent.parent / "data" / "benchmarks" / "baselines.json"
-        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        spec = json.loads(resources.files("yaw").joinpath("baselines.json").read_text(encoding="utf-8"))
         self.assertEqual(set(spec["datasets"]), set(DATASETS))
         self.assertEqual(spec["baselines"], BASELINES)
 

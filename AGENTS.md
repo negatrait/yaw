@@ -41,4 +41,4 @@ git diff --check
 - `uv run yaw qa "<question>" [--json]`: Tier-1 `dspy.ReAct` benchmark QA.
 - `uv run yaw optimize dspy [--fresh]`: launch or resume `dspy.GEPA` QA prompt compilation.
 - `uv run yaw config {show|get|set}`: inspect or update `yaw.toml` atomically (secrets redacted).
-- `$env:YAW_ARTIFACT_DIR = "<dir>"; uv run watchdog --watch 300`: optimization telemetry watchdog.
+- `$env:YAW_ARTIFACT_DIR = "<dir>"; uv run python -m scripts.watchdog --watch 300`: optimization telemetry watchdog.

@@ -465,10 +465,9 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(is_allowed_internal_import("yaw.pkg_a", "yaw.core.types"))
 
     def test_zero_hipporag_imports_in_yaw(self):
-        """Rule 4: Zero hipporag imports across the entire repository (yaw/, benchmark.py, scripts/, tests/)."""
+        """Rule 4: Zero hipporag imports across the entire repository (yaw/, scripts/, tests/)."""
         py_files = (
             list(YAW_DIR.rglob("*.py"))
-            + [PROJECT_ROOT / "benchmark.py"]
             + list((PROJECT_ROOT / "scripts").rglob("*.py"))
             + list((PROJECT_ROOT / "tests").rglob("*.py"))
         )
@@ -770,7 +769,6 @@ class ArchitectureTests(unittest.TestCase):
         target_files = (
             list(YAW_DIR.rglob("*.py"))
             + list((PROJECT_ROOT / "tests").rglob("*.py"))
-            + [PROJECT_ROOT / "benchmark.py"]
             + list((PROJECT_ROOT / "scripts").rglob("*.py"))
             + list(DOCS_DIR.rglob("*.md"))
             + list(RULES_DIR.glob("*.md"))
@@ -1115,3 +1113,57 @@ class ArchitectureTests(unittest.TestCase):
             [],
             "Purged dependency references found under yaw/:\n" + "\n".join(violations),
         )
+
+    def test_wheel_packaging_hygiene_and_bundled_catalog(self):
+        """Rule 14: Wheel ships only yaw/ + yaw.core/ with py.typed & baselines.json and lean runtime deps."""
+        import json
+        import tomllib
+        from importlib import resources
+
+        import yaw.datasets as yaw_datasets
+
+        data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        project = data["project"]
+        self.assertEqual(set(project["scripts"].keys()), {"yaw"})
+
+        setuptools_cfg = data["tool"]["setuptools"]
+        self.assertEqual(setuptools_cfg["packages"], ["yaw", "yaw.core"])
+        self.assertNotIn("py-modules", setuptools_cfg)
+        self.assertNotIn("find", setuptools_cfg)
+        self.assertLessEqual({"py.typed", "baselines.json"}, set(setuptools_cfg["package-data"]["yaw"]))
+        self.assertTrue((YAW_DIR / "py.typed").is_file())
+        self.assertTrue((YAW_DIR / "baselines.json").is_file())
+
+        def _req_names(reqs: list[str]) -> set[str]:
+            names: set[str] = set()
+            for req in reqs:
+                match = re.match(r"^\s*([A-Za-z0-9._-]+)", req)
+                if match:
+                    names.add(match.group(1).lower().replace("_", "-"))
+            return names
+
+        runtime_deps = list(project["dependencies"])
+        dev_deps = list(data["dependency-groups"]["dev"])
+        runtime_names = _req_names(runtime_deps)
+        dev_names = _req_names(dev_deps)
+        self.assertNotIn("matplotlib", runtime_names)
+        self.assertNotIn("psutil", runtime_names)
+        self.assertIn("matplotlib", dev_names)
+        self.assertIn("psutil", dev_names)
+        coco_deps = [d for d in runtime_deps if d.lower().startswith("cocoindex")]
+        self.assertTrue(
+            any(d.startswith("cocoindex>=1.2.0") for d in coco_deps),
+            f"Expected cocoindex>=1.2.0 in project.dependencies, got {coco_deps}",
+        )
+
+        catalog_res = resources.files("yaw").joinpath("baselines.json")
+        self.assertTrue(catalog_res.is_file())
+        catalog = json.loads(catalog_res.read_text(encoding="utf-8"))
+        self.assertEqual(tuple(catalog["datasets"].keys()), yaw_datasets.DATASETS)
+        self.assertEqual(dict(catalog["baselines"]), yaw_datasets.BASELINES)
+
+        self.assertFalse((PROJECT_ROOT / "benchmark.py").exists())
+        self.assertTrue((PROJECT_ROOT / "scripts" / "benchmark.py").is_file())
+        self.assertTrue((PROJECT_ROOT / "scripts" / "download_datasets.py").is_file())
+        self.assertFalse((PROJECT_ROOT / "scripts" / "preflight.py").exists())
+        self.assertFalse((PROJECT_ROOT / "referencces").exists())

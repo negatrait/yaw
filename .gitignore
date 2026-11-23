@@ -3,13 +3,13 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .yaw/
 corpus/
 outputs/
 datasets/
 data/*
-!data/benchmarks/
-!data/benchmarks/baselines.json
 .env
 .env.*
 !.env.example

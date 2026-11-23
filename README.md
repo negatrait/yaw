@@ -20,10 +20,10 @@ uv run yaw recall <query> [--top-k 5] [--config PATH] [--json]
 uv run yaw qa <question> [--config PATH] [--json]
 uv run yaw optimize dspy [--dataset ...] [--max-queries N] [--query-offset M] [--threads N] [--fresh]
 uv run yaw config {show|get [key]|set <key> <value>} [--config PATH] [--json]
-uv run watchdog --once [--artifact-dir PATH]
-uv run python scripts/download-datasets.py [--dataset all]
-uv run python benchmark.py --dataset sample --mode retrieval
-uv run python scripts/verify_paper_parity_gate.py --mode eval
+uv run python -m scripts.watchdog --once [--artifact-dir PATH]
+uv run python -m scripts.download_datasets [--dataset all]
+uv run python -m scripts.benchmark --dataset sample --mode retrieval
+uv run python -m scripts.verify_paper_parity_gate --mode eval
 ```
 
 Guarded parity/tier-2 benchmarks (`2wikimultihopqa`, `hotpotqa`, `musique`, `popqa`, `nq`, `lveval`, `narrativeqa`) reserve query slice `[0, 10)` for held-out evaluation; pass `--query-offset 10` or set `[optimization].query_offset >= 10` in [`yaw.toml`](yaw.toml) when optimizing against those datasets.
@@ -44,7 +44,7 @@ The replacement CLI handles Ctrl-C, SIGTERM, and Windows Ctrl-Break during optim
 
 ## Benchmarks & Baselines
 
-`benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate YAW against Standard DPR and two consolidated targets (see [evaluation ledger](docs/evaluation.md)):
+`scripts/benchmark.py` and `scripts/verify_paper_parity_gate.py` evaluate YAW against Standard DPR and two consolidated targets (see [evaluation ledger](docs/evaluation.md)):
 
 - **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Archived historical runs of upstream HippoRAG 2 on the older `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` stack only (stored in [`outputs/benchmarks/consolidated_historical_baselines.json`](outputs/benchmarks/consolidated_historical_baselines.json)).
 - **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper scores (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
@@ -61,7 +61,7 @@ uv run --locked pytest
 git diff --check
 ```
 
-`preflight` runs Ruff, `ty`, and `pytest` with `--testmon` and coverage tracking; see [coverage plan](docs/coverage-plan.md). Remaining upstream algorithm references:
+See [coverage plan](docs/coverage-plan.md) for full `--cov` verification commands. Remaining upstream algorithm references:
 
 1. **HippoRAG (`arXiv:2405.14831v3`):** [arXiv:2405.14831](https://arxiv.org/abs/2405.14831) / [Local Copy](docs/arxiv-2405.14831v3-hipporag.md)
 2. **HippoRAG 2 (`arXiv:2502.14802v1`):** [arXiv:2502.14802](https://arxiv.org/abs/2502.14802) / [Local Copy](docs/arxiv-2502.14802v1-hipporag2.md)

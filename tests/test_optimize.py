@@ -218,7 +218,7 @@ def test_optimizers_reject_held_out_overlap_before_indexing(tmp_path):
     with pytest.raises(YawRuntimeError, match="held-out"):
         optimize_dspy(cfg, datasets="2wikimultihopqa", query_offset=0)
     with pytest.raises(
-        YawRuntimeError, match=r"Prepared dataset bundle not found.*scripts/download-datasets\.py --dataset"
+        YawRuntimeError, match=r"Prepared dataset bundle not found.*scripts\.download_datasets --dataset"
     ) as exc_missing:
         optimize_dspy(cfg, datasets="hotpotqa", query_offset=10)
     assert exc_missing.value.code == "INVALID_INPUT"

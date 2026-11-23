@@ -268,7 +268,7 @@ def _resolve_dataset_refs(ws: Path, names: Sequence[str], *, query_offset: int) 
             raise YawRuntimeError(
                 "INVALID_INPUT",
                 f"Prepared dataset bundle not found for {canonical!r}; "
-                f"run scripts/download-datasets.py --dataset {canonical}.",
+                f"run python -m scripts.download_datasets --dataset {canonical}.",
             )
     return out
 

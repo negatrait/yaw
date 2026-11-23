@@ -11,6 +11,7 @@ import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +20,10 @@ from filelock import FileLock
 from yaw.core import render_document_text, write_text_atomic
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_CATALOG_PATH = _REPO_ROOT / "data" / "benchmarks" / "baselines.json"
-_CATALOG: dict[str, Any] = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
+_CATALOG: dict[str, Any] = json.loads(resources.files("yaw").joinpath("baselines.json").read_text(encoding="utf-8"))
 _DATASET_SPECS: dict[str, dict[str, Any]] = dict(_CATALOG["datasets"])
 
+BASELINES: dict[str, dict[str, Any]] = dict(_CATALOG["baselines"])
 PINNED_COMMIT: str = str(_CATALOG["pinned_commit"])
 HF_BASE_URL: str = str(_CATALOG["hf_base_url"])
 UPSTREAM_DATASET_BASE_URL: str = str(_CATALOG["upstream_dataset_base_url"])

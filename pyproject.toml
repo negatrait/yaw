@@ -5,25 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yaw"
 version = "0.1.0"
-description = "Graphless RAG QA on a local LLM"
+description = "Local-first SQLite retrieval and DSPy QA library"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["rag", "retrieval", "sqlite", "fts5", "dspy", "cocoindex", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 requires-python = ">=3.14"
 dependencies = [
-    "cocoindex>=1.1.0",
+    "cocoindex>=1.2.0",
     "dspy[openai]>=3.5.0",
     "fastmcp>=4.2.0",
     "filelock>=3.32.7",
-    "matplotlib>=3.11.2",
     "numpy>=2.5.4",
-    "psutil>=7.2.2",
     "scipy>=1.18.1",
 ]
 
 [project.scripts]
 yaw = "yaw.cli:cli_entrypoint"
-watchdog = "scripts.watchdog:main"
-preflight = "scripts.preflight:main"
-typecheck = "scripts.preflight:typecheck"
 
 [dependency-groups]
 dev = [
@@ -33,6 +37,8 @@ dev = [
     "coverage>=7.17.0",
     "pytest-cov>=7.0.0",
     "ty>=0.0.89",
+    "matplotlib>=3.11.2",
+    "psutil>=7.2.2",
 ]
 
 [tool.uv]
@@ -40,10 +46,10 @@ package = true
 preview-features = ["content-addressed-cache"]
 
 [tool.setuptools]
-py-modules = ["benchmark"]
+packages = ["yaw", "yaw.core"]
 
-[tool.setuptools.packages.find]
-include = ["yaw*", "scripts*"]
+[tool.setuptools.package-data]
+yaw = ["py.typed", "baselines.json"]
 
 [tool.ruff]
 fix = true

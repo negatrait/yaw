@@ -1,17 +1,16 @@
 """Downloader network fallback and CLI contracts over loopback and real files."""
 
-import importlib.util
 import json
 import os
 import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import TypedDict, override
 
 import pytest
 
+import scripts.download_datasets as download_datasets
 from yaw.datasets import prepare_dataset_bundle
 
 
@@ -23,12 +22,7 @@ class DownloadState(TypedDict):
 
 @pytest.fixture
 def downloader():
-    path = Path(__file__).resolve().parents[2] / "scripts" / "download-datasets.py"
-    spec = importlib.util.spec_from_file_location("download_edges_subject", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return download_datasets
 
 
 @pytest.fixture

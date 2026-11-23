@@ -28,8 +28,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import benchmark
-from benchmark import BASELINES
+import scripts.benchmark as benchmark
+from scripts.benchmark import BASELINES
 from scripts.evaluation import evaluate_benchmark_gate
 from yaw.core.config import load_config
 

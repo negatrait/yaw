@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from openai import AuthenticationError
 
-import benchmark
+import scripts.benchmark as benchmark
 from yaw.core import YawConfig, YawRuntimeError
 from yaw.datasets import prepare_dataset_bundle
 from yaw.pipeline import list_user_tables

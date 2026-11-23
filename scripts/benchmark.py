@@ -1,11 +1,11 @@
 """Live Native YAW RetrievalIndex & ReAct QA benchmark runner.
 
 Tier 0 (sample):
-  uv run --locked python benchmark.py --dataset sample --mode all
+  uv run --locked python -m scripts.benchmark --dataset sample --mode all
 Tier 1 (calibration slice with pooled candidate passages):
-  uv run --locked python benchmark.py --dataset musique --max-queries 10
-  uv run --locked python benchmark.py --dataset 2wikimultihopqa --max-queries 10
-  uv run --locked python benchmark.py --dataset hotpotqa --max-queries 10
+  uv run --locked python -m scripts.benchmark --dataset musique --max-queries 10
+  uv run --locked python -m scripts.benchmark --dataset 2wikimultihopqa --max-queries 10
+  uv run --locked python -m scripts.benchmark --dataset hotpotqa --max-queries 10
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from yaw.core import (
     write_text_atomic,
 )
 from yaw.datasets import (
+    BASELINES,
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
     DATASETS,
@@ -78,7 +79,7 @@ from yaw.retrieval import (
     search_index,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 __all__ = [
     "BASELINES",
@@ -100,10 +101,6 @@ __all__ = [
     "run_yaw_benchmark",
     "verify_embeddings",
 ]
-
-BASELINES: dict[str, dict[str, Any]] = json.loads(
-    (PROJECT_ROOT / "data" / "benchmarks" / "baselines.json").read_text(encoding="utf-8")
-)["baselines"]
 
 QA_TOP_K = 5
 RETRIEVAL_TOP_K = 20

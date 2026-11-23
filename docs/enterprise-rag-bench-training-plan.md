@@ -5,17 +5,17 @@ Status: active (clean-slate `14`-file `M_FINAL_1B`, `5c4b115`).
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
-| Rules | [tests.md](../.agents/rules/tests.md): `benchmark.py`, `scripts/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
-| Owns code | `benchmark.py`, `scripts/download-datasets.py`, `scripts/verify_paper_parity_gate.py`, `scripts/evaluation.py`, `data/benchmarks/baselines.json` |
-| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`YawConfig`, `configure_logging`, `format_doc_for_embedding`, `format_query_for_embedding`, `write_text_atomic`); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/datasets.py` & `yaw/pipeline.py` (bundle preparation/validation, slice scoping, `start_pipeline`, `update_pipeline_once`, `score_retrieval_recalls`, `score_qa_em_f1`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval.py` (`build_retrieval_index`, `search_index`, `hydrate_ranked_passages`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` (`make_react_instruction_proposer`, `qa_gepa_metric`, `optimize_dspy`, `.yaw/qa_program.json`); [epic-3-performance.md](epic-3-performance.md): owns `scripts/{watchdog,preflight}.py` & tracks shipped `M_FINAL_1B` parity benchmarks; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_benchmark*.py`, `tests/test_download_datasets.py`, `tests/scripts/test_{download_edges,evaluation,parity_rendering}.py`) |
-| References | [data/benchmarks/baselines.json](../data/benchmarks/baselines.json), [outputs/benchmarks/consolidated_historical_baselines.json](../outputs/benchmarks/consolidated_historical_baselines.json), [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md), [archive/pre-epic2-memo.md](archive/pre-epic2-memo.md) (historical context) |
+| Rules | [tests.md](../.agents/rules/tests.md): `scripts/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `scripts/benchmark.py`, `scripts/download_datasets.py`, `scripts/verify_paper_parity_gate.py`, `scripts/evaluation.py` |
+| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`YawConfig`, `configure_logging`, `format_doc_for_embedding`, `format_query_for_embedding`, `write_text_atomic`); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/datasets.py` & `yaw/pipeline.py` (bundle preparation/validation, slice scoping, `start_pipeline`, `update_pipeline_once`, `score_retrieval_recalls`, `score_qa_em_f1`, bundled `yaw/baselines.json`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval.py` (`build_retrieval_index`, `search_index`, `hydrate_ranked_passages`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` (`make_react_instruction_proposer`, `qa_gepa_metric`, `optimize_dspy`, `.yaw/qa_program.json`); [epic-3-performance.md](epic-3-performance.md): owns `scripts/watchdog.py` & tracks shipped `M_FINAL_1B` parity benchmarks; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_benchmark*.py`, `tests/test_download_datasets.py`, `tests/scripts/test_{download_edges,evaluation,parity_rendering}.py`) |
+| References | [yaw/baselines.json](../yaw/baselines.json), [outputs/benchmarks/consolidated_historical_baselines.json](../outputs/benchmarks/consolidated_historical_baselines.json), [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md), [archive/pre-epic2-memo.md](archive/pre-epic2-memo.md) (historical context) |
 | Records | [evaluation.md](evaluation.md), [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md), [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md) |
 
 ---
 
 ## 1. Consolidated Benchmark Reference Targets
 
-Upstream `hipporag` is permanently retired (`0` imports repository-wide). YAW benchmarks compare against **two explicit frozen targets** stored in [data/benchmarks/baselines.json](../data/benchmarks/baselines.json) and [outputs/benchmarks/consolidated_historical_baselines.json](../outputs/benchmarks/consolidated_historical_baselines.json):
+Upstream `hipporag` is permanently retired (`0` imports repository-wide). YAW benchmarks compare against **two explicit frozen targets** stored in [yaw/baselines.json](../yaw/baselines.json) and [outputs/benchmarks/consolidated_historical_baselines.json](../outputs/benchmarks/consolidated_historical_baselines.json):
 
 1. **Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`):** Historical local runs of upstream HippoRAG 2 on the legacy `Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF` setup (never re-executed).
 2. **Target 2 (`PAPER_BASELINES`):** Published HippoRAG 2 paper results (`Llama-3.3-70B-Instruct` + `NV-Embed-v2`, `arXiv:2502.14802v1`).
@@ -34,14 +34,14 @@ Upstream `hipporag` is permanently retired (`0` imports repository-wide). YAW be
 
 ## 2. Owned Benchmark/Dataset Tooling & EnterpriseRAG-Bench Quotas
 
-1. **Prepared v2 `.md` Bundles (`scripts/download-datasets.py`, consuming `yaw/datasets.py` owned by [native-cocoindex-indexing.md](native-cocoindex-indexing.md)):**
-   - `scripts/download-datasets.py` downloads datasets (or checks local bundles with `--check`) and invokes `prepare_dataset_bundle` to export each corpus row as a UTF-8 Markdown file under `documents/<document_filename(doc_id)>.md` (`# {title}` H1 header via `render_document_markdown`), accompanied by `evaluation/questions.json` and SHA-256 `manifest.json`.
+1. **Prepared v2 `.md` Bundles (`scripts/download_datasets.py`, consuming `yaw/datasets.py` owned by [native-cocoindex-indexing.md](native-cocoindex-indexing.md)):**
+   - `scripts/download_datasets.py` downloads datasets (or checks local bundles with `--check`) and invokes `prepare_dataset_bundle` to export each corpus row as a UTF-8 Markdown file under `documents/<document_filename(doc_id)>.md` (`# {title}` H1 header via `render_document_markdown`), accompanied by `evaluation/questions.json` and SHA-256 `manifest.json`.
    - `resolve_slice_corpus_scope` passes prepared `.md` files directly to `yaw/pipeline.py` (`_indexing_main`) with zero JSON-to-text re-staging and keeps `evaluation/questions.json` strictly outside `documents_root`.
-2. **EnterpriseRAG-Bench Category Quotas (`data/benchmarks/baselines.json`):**
+2. **EnterpriseRAG-Bench Category Quotas (`yaw/baselines.json`):**
    - `datasets["enterprise_rag_bench"]` declares `train_partition_size = 135` (`135` train / `27` validation = `162` queries) across 10 categories in `category_quotas`:
      `Basic: [33, 5]`, `Semantic: [25, 4]`, `Intra-Document Reasoning: [15, 3]`, `Project Related: [15, 3]`, `Constrained: [11, 2]`, `Conflicting Info: [8, 2]`, `Completeness: [8, 2]`, `Miscellaneous: [8, 2]`, `Info Not Found: [8, 2]`, `High Level: [4, 2]`.
-3. **Evaluation & Gate Harnesses (`benchmark.py`, `scripts/evaluation.py`, `scripts/verify_paper_parity_gate.py`):**
-   - `benchmark.py` executes slice retrieval/QA benchmarks over `yaw/pipeline.py`, `yaw/retrieval.py` (`RetrievalIndex`), and `yaw/qa.py` (`build_qa_agent`, `ask_question`).
+3. **Evaluation & Gate Harnesses (`scripts/benchmark.py`, `scripts/evaluation.py`, `scripts/verify_paper_parity_gate.py`):**
+   - `scripts/benchmark.py` executes slice retrieval/QA benchmarks over `yaw/pipeline.py`, `yaw/retrieval.py` (`RetrievalIndex`), and `yaw/qa.py` (`build_qa_agent`, `ask_question`).
    - `scripts/evaluation.py` (`RetrievalRecall`, `QAExactMatch`, `QAF1Score`, `check_benchmark_integrity`, `evaluate_benchmark_gate`) and `scripts/verify_paper_parity_gate.py` evaluate YAW against Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`), Target 2 (`PAPER_BASELINES`), and Standard DPR (`--compiled-program .yaw/qa_program.json` or `.yaw/compiled_program.json`).
 4. **GEPA Optimization Sandbox (Peer `yaw/optimize.py`, [dspy-improvements.md](dspy-improvements.md)):**
    - Default optimization config (`yaw.toml` `[optimization]`) targets `datasets = ["enterprise_rag_bench"]`, `max_queries = 162`, `query_offset = 0`, `auto = "light"` inside `.yaw/optimize_*` while sharing `.yaw/coco_lmdb` (`--fresh` wipes `.yaw/optimize_*`), saving `.yaw/qa_program.json`.
@@ -51,8 +51,8 @@ Upstream `hipporag` is permanently retired (`0` imports repository-wide). YAW be
 
 ## 3. Domain Containment & Non-Goals
 
-- `yaw/datasets.py` (`L1`, owned by [native-cocoindex-indexing.md](native-cocoindex-indexing.md)) and `yaw/optimize.py` (`L4`, owned by [dspy-improvements.md](dspy-improvements.md)) obey `tests/core/test_architecture.py` containment; this spec owns only `benchmark.py`, `scripts/{download-datasets,evaluation,verify_paper_parity_gate}.py`, and `data/benchmarks/baselines.json`.
-- Zero `hipporag` imports anywhere in `yaw/`, `benchmark.py`, `scripts/`, or `tests/`.
+- `yaw/datasets.py` (`L1`, owned by [native-cocoindex-indexing.md](native-cocoindex-indexing.md), bundling `yaw/baselines.json`) and `yaw/optimize.py` (`L4`, owned by [dspy-improvements.md](dspy-improvements.md)) obey `tests/core/test_architecture.py` containment; this spec owns `scripts/{benchmark,download_datasets,evaluation,verify_paper_parity_gate}.py`.
+- Zero `hipporag` imports anywhere in `yaw/`, `scripts/`, or `tests/`.
 - Zero custom optimization scripts or legacy `yaw/daemon/` / `YawProgram` / `sqlite-vec` dependencies.
 
 ---
@@ -61,13 +61,13 @@ Upstream `hipporag` is permanently retired (`0` imports repository-wide). YAW be
 
 1. **Bundle Preparation & Integrity Check:**
    ```powershell
-   uv run --offline --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --source-dir outputs/datasets/sources
-   uv run --offline --locked python scripts/download-datasets.py --dataset enterprise_rag_bench --check
+   uv run --offline --locked python -m scripts.download_datasets --dataset enterprise_rag_bench --source-dir outputs/datasets/sources
+   uv run --offline --locked python -m scripts.download_datasets --dataset enterprise_rag_bench --check
    ```
 2. **GEPA Compilation & Gate Verification:**
    ```powershell
    uv run --offline --locked yaw optimize dspy --dataset enterprise_rag_bench --fresh
-   uv run --offline --locked python scripts/verify_paper_parity_gate.py --compiled-program .yaw/qa_program.json --mode eval
+   uv run --offline --locked python -m scripts.verify_paper_parity_gate --compiled-program .yaw/qa_program.json --mode eval
    ```
 3. **Mandatory Quality Gates:**
    ```powershell
