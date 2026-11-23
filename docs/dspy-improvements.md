@@ -174,7 +174,7 @@ The real leverage of `dspy.Flex` is **arbitrary code and tool execution**, not p
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md) (Prime Directive: no fallbacks, no degraded modes) |
-| Rules | [inference.md](../.agents/rules/inference.md): `yaw/daemon/graph/inference/*.py` |
+| Rules | [qa.md](../.agents/rules/qa.md): `yaw/qa.py`, `yaw/optimize.py` *(replaces historical `inference.md` / `yaw/daemon/graph/inference/*.py`)* |
 | Owns code | `inference/chat.py:create_dspy_lm`, `inference/models.py`, `inference/embedding.py:create_dspy_embedder`, `inference/reflection.py`, `inference/confidence.py`, `inference/adapter.py`, `benchmark.py` preflight, `scripts/watchdog.py:get_lemonade_server_metrics` |
 | Peers | [model-evaluation.md](model-evaluation.md): hardware profiles (Lemonade-specific today, superseded for serving parameters by this section); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): `ChunkInference` memo identity consumes program identity; [w3c-improvements.md](w3c-improvements.md): three-layer parity depends on §6.4 decision |
 | References | [DSPy lm15 migration guide](https://dspy.ai/current/community/normalized-lm-api-migration/), [Unsloth API](https://unsloth.ai/docs/basics/api) |

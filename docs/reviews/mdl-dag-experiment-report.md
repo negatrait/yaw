@@ -5,7 +5,7 @@
 | Relation | Reference |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../../FOUNDATIONAL.md), [AGENTS.md](../../AGENTS.md), [epic-3-performance.md](../epic-3-performance.md#decisions) |
-| Rules | [docs.md](../../.agents/rules/docs.md), [graph-storage.md](../../.agents/rules/graph-storage.md), [tests.md](../../.agents/rules/tests.md), [canonical-files.md](../../.agents/rules/canonical-files.md) |
+| Rules | [docs.md](../../.agents/rules/docs.md), [retrieval.md](../../.agents/rules/retrieval.md), [pipeline.md](../../.agents/rules/pipeline.md), [runtime.md](../../.agents/rules/runtime.md), [qa.md](../../.agents/rules/qa.md), [tests.md](../../.agents/rules/tests.md), [canonical-files.md](../../.agents/rules/canonical-files.md) |
 | Specification & Ledger | [mdl-dag-sprint.md](mdl-dag-sprint.md) (`Rev 4`) |
 | Evaluation Ledgers | [evaluation.md](../evaluation.md), [evaluation-graph-storage.md](../evaluation-graph-storage.md) |
 | Peer Specs | [bare-bones-replacement-sprint.md](bare-bones-replacement-sprint.md), [epic-3-fts-vec-graph-experiment.md](epic-3-fts-vec-graph-experiment.md), [substate-manifold-shootout.md](substate-manifold-shootout.md) |

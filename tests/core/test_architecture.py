@@ -13,6 +13,7 @@ YAW_DIR = PROJECT_ROOT / "yaw"
 DOCS_DIR = PROJECT_ROOT / "docs"
 RULES_DIR = PROJECT_ROOT / ".agents" / "rules"
 AGENTS_DIR = PROJECT_ROOT / ".agents" / "agents"
+SKILLS_DIR = PROJECT_ROOT / ".agents" / "skills"
 
 _VALID_SUBAGENT_TOOLS = frozenset(
     {
@@ -51,6 +52,9 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
 )
 _MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 _WIKI_LINK_RE = re.compile(r"\[\[[^\]]+\]\]")
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
+_HTML_ANCHOR_RE = re.compile(r"<a\s+(?:id|name)=[\"']([^\"']+)[\"']", re.IGNORECASE)
+_LINE_FRAG_RE = re.compile(r"^L(\d+)(?:-L(\d+))?$")
 
 
 def _parse_yaml_frontmatter(md_path: Path) -> tuple[dict[str, object], str]:
@@ -69,18 +73,46 @@ def _parse_yaml_frontmatter(md_path: Path) -> tuple[dict[str, object], str]:
     return loaded, body
 
 
-def _strip_fenced_code_blocks(markdown_text: str) -> str:
-    """Remove fenced code blocks and inline code spans before scanning prose links."""
+def _strip_fenced_lines(markdown_text: str) -> list[str]:
+    """Return lines outside fenced code blocks."""
     lines: list[str] = []
     in_fence = False
     for line in markdown_text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith(("```", "~~~")):
+        if line.lstrip().startswith(("```", "~~~")):
             in_fence = not in_fence
             continue
         if not in_fence:
-            lines.append(re.sub(r"`[^`]*`", "", line))
-    return "\n".join(lines)
+            lines.append(line)
+    return lines
+
+
+def _strip_fenced_code_blocks(markdown_text: str) -> str:
+    """Remove fenced code blocks and inline code spans before scanning prose links."""
+    return "\n".join(re.sub(r"`[^`]*`", "", line) for line in _strip_fenced_lines(markdown_text))
+
+
+def _collect_anchors_and_line_count(target: Path) -> tuple[set[str], int]:
+    """Collect GitHub-style heading slugs, HTML anchor IDs, and line count for a local target file."""
+    raw_text = target.read_text(encoding="utf-8")
+    total_lines = len(raw_text.splitlines())
+    if target.suffix.lower() != ".md":
+        return set(), total_lines
+
+    anchors: set[str] = set()
+    heading_counts: dict[str, int] = {}
+    for line in _strip_fenced_lines(raw_text):
+        for anchor_match in _HTML_ANCHOR_RE.finditer(line):
+            anchors.add(anchor_match.group(1).lower())
+        heading_match = _HEADING_RE.match(line)
+        if not heading_match:
+            continue
+        heading = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", heading_match.group(1))
+        heading = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", heading).replace("`", "")
+        base = "".join(ch for ch in heading.lower() if ch.isalnum() or ch in (" ", "-", "_")).replace(" ", "-")
+        idx = heading_counts.get(base, 0)
+        heading_counts[base] = idx + 1
+        anchors.add(base if idx == 0 else f"{base}-{idx}")
+    return anchors, total_lines
 
 
 def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
@@ -570,10 +602,11 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(
             {f.name for f in rule_files},
             {
-                "yaw.md",
-                "daemon.md",
-                "graph-storage.md",
-                "inference.md",
+                "core.md",
+                "retrieval.md",
+                "pipeline.md",
+                "runtime.md",
+                "qa.md",
                 "tests.md",
                 "canonical-files.md",
                 "docs.md",
@@ -602,7 +635,7 @@ class ArchitectureTests(unittest.TestCase):
             self.assertNotIn("@[", body, f"Rule {rel} must use pointer links [label](path), never @[label](path)")
 
     def test_custom_subagents_yaml_frontmatter_and_tool_validity(self):
-        """Rule 8: Custom subagents in .agents/agents/*/agent.md mount visibly with valid tools and current stack."""
+        """Rule 8: Subagents and skills mount cleanly with valid YAML frontmatter, tools, and zero retired markers."""
         expected_agents = {"critic", "implementer", "ontologist"}
         agent_files = {p.parent.name: p for p in AGENTS_DIR.glob("*/agent.md")}
         self.assertEqual(set(agent_files.keys()), expected_agents)
@@ -617,6 +650,11 @@ class ArchitectureTests(unittest.TestCase):
             "ppr.py",
             "hmm.py",
             "spacy",
+            "sqlite-vec",
+            "sqlite_vec",
+            "optuna",
+            "dspy.RLM",
+            "dspy-rlm-module",
         )
         for agent_name, agent_path in sorted(agent_files.items()):
             rel = agent_path.relative_to(PROJECT_ROOT)
@@ -650,6 +688,49 @@ class ArchitectureTests(unittest.TestCase):
             for marker in retired_markers:
                 self.assertNotIn(marker.casefold(), body_cf, f"Subagent {rel} contains retired reference '{marker}'")
 
+        # Validate active .agents/skills/*/SKILL.md frontmatter and enforce retired-marker ban across skills and rules.
+        self.assertFalse((SKILLS_DIR / "dspy-rlm-module").exists(), "Retired dspy-rlm-module skill must not exist")
+        self.assertFalse((SKILLS_DIR / "spacy").exists(), "Retired spacy skill must not exist")
+
+        skill_dirs = sorted(p for p in SKILLS_DIR.iterdir() if p.is_dir())
+        self.assertGreater(len(skill_dirs), 0, "No skill directories found in .agents/skills/")
+        for skill_dir in skill_dirs:
+            skill_md = skill_dir / "SKILL.md"
+            self.assertTrue(skill_md.is_file(), f"Skill directory {skill_dir.name} missing SKILL.md")
+            rel = skill_md.relative_to(PROJECT_ROOT)
+            meta, _ = _parse_yaml_frontmatter(skill_md)
+            self.assertEqual(meta.get("name"), skill_dir.name, f"Skill {rel} name must match directory")
+            desc = meta.get("description")
+            self.assertIsInstance(desc, str, f"Skill {rel} must declare a description string")
+            assert isinstance(desc, str)
+            word_count = len(desc.split())
+            self.assertTrue(1 <= word_count <= 60, f"Skill {rel} description must be 1..60 words (got {word_count})")
+
+        extended_markers = retired_markers + ("vec_distance_cosine", "temperature=0.0")
+        for skill_file in sorted(p for p in SKILLS_DIR.rglob("*") if p.is_file() and p.suffix in {".md", ".py"}):
+            rel = skill_file.relative_to(PROJECT_ROOT)
+            text_cf = skill_file.read_text(encoding="utf-8").casefold()
+            for marker in extended_markers:
+                self.assertNotIn(marker.casefold(), text_cf, f"Skill {rel} contains retired marker '{marker}'")
+
+        rule13_doc_tokens = {"spacy", "sqlite_vec", "sqlite-vec", "optuna"}
+        for rule_file in sorted(RULES_DIR.glob("*.md")):
+            rel = rule_file.relative_to(PROJECT_ROOT)
+            for lineno, line in enumerate(rule_file.read_text(encoding="utf-8").splitlines(), start=1):
+                line_cf = line.casefold()
+                is_rule13_desc = (
+                    rule_file.name == "canonical-files.md"
+                    and "rule 13 (`test_purged_dependencies_banned_across_yaw`)" in line_cf
+                )
+                for marker in extended_markers:
+                    if is_rule13_desc and marker.casefold() in rule13_doc_tokens:
+                        continue
+                    self.assertNotIn(
+                        marker.casefold(),
+                        line_cf,
+                        f"Rule {rel}:{lineno} contains retired marker '{marker}'",
+                    )
+
     def test_every_repo_target_file_matches_at_least_one_rule_glob(self):
         """Rule 9: Every repo target file matches its owning .agents/rules glob without unintended overlap."""
         rule_globs_by_name: dict[str, list[str]] = {}
@@ -667,6 +748,7 @@ class ArchitectureTests(unittest.TestCase):
             + list(DOCS_DIR.rglob("*.md"))
             + list(RULES_DIR.glob("*.md"))
             + list(AGENTS_DIR.rglob("*.md"))
+            + list(SKILLS_DIR.rglob("*.md"))
             + [PROJECT_ROOT / "AGENTS.md", PROJECT_ROOT / "FOUNDATIONAL.md", PROJECT_ROOT / "README.md"]
         )
         self.assertGreater(len(target_files), 0)
@@ -697,17 +779,21 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_zero_broken_markdown_links_and_zero_wiki_links(self):
-        """Rule 10: Zero [[wiki-links]] and zero broken relative Markdown links across rules, agents, and docs."""
-        non_arxiv_docs = [p for p in sorted(DOCS_DIR.glob("*.md")) if not p.name.startswith("arxiv-")]
+        """Rule 10: Zero [[wiki-links]] or broken relative Markdown links across rules, agents, skills, and docs."""
+        non_arxiv_docs = [
+            p for p in sorted(DOCS_DIR.rglob("*.md")) if "papers" not in p.parts and not p.name.startswith("arxiv-")
+        ]
         checked_files = (
             [PROJECT_ROOT / "AGENTS.md", PROJECT_ROOT / "FOUNDATIONAL.md", PROJECT_ROOT / "README.md"]
             + sorted(RULES_DIR.glob("*.md"))
             + sorted(AGENTS_DIR.glob("*/agent.md"))
+            + sorted(SKILLS_DIR.rglob("*.md"))
             + non_arxiv_docs
         )
 
         wiki_violations: list[str] = []
         broken_links: list[str] = []
+        target_cache: dict[Path, tuple[set[str], int]] = {}
         for md_file in checked_files:
             rel_source = md_file.relative_to(PROJECT_ROOT)
             prose = _strip_fenced_code_blocks(md_file.read_text(encoding="utf-8"))
@@ -717,15 +803,33 @@ class ArchitectureTests(unittest.TestCase):
             for match in _MD_LINK_RE.finditer(prose):
                 raw_target = match.group(1).strip()
                 if not raw_target or raw_target.startswith(
-                    ("http://", "https://", "mailto:", "file://", "conversation://", "#")
+                    ("http://", "https://", "mailto:", "file://", "conversation://")
                 ):
                     continue
-                path_part = raw_target.split("#", 1)[0].strip()
-                if not path_part:
-                    continue
-                resolved = (md_file.parent / path_part).resolve()
+                path_part, _, raw_frag = raw_target.partition("#")
+                path_part = path_part.strip()
+                frag = raw_frag.strip()
+                resolved = md_file.resolve() if not path_part else (md_file.parent / path_part).resolve()
                 if not resolved.exists():
                     broken_links.append(f"{rel_source}: broken relative link '{raw_target}' -> {resolved}")
+                    continue
+                if not frag:
+                    continue
+                if not resolved.is_file():
+                    broken_links.append(f"{rel_source}: fragment '#{frag}' on non-file target '{raw_target}'")
+                    continue
+                if resolved not in target_cache:
+                    target_cache[resolved] = _collect_anchors_and_line_count(resolved)
+                anchors, total_lines = target_cache[resolved]
+                if line_match := _LINE_FRAG_RE.match(frag):
+                    start = int(line_match.group(1))
+                    end = int(line_match.group(2)) if line_match.group(2) else start
+                    if not (1 <= start <= end <= total_lines):
+                        broken_links.append(
+                            f"{rel_source}: out-of-range line fragment '{raw_target}' (lines=1..{total_lines})"
+                        )
+                elif frag.lower() not in anchors:
+                    broken_links.append(f"{rel_source}: broken heading/anchor fragment '{raw_target}'")
 
         self.assertEqual(wiki_violations, [], "Forbidden [[wiki-links]] found:\n" + "\n".join(wiki_violations))
         self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
@@ -740,7 +844,7 @@ class ArchitectureTests(unittest.TestCase):
             f"Missing: {sorted(_CANONICAL_DOCS_INVENTORY - actual_docs)}",
         )
 
-        domain_rules = ("daemon.md", "graph-storage.md", "inference.md", "tests.md")
+        domain_rules = ("retrieval.md", "pipeline.md", "runtime.md", "qa.md", "tests.md")
         linked_docs: set[str] = set()
         for rule_name in domain_rules:
             rule_file = RULES_DIR / rule_name

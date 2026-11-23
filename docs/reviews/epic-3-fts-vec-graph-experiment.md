@@ -7,7 +7,7 @@
 | Governed by | [FOUNDATIONAL.md](../../FOUNDATIONAL.md), [AGENTS.md](../../AGENTS.md); implementation remains subject to their acceptance and failure policies |
 | Parent | [Epic 3](../epic-3-performance.md); this paper proposes its retrieval research program and does not replace the governing epic |
 | Prerequisite | Accepted Epic 1/2 gates and a frozen [bare-bones baseline](bare-bones-replacement-sprint.md); authoring this proposal does not authorize running expensive studies or changing the current cutover |
-| Rules | [Documentation](../../.agents/rules/docs.md), [graph storage/retrieval](../../.agents/rules/graph-storage.md), [inference](../../.agents/rules/inference.md), [tests](../../.agents/rules/tests.md) |
+| Rules | [Documentation](../../.agents/rules/docs.md), [retrieval](../../.agents/rules/retrieval.md), [qa](../../.agents/rules/qa.md), [tests](../../.agents/rules/tests.md) |
 | Owns code | None. Experimental code, dependencies, model training, and production promotion require a subsequent scoped implementation contract |
 | Evidence | [Weekend shootout](substate-manifold-shootout.md), [historical research](hmm-graph-substate-manifold-research.md), [H1 review](hmm-retrieval.md), [evaluation ledger](../evaluation-graph-storage.md) |
 | References | [Local paper collection](../papers/epic-3-fts-vec-graph-experiment/README.md), [version/hash manifest](../papers/epic-3-fts-vec-graph-experiment/manifest.json) |
@@ -69,7 +69,7 @@ Source: [ablation artifact](../../outputs/benchmarks/manifold_ablations_4ds_10q.
 
 ### 2.2 Source-level gaps in what was tested
 
-At the audited snapshot, [hmm.py](../../yaw/daemon/graph/hmm.py) implements pure-chunk heuristics, not classical HMM filtering/smoothing or calibrated Bayesian inference:
+At the audited snapshot, `yaw/daemon/graph/hmm.py` implements pure-chunk heuristics, not classical HMM filtering/smoothing or calibrated Bayesian inference:
 
 - `derive_manifold_telemetry` reports eight hops, while `range(1, min(3, eff_hops))` permits only two expansion steps. An eight-hop policy remains untested by this code.
 - A shared `q_act` is deflated using the first nonempty branch's first frontier node. Branch hypotheses do not maintain independent residual states.
@@ -79,7 +79,7 @@ At the audited snapshot, [hmm.py](../../yaw/daemon/graph/hmm.py) implements pure
 - `_build_routes` adds both actual parent and previous-output dependencies, returns snippets rather than exact bridge spans, and operates separately from final passage selection. Acyclicity alone does not validate these dependencies or ensure returned evidence contains the required connectors.
 - ABTT uses an uncentered second moment, a floored spectral cutoff, and at most eight directions. Its Marchenko-Pastur interpretation requires a null-model check; it is not justified merely by computing eigenvalues. CSLS-style preprocessing performs tiled all-pairs work.
 
-The [probe script](../../scripts/probe_manifold.py) constructs an in-memory representation of all loaded chunks. Expansion can score the whole slice, rather than being confined to a seed-local acquisition frontier. The [historical slice builder](../../yaw/daemon/ingestion/datasets.py) pools question-associated passages and explicitly includes gold documents. That is a legitimate conditional development task, but it is easier than blind acquisition from a fixed full corpus. Repeatedly inspected weekend offsets are development material for this program, not a fresh final holdout.
+The historical probe script (`scripts/probe_manifold.py`) constructs an in-memory representation of all loaded chunks. Expansion can score the whole slice, rather than being confined to a seed-local acquisition frontier. The historical slice builder (`yaw/daemon/ingestion/datasets.py`) pools question-associated passages and explicitly includes gold documents. That is a legitimate conditional development task, but it is easier than blind acquisition from a fixed full corpus. Repeatedly inspected weekend offsets are development material for this program, not a fresh final holdout.
 
 ## 3. Literature: supporting evidence and limits
 
