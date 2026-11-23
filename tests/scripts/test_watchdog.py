@@ -15,29 +15,27 @@ from xml.etree import ElementTree
 import filelock
 import numpy as np
 import pytest
-import sqlite_vec
 
 import scripts.watchdog as watchdog
 from yaw.core import DaemonStatus
 
 
-def _create_vec_fts_db(db_path: Path, num_chunks: int) -> None:
+def _create_yaw_db(db_path: Path, num_chunks: int) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
+        conn.execute("CREATE TABLE chunks (chunk_id INTEGER PRIMARY KEY, embedding_f16 BLOB NOT NULL)")
         conn.execute(
-            "CREATE VIRTUAL TABLE chunks USING vec0("
-            "chunk_id INTEGER PRIMARY KEY, "
-            "embedding float[4] distance_metric=cosine)"
+            "CREATE VIRTUAL TABLE chunk_fts USING fts5("
+            "title, body, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 1')"
         )
-        conn.execute("CREATE VIRTUAL TABLE chunk_fts USING fts5(title, body, content='', contentless_delete=1)")
+        conn.execute("CREATE VIRTUAL TABLE chunk_vocab USING fts5vocab(chunk_fts, 'row')")
+        conn.execute("CREATE TABLE rabitq_index (id INTEGER PRIMARY KEY CHECK (id = 1))")
+        conn.execute("CREATE TABLE citation_graph (id INTEGER PRIMARY KEY CHECK (id = 1))")
         for idx in range(1, num_chunks + 1):
-            vec = np.array([1.0 if i == (idx % 4) else 0.0 for i in range(4)], dtype=np.float32).tobytes()
-            conn.execute("INSERT INTO chunks(chunk_id, embedding) VALUES (?, ?)", (idx, vec))
+            vec = np.array([1.0 if i == (idx % 4) else 0.0 for i in range(4)], dtype="<f2").tobytes()
+            conn.execute("INSERT INTO chunks(chunk_id, embedding_f16) VALUES (?, ?)", (idx, vec))
             conn.execute(
-                "INSERT INTO chunk_fts(rowid, title, body) VALUES (?, ?, ?)", (idx, f"Title {idx}", f"Body {idx}")
+                "INSERT INTO chunk_fts(rowid, title, body) VALUES (?, ?, ?)", (idx, f"title {idx}", f"body {idx}")
             )
         conn.commit()
 
@@ -70,9 +68,8 @@ def prometheus_server():
 def _populate_workspace(ws: Path, base_url: str, api_key: str) -> None:
     yaw_dir = ws / ".yaw"
     yaw_dir.mkdir(parents=True, exist_ok=True)
-    _create_vec_fts_db(yaw_dir / "yaw.db", 2)
-    _create_vec_fts_db(yaw_dir / "optimize_yaw.db", 1)
-    _create_vec_fts_db(yaw_dir / "optuna_index.db", 3)
+    _create_yaw_db(yaw_dir / "yaw.db", 2)
+    _create_yaw_db(yaw_dir / "optimize_yaw.db", 1)
 
     (ws / "yaw.toml").write_text(
         f'[inference]\nbase_url = "{base_url}"\napi_key = "{api_key}"\n',
@@ -100,23 +97,9 @@ def _populate_workspace(ws: Path, base_url: str, api_key: str) -> None:
         ),
         encoding="utf-8",
     )
-    (yaw_dir / "optuna_status.json").write_text(
-        json.dumps({"state": "completed", "total_trials": 16, "best_score": 0.84}),
-        encoding="utf-8",
-    )
-    (yaw_dir / "optuna_best_params.json").write_text(
-        json.dumps(
-            {
-                "best_score": 0.84,
-                "best_params": {"hybrid_alpha": 0.65, "ppr_alpha": 0.5, "seed_top_k": 15},
-                "total_trials": 16,
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
-def test_snapshot_reads_real_sqlite_vec_fts_locks_json_and_metrics(tmp_path: Path, prometheus_server) -> None:
+def test_snapshot_reads_real_sqlite_fts_locks_json_and_metrics(tmp_path: Path, prometheus_server) -> None:
     base_url, seen = prometheus_server
     _populate_workspace(tmp_path, base_url, "tok-123")
     yaw_dir = tmp_path / ".yaw"
@@ -129,20 +112,25 @@ def test_snapshot_reads_real_sqlite_vec_fts_locks_json_and_metrics(tmp_path: Pat
     finally:
         held_lock.release()
 
+    assert set(snap["databases"]) == {"yaw.db", "optimize_yaw.db"}
     assert snap["databases"]["yaw.db"]["chunks"] == 2
-    assert snap["databases"]["yaw.db"]["tables"] == ["chunk_fts", "chunks"]
+    assert snap["databases"]["yaw.db"]["tables"] == [
+        "chunk_fts",
+        "chunk_vocab",
+        "chunks",
+        "citation_graph",
+        "rabitq_index",
+    ]
     assert snap["databases"]["optimize_yaw.db"]["chunks"] == 1
-    assert snap["databases"]["optuna_index.db"]["chunks"] == 3
     assert snap["locks"] == {
         "yaw.db.lock": False,
         "optimize_yaw.db.lock": True,
-        "optuna_index.db.lock": False,
     }
+    assert "optuna_status" not in snap
+    assert "optuna_best_params" not in snap
     assert snap["status"]["lifecycle"] == "ready"
     assert snap["dspy_status"]["state"] == "running"
     assert snap["dspy_gepa_audit"]["best_val_score"] == 0.78
-    assert snap["optuna_status"]["state"] == "completed"
-    assert snap["optuna_best_params"]["best_score"] == 0.84
     assert snap["llm_metrics"] == {"server_up": True, "llm_tps": 98.8}
     assert seen == [("/metrics", "Bearer tok-123")]
     assert isinstance(snap["resources"]["pipeline_ram_gb"], float)
@@ -170,14 +158,12 @@ def test_run_once_and_cli_emit_valid_svg_markdown_and_log(tmp_path: Path, promet
 
     report = md_path.read_text(encoding="utf-8")
     assert "![Score Progress](score_progress.svg)" in report
+    assert "optuna" not in report.lower()
     assert "`ready`" in report
     assert "`running`" in report
-    assert "`completed`" in report
     assert "`2` chunks" in report
     assert "`1` chunks" in report
-    assert "`3` chunks" in report
     assert "`0.7800`" in report
-    assert "`0.8400`" in report
     assert "98.8 tok/s" in report
 
     log_path = tmp_path / ".yaw" / "yaw.log"
@@ -205,7 +191,7 @@ def test_snapshot_respects_custom_paths_from_yaw_toml(tmp_path: Path) -> None:
     # Decoy default .yaw/ files must be ignored when yaw.toml configures custom paths.
     decoy_dir = tmp_path / ".yaw"
     decoy_dir.mkdir(parents=True)
-    _create_vec_fts_db(decoy_dir / "yaw.db", 9)
+    _create_yaw_db(decoy_dir / "yaw.db", 9)
     (decoy_dir / "status.json").write_text(json.dumps({"lifecycle": "error"}), encoding="utf-8")
     (decoy_dir / "dspy_status.json").write_text(json.dumps({"state": "failed"}), encoding="utf-8")
 
@@ -216,40 +202,33 @@ def test_snapshot_respects_custom_paths_from_yaw_toml(tmp_path: Path) -> None:
         'status_path = "runtime_meta/daemon_status.json"\n',
         encoding="utf-8",
     )
-    _create_vec_fts_db(custom_dir / "main.db", 4)
-    _create_vec_fts_db(custom_dir / "optimize_yaw.db", 2)
-    _create_vec_fts_db(custom_dir / "optuna_index.db", 5)
+    _create_yaw_db(custom_dir / "main.db", 4)
+    _create_yaw_db(custom_dir / "optimize_yaw.db", 2)
 
     (status_dir / "daemon_status.json").write_text(
         json.dumps({"lifecycle": "ready", "num_chunks": 4}), encoding="utf-8"
     )
     (custom_dir / "dspy_status.json").write_text(json.dumps({"state": "running"}), encoding="utf-8")
     (custom_dir / "dspy_gepa_audit.json").write_text(json.dumps({"best_val_score": 0.91}), encoding="utf-8")
-    (custom_dir / "optuna_status.json").write_text(json.dumps({"state": "completed"}), encoding="utf-8")
-    (custom_dir / "optuna_best_params.json").write_text(json.dumps({"best_score": 0.88}), encoding="utf-8")
     (custom_dir / "optimize_yaw.db.lock").write_text("", encoding="utf-8")
 
     main_lock = filelock.FileLock(str(custom_dir / "main.db.lock"), timeout=0)
-    optuna_lock = filelock.FileLock(str(custom_dir / "optuna_index.db.lock"), timeout=0)
     main_lock.acquire()
-    optuna_lock.acquire()
     try:
         snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
     finally:
-        optuna_lock.release()
         main_lock.release()
 
+    assert set(snap["databases"]) == {"yaw.db", "optimize_yaw.db"}
     assert Path(snap["databases"]["yaw.db"]["path"]) == (custom_dir / "main.db").resolve()
     assert snap["databases"]["yaw.db"]["chunks"] == 4
     assert snap["databases"]["optimize_yaw.db"]["chunks"] == 2
-    assert snap["databases"]["optuna_index.db"]["chunks"] == 5
     assert snap["locks"] == {
         "yaw.db.lock": True,
         "optimize_yaw.db.lock": False,
-        "optuna_index.db.lock": True,
     }
+    assert "optuna_status" not in snap
+    assert "optuna_best_params" not in snap
     assert snap["status"] == {"lifecycle": "ready", "num_chunks": 4}
     assert snap["dspy_status"] == {"state": "running"}
     assert snap["dspy_gepa_audit"] == {"best_val_score": 0.91}
-    assert snap["optuna_status"] == {"state": "completed"}
-    assert snap["optuna_best_params"] == {"best_score": 0.88}

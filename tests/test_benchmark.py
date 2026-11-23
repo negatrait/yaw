@@ -28,11 +28,11 @@ from yaw.core import ChunkPointer, YawConfig, render_document_text
 from yaw.datasets import document_identity, prepare_dataset_bundle, resolve_dataset_name
 from yaw.pipeline import chunk_file_content, close_pipeline, start_pipeline, update_pipeline_once
 from yaw.retrieval import (
-    build_vector_search,
+    build_retrieval_index,
     hydrate_passage,
     hydrate_ranked_passages,
     open_readonly_db,
-    search_vectors,
+    search_index,
 )
 
 
@@ -701,7 +701,7 @@ class PaperParityGateTests(unittest.TestCase):
                 chunk_overlap=20,
                 min_chunk_size=30,
             )
-            session = start_pipeline(cfg, embed_fn=semantic_embed, vector_dim=4, live=False)
+            session = start_pipeline(cfg, embed_fn=semantic_embed, live=False)
             try:
                 update_pipeline_once(session)
             finally:
@@ -709,17 +709,21 @@ class PaperParityGateTests(unittest.TestCase):
 
             assert cfg.db_path is not None
             with contextlib.closing(open_readonly_db(cfg.db_path)) as conn:
-                vs = build_vector_search(conn)
-                self.assertGreaterEqual(vs.size, 3)
+                idx = build_retrieval_index(
+                    conn,
+                    expected_embedding_model=cfg.embedding_model,
+                    expected_task_mode=cfg.embedding_task_mode,
+                )
+                self.assertGreaterEqual(idx.size, 3)
                 q_vec = semantic_embed(["task: question answering | query: Which county is Erik Hort born in?"])[0]
-                ranked = search_vectors(
-                    vs,
+                ranked = search_index(
+                    idx,
                     q_vec,
                     query_text="Which county is Erik Hort's birthplace part of?",
                     conn=conn,
                     top_k=max(5 * 4, 50),
-                )
-                hits = hydrate_ranked_passages(vs, ranked, corpus_dir, top_k=5)
+                ).ranked
+                hits = hydrate_ranked_passages(idx, ranked, corpus_dir, top_k=5)
                 self.assertGreaterEqual(len(hits), 2)
                 overall, _ = RetrievalRecall().calculate_metric_scores(
                     gold_docs=[[full_gold_passage]],

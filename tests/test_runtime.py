@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,17 +25,17 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from numpy.typing import NDArray
 
-from yaw.core import YawConfig, YawRuntimeError, write_text_atomic
-from yaw.qa import build_qa_agent, make_qa_tools
-from yaw.retrieval import build_vector_search, open_readonly_db, resolve_retrieval_params
+from yaw.core import YawConfig, YawRuntimeError
+from yaw.qa import build_qa_agent
+from yaw.retrieval import build_retrieval_index, open_readonly_db
 from yaw.runtime import (
     YawRuntime,
     ask,
     ask_once,
     close_runtime,
     create_lm,
+    get_retrieval_index,
     get_status,
-    get_vector_search,
     recall,
     recall_once,
     redact_secrets,
@@ -47,7 +49,7 @@ from yaw.runtime import (
 )
 
 
-def _topic_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
+def _topic_embed(texts: list[str], *, dim: int = 64) -> NDArray[np.float32]:
     topics = (
         ("orbital", "booster", "valve", "specification", "stage"),
         ("xylophone", "zither", "ohio", "armstrong", "musician"),
@@ -57,11 +59,12 @@ def _topic_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
     for row_idx, text in enumerate(texts):
         low = text.lower()
         digest = hashlib.sha256(text.encode("utf-8")).digest()
-        base = (np.frombuffer(digest * 2, dtype=np.uint8)[:dim].astype(np.float32) - 127.5) * 0.05
+        repeats = (dim + len(digest) - 1) // len(digest)
+        base = (np.frombuffer(digest * repeats, dtype=np.uint8)[:dim].astype(np.float32) - 127.5) * 0.005
         for t_idx, kws in enumerate(topics):
             for kw in kws:
                 if kw in low:
-                    base[t_idx] += 2.0
+                    base[t_idx] += 3.0
         rows[row_idx] = base / max(float(np.linalg.norm(base)), 1e-12)
     return rows
 
@@ -163,7 +166,7 @@ def test_empty_corpus_precedence_filelock_and_lifecycle(tmp_path: Path) -> None:
 
     def tracked_embed(texts: list[str]) -> NDArray[np.float32]:
         embed_calls.append(list(texts))
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     rt = start_runtime(
         cfg,
@@ -259,20 +262,20 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
         if gate_enabled.is_set() and any("gateprobe" in t for t in texts):
             entered_embed.set()
             assert release_embed.wait(timeout=5.0)
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=gated_embed, lm=create_lm(cfg))
     try:
         assert isinstance(rt, YawRuntime)
         assert wait_ready(rt, timeout=20.0) is True
-        vs0 = get_vector_search(rt)
+        idx0 = get_retrieval_index(rt)
         ver0 = rt.index_data_version
-        assert vs0.size >= 7 and ver0 >= 1
+        assert idx0.size >= 7 and ver0 >= 1
 
         hits = recall(rt, "orbital booster", top_k=2)
         paths = [h.pointer.rel_posix_path for h in hits]
         assert len(hits) == 2
-        assert "multi.json" in paths
+        assert {"multi.json", "booster_backup.md"} == set(paths)
         assert len({hit.pointer.span_label for hit in hits}) == 2
 
         # Queries > 1024 bytes succeed cleanly without artificial byte truncation
@@ -295,7 +298,8 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
             time.sleep(0.1)
         assert found_live is True
         assert rt.index_data_version > ver0
-        assert get_status(rt).num_chunks > vs0.size
+        assert get_status(rt).num_chunks > idx0.size
+        assert get_retrieval_index(rt).size == get_status(rt).num_chunks
 
         # Pause inside embed_fn -> verify index_lock is NOT held and get_status returns immediately
         gate_enabled.set()
@@ -340,7 +344,7 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
             assert release_all.wait(timeout=5.0)
             with in_lock:
                 in_embed -= 1
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     seen_reqs: list[dict[str, Any]] = []
 
@@ -470,7 +474,7 @@ def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_pa
     def failing_embed(texts: list[str]) -> NDArray[np.float32]:
         if any("Trigger initial live" in t for t in texts):
             raise RuntimeError(f"embed backend failed with key={secret_tok}")
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=failing_embed, lm=create_lm(cfg))
     try:
@@ -497,17 +501,9 @@ def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_pa
         close_runtime(rt)
 
 
-def test_optuna_best_params_wiring_rank_flip_and_strict_validation(tmp_path: Path) -> None:
-    import contextlib
-
+def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path: Path) -> None:
     def rank_embed(texts: list[str]) -> NDArray[np.float32]:
-        rows = np.zeros((len(texts), 16), dtype=np.float32)
-        for idx, text in enumerate(texts):
-            if text.startswith("task:") or "Orbital telemetry" in text:
-                rows[idx, 0] = 1.0
-            else:
-                rows[idx, 1] = 1.0
-        return rows
+        return _topic_embed(texts, dim=64)
 
     class _OpenAIHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -599,7 +595,7 @@ def test_optuna_best_params_wiring_rank_flip_and_strict_validation(tmp_path: Pat
         assert cfg.corpus_root is not None and cfg.db_path is not None
         cfg.corpus_root.mkdir(parents=True)
         (cfg.corpus_root / "doc_lex.md").write_text(
-            "# Lexical Target\nQuasarPulse99 appears twice QuasarPulse99 in lexical target.\n",
+            "# Lexical Target\nQuasarPulse99 appears in lexical target doc_lex.\n",
             encoding="utf-8",
         )
         (cfg.corpus_root / "doc_dense.md").write_text(
@@ -607,83 +603,54 @@ def test_optuna_best_params_wiring_rank_flip_and_strict_validation(tmp_path: Pat
             encoding="utf-8",
         )
 
-        # Missing params file returns {} cleanly
-        assert resolve_retrieval_params(cfg) == {}
+        # Unindexed workspace fails fast on standalone recall_once with EMPTY_INDEX
+        with pytest.raises(YawRuntimeError) as exc_empty:
+            recall_once(cfg, "QuasarPulse99", top_k=1)
+        assert exc_empty.value.code == "EMPTY_INDEX"
 
-        opt_db = cfg.for_optimization(".yaw/optuna_index.db").db_path
-        assert opt_db is not None
-        params_path = opt_db.parent / "optuna_best_params.json"
-
-        rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=rank_embed, lm=create_lm(cfg))
+        rt = start_runtime(cfg, live=True, wait_for_ready=True, embed_fn=rank_embed, lm=create_lm(cfg))
         try:
-            # 1. Lexical-heavy Optuna override (hybrid_alpha=0.05) ranks doc_lex.md first
-            write_text_atomic(
-                params_path,
-                json.dumps({"best_params": {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}}),
-            )
-            assert resolve_retrieval_params(cfg) == {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}
-            assert recall(rt, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+            idx0 = get_retrieval_index(rt)
+            ver0 = rt.index_data_version
+            assert idx0.size >= 2 and ver0 >= 1
 
+            # Standalone lock-free recall_once and ask_once work cleanly alongside live runtime
+            assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+            qa_res = ask_once(cfg, "Which doc matches QuasarPulse99?")
+            assert qa_res.passages[0].pointer.rel_posix_path == "doc_lex.md"
+
+            # Mismatched model / task_mode raises INDEX_NOT_READY in build_retrieval_index / recall_once
             with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
-                ro_vs = build_vector_search(ro_conn)
-                tools_lex = make_qa_tools(
-                    ro_vs, cfg.corpus_root, rank_embed, ro_conn, search_params=resolve_retrieval_params(cfg)
+                _ = build_retrieval_index(
+                    ro_conn,
+                    expected_embedding_model=cfg.embedding_model,
+                    expected_task_mode=cfg.embedding_task_mode,
                 )
-                assert "doc_lex.md" in tools_lex[0].func("QuasarPulse99", top_k=1)
+            with pytest.raises(YawRuntimeError) as exc_mm:
+                recall_once(replace(cfg, embedding_model="mismatched-model"), "QuasarPulse99", top_k=1)
+            assert exc_mm.value.code == "INDEX_NOT_READY"
 
-            # 2. Dense-heavy Optuna override (hybrid_alpha=0.95) flips top rank to doc_dense.md
-            write_text_atomic(
-                params_path,
-                json.dumps({"best_params": {"hybrid_alpha": 0.95, "ppr_alpha": 0.0, "seed_top_k": 5}}),
-            )
-            assert recall(rt, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_dense.md"
+            # 1. Transient post-ready INDEX_NOT_READY falls back to prior idx0 without advancing index_data_version
+            with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
+                orig_vsha = str(rw_conn.execute("SELECT vec_sha256 FROM rabitq_index WHERE id = 1").fetchone()[0])
+                rw_conn.execute("UPDATE rabitq_index SET vec_sha256 = 'transient_stale_sha' WHERE id = 1")
+                rw_conn.commit()
+            fallback_idx = get_retrieval_index(rt)
+            assert fallback_idx is idx0
+            assert rt.index_data_version == ver0
 
-            with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
-                ro_vs = build_vector_search(ro_conn)
-                tools_dense = make_qa_tools(
-                    ro_vs, cfg.corpus_root, rank_embed, ro_conn, search_params=resolve_retrieval_params(cfg)
+            # 2. Restore fingerprint and introduce CONSISTENCY_ERROR -> NEVER swallowed by get_retrieval_index
+            with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
+                rw_conn.execute(
+                    "UPDATE rabitq_index SET vec_sha256 = ?, codes_blob = X'0001' WHERE id = 1",
+                    (orig_vsha,),
                 )
-                assert "doc_dense.md" in tools_dense[0].func("QuasarPulse99", top_k=1)
+                rw_conn.commit()
+            with pytest.raises(YawRuntimeError) as exc_cons:
+                get_retrieval_index(rt)
+            assert exc_cons.value.code == "CONSISTENCY_ERROR"
         finally:
             close_runtime(rt)
-
-        # 3. Standalone recall_once and ask_once (lock-free) honor optuna_best_params.json
-        write_text_atomic(
-            params_path,
-            json.dumps({"best_params": {"hybrid_alpha": 0.05, "ppr_alpha": 0.0, "seed_top_k": 5}}),
-        )
-        assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
-        qa_lex = ask_once(cfg, "Which doc matches QuasarPulse99?")
-        assert qa_lex.passages[0].pointer.rel_posix_path == "doc_lex.md"
-
-        write_text_atomic(
-            params_path,
-            json.dumps({"best_params": {"hybrid_alpha": 0.95, "ppr_alpha": 0.0, "seed_top_k": 5}}),
-        )
-        assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_dense.md"
-        qa_dense = ask_once(cfg, "Which doc matches QuasarPulse99?")
-        assert qa_dense.passages[0].pointer.rel_posix_path == "doc_dense.md"
-
-        # 4. Corrupt / unknown / boolean / NaN / out-of-range Optuna params fail fast with CONSISTENCY_ERROR
-        for bad_raw in (
-            "{not valid json",
-            json.dumps([1, 2, 3]),
-            json.dumps({"best_params": "not-a-dict"}),
-            json.dumps({"best_params": {"unknown_key": 0.5}}),
-            json.dumps({"best_params": {"hybrid_alpha": True}}),
-            json.dumps({"best_params": {"hybrid_alpha": 1.2}}),
-            json.dumps({"best_params": {"ppr_alpha": -0.1}}),
-            json.dumps({"best_params": {"seed_top_k": 0}}),
-            json.dumps({"best_params": {"seed_top_k": 2.5}}),
-            '{"best_params": {"hybrid_alpha": NaN}}',
-        ):
-            write_text_atomic(params_path, bad_raw)
-            with pytest.raises(YawRuntimeError) as exc_bad:
-                resolve_retrieval_params(cfg)
-            assert exc_bad.value.code == "CONSISTENCY_ERROR"
-            with pytest.raises(YawRuntimeError) as exc_rec:
-                recall_once(cfg, "QuasarPulse99", top_k=1)
-            assert exc_rec.value.code == "CONSISTENCY_ERROR"
     finally:
         srv.shutdown()
 
@@ -701,7 +668,7 @@ def test_live_post_ready_pipeline_failure_transitions_to_error_and_blocks_querie
     def post_ready_failing_embed(texts: list[str]) -> NDArray[np.float32]:
         if any("POST_READY_EMBED_BOOM" in t for t in texts):
             raise RuntimeError(f"post-ready embed boom key={secret_tok}")
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> str:
         _ = payload

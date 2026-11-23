@@ -1,29 +1,25 @@
-"""Offline DSPy GEPA + bare dspy.ReAct and Optuna hyperparameter optimization."""
+"""Offline DSPy GEPA + bare dspy.ReAct prompt optimization."""
 
 from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import shutil
-import sqlite3
 import time
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import dspy
-import numpy as np
 from dspy.teleprompt.gepa.gepa_utils import DSPyTrace, ScoreWithFeedback
 from filelock import FileLock, Timeout
-from numpy.typing import NDArray
 
 from yaw.core import (
+    EmbedFn,
     YawConfig,
     YawRuntimeError,
-    format_query_for_embedding,
     parse_dataset_list,
     redact_secrets,
     resolve_coco_state_root,
@@ -35,7 +31,6 @@ from yaw.datasets import (
     DatasetBundle,
     build_benchmark_slice,
     compute_qa_em_f1,
-    doc_matches_gold,
     load_dataset_bundle,
     resolve_dataset_bundle,
     resolve_dataset_name,
@@ -52,36 +47,7 @@ from yaw.qa import (
     make_qa_tools,
     strip_inline_citations,
 )
-from yaw.retrieval import (
-    build_vector_search,
-    hydrate_ranked_passages,
-    open_readonly_db,
-    resolve_retrieval_params,
-    search_vectors,
-)
-
-if TYPE_CHECKING:
-    import optuna
-
-
-def compute_ndcg_at_k(
-    retrieved_docs: Sequence[str],
-    gold_docs: Sequence[str] | None,
-    k: int,
-) -> float | None:
-    """Binary-relevance Normalized Discounted Cumulative Gain at rank k."""
-    if gold_docs is None or not gold_docs or k <= 0:
-        return None
-    remaining = list(gold_docs)
-    dcg = 0.0
-    for rank, rd in enumerate(retrieved_docs[:k], start=1):
-        matched_idx = next((i for i, gd in enumerate(remaining) if doc_matches_gold(rd, gd)), None)
-        if matched_idx is not None:
-            remaining.pop(matched_idx)
-            dcg += 1.0 / math.log2(rank + 1.0)
-    ideal_hits = min(len(gold_docs), k)
-    idcg = sum(1.0 / math.log2(r + 1.0) for r in range(1, ideal_hits + 1))
-    return float(dcg / idcg) if idcg > 0.0 else 0.0
+from yaw.retrieval import build_retrieval_index, open_readonly_db
 
 
 def qa_gepa_metric(
@@ -329,7 +295,7 @@ def _index_bundle_slices(
     corpus_root: Path,
     slice_patterns: tuple[str, ...],
     db_file: Path,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]],
+    embed_fn: EmbedFn,
     *,
     fresh: bool,
     extra_wipe: Sequence[Path] = (),
@@ -337,7 +303,7 @@ def _index_bundle_slices(
     idx_cfg = replace(cfg, db_path=db_file, corpus_root=corpus_root, included_patterns=slice_patterns)
     if fresh:
         if cfg.state_dir is not None and resolve_coco_state_root(cfg.state_dir).exists():
-            drop_session = start_pipeline(idx_cfg, live=False, embed_fn=embed_fn, vector_dim=1)
+            drop_session = start_pipeline(idx_cfg, live=False, embed_fn=embed_fn)
             try:
                 drop_session.app.drop_blocking()
             finally:
@@ -381,139 +347,6 @@ def _require_int_param(val: int | None, default: int, *, name: str, min_value: i
     return val
 
 
-def optimize_optuna(
-    cfg: YawConfig,
-    *,
-    datasets: str | None = None,
-    trials: int | None = None,
-    max_queries: int | None = None,
-    query_offset: int | None = None,
-    fresh: bool = False,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
-) -> dict[str, Any]:
-    """Tune retrieval hyperparameters (hybrid_alpha, ppr_alpha, seed_top_k) via Optuna TPE."""
-    import optuna
-
-    eff_trials = _require_int_param(trials, 64, name="trials", min_value=1)
-    eff_max_q = _require_int_param(max_queries, cfg.optimize_max_queries, name="max_queries", min_value=1)
-    eff_offset = _require_int_param(query_offset, cfg.optimize_query_offset, name="query_offset", min_value=0)
-    base_dir = Path(cfg.db_path).parent if cfg.db_path else cfg.workspace_root / ".yaw"
-    opt_cfg = cfg.for_optimization(base_dir / "optuna_index.db")
-    lock_path = _require_opt_path(opt_cfg.lock_path, "optuna lock_path")
-    db_path = _require_opt_path(opt_cfg.db_path, "optuna db_path")
-    status_path = _require_opt_path(opt_cfg.status_path, "optuna status_path")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = FileLock(str(lock_path), timeout=0)
-    try:
-        lock.acquire()
-    except Timeout as exc:
-        raise YawRuntimeError("BUSY", f"Optimization lock is already held: {lock_path}") from exc
-    try:
-        ws = opt_cfg.workspace_root
-        opt_dir = db_path.parent
-        opt_dir.mkdir(parents=True, exist_ok=True)
-        study_db = opt_dir / "optuna_study.db"
-        params_path = opt_dir / "optuna_best_params.json"
-
-        ds_names = parse_dataset_list(datasets) if datasets is not None else list(opt_cfg.optimize_datasets)
-        refs = _resolve_dataset_refs(ws, ds_names, query_offset=eff_offset)
-        loaded = [_load_slice(r, max_queries=eff_max_q, query_offset=eff_offset) for r in refs]
-        corpus_root, slice_patterns = resolve_slice_corpus_scope(
-            [(ref.bundle, doc_ids) for ref, (doc_ids, _, _, _) in zip(refs, loaded, strict=True)]
-        )
-        active_embed = embed_fn or make_dspy_embed_fn(opt_cfg)
-
-        with _optimization_status(status_path, opt_cfg.api_key):
-            conn: sqlite3.Connection | None = None
-            storage: Any = None
-            try:
-                _index_bundle_slices(
-                    opt_cfg,
-                    corpus_root,
-                    slice_patterns,
-                    db_path,
-                    active_embed,
-                    fresh=fresh,
-                    extra_wipe=(study_db, params_path),
-                )
-
-                conn = open_readonly_db(db_path)
-                vs = build_vector_search(conn)
-                eval_items: list[tuple[str, NDArray[np.float32], list[str]]] = []
-                for _, questions, gold_docs, _ in loaded:
-                    if not gold_docs:
-                        continue
-                    formatted_qs = [
-                        format_query_for_embedding(q, task_mode=opt_cfg.embedding_task_mode) for q in questions
-                    ]
-                    q_vecs = np.asarray(active_embed(formatted_qs), dtype=np.float32)
-                    for idx, (q, gd) in enumerate(zip(questions, gold_docs, strict=True)):
-                        if gd:
-                            eval_items.append((q, q_vecs[idx], gd))
-                if not eval_items:
-                    raise YawRuntimeError(
-                        "INVALID_INPUT",
-                        "Selected Optuna datasets contain no gold retrieval documents.",
-                    )
-
-                optuna.logging.set_verbosity(optuna.logging.WARNING)
-                storage_url = f"sqlite:///{study_db.resolve().as_posix()}"
-                storage = optuna.storages.RDBStorage(url=storage_url)
-                sampler = optuna.samplers.TPESampler(seed=42)
-                study = optuna.create_study(
-                    study_name="yaw_retrieval_ppr",
-                    storage=storage,
-                    direction="maximize",
-                    load_if_exists=not fresh,
-                    sampler=sampler,
-                )
-
-                def objective(trial: optuna.Trial) -> float:
-                    h_alpha = trial.suggest_float("hybrid_alpha", 0.1, 0.95)
-                    p_alpha = trial.suggest_float("ppr_alpha", 0.0, 0.95)
-                    s_top_k = trial.suggest_int("seed_top_k", 5, 40)
-                    scores: list[float] = []
-                    for q_text, q_vec, gd in eval_items:
-                        ranked = search_vectors(
-                            vs,
-                            q_vec,
-                            query_text=q_text,
-                            conn=conn,
-                            top_k=max(5 * 4, 50),
-                            seed_top_k=s_top_k,
-                            hybrid_alpha=h_alpha,
-                            ppr_alpha=p_alpha,
-                        )
-                        hydrated = hydrate_ranked_passages(vs, ranked, corpus_root, top_k=5)
-                        texts = [hp.text for hp in hydrated if not hp.stale_on_disk]
-                        r_k = score_retrieval_recalls([gd], [texts], k_list=(5,))[0]["Recall@5"]
-                        n_k = compute_ndcg_at_k(texts, gd, 5) or 0.0
-                        scores.append(0.6 * r_k + 0.4 * n_k)
-                    return float(np.mean(scores)) if scores else 0.0
-
-                study.optimize(objective, n_trials=eff_trials)
-                payload = {
-                    "best_score": float(study.best_value),
-                    "best_params": dict(study.best_params),
-                    "total_trials": len(study.trials),
-                    "datasets": [r.canonical for r in refs],
-                }
-                write_text_atomic(params_path, json.dumps(payload, indent=2) + "\n")
-                write_text_atomic(
-                    status_path,
-                    json.dumps({"state": "completed", "completed_at": time.time(), **payload}, indent=2) + "\n",
-                )
-                return payload
-            finally:
-                if conn is not None:
-                    conn.close()
-                if storage is not None:
-                    storage.remove_session()
-                    storage.engine.dispose()
-    finally:
-        lock.release()
-
-
 def optimize_dspy(
     cfg: YawConfig,
     *,
@@ -524,7 +357,7 @@ def optimize_dspy(
     query_offset: int | None = None,
     threads: int | None = None,
     fresh: bool = False,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
+    embed_fn: EmbedFn | None = None,
     student_lm: Any = None,
     reflection_lm: Any = None,
     instruction_proposer: Callable[..., dict[str, str]] | None = None,
@@ -577,7 +410,7 @@ def _compile_dspy(
     query_offset: int,
     threads: int,
     fresh: bool,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None,
+    embed_fn: EmbedFn | None,
     student_lm: Any,
     reflection_lm: Any,
     instruction_proposer: Callable[..., dict[str, str]] | None,
@@ -651,14 +484,17 @@ def _compile_dspy(
             gepa_kwargs["auto"] = eff_auto
 
         with contextlib.closing(open_readonly_db(db_path)) as init_conn:
-            vs = build_vector_search(init_conn)
+            index = build_retrieval_index(
+                init_conn,
+                expected_embedding_model=opt_cfg.embedding_model,
+                expected_task_mode=opt_cfg.embedding_task_mode,
+            )
         tools = make_qa_tools(
-            vs,
+            index,
             corpus_root,
             active_embed,
             db_path,
             task_mode=opt_cfg.embedding_task_mode,
-            search_params=resolve_retrieval_params(opt_cfg),
         )
         student = build_qa_agent(tools, max_iters=opt_cfg.react_max_iters)
         optimizer = dspy.GEPA(**gepa_kwargs)

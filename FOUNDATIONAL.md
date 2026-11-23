@@ -2,10 +2,10 @@
 
 ## 1. Purpose
 
-`yaw` is a local, zero-LLM-index multi-hop retrieval engine and QA runtime built on SQLite (`sqlite-vec` + contentless `FTS5`).
+`yaw` is a local, zero-LLM-index multi-hop retrieval engine and QA runtime built on plain SQLite (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`).
 
-- **Tier 0 — Primary Librarian Surface (`recall`):** Queries local corpora with **zero generative LLM dependency** (`yaw/retrieval.py`), returning verified disk spans, multi-hop entity/AST evidence routes, and SHA-256 staleness flags (`VectorSearch`).
-- **Tier 1 — Benchmark QA Harness (`qa`, `optimize dspy`, `optimize optuna`):** Optional local SLM reader (`dspy.ReAct` + `dspy.GEPA`, `temperature=1.0` unconditionally) and `optuna` hyperparameter tuner used for academic EM/F1 benchmarking (`PopQA`, `MuSiQue`, `HotpotQA`, `2WikiMultiHopQA`) and interactive multi-hop synthesis (`yaw/qa.py`, `yaw/optimize.py`).
+- **Tier 0 — Primary Librarian Surface (`recall`):** Queries local corpora with **zero generative LLM dependency** (`yaw/retrieval.py`), returning verified disk spans, multi-hop citation/PMI evidence routes, and SHA-256 staleness flags (`RetrievalIndex`, `SearchResult`, `search_index`).
+- **Tier 1 — Benchmark QA Harness (`qa`, `optimize dspy`):** Optional local SLM reader (`dspy.ReAct` + `dspy.GEPA`, `temperature=1.0` unconditionally) used for academic EM/F1 benchmarking (`PopQA`, `MuSiQue`, `HotpotQA`, `2WikiMultiHopQA`) and interactive multi-hop synthesis (`yaw/qa.py`, `yaw/optimize.py`).
 
 Upstream `HippoRAG 2` and `Youtu-GraphRAG` are external benchmark baselines only (`0` `hipporag` imports anywhere in `yaw/`, `scripts/`, or `tests/`).
 
@@ -14,7 +14,7 @@ Upstream `HippoRAG 2` and `Youtu-GraphRAG` are external benchmark baselines only
 `yaw` does **not** provide backward-compatibility shims, multi-backend storage abstractions, imperative SQLite bypass writers, speculative configuration knobs, wrapper subclasses (`dspy.Module`, `dspy.BaseLM`, `dspy.Adapter`), or fallback retrieval paths.
 
 The following remain permanently retired unless controlled benchmarks prove material gains justifying their dependency weight:
-`rdflib`, OWL 2 RL, `pySHACL`, LLM OpenIE triple/ontology extraction, GBNF grammars, `skos:ConceptScheme`, `dspy.RLM` / Deno WASM REPL, and legacy `yaw/daemon/**`. *(Note: `spacy` with `en_core_web_sm` remains active for noun-phrase bridging in `yaw/retrieval.py` until superseded by the post-`CS-6` sprint.)*
+`rdflib`, OWL 2 RL, `pySHACL`, LLM OpenIE triple/ontology extraction, GBNF grammars, `skos:ConceptScheme`, `dspy.RLM` / Deno WASM REPL, and legacy `yaw/daemon/**`.
 
 ## 3. Package Boundaries
 
@@ -34,12 +34,12 @@ yaw/
 
 1. **Declarative Ingestion (`yaw/pipeline.py`):**
    - Sole writer to `.yaw/yaw.db` via event-driven CocoIndex (`localfs.walk_dir(..., live=live)`), per-`db_path` `app_name`, native `CodeSource`/`RecursiveSplitter` (`included_patterns` / `chunk_size` UTF-8 byte cap), configurable `embed_batch_size` + `embed_max_in_flight`, and persistent content-addressed `.yaw/coco_lmdb` memoization.
-   - Mounts `chunks` (`vec0` cosine KNN + source spans + token/entity metadata, `0` raw chunk text) and contentless `chunk_fts` (`fts5` via `_FtsTableHandler`). Native dataset bundles export directly to `.md` files (`<idx>.md`, `# Title` headings) and index without duplicate JSON-to-text re-staging.
+   - Publishes the 5-table plain SQLite schema: `chunks` (ROWID via `ChunkRow` / `sqlite.mount_table_target` with `<f2>` `embedding_f16 BLOB` + source spans, `0` raw chunk text), `chunk_fts` (`unicode61 remove_diacritics 1`) + `chunk_vocab` (`fts5vocab` via `_FtsTableHandler`), and single-row `rabitq_index` + `citation_graph` materialized via `reconcile_index_tables` (`IndexArtifacts`). Native dataset bundles export directly to `.md` files (`<idx>.md`, `# Title` headings) and index without duplicate JSON-to-text re-staging.
 2. **Pointer-Only Disk Hydration (`yaw/retrieval.py`):**
    - `yaw.db` stores 1-indexed `(rel_posix_path, start_line, end_line)`, character offsets `(char_start, char_end)`, and SHA-256 `source_hash`—never authoritative copies of corpus text.
    - Passages hydrate pure line/character spans uniformly from disk at query time (`max_chars=None` uncropped by default, `pool_k = max(top_k * 4, 50)` before span deduplication, zero serde JSON reparsing): missing or hash-mismatched files return `stale_on_disk = True` with `text = ""`.
-3. **Zero-LLM Hybrid Ranking (`yaw/retrieval.py`):**
-   - Combines `sqlite-vec` dense KNN, `FTS5` `ORDER BY bm25(...) ASC LIMIT ?`, and SciPy entity-chunk PPR (`VectorSearch`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), hot-swapping outside `index_lock` via `PRAGMA data_version`.
+3. **Zero-LLM Hybrid Ranking (`yaw/retrieval.py`, `yaw/runtime.py`):**
+   - Combines 1-bit SoA RaBitQ (`rabitq_index`), `FTS5` (`chunk_fts` / `chunk_vocab`), and tangent-steered cyclic citation + 1-bit PMI diffusion (`CitationGraph`, `DiffusionOperators`) inside `RetrievalIndex` (`build_retrieval_index`, `empty_retrieval_index`, `search_index`, `expand_citation_neighbors`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), hot-swapping outside `index_lock` via `PRAGMA data_version` (`get_retrieval_index`).
 4. **Runtime Concurrency & Native Tool Calling (`yaw/runtime.py`, `yaw/qa.py`, `yaw/optimize.py`):**
    - `recall` runs under `BoundedSemaphore(32)` over `?mode=ro` SQLite connections with zero LM endpoint dependency.
    - Bare `dspy.ReAct` QA and `dspy.GEPA` instruction proposal declare `ProviderDefinition.chat` (`ModelSupport(function_calling=True)`) via `dspy.lm15.register_provider`, enforce `tool_choice="required"`, serialize under `Semaphore(1)`, run student and GEPA reflection at `temperature=1.0` unconditionally, and validate inline `[chunk_id=<int>]` citations strictly against non-`submit` tool observations (`0` SQLite writes during QA).

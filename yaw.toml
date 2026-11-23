@@ -3,7 +3,7 @@
 [paths]
 # Directory watched and indexed into SQLite.
 corpus_root = "corpus"
-# Primary SQLite database storing sqlite-vec chunks and contentless FTS5 rows.
+# Primary SQLite database storing plain ROWID chunks (<f2> embeddings), FTS5/fts5vocab, rabitq_index, and citation_graph.
 db_path = ".yaw/yaw.db"
 # Exclusive file lock guarding daemon and write access to yaw.db.
 lock_path = ".yaw/yaw.db.lock"

@@ -33,12 +33,12 @@ from yaw.qa import (
     strip_inline_citations,
 )
 from yaw.qa import ask_question as run_qa
-from yaw.retrieval import build_vector_search, open_readonly_db
+from yaw.retrieval import build_retrieval_index, open_readonly_db
 
 _CID_IN_PROMPT_RE = re.compile(r"\[chunk_id=(\d+)\]")
 
 
-def _topic_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
+def _topic_embed(texts: list[str], *, dim: int = 64) -> NDArray[np.float32]:
     topics = (
         ("apollo", "lunar", "moon", "armstrong", "commander"),
         ("instrument", "xylophone", "zither", "music", "wapakoneta", "childhood"),
@@ -49,11 +49,12 @@ def _topic_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
     for row_idx, text in enumerate(texts):
         low = text.lower()
         digest = hashlib.sha256(text.encode("utf-8")).digest()
-        base = (np.frombuffer(digest * 2, dtype=np.uint8)[:dim].astype(np.float32) - 127.5) * 0.05
+        repeats = (dim + len(digest) - 1) // len(digest)
+        base = (np.frombuffer(digest * repeats, dtype=np.uint8)[:dim].astype(np.float32) - 127.5) * 0.01
         for t_idx, kws in enumerate(topics):
             for kw in kws:
                 if kw in low:
-                    base[t_idx] += 2.0
+                    base[t_idx] += 3.0
         rows[row_idx] = base / max(float(np.linalg.norm(base)), 1e-12)
     return rows
 
@@ -106,11 +107,18 @@ def _index_qa_corpus(root: Path, *, single_doc: bool = False) -> YawConfig:
             encoding="utf-8",
         )
         (cfg.corpus_root / "booster_backup.md").write_text(
-            "# Booster Backup\nOrbital booster backup valve specification for emergency stage separation.\n",
+            "# Booster Backup\n"
+            "See Booster Manual. Orbital booster backup valve specification for emergency stage separation.\n",
             encoding="utf-8",
         )
+        for bg_i in range(6):
+            (cfg.corpus_root / f"geology_{bg_i}.md").write_text(
+                f"# Geology Field Note {bg_i}\n"
+                f"Basalt and limestone mineral sample {bg_i} cataloged at survey station {bg_i}.\n",
+                encoding="utf-8",
+            )
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    session = start_pipeline(cfg, embed_fn=lambda ts: _topic_embed(ts, dim=64), live=False)
     try:
         update_pipeline_once(session)
     finally:
@@ -220,10 +228,12 @@ def test_qa_module_isolation_and_zero_wrappers() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert not alias.name.startswith(("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy"))
+                assert not alias.name.startswith(
+                    ("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy", "optuna")
+                )
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
-            assert not mod.startswith(("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy"))
+            assert not mod.startswith(("cocoindex", "yaw.daemon", "yaw.pipeline", "sqlite_vec", "spacy", "optuna"))
 
     def _dummy_tool(query: str) -> str:
         return query
@@ -356,13 +366,13 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
 
     def tracked_embed(texts: list[str]) -> NDArray[np.float32]:
         embed_calls.append(list(texts))
-        return _topic_embed(texts, dim=16)
+        return _topic_embed(texts, dim=64)
 
     with open_readonly_db(cfg.db_path) as conn:
-        vs = build_vector_search(conn)
-        assert vs.size >= 10
+        idx = build_retrieval_index(conn)
+        assert idx.size >= 10
         search_passages, lexical_grep, expand_neighbors, read_chunk = (
-            tool.func for tool in make_qa_tools(vs, cfg.corpus_root, tracked_embed, conn)
+            tool.func for tool in make_qa_tools(idx, cfg.corpus_root, tracked_embed, conn)
         )
 
         # Blank/non-string queries and invalid top_k fail fast without invoking embedder
@@ -405,7 +415,7 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         assert len(_CID_IN_PROMPT_RE.findall(grep_long)) >= 1
 
         # Identify chunk 1 and chunk 2 of bridge.md to verify expand_neighbors and read_chunk
-        bridge_cids = [int(p.chunk_id) for p in vs.pointers if p.rel_posix_path == "bridge.md"]
+        bridge_cids = [int(p.chunk_id) for p in idx.pointers if p.rel_posix_path == "bridge.md"]
         assert len(bridge_cids) >= 2
         long_cid = int(_CID_IN_PROMPT_RE.findall(grep_long)[0])
 
@@ -432,16 +442,16 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         chunk_plain = read_chunk(long_cid)
         assert f"[chunk_id={long_cid}]" in chunk_plain and "score=1.000:" in chunk_plain
 
-    # Solo 1-chunk VectorSearch returns No matching passages on expand_neighbors
+    # Solo 1-chunk RetrievalIndex returns No matching passages on expand_neighbors
     solo_cfg = _index_qa_corpus(tmp_path / "solo", single_doc=True)
     assert solo_cfg.corpus_root is not None and solo_cfg.db_path is not None
     with open_readonly_db(solo_cfg.db_path) as s_conn:
-        s_vs = build_vector_search(s_conn)
-        assert s_vs.size == 1
-        solo_tools = make_qa_tools(s_vs, solo_cfg.corpus_root, tracked_embed, s_conn)
-        assert solo_tools[2](chunk_id=int(s_vs.chunk_ids[0])) == "No matching passages found."
+        s_idx = build_retrieval_index(s_conn)
+        assert s_idx.size == 1
+        solo_tools = make_qa_tools(s_idx, solo_cfg.corpus_root, tracked_embed, s_conn)
+        assert solo_tools[2](chunk_id=int(s_idx.chunk_ids[0])) == "No matching passages found."
         with pytest.raises(ValueError, match="top_k"):
-            solo_tools[2](chunk_id=int(s_vs.chunk_ids[0]), top_k=0)
+            solo_tools[2](chunk_id=int(s_idx.chunk_ids[0]), top_k=0)
 
     # Verify top_k > 10 is honored without clamping to 10 across search_passages, lexical_grep, and expand_neighbors
     many_cfg = _make_cfg(tmp_path / "many")
@@ -452,17 +462,17 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
             f"# ManyDoc {i}\nSharedManyToken document body number {i}.\n",
             encoding="utf-8",
         )
-    many_sess = start_pipeline(many_cfg, embed_fn=lambda ts: _topic_embed(ts, dim=16), vector_dim=16, live=False)
+    many_sess = start_pipeline(many_cfg, embed_fn=lambda ts: _topic_embed(ts, dim=64), live=False)
     try:
         update_pipeline_once(many_sess)
     finally:
         close_pipeline(many_sess)
     with open_readonly_db(many_cfg.db_path) as m_conn:
-        m_vs = build_vector_search(m_conn)
-        m_search, m_grep, m_expand, _ = make_qa_tools(m_vs, many_cfg.corpus_root, tracked_embed, m_conn)
+        m_idx = build_retrieval_index(m_conn)
+        m_search, m_grep, m_expand, _ = make_qa_tools(m_idx, many_cfg.corpus_root, tracked_embed, m_conn)
         assert len(_CID_IN_PROMPT_RE.findall(m_search(query="SharedManyToken", top_k=12))) == 12
         assert len(_CID_IN_PROMPT_RE.findall(m_grep(query="SharedManyToken", top_k=12))) == 12
-        assert len(_CID_IN_PROMPT_RE.findall(m_expand(chunk_id=int(m_vs.chunk_ids[0]), top_k=12))) == 12
+        assert len(_CID_IN_PROMPT_RE.findall(m_expand(chunk_id=int(m_idx.chunk_ids[0]), top_k=12))) == 12
 
 
 def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None:
@@ -470,9 +480,9 @@ def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None
     assert cfg.corpus_root is not None and cfg.db_path is not None
 
     with open_readonly_db(cfg.db_path) as conn:
-        vs = build_vector_search(conn)
+        idx = build_retrieval_index(conn)
         ver_before = conn.execute("PRAGMA data_version").fetchone()[0]
-        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        tools = make_qa_tools(idx, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=64), conn)
         agent = build_qa_agent(tools, max_iters=6)
 
         observed_cids: list[int] = []
@@ -527,7 +537,7 @@ def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None
                     agent,
                     "What unusual instrument did the Apollo 11 commander play?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=lm,
                     lm_sem=threading.Semaphore(1),
                 )
@@ -559,8 +569,8 @@ def test_forced_submit_unannotated_citations_and_semaphore_serialization(tmp_pat
     assert cfg.corpus_root is not None and cfg.db_path is not None
 
     with open_readonly_db(cfg.db_path) as conn:
-        vs = build_vector_search(conn)
-        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        idx = build_retrieval_index(conn)
+        tools = make_qa_tools(idx, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=64), conn)
         agent_1 = build_qa_agent(tools, max_iters=1)
 
         def forced_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
@@ -581,7 +591,7 @@ def test_forced_submit_unannotated_citations_and_semaphore_serialization(tmp_pat
                 agent_1,
                 "What instrument did he play?",
                 corpus_root=cfg.corpus_root,
-                vs=vs,
+                index=idx,
                 lm=_make_loopback_lm(srv1),
                 lm_sem=threading.Semaphore(1),
                 max_citations=2,
@@ -613,7 +623,7 @@ def test_forced_submit_unannotated_citations_and_semaphore_serialization(tmp_pat
                         agent_conc,
                         f"Question {i}?",
                         corpus_root=cfg.corpus_root,
-                        vs=vs,
+                        index=idx,
                         lm=lm2,
                         lm_sem=shared_sem,
                     )
@@ -633,8 +643,8 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
     assert cfg.corpus_root is not None and cfg.db_path is not None
 
     with open_readonly_db(cfg.db_path) as conn:
-        vs = build_vector_search(conn)
-        tools = make_qa_tools(vs, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=16), conn)
+        idx = build_retrieval_index(conn)
+        tools = make_qa_tools(idx, cfg.corpus_root, lambda ts: _topic_embed(ts, dim=64), conn)
         agent = build_qa_agent(tools, max_iters=2)
 
         def unused_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
@@ -647,7 +657,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
             sem = threading.Semaphore(1)
 
             with pytest.raises(YawRuntimeError) as exc_blank:
-                ask_question(agent, "   ", corpus_root=cfg.corpus_root, vs=vs, lm=lm_unused, lm_sem=sem)
+                ask_question(agent, "   ", corpus_root=cfg.corpus_root, index=idx, lm=lm_unused, lm_sem=sem)
             assert exc_blank.value.code == "INVALID_INPUT"
 
             with pytest.raises(YawRuntimeError) as exc_mc:
@@ -655,7 +665,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Valid question?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=lm_unused,
                     lm_sem=sem,
                     max_citations=0,
@@ -663,9 +673,9 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
             assert exc_mc.value.code == "INVALID_INPUT"
 
             with contextlib.closing(sqlite3.connect(":memory:")) as empty_conn:
-                empty_vs = build_vector_search(empty_conn)
+                empty_idx = build_retrieval_index(empty_conn)
             with pytest.raises(YawRuntimeError) as exc_empty:
-                ask_question(agent, "Valid?", corpus_root=cfg.corpus_root, vs=empty_vs, lm=lm_unused, lm_sem=sem)
+                ask_question(agent, "Valid?", corpus_root=cfg.corpus_root, index=empty_idx, lm=lm_unused, lm_sem=sem)
             assert exc_empty.value.code == "EMPTY_INDEX"
             assert reqs_unused == []
         finally:
@@ -684,7 +694,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Who commanded?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_bad_id),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -692,8 +702,8 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
         finally:
             srv_bad_id.shutdown()
 
-        # Real chunk_id present in vs.id_to_pos & mentioned in next_thought, but NEVER returned by a tool -> MODEL_ERROR
-        real_unseen_cid = int(vs.chunk_ids[0])
+        # Real chunk_id present in idx.id_to_pos & next_thought, but NEVER returned by a tool -> MODEL_ERROR
+        real_unseen_cid = int(idx.chunk_ids[0])
 
         def hallucinated_real_id(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
             if turn_idx == 0:
@@ -713,7 +723,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Test ungrounded real id",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_unseen),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -739,7 +749,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Test comma-joined ungrounded citation",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_comma),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -757,7 +767,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Empty answer test?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_ws),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -773,7 +783,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Malformed output test?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_garbage),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -782,7 +792,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
             srv_garbage.shutdown()
 
         # Stale/mutated cited file -> CONSISTENCY_ERROR
-        alpha_cid = next(int(p.chunk_id) for p in vs.pointers if p.rel_posix_path == "alpha.md")
+        alpha_cid = next(int(p.chunk_id) for p in idx.pointers if p.rel_posix_path == "alpha.md")
 
         def stale_responder(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
             if turn_idx == 0:
@@ -799,7 +809,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Who commanded Apollo 11?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_stale),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -862,7 +872,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     forced_agent,
                     "Who commanded Apollo 11?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_forced_err),
                     lm_sem=threading.Semaphore(1),
                 )
@@ -877,7 +887,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                 return dspy.Prediction(answer="Armstrong", termination_reason="max_iters")
 
         with pytest.raises(YawRuntimeError) as exc_term:
-            run_qa("Who commanded Apollo 11?", vs=vs, corpus_root=cfg.corpus_root, agent=_BadTerminationModule())
+            run_qa("Who commanded Apollo 11?", index=idx, corpus_root=cfg.corpus_root, agent=_BadTerminationModule())
         assert exc_term.value.code == "MODEL_ERROR"
 
         # HTTP 500 server error must propagate unmasked (LMServerError), NOT be wrapped or swallowed
@@ -888,7 +898,7 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
                     agent,
                     "Server down test?",
                     corpus_root=cfg.corpus_root,
-                    vs=vs,
+                    index=idx,
                     lm=_make_loopback_lm(srv_500),
                     lm_sem=threading.Semaphore(1),
                 )

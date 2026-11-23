@@ -379,7 +379,7 @@ def test_full_native_benchmark_reports_real_ingestion_retrieval_and_restart_reus
     db_file = tmp_path / "index" / "yaw.db"
     assert db_file.is_file()
     with contextlib.closing(open_readonly_db(db_file)) as conn:
-        assert list_user_tables(conn) == ("chunk_fts", "chunks")
+        assert list_user_tables(conn) == ("chunk_fts", "chunk_vocab", "chunks", "citation_graph", "rabitq_index")
 
     req_idx_before = len(requests)
     resumed: dict[str, Any] = {}
@@ -467,7 +467,13 @@ def test_benchmark_main_persists_success_or_failure_with_disjoint_probe_queries(
             assert result["records"][0]["answer"] == "Cambridge"
             assert {route for route, _, _ in requests} == {"/v1/embeddings", "/v1/chat/completions"}
             with contextlib.closing(open_readonly_db(Path(result["index_dir"]) / "yaw.db")) as conn:
-                assert list_user_tables(conn) == ("chunk_fts", "chunks")
+                assert list_user_tables(conn) == (
+                    "chunk_fts",
+                    "chunk_vocab",
+                    "chunks",
+                    "citation_graph",
+                    "rabitq_index",
+                )
                 assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 1
     else:
         with pytest.raises(AuthenticationError):

@@ -29,7 +29,7 @@ from yaw.core import YawConfig, load_config, write_text_atomic
 from yaw.datasets import prepare_dataset_bundle
 from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
 from yaw.qa import build_qa_agent
-from yaw.retrieval import build_vector_search, open_readonly_db
+from yaw.retrieval import build_retrieval_index, open_readonly_db
 from yaw.runtime import signal_stop_event
 
 _CID_IN_TEXT_RE = re.compile(r"\[chunk_id=(\d+)\]")
@@ -346,7 +346,7 @@ def test_cli_containment_main_loc_zero_wrappers_and_clean_vocabulary() -> None:
         "uvicorn",
         "numpy",
     )
-    lazy_top_level = ("yaw.optimize", "yaw.datasets", "optuna")
+    lazy_top_level = ("yaw.optimize", "yaw.datasets")
     for top_node in tree.body:
         if isinstance(top_node, ast.Import):
             for alias in top_node.names:
@@ -662,7 +662,7 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
         _index_corpus(cfg)
 
         with contextlib.closing(open_readonly_db(cfg.db_path)) as conn:
-            vs = build_vector_search(conn)
+            idx = build_retrieval_index(conn)
 
             def _dummy_tool(query: str) -> str:
                 return query
@@ -680,9 +680,8 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
             qa_out = json.loads(capsys.readouterr().out)
             assert "Neil Armstrong" in qa_out["answer"]
             assert qa_out["turns"] >= 1
-            assert qa_out["turns"] >= 1
             assert len(qa_out["citations"]) == 1
-            assert qa_out["citations"][0]["chunk_id"] in vs.id_to_pos
+            assert qa_out["citations"][0]["chunk_id"] in idx.id_to_pos
             assert any("CLI_OPT_PROG_MARKER" in m for m in seen_messages)
 
             seen_messages.clear()
@@ -707,8 +706,16 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
         srv.shutdown()
 
 
-def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_optimize_dspy_and_rejects_optuna(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from yaw.cli import main
+
+    assert main(["optimize", "--help"]) == 0
+    help_out = capsys.readouterr().out
+    assert "{dspy}" in help_out
+    assert "optuna" not in help_out
+
+    assert main(["optimize", "optuna"]) == 2
+    assert "invalid choice" in capsys.readouterr().err
 
     bundle = _prepare_sample_bundle(tmp_path, dataset_name="sample")
     bundle_14 = _prepare_sample_bundle(tmp_path, dataset_name="sample14", total_questions=14)
@@ -750,8 +757,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         ans = f"Neil Armstrong [chunk_id={cid}]" if "Apollo" in blob else f"XylophoneZither [chunk_id={cid}]"
         return 200, _tool_reply("Submit answer", [{"name": "submit", "args": {"answer": ans}}])
 
-    seen_embed_inputs: list[str] = []
-    srv, _ = _start_openai_stub(chat_responder, embed_inputs=seen_embed_inputs)
+    srv, _ = _start_openai_stub(chat_responder)
     try:
         toml_path = _write_toml(tmp_path, port=srv.server_port)
         assert (
@@ -765,9 +771,9 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
                     str(toml_path),
                 ]
             )
-            == 1
+            == 2
         )
-        assert "query_offset" in capsys.readouterr().err
+        assert "optuna" in capsys.readouterr().err
 
         assert (
             main(
@@ -815,7 +821,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         assert_direct_bundle_md_indexing("dspy_corpus", "optimize_yaw.db")
         assert json.loads(program.with_name("dspy_gepa_audit.json").read_text(encoding="utf-8")) == dspy_res
 
-        # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml for both dspy and optuna
+        # Omitting --query-offset honors [optimization] query_offset = 10 from yaw.toml for dspy
         seen_chat_blobs.clear()
         offset_ws = tmp_path / "offset_ws"
         offset_ws.mkdir()
@@ -848,61 +854,7 @@ def test_cli_optimize_dspy_and_optuna_commands(tmp_path: Path, capsys: pytest.Ca
         joined_chats = "\n".join(seen_chat_blobs)
         assert "OffsetCheck question 10" in joined_chats
         assert "OffsetCheck question 6" not in joined_chats
-
-        seen_embed_inputs.clear()
-        assert (
-            main(
-                [
-                    "optimize",
-                    "optuna",
-                    "--config",
-                    str(offset_toml),
-                    "--dataset",
-                    str(bundle_14),
-                    "--max-queries",
-                    "4",
-                    "--trials",
-                    "1",
-                    "--fresh",
-                    "--json",
-                ]
-            )
-            == 0
-        )
-        optuna_offset_res = json.loads(capsys.readouterr().out)
-        assert optuna_offset_res["total_trials"] == 1
-        joined_embeds = "\n".join(seen_embed_inputs)
-        assert "OffsetCheck question 10" in joined_embeds
-        assert "OffsetCheck question 6" not in joined_embeds
-
-        assert (
-            main(
-                [
-                    "optimize",
-                    "optuna",
-                    "--config",
-                    str(toml_path),
-                    "--dataset",
-                    str(bundle),
-                    "--query-offset",
-                    "0",
-                    "--max-queries",
-                    "6",
-                    "--trials",
-                    "2",
-                    "--fresh",
-                    "--json",
-                ]
-            )
-            == 0
-        )
-        optuna_res = json.loads(capsys.readouterr().out)
-        assert optuna_res["total_trials"] == 2
-        assert_direct_bundle_md_indexing("optuna_corpus", "optuna_index.db")
         assert not (offset_ws / ".yaw" / "dspy_corpus").exists()
-        assert not (offset_ws / ".yaw" / "optuna_corpus").exists()
-        assert (tmp_path / ".yaw" / "optuna_study.db").is_file()
-        assert set(optuna_res["best_params"]) == {"hybrid_alpha", "ppr_alpha", "seed_top_k"}
     finally:
         srv.shutdown()
 

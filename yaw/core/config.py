@@ -236,7 +236,7 @@ class YawConfig:
             raise _invalid("YawConfig(): optimize_datasets must not be empty")
 
     def for_optimization(self, db_override: Path | str | None = None) -> YawConfig:
-        """Derive an isolated configuration for prompt or retrieval optimization."""
+        """Derive an isolated configuration for DSPy prompt optimization."""
         base_dir = (Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")).parent
         if db_override is None:
             opt_db, status_name, prog_name = base_dir / "optimize_yaw.db", "dspy_status.json", "qa_program.json"
@@ -246,12 +246,9 @@ class YawConfig:
                 raise _invalid("for_optimization(): Optimization database path cannot be empty.")
             opt_db = _resolve_path(self.workspace_root, raw_path, raw_path, field_name="db_override")
             base_dir = opt_db.parent
-            if opt_db.stem == "optuna_index":
-                status_name, prog_name = "optuna_status.json", "qa_program.json"
-            else:
-                suffix = opt_db.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
-                status_name = f"optimize_status_{suffix}.json" if suffix else "dspy_status.json"
-                prog_name = f"optimize_program_{suffix}.json" if suffix else "qa_program.json"
+            suffix = opt_db.stem.removeprefix("optimize_yaw").removeprefix("yaw_optimize").lstrip("_")
+            status_name = f"optimize_status_{suffix}.json" if suffix else "dspy_status.json"
+            prog_name = f"optimize_program_{suffix}.json" if suffix else "qa_program.json"
         return replace(
             self,
             corpus_root=self.workspace_root,

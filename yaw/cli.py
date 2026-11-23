@@ -380,7 +380,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_qa = sub.add_parser("qa", parents=[common], help="Run ReAct multi-hop question answering")
     p_qa.add_argument("question", help="Question to answer")
 
-    p_opt = sub.add_parser("optimize", parents=[common], help="Optimize QA prompts or retrieval hyperparameters")
+    p_opt = sub.add_parser("optimize", parents=[common], help="Optimize QA prompts with GEPA")
     sub_opt = p_opt.add_subparsers(dest="optimize_cmd", required=True)
     p_dspy = sub_opt.add_parser("dspy", parents=[common], help="Compile bare ReAct QA instructions with GEPA")
     p_dspy.add_argument("--dataset", nargs="+", default=None, dest="datasets")
@@ -390,13 +390,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_dspy.add_argument("--max-metric-calls", type=int, default=None)
     p_dspy.add_argument("--threads", type=int, default=None)
     p_dspy.add_argument("--fresh", action="store_true", default=False)
-
-    p_optuna = sub_opt.add_parser("optuna", parents=[common], help="Tune retrieval hyperparameters with Optuna")
-    p_optuna.add_argument("--dataset", nargs="+", default=None, dest="datasets")
-    p_optuna.add_argument("--query-offset", type=int, default=None)
-    p_optuna.add_argument("--max-queries", type=int, default=None)
-    p_optuna.add_argument("--trials", type=int, default=None, help="Number of Optuna trials (default: 64)")
-    p_optuna.add_argument("--fresh", action="store_true", default=False)
 
     p_cfg = sub.add_parser("config", parents=[common], help="Inspect or update yaw.toml settings")
     sub_cfg = p_cfg.add_subparsers(dest="config_cmd", required=True)
@@ -454,28 +447,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cites = _format_passages_text(payload["citations"]) if payload["citations"] else ""
                     text = f"{payload['answer']}\n\n{cites}" if cites else payload["answer"]
                 else:
-                    from yaw.optimize import optimize_dspy, optimize_optuna
+                    from yaw.optimize import optimize_dspy
 
-                    if args.optimize_cmd == "dspy":
-                        payload = optimize_dspy(
-                            cfg,
-                            datasets=",".join(args.datasets) if args.datasets else None,
-                            max_queries=args.max_queries,
-                            query_offset=args.query_offset,
-                            auto=args.auto,
-                            max_metric_calls=args.max_metric_calls,
-                            threads=args.threads,
-                            fresh=args.fresh,
-                        )
-                    else:
-                        payload = optimize_optuna(
-                            cfg,
-                            datasets=",".join(args.datasets) if args.datasets else None,
-                            query_offset=args.query_offset,
-                            max_queries=args.max_queries,
-                            trials=args.trials,
-                            fresh=args.fresh,
-                        )
+                    payload = optimize_dspy(
+                        cfg,
+                        datasets=",".join(args.datasets) if args.datasets else None,
+                        max_queries=args.max_queries,
+                        query_offset=args.query_offset,
+                        auto=args.auto,
+                        max_metric_calls=args.max_metric_calls,
+                        threads=args.threads,
+                        fresh=args.fresh,
+                    )
                     text = json.dumps(payload, indent=2)
         _emit(payload, json_out=json_out, text=text)
         return 0

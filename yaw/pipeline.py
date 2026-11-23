@@ -1,11 +1,10 @@
-"""Declarative live CocoIndex v1 pipeline indexing chunks into SQLite vec0 and FTS5."""
+"""Declarative live CocoIndex v1 pipeline indexing IEEE float16 chunks, unicode61 FTS5, and SoA artifacts."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -18,13 +17,11 @@ from typing import Any, Literal, NamedTuple, cast
 import cocoindex as coco
 import dspy
 import numpy as np
-import sqlite_vec
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import localfs, sqlite
 from cocoindex.ops.code import CodeSource
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
-from cocoindex.resources import schema as coco_schema
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from numpy.typing import NDArray
 
@@ -36,27 +33,35 @@ from yaw.core import (
     inclusive_end_line,
     resolve_coco_state_root,
 )
-from yaw.retrieval import extract_text_features
+from yaw.retrieval import (
+    compute_db_fingerprints,
+    compute_index_artifacts,
+    normalize_fts_unicode61,
+)
 
 CORPUS_ROOT = coco.ContextKey[Path]("yaw/pipeline/corpus_root")
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/pipeline/sqlite_db")
 
-_CHUNK_AUXILIARY_COLS: list[str] = [
-    "rel_path",
-    "source_hash",
-    "start_line",
-    "end_line",
-    "char_start",
-    "char_end",
-    "ast_island_start",
-    "ast_island_end",
-    "title",
-    "tokens_json",
-    "entities_json",
-]
 _SPLITTER = RecursiveSplitter()
-_VEC0_DIM_RE = re.compile(r"\bfloat\[(\d+)\]", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FTS_MODE = "chunk_fts_u61_vocab"
+_RABITQ_COLS = frozenset(
+    {
+        "id",
+        "n_chunks",
+        "dim",
+        "embedding_model",
+        "task_mode",
+        "vec_sha256",
+        "source_sha256",
+        "n_words",
+        "codes_blob",
+        "ip_norm_blob",
+        "mean_blob",
+        "d_eff_shannon",
+    }
+)
+_CITATION_GRAPH_COLS = frozenset({"id", "n_chunks", "vec_sha256", "source_sha256", "doc_titles_blob", "graph_blob"})
 
 
 def _validate_identifier(name: str) -> str:
@@ -83,7 +88,11 @@ class _DspyBatchEmbedder:
         arr = np.asarray(raw, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
-        norms = np.maximum(np.linalg.norm(arr, axis=1, keepdims=True), 1e-12)
+        if arr.ndim != 2 or arr.shape[1] < 1 or not np.all(np.isfinite(arr)):
+            raise YawRuntimeError("MODEL_ERROR", "Embedder produced invalid or non-finite embedding array.")
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        if np.any(norms <= 1e-12):
+            raise YawRuntimeError("MODEL_ERROR", "Embedder produced zero-norm embedding vector.")
         return (arr / norms).astype(np.float32, copy=False)
 
     def __call__(self, texts: list[str]) -> NDArray[np.float32]:
@@ -94,52 +103,30 @@ class _DspyBatchEmbedder:
         return self._normalize_batch(raw)
 
 
-class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
-    """CocoIndex-native batching and VectorSchemaProvider adapter over a batch embed callable."""
+class _PipelineEmbedder:
+    """CocoIndex-native batching adapter over a batch embed callable."""
 
     def __init__(
         self,
         embed_fn: Callable[[list[str]], NDArray[np.float32]],
         *,
-        vector_dim: int | None = None,
         memo_key: object = None,
         batch_size: int,
         max_in_flight: int,
     ) -> None:
         self._embed_fn = embed_fn
-        self._dim = vector_dim
         self._memo_key = memo_key
-        self._dim_lock = asyncio.Lock()
+        self._dim: int | None = None
+        self._dim_lock = threading.Lock()
         self.embed = coco.fn.as_async(
             batching=True,
-            max_batch_size=batch_size,
-            max_in_flight=max_in_flight,
+            max_batch_size=max(1, batch_size),
+            max_in_flight=max(1, max_in_flight),
         )(self._embed_batch)
 
     async def invoke(self, texts: list[str]) -> NDArray[np.float32]:
         raw = await asyncio.to_thread(self._embed_fn, texts)
         return np.asarray(raw, dtype=np.float32)
-
-    def record_dim(self, dim: int) -> None:
-        if self._dim is None:
-            self._dim = dim
-        elif self._dim != dim:
-            raise ValueError(f"Inconsistent embedding dimension: expected {self._dim}, got {dim}")
-
-    async def _resolve_dim(self) -> int:
-        if self._dim is not None:
-            return self._dim
-        async with self._dim_lock:
-            if self._dim is None:
-                probe = await self.invoke(["dimension probe"])
-                if probe.ndim != 2 or probe.shape[1] < 1:
-                    raise ValueError(f"Invalid embedding dimension from probe shape {probe.shape}")
-                self._dim = int(probe.shape[1])
-            return self._dim
-
-    async def __coco_vector_schema__(self) -> coco_schema.VectorSchema:
-        dim = await self._resolve_dim()
-        return coco_schema.VectorSchema(dtype=np.dtype(np.float32), size=dim)
 
     def __coco_memo_key__(self) -> object:
         return self._memo_key
@@ -147,24 +134,36 @@ class _PipelineEmbedder(coco_schema.VectorSchemaProvider):
     async def _embed_batch(self, texts: list[str]) -> list[NDArray[np.float32]]:
         if not texts:
             return []
-        arr = np.ascontiguousarray(await self.invoke(texts), dtype="<f4")
+        arr = np.ascontiguousarray(await self.invoke(texts), dtype=np.float32)
+        if arr.ndim == 1 and len(texts) == 1:
+            arr = arr.reshape(1, -1)
         if arr.ndim != 2 or arr.shape[0] != len(texts) or arr.shape[1] < 1:
             if len(texts) > 1:
                 raise coco.RetryWithSmallerBatch()
-            raise ValueError(f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
-        self.record_dim(int(arr.shape[1]))
-        return [arr[i] for i in range(len(texts))]
+            raise YawRuntimeError("MODEL_ERROR", f"Expected ({len(texts)}, dim) embedding array, got {arr.shape}")
+        if not np.all(np.isfinite(arr)):
+            raise YawRuntimeError("MODEL_ERROR", "Embedder produced non-finite embedding values.")
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        if np.any(norms <= 1e-12):
+            raise YawRuntimeError("MODEL_ERROR", "Embedder produced zero-norm embedding vector.")
+        unit = (arr / norms).astype(np.float32, copy=False)
+        with self._dim_lock:
+            if self._dim is None:
+                self._dim = int(unit.shape[1])
+            elif self._dim != int(unit.shape[1]):
+                raise YawRuntimeError("MODEL_ERROR", f"Embedding dimension changed: {self._dim} != {unit.shape[1]}")
+        return [unit[i] for i in range(len(texts))]
 
 
 EMBEDDER = coco.ContextKey[_PipelineEmbedder]("yaw/pipeline/embedder", detect_change=True)
 
 
 @dataclass(frozen=True, slots=True)
-class ChunkVecRow:
-    """Row schema for the single sqlite-vec `chunks` virtual table."""
+class ChunkRow:
+    """Row schema for the plain SQLite `chunks` table storing IEEE float16 embeddings."""
 
     chunk_id: int
-    embedding: NDArray[np.float32]
+    embedding_f16: bytes
     rel_path: str
     source_hash: str
     start_line: int
@@ -174,13 +173,11 @@ class ChunkVecRow:
     ast_island_start: int
     ast_island_end: int
     title: str
-    tokens_json: str
-    entities_json: str
 
 
 @dataclass(frozen=True, slots=True)
 class SourceChunk:
-    """Deterministic file chunk ready for batched feature extraction and target declaration."""
+    """Deterministic file chunk ready for batched embedding and target declaration."""
 
     chunk_id: int
     rel_path: str
@@ -205,6 +202,7 @@ class _FtsTableAction:
     key: _FtsTableKey
     table_name: str
     action: statediff.DiffAction | None
+    desired_mode: str | coco.NonExistenceType
 
 
 @dataclass(frozen=True)
@@ -283,12 +281,17 @@ def _apply_fts_tables(context_provider: coco.ContextProvider, actions: Sequence[
             for act in db_actions:
                 table = _validate_identifier(act.table_name)
                 if act.action in ("delete", "replace"):
+                    conn.execute('DROP TABLE IF EXISTS "chunk_vocab"')
                     conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                if coco.is_non_existence(act.desired_mode):
+                    continue
                 if act.action in ("insert", "upsert", "replace"):
                     conn.execute(
                         f'CREATE VIRTUAL TABLE IF NOT EXISTS "{table}" '
-                        "USING fts5(title, body, content='', contentless_delete=1)"
+                        "USING fts5(title, body, content='', contentless_delete=1, "
+                        "tokenize='unicode61 remove_diacritics 1')"
                     )
+                    conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS \"chunk_vocab\" USING fts5vocab({table}, 'row')")
 
 
 _FTS_TABLE_SINK = coco.TargetActionSink[_FtsTableAction].from_fn(
@@ -312,7 +315,7 @@ class _FtsTableHandler(coco.TargetHandler[str, str, _FtsRowHandler]):
         action = statediff.diff(statediff.TrackingRecordTransition(desired, prev_possible_records, prev_may_be_missing))
         invalid: Literal["destructive"] | None = "destructive" if action in ("delete", "replace") else None
         return coco.TargetReconcileOutput[_FtsTableAction, str, _FtsRowHandler](
-            action=_FtsTableAction(t_key, t_key.table_name, action),
+            action=_FtsTableAction(t_key, t_key.table_name, action, desired),
             sink=_FTS_TABLE_SINK,
             tracking_record=desired,
             child_invalidation=invalid,
@@ -323,10 +326,10 @@ _FTS_TABLES = coco.register_root_target_states_provider("yaw/pipeline/fts5", _Ft
 
 
 def open_managed_db(db_path: Path | str) -> sqlite.ManagedConnection:
-    """Open CocoIndex ManagedConnection with sqlite-vec loaded and WAL configured."""
+    """Open CocoIndex ManagedConnection with WAL configured and no vector extensions."""
     target = Path(db_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    conn_mgr = sqlite.connect(target, timeout=30.0, load_vec=True)
+    conn_mgr = sqlite.connect(target, timeout=30.0, load_vec=False)
     with conn_mgr.readonly() as conn:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -337,15 +340,6 @@ def open_managed_db(db_path: Path | str) -> sqlite.ManagedConnection:
 def make_dspy_embed_fn(cfg: YawConfig) -> Callable[[list[str]], NDArray[np.float32]]:
     """Build a native DSPy batch embedder preserving each input unchanged."""
     return _DspyBatchEmbedder(cfg)
-
-
-def _detect_existing_vec_dim(conn_mgr: sqlite.ManagedConnection) -> int | None:
-    with conn_mgr.readonly() as conn:
-        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
-    if row is None or not row[0]:
-        return None
-    m = _VEC0_DIM_RE.search(str(row[0]))
-    return int(m.group(1)) if m is not None else None
 
 
 def chunk_file_content(
@@ -384,30 +378,22 @@ def chunk_file_content(
 
 
 # Keyed strictly by content (title, body) so line shifts or file moves reuse CocoIndex LMDB memos.
-@coco.fn(memo=True, version=3)
-async def _compute_chunk_features(
+@coco.fn(memo=True, version=4)
+async def _compute_chunk_embedding(
     title_body: tuple[str, str],
     task_mode: str,
     embedder: _PipelineEmbedder,
-) -> tuple[NDArray[np.float32], str, str]:
+) -> bytes:
     title, body = title_body
     formatted = format_doc_for_embedding(body, title=title, task_mode=task_mode)
-
-    def _nlp_features() -> tuple[str, str]:
-        terms, ents = extract_text_features(title, body)
-        return json.dumps(terms, ensure_ascii=False), json.dumps(list(ents), ensure_ascii=False)
-
-    vec, (tokens_json, entities_json) = await asyncio.gather(
-        embedder.embed(formatted),
-        asyncio.to_thread(_nlp_features),
-    )
-    return vec, tokens_json, entities_json
+    vec = await embedder.embed(formatted)
+    return np.asarray(vec, dtype="<f2").tobytes()
 
 
-@coco.fn(memo=True, version=5)
+@coco.fn(memo=True, version=6)
 async def _process_file(
     file: FileLike[Any],
-    chunks_target: sqlite.TableTarget[ChunkVecRow],
+    chunks_target: sqlite.TableTarget[ChunkRow],
     fts_target: coco.TargetStateProvider[tuple[str, str] | coco.NonExistenceType, None],
     embedder: _PipelineEmbedder,
     chunk_size: int,
@@ -424,13 +410,14 @@ async def _process_file(
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
     )
-    feats = await coco.map(_compute_chunk_features, [(p.title, p.body) for p in pieces], task_mode, embedder)
-    for piece, (vec, tokens_json, entities_json) in zip(pieces, feats, strict=True):
-        vec_arr = np.asarray(vec, dtype=np.float32)
+    if not pieces:
+        return 0
+    embeddings_f16 = await coco.map(_compute_chunk_embedding, [(p.title, p.body) for p in pieces], task_mode, embedder)
+    for piece, emb_f16 in zip(pieces, embeddings_f16, strict=True):
         chunks_target.declare_row(
-            row=ChunkVecRow(
+            row=ChunkRow(
                 chunk_id=piece.chunk_id,
-                embedding=vec_arr,
+                embedding_f16=bytes(emb_f16),
                 rel_path=piece.rel_path,
                 source_hash=piece.source_hash,
                 start_line=piece.start_line,
@@ -440,11 +427,14 @@ async def _process_file(
                 ast_island_start=piece.ast_island_start,
                 ast_island_end=piece.ast_island_end,
                 title=piece.title,
-                tokens_json=tokens_json,
-                entities_json=entities_json,
             )
         )
-        coco.declare_target_state(fts_target.target_state((piece.chunk_id,), (piece.title, piece.body)))
+        coco.declare_target_state(
+            fts_target.target_state(
+                (piece.chunk_id,),
+                (normalize_fts_unicode61(piece.title), normalize_fts_unicode61(piece.body)),
+            )
+        )
     return len(pieces)
 
 
@@ -459,27 +449,9 @@ async def _indexing_main(
     live: bool,
 ) -> None:
     embedder = coco.use_context(EMBEDDER)
-    vector_schema = await embedder.__coco_vector_schema__()
-    vector_dim = vector_schema.size
-    schema = await sqlite.TableSchema[ChunkVecRow].from_class(
-        ChunkVecRow,
-        primary_key=["chunk_id"],
-        column_overrides={
-            "embedding": sqlite.SqliteType(
-                f"float[{vector_dim}] distance_metric=cosine",
-                sqlite_vec.serialize_float32,
-            )
-        },
-    )
-    chunks_target = await sqlite.mount_table_target(
-        SQLITE_DB,
-        "chunks",
-        schema,
-        virtual_table_def=sqlite.Vec0TableDef(auxiliary_columns=list(_CHUNK_AUXILIARY_COLS)),
-    )
-    fts_target = await coco.mount_target(
-        _FTS_TABLES.target_state(_FtsTableKey(SQLITE_DB.key, "chunk_fts"), "chunk_fts")
-    )
+    schema = await sqlite.TableSchema[ChunkRow].from_class(ChunkRow, primary_key=["chunk_id"])
+    chunks_target = await sqlite.mount_table_target(SQLITE_DB, "chunks", schema)
+    fts_target = await coco.mount_target(_FTS_TABLES.target_state(_FtsTableKey(SQLITE_DB.key, "chunk_fts"), _FTS_MODE))
     matcher = PatternFilePathMatcher(
         included_patterns=list(included_patterns),
         excluded_patterns=list(excluded_patterns),
@@ -500,6 +472,134 @@ async def _indexing_main(
         await mount_handle.ready()
 
 
+def _create_index_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS "rabitq_index" (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            n_chunks INTEGER NOT NULL,
+            dim INTEGER NOT NULL,
+            embedding_model TEXT NOT NULL,
+            task_mode TEXT NOT NULL,
+            vec_sha256 TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            n_words INTEGER NOT NULL,
+            codes_blob BLOB NOT NULL,
+            ip_norm_blob BLOB NOT NULL,
+            mean_blob BLOB NOT NULL,
+            d_eff_shannon REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS "citation_graph" (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            n_chunks INTEGER NOT NULL,
+            vec_sha256 TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            doc_titles_blob BLOB NOT NULL,
+            graph_blob BLOB NOT NULL
+        )
+        """
+    )
+
+
+def reconcile_index_tables(
+    conn_mgr: sqlite.ManagedConnection,
+    *,
+    embedding_model: str,
+    task_mode: str,
+    corpus_root: Path | None = None,
+) -> bool:
+    """Optimize FTS5 and materialize single-row `rabitq_index` + `citation_graph` when chunks change."""
+    with conn_mgr.readonly() as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
+            return False
+        n, dim, vec_sha, src_sha, rows = compute_db_fingerprints(conn)
+        r_cols = {str(r[1]) for r in conn.execute('PRAGMA table_info("rabitq_index")').fetchall()}
+        g_cols = {str(r[1]) for r in conn.execute('PRAGMA table_info("citation_graph")').fetchall()}
+        schema_ok = _RABITQ_COLS.issubset(r_cols) and _CITATION_GRAPH_COLS.issubset(g_cols)
+        if schema_ok:
+            if n == 0:
+                has_r = conn.execute('SELECT 1 FROM "rabitq_index" WHERE id = 1').fetchone() is not None
+                has_g = conn.execute('SELECT 1 FROM "citation_graph" WHERE id = 1').fetchone() is not None
+                if not has_r and not has_g:
+                    return False
+            else:
+                r_row = conn.execute(
+                    "SELECT n_chunks, dim, embedding_model, task_mode, vec_sha256, source_sha256, "
+                    'length(codes_blob), length(ip_norm_blob), length(mean_blob) FROM "rabitq_index" WHERE id = 1'
+                ).fetchone()
+                g_row = conn.execute(
+                    "SELECT n_chunks, vec_sha256, source_sha256, length(doc_titles_blob), length(graph_blob) "
+                    'FROM "citation_graph" WHERE id = 1'
+                ).fetchone()
+                if (
+                    r_row is not None
+                    and g_row is not None
+                    and tuple(r_row[:6]) == (n, dim, embedding_model, task_mode, vec_sha, src_sha)
+                    and tuple(g_row[:3]) == (n, vec_sha, src_sha)
+                    and min(int(r_row[6]), int(r_row[7]), int(r_row[8]), int(g_row[3]), int(g_row[4])) > 0
+                ):
+                    return False
+
+    if n == 0:
+        with conn_mgr.transaction() as conn:
+            _create_index_tables(conn)
+            r_del = conn.execute('DELETE FROM "rabitq_index" WHERE id = 1').rowcount
+            g_del = conn.execute('DELETE FROM "citation_graph" WHERE id = 1').rowcount
+        return bool((r_del or 0) + (g_del or 0))
+
+    artifacts = compute_index_artifacts(rows, corpus_root)
+    with conn_mgr.transaction() as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_fts'").fetchone() is not None:
+            conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize')")
+        cur_r_cols = {str(r[1]) for r in conn.execute('PRAGMA table_info("rabitq_index")').fetchall()}
+        if cur_r_cols and not _RABITQ_COLS.issubset(cur_r_cols):
+            conn.execute('DROP TABLE IF EXISTS "rabitq_index"')
+        cur_g_cols = {str(r[1]) for r in conn.execute('PRAGMA table_info("citation_graph")').fetchall()}
+        if cur_g_cols and not _CITATION_GRAPH_COLS.issubset(cur_g_cols):
+            conn.execute('DROP TABLE IF EXISTS "citation_graph"')
+        _create_index_tables(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO "rabitq_index" (
+                id, n_chunks, dim, embedding_model, task_mode, vec_sha256, source_sha256,
+                n_words, codes_blob, ip_norm_blob, mean_blob, d_eff_shannon
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifacts.n_chunks,
+                artifacts.dim,
+                embedding_model,
+                task_mode,
+                artifacts.vec_sha256,
+                artifacts.source_sha256,
+                artifacts.n_words,
+                artifacts.codes_blob,
+                artifacts.ip_norm_blob,
+                artifacts.mean_blob,
+                artifacts.d_eff_shannon,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO "citation_graph" (
+                id, n_chunks, vec_sha256, source_sha256, doc_titles_blob, graph_blob
+            ) VALUES (1, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifacts.n_chunks,
+                artifacts.vec_sha256,
+                artifacts.source_sha256,
+                artifacts.doc_titles_blob,
+                artifacts.graph_blob,
+            ),
+        )
+    return True
+
+
 @dataclass(slots=True)
 class PipelineSession:
     """Handle bundle owning a CocoIndex Environment, worker thread/loop, and SQLite connection."""
@@ -507,6 +607,8 @@ class PipelineSession:
     db_path: Path
     state_dir: Path
     corpus_root: Path
+    embedding_model: str
+    task_mode: str
     env: coco.Environment
     app: coco.App[Any, Any]
     conn_mgr: sqlite.ManagedConnection
@@ -538,6 +640,13 @@ async def _watch_pipeline(
                     break
                 continue
             if snap.status.name == "READY":
+                await asyncio.to_thread(
+                    reconcile_index_tables,
+                    session.conn_mgr,
+                    embedding_model=session.embedding_model,
+                    task_mode=session.task_mode,
+                    corpus_root=session.corpus_root,
+                )
                 session.ready_event.set()
         if had_errors and session.error is None:
             session.error = YawRuntimeError(
@@ -562,7 +671,6 @@ def start_pipeline(
     cfg: YawConfig,
     *,
     embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
-    vector_dim: int | None = None,
     live: bool = True,
     app_name: str | None = None,
 ) -> PipelineSession:
@@ -576,11 +684,6 @@ def start_pipeline(
 
     active_embed = embed_fn or make_dspy_embed_fn(cfg)
     conn_mgr = open_managed_db(db_path)
-    try:
-        known_dim = vector_dim or _detect_existing_vec_dim(conn_mgr)
-    except Exception:
-        conn_mgr.close()
-        raise
 
     os.environ.setdefault("COCOINDEX_BANNER", "false")
     ready_event = threading.Event()
@@ -607,7 +710,6 @@ def start_pipeline(
         memo_key = (*base_memo, "custom", custom_id)
     embedder = _PipelineEmbedder(
         active_embed,
-        vector_dim=known_dim,
         memo_key=memo_key,
         batch_size=cfg.embed_batch_size,
         max_in_flight=cfg.embed_max_in_flight,
@@ -644,6 +746,8 @@ def start_pipeline(
                 db_path=db_path,
                 state_dir=state_dir,
                 corpus_root=corpus_root,
+                embedding_model=cfg.embedding_model,
+                task_mode=cfg.embedding_task_mode,
                 env=env,
                 app=app,
                 conn_mgr=conn_mgr,
@@ -713,17 +817,23 @@ def start_pipeline(
 
 
 def update_pipeline_once(session: PipelineSession) -> None:
-    """Execute one catch-up CocoIndex update synchronously (for non-live batch sessions)."""
+    """Execute one catch-up CocoIndex update synchronously and reconcile persisted index tables."""
     if session.error is not None:
         raise session.error
     session.app.update_blocking(live=False)
     if session.error is not None:
         raise session.error
+    reconcile_index_tables(
+        session.conn_mgr,
+        embedding_model=session.embedding_model,
+        task_mode=session.task_mode,
+        corpus_root=session.corpus_root,
+    )
     session.ready_event.set()
 
 
 def wait_pipeline_ready(session: PipelineSession, timeout: float = 30.0) -> bool:
-    """Block until initial CocoIndex catch-up finishes; re-raises live watcher failures."""
+    """Block until initial CocoIndex catch-up and reconciliation finish; re-raises live watcher failures."""
     ready = session.ready_event.wait(timeout=timeout)
     if session.error is not None:
         raise session.error
@@ -748,10 +858,10 @@ def close_pipeline(session: PipelineSession) -> None:
 
 
 def list_user_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
-    """Return top-level logical tables in yaw.db excluding sqlite-vec and fts5 internal shadow tables."""
+    """Return top-level logical tables in yaw.db excluding FTS5 and SQLite internal shadow tables."""
     rows = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
     logical: list[str] = []
-    shadow_prefixes = ("chunks_", "chunk_fts_", "sqlite_")
+    shadow_prefixes = ("chunk_fts_", "sqlite_")
     for name, _ in rows:
         name_s = str(name)
         if not name_s.startswith(shadow_prefixes):

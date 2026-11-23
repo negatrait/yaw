@@ -205,7 +205,7 @@ def create_mcp_app(
         query: Annotated[str, Field(min_length=1)],
         top_k: Annotated[int, Field(ge=1, le=20)] = 5,
     ) -> dict[str, Any]:
-        """Retrieve ranked disk-hydrated corpus passages using zero-LLM VectorSearch."""
+        """Retrieve ranked disk-hydrated corpus passages using zero-LLM RetrievalIndex."""
         if (active := holder["rt"]) is None:
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:

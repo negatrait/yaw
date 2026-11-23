@@ -1,4 +1,4 @@
-"""Unmocked integration tests for declarative CocoIndex sqlite-vec + FTS5 pipeline."""
+"""Unmocked integration tests for declarative CocoIndex 5-table SQLite, unicode61 FTS5, and SoA RaBitQ pipeline."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from typing import Any
 
 import numpy as np
 import pytest
-import sqlite_vec
 from cocoindex.ops.code import CodeSource
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from numpy.typing import NDArray
@@ -34,11 +33,12 @@ from yaw.pipeline import (
     close_pipeline,
     list_user_tables,
     make_dspy_embed_fn,
+    reconcile_index_tables,
     start_pipeline,
     update_pipeline_once,
     wait_pipeline_ready,
 )
-from yaw.retrieval import hydrate_passage
+from yaw.retrieval import hydrate_passage, open_readonly_db
 
 
 def _hash_embed(texts: list[str], *, dim: int = 16) -> NDArray[np.float32]:
@@ -75,15 +75,10 @@ def _make_cfg(
 
 
 def _open_ro(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, check_same_thread=False)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+    return open_readonly_db(db_path)
 
 
-def test_declarative_two_table_schema_edit_and_delete(tmp_path: Path) -> None:
+def test_declarative_five_table_schema_edit_and_delete(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
     corpus = cfg.corpus_root
     assert corpus is not None and cfg.db_path is not None
@@ -96,35 +91,88 @@ def test_declarative_two_table_schema_edit_and_delete(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=16), vector_dim=16, live=False)
+    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=16), live=False)
     try:
         update_pipeline_once(session)
         with _open_ro(cfg.db_path) as conn:
-            assert list_user_tables(conn) == ("chunk_fts", "chunks")
+            assert list_user_tables(conn) == (
+                "chunk_fts",
+                "chunk_vocab",
+                "chunks",
+                "citation_graph",
+                "rabitq_index",
+            )
+            all_names = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master").fetchall()}
+            assert "yaw_stage1" not in all_names
             ddl = str(conn.execute("SELECT sql FROM sqlite_master WHERE name='chunks'").fetchone()[0])
-            assert "distance_metric=cosine" in ddl
+            assert "vec0" not in ddl.lower()
+            cols = {str(r[1]) for r in conn.execute('PRAGMA table_info("chunks")').fetchall()}
+            assert cols == {
+                "chunk_id",
+                "embedding_f16",
+                "rel_path",
+                "source_hash",
+                "start_line",
+                "end_line",
+                "char_start",
+                "char_end",
+                "ast_island_start",
+                "ast_island_end",
+                "title",
+            }
+            assert "tokens_json" not in cols and "entities_json" not in cols
+
+            fts_ddl = str(conn.execute("SELECT sql FROM sqlite_master WHERE name='chunk_fts'").fetchone()[0])
+            assert "unicode61 remove_diacritics 1" in fts_ddl
+
             rows = conn.execute(
-                "SELECT chunk_id, rel_path, source_hash, start_line, end_line, title, tokens_json, entities_json "
+                "SELECT chunk_id, embedding_f16, rel_path, source_hash, start_line, end_line, title "
                 "FROM chunks ORDER BY rel_path"
             ).fetchall()
             assert len(rows) == 2
-            fts_count = conn.execute("SELECT count(*) FROM chunk_fts").fetchone()[0]
-            assert fts_count == 2
+            assert conn.execute("SELECT count(*) FROM chunk_fts").fetchone()[0] == 2
 
-            # Verify FTS5 BM25 query and vec0 cosine KNN query work on the same integer chunk_id
+            # Verify IEEE <f2> float16 LE blob round-trip matches embedded unit vector
+            raw_a = doc_a.read_text(encoding="utf-8")
+            expected_f16 = _hash_embed([f"title: none | text: {raw_a.strip()}"], dim=16)[0].astype("<f2").tobytes()
+            assert bytes(rows[0][1]) == expected_f16
+            vec_a = np.frombuffer(bytes(rows[0][1]), dtype="<f2").astype(np.float32)
+            assert vec_a.shape == (16,) and np.all(np.isfinite(vec_a))
+            assert abs(float(np.linalg.norm(vec_a)) - 1.0) < 5e-3
+
+            # Verify FTS5 + fts5vocab + single-row rabitq_index & citation_graph
             fts_hits = conn.execute("SELECT rowid, title FROM chunk_fts WHERE chunk_fts MATCH 'lunar'").fetchall()
-            assert len(fts_hits) == 1
-            alpha_cid = rows[0][0]
-            assert fts_hits[0][0] == alpha_cid
-            q_vec = _hash_embed([format_query_for_embedding("lunar rovers", "distinct-titled")], dim=16)[0]
-            knn_hits = conn.execute(
-                "SELECT chunk_id, distance FROM chunks WHERE embedding MATCH ? AND k = 2",
-                (sqlite_vec.serialize_float32(q_vec.tolist()),),
-            ).fetchall()
-            assert len(knn_hits) == 2
-            assert {r[0] for r in rows} == {h[0] for h in knn_hits}
+            assert [r[0] for r in fts_hits] == [rows[0][0]]
+            vocab_row = conn.execute("SELECT doc FROM chunk_vocab WHERE term = 'lunar'").fetchone()
+            assert vocab_row is not None and int(vocab_row[0]) == 1
 
-        # Mutate doc_a and unlink doc_b -> assert clean reconciliation
+            r_row = conn.execute(
+                "SELECT n_chunks, dim, embedding_model, task_mode, n_words, "
+                "length(codes_blob), length(ip_norm_blob), length(mean_blob), d_eff_shannon "
+                "FROM rabitq_index WHERE id = 1"
+            ).fetchone()
+            assert r_row is not None
+            assert tuple(r_row[:5]) == (2, 16, cfg.embedding_model, cfg.embedding_task_mode, 1)
+            assert tuple(r_row[5:8]) == (8 * 2, 4 * 2, 16 * 4)
+            assert float(r_row[8]) >= 2.0
+
+            g_row = conn.execute(
+                "SELECT n_chunks, length(doc_titles_blob), length(graph_blob) FROM citation_graph WHERE id = 1"
+            ).fetchone()
+            assert g_row is not None and g_row[0] == 2 and g_row[1] > 0 and g_row[2] > 0
+
+        # Idempotent reconciliation emits False when chunks have not changed
+        assert (
+            reconcile_index_tables(
+                session.conn_mgr,
+                embedding_model=cfg.embedding_model,
+                task_mode=cfg.embedding_task_mode,
+                corpus_root=corpus,
+            )
+            is False
+        )
+
+        # Mutate doc_a and unlink doc_b -> assert clean reconciliation across all 5 tables
         doc_a.write_text("# Alpha System\nTitanium thrusters propel orbital tugs smoothly.\n", encoding="utf-8")
         doc_b.unlink()
         update_pipeline_once(session)
@@ -137,6 +185,16 @@ def test_declarative_two_table_schema_edit_and_delete(tmp_path: Path) -> None:
             assert conn.execute("SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'lunar'").fetchall() == []
             thruster_hits = conn.execute("SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'thrusters'").fetchall()
             assert [r[0] for r in thruster_hits] == [rows_after[0][0]]
+            assert conn.execute("SELECT n_chunks FROM rabitq_index WHERE id = 1").fetchone()[0] == 1
+            assert conn.execute("SELECT n_chunks FROM citation_graph WHERE id = 1").fetchone()[0] == 1
+
+        # Deleting remaining file clears chunks, rabitq_index, and citation_graph cleanly
+        doc_a.unlink()
+        update_pipeline_once(session)
+        with _open_ro(cfg.db_path) as conn:
+            assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM rabitq_index").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM citation_graph").fetchone()[0] == 0
     finally:
         close_pipeline(session)
 
@@ -155,7 +213,7 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
 
     def tracked_embed(texts: list[str]) -> NDArray[np.float32]:
         batch_sizes_seen.append(len(texts))
-        return _hash_embed(texts, dim=12)
+        return _hash_embed(texts, dim=70)
 
     docs = [
         (f"doc_{i:03d}.md", f"# Note {i}\nEntity{i} collaborates with Laboratory{i} in sector {i % 7}.\n")
@@ -166,7 +224,7 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
     for name, body in docs:
         (cfg_b.corpus_root / name).write_text(body, encoding="utf-8")
 
-    sess_a = start_pipeline(cfg_a, embed_fn=tracked_embed, vector_dim=12, live=False)
+    sess_a = start_pipeline(cfg_a, embed_fn=tracked_embed, live=False)
     try:
         update_pipeline_once(sess_a)
         for name, body in docs[64:]:
@@ -175,7 +233,7 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
     finally:
         close_pipeline(sess_a)
 
-    sess_b = start_pipeline(cfg_b, embed_fn=tracked_embed, vector_dim=12, live=False)
+    sess_b = start_pipeline(cfg_b, embed_fn=tracked_embed, live=False)
     try:
         update_pipeline_once(sess_b)
     finally:
@@ -185,8 +243,8 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
 
     with _open_ro(cfg_a.db_path) as conn_a, _open_ro(cfg_b.db_path) as conn_b:
         sel = (
-            "SELECT chunk_id, embedding, rel_path, source_hash, start_line, end_line, "
-            "char_start, char_end, ast_island_start, ast_island_end, title, tokens_json, entities_json "
+            "SELECT chunk_id, embedding_f16, rel_path, source_hash, start_line, end_line, "
+            "char_start, char_end, ast_island_start, ast_island_end, title "
             "FROM chunks ORDER BY chunk_id"
         )
         rows_a = conn_a.execute(sel).fetchall()
@@ -203,6 +261,20 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
         assert len(fts_a) == 128
         assert fts_a == fts_b
 
+        vocab_a = conn_a.execute("SELECT term, doc, cnt FROM chunk_vocab ORDER BY term").fetchall()
+        vocab_b = conn_b.execute("SELECT term, doc, cnt FROM chunk_vocab ORDER BY term").fetchall()
+        assert vocab_a == vocab_b
+
+        rab_a = conn_a.execute("SELECT * FROM rabitq_index").fetchall()
+        rab_b = conn_b.execute("SELECT * FROM rabitq_index").fetchall()
+        assert len(rab_a) == 1 and rab_a == rab_b
+        assert rab_a[0][1] == 128 and rab_a[0][2] == 70 and rab_a[0][7] == 2  # n_words == (70 + 63) // 64
+        assert len(bytes(rab_a[0][8])) == 2 * 8 * 128
+
+        cg_a = conn_a.execute("SELECT * FROM citation_graph").fetchall()
+        cg_b = conn_b.execute("SELECT * FROM citation_graph").fetchall()
+        assert len(cg_a) == 1 and cg_a == cg_b
+
 
 def test_live_mode_reconciles_disk_changes_and_allows_concurrent_wal_reads(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
@@ -210,7 +282,7 @@ def test_live_mode_reconciles_disk_changes_and_allows_concurrent_wal_reads(tmp_p
     cfg.corpus_root.mkdir(parents=True)
     (cfg.corpus_root / "seed.md").write_text("# Seed\nInitial quartz oscillator specification.\n", encoding="utf-8")
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), vector_dim=8, live=True)
+    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
     try:
         assert wait_pipeline_ready(session, timeout=20.0)
         with _open_ro(cfg.db_path) as reader:
@@ -293,14 +365,14 @@ def test_loopback_dspy_embedder_pipeline(tmp_path: Path) -> None:
         (cfg.corpus_root / "note.md").write_text("# Photonic Core\nOptical waveguide routing.\n", encoding="utf-8")
 
         embed_fn = make_dspy_embed_fn(cfg)
-        session = start_pipeline(cfg, embed_fn=embed_fn, vector_dim=10, live=False)
+        session = start_pipeline(cfg, embed_fn=embed_fn, live=False)
         try:
             update_pipeline_once(session)
             assert any(s.startswith("title: none | text: # Photonic Core\n") for s in seen_inputs)
             with _open_ro(cfg.db_path) as conn:
-                blob = conn.execute("SELECT embedding FROM chunks").fetchone()[0]
-                vec = np.frombuffer(blob, dtype=np.float32)
-                assert abs(float(np.linalg.norm(vec)) - 1.0) < 1e-5
+                blob = conn.execute("SELECT embedding_f16 FROM chunks").fetchone()[0]
+                vec = np.frombuffer(blob, dtype="<f2").astype(np.float32)
+                assert abs(float(np.linalg.norm(vec)) - 1.0) < 5e-3
         finally:
             close_pipeline(session)
     finally:
@@ -318,7 +390,7 @@ def test_batch_pipeline_propagates_component_failures(tmp_path: Path) -> None:
         _ = texts
         raise RuntimeError("Embedder exploded in batch mode")
 
-    session = start_pipeline(cfg, embed_fn=failing_embed, vector_dim=4, live=False)
+    session = start_pipeline(cfg, embed_fn=failing_embed, live=False)
     try:
         with pytest.raises(RuntimeError, match="Embedder exploded in batch mode"):
             update_pipeline_once(session)
@@ -337,7 +409,7 @@ def test_live_pipeline_propagates_component_failures(tmp_path: Path, capfd: pyte
         raise RuntimeError("Model server is down 503")
 
     capfd.readouterr()
-    session = start_pipeline(cfg, embed_fn=failing_embed, vector_dim=4, live=True)
+    session = start_pipeline(cfg, embed_fn=failing_embed, live=True)
     try:
         with pytest.raises(RuntimeError, match="Model server is down 503"):
             wait_pipeline_ready(session, timeout=10.0)
@@ -366,7 +438,7 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(
         return _hash_embed(texts, dim=4)
 
     capfd.readouterr()
-    session = start_pipeline(cfg, embed_fn=flaky_embed, vector_dim=4, live=True)
+    session = start_pipeline(cfg, embed_fn=flaky_embed, live=True)
     try:
         assert wait_pipeline_ready(session, timeout=15.0)
         (cfg.corpus_root / "beta.md").write_text("# Beta\nTriggers second embed call.\n", encoding="utf-8")
@@ -394,6 +466,7 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
         "open_managed_db",
         "make_dspy_embed_fn",
         "chunk_file_content",
+        "reconcile_index_tables",
         "start_pipeline",
         "update_pipeline_once",
         "wait_pipeline_ready",
@@ -417,7 +490,7 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
     (cfg.corpus_root / "seed.md").write_text("# Seed\nInitial content.\n", encoding="utf-8")
     capfd.readouterr()
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), vector_dim=8, live=True)
+    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
     try:
         assert wait_pipeline_ready(session, timeout=20.0)
         churn = cfg.corpus_root / "churn.md"
@@ -452,7 +525,7 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
         "(cfg.corpus_root / 'seed.md').write_text('# Seed\\nInitial.\\n', encoding='utf-8')\n"
         "def emb(ts):\n"
         "    return np.ones((len(ts), 8), dtype=np.float32) / np.sqrt(8.0)\n"
-        "sess = start_pipeline(cfg, embed_fn=emb, vector_dim=8, live=True)\n"
+        "sess = start_pipeline(cfg, embed_fn=emb, live=True)\n"
         "try:\n"
         "    assert wait_pipeline_ready(sess, timeout=20.0)\n"
         "    churn = cfg.corpus_root / 'churn.md'\n"
@@ -477,8 +550,8 @@ def test_concurrent_live_sessions_isolated_on_close(tmp_path: Path) -> None:
     (cfg_a.corpus_root / "a1.md").write_text("# Session A\nAlpha session seed.\n", encoding="utf-8")
     (cfg_b.corpus_root / "b1.md").write_text("# Session B\nBeta session seed.\n", encoding="utf-8")
 
-    sa = start_pipeline(cfg_a, embed_fn=lambda ts: _hash_embed(ts, dim=8), vector_dim=8, live=True)
-    sb = start_pipeline(cfg_b, embed_fn=lambda ts: _hash_embed(ts, dim=8), vector_dim=8, live=True)
+    sa = start_pipeline(cfg_a, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
+    sb = start_pipeline(cfg_b, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
     try:
         assert wait_pipeline_ready(sa, timeout=20.0)
         assert wait_pipeline_ready(sb, timeout=20.0)
@@ -516,7 +589,7 @@ def test_live_pipeline_inside_asyncio_run_uses_dedicated_loop(tmp_path: Path) ->
 
     async def _exercise() -> float:
         caller_loop = asyncio.get_running_loop()
-        sess = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), vector_dim=8, live=True)
+        sess = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
         try:
             assert sess.env.event_loop is not caller_loop
             assert wait_pipeline_ready(sess, timeout=20.0)
@@ -549,7 +622,7 @@ def test_memo_hit_and_cross_file_batching(tmp_path: Path) -> None:
         time.sleep(0.05)
         return _hash_embed(texts, dim=8)
 
-    sess = start_pipeline(cfg, embed_fn=tracked_embed, vector_dim=8, live=False)
+    sess = start_pipeline(cfg, embed_fn=tracked_embed, live=False)
     try:
         update_pipeline_once(sess)
         assert sum(batch_sizes) == 10
@@ -558,7 +631,7 @@ def test_memo_hit_and_cross_file_batching(tmp_path: Path) -> None:
         assert max(batch_sizes) <= cfg.embed_batch_size
 
         with _open_ro(cfg.db_path) as conn:
-            sel = "SELECT chunk_id, embedding, rel_path FROM chunks ORDER BY chunk_id"
+            sel = "SELECT chunk_id, embedding_f16, rel_path FROM chunks ORDER BY chunk_id"
             rows_before = conn.execute(sel).fetchall()
             fts_before = conn.execute(
                 "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'batching' ORDER BY rowid"
@@ -790,7 +863,7 @@ def test_native_pipeline_batch_size_is_configured(tmp_path: Path, batch_size: in
             chunk_overlap=cfg.chunk_overlap,
             min_chunk_size=cfg.min_chunk_size,
         )
-        session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), vector_dim=8, live=False)
+        session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), live=False)
         try:
             update_pipeline_once(session)
             with _open_ro(cfg.db_path) as conn:
@@ -830,7 +903,7 @@ def test_batch_size_changes_only_http_grouping_not_chunks(tmp_path: Path) -> Non
                     f"Section {i}: " + "Distinct evidence with café, 漢字 and 🧠. " * 20 for i in range(24)
                 )
                 (cfg.corpus_root / f"{title}.md").write_text(f"# {title}\n\n{body}", encoding="utf-8")
-            session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), vector_dim=8, live=False)
+            session = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), live=False)
             try:
                 update_pipeline_once(session)
                 with _open_ro(cfg.db_path) as conn:
@@ -879,7 +952,7 @@ def test_http_concurrency_is_shared_by_queries_and_ingestion(tmp_path: Path, max
         for i in range(8):
             (cfg.corpus_root / f"note{i}.txt").write_text(f"Routing example {i}.\n", encoding="utf-8")
         embed = make_dspy_embed_fn(cfg)
-        session = start_pipeline(cfg, embed_fn=embed, vector_dim=8, live=False)
+        session = start_pipeline(cfg, embed_fn=embed, live=False)
         try:
             with ThreadPoolExecutor(max_workers=5) as pool:
                 futures = [pool.submit(update_pipeline_once, session)]
@@ -922,8 +995,9 @@ def test_model_change_invalidates_memo_cache(tmp_path: Path) -> None:
         calls_a = [c for c in seen_calls if "model-a" in c[0] and any("waveguide" in t for t in c[1])]
         assert len(calls_a) == 1
         with _open_ro(cfg_a.db_path) as conn:
-            blob_a = conn.execute("SELECT embedding FROM chunks").fetchone()[0]
-            assert np.allclose(np.frombuffer(blob_a, dtype=np.float32), [1.0, 0.0, 0.0, 0.0], atol=1e-5)
+            blob_a = conn.execute("SELECT embedding_f16 FROM chunks").fetchone()[0]
+            assert np.allclose(np.frombuffer(blob_a, dtype="<f2").astype(np.float32), [1.0, 0.0, 0.0, 0.0], atol=1e-3)
+            assert conn.execute("SELECT embedding_model FROM rabitq_index WHERE id = 1").fetchone()[0] == "model-a"
 
         count_before_b = len(seen_calls)
         cfg_b = _make_http_cfg(tmp_path, port=port, embedding_model="model-b")
@@ -936,8 +1010,9 @@ def test_model_change_invalidates_memo_cache(tmp_path: Path) -> None:
         calls_b = [c for c in seen_calls[count_before_b:] if "model-b" in c[0] and any("waveguide" in t for t in c[1])]
         assert len(calls_b) == 1
         with _open_ro(cfg_b.db_path) as conn:
-            blob_b = conn.execute("SELECT embedding FROM chunks").fetchone()[0]
-            assert np.allclose(np.frombuffer(blob_b, dtype=np.float32), [0.0, 1.0, 0.0, 0.0], atol=1e-5)
+            blob_b = conn.execute("SELECT embedding_f16 FROM chunks").fetchone()[0]
+            assert np.allclose(np.frombuffer(blob_b, dtype="<f2").astype(np.float32), [0.0, 1.0, 0.0, 0.0], atol=1e-3)
+            assert conn.execute("SELECT embedding_model FROM rabitq_index WHERE id = 1").fetchone()[0] == "model-b"
 
 
 def test_restart_memo_hit_with_make_dspy_embed_fn(tmp_path: Path) -> None:
@@ -966,13 +1041,15 @@ def test_restart_memo_hit_with_make_dspy_embed_fn(tmp_path: Path) -> None:
         calls_after_first = len(http_calls)
         assert calls_after_first > 0
         with _open_ro(cfg.db_path) as conn:
-            rows_first = conn.execute("SELECT chunk_id, rel_path, embedding FROM chunks ORDER BY chunk_id").fetchall()
+            rows_first = conn.execute(
+                "SELECT chunk_id, rel_path, embedding_f16 FROM chunks ORDER BY chunk_id"
+            ).fetchall()
             fts_first = conn.execute(
                 "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'memo' ORDER BY rowid"
             ).fetchall()
             assert rows_first and fts_first
 
-        # Fresh start_pipeline + make_dspy_embed_fn on existing schema (_detect_existing_vec_dim -> 8)
+        # Fresh start_pipeline + make_dspy_embed_fn on existing 5-table schema
         s2 = start_pipeline(cfg, embed_fn=make_dspy_embed_fn(cfg), live=False)
         try:
             update_pipeline_once(s2)
@@ -981,7 +1058,9 @@ def test_restart_memo_hit_with_make_dspy_embed_fn(tmp_path: Path) -> None:
 
         assert len(http_calls) == calls_after_first
         with _open_ro(cfg.db_path) as conn:
-            rows_second = conn.execute("SELECT chunk_id, rel_path, embedding FROM chunks ORDER BY chunk_id").fetchall()
+            rows_second = conn.execute(
+                "SELECT chunk_id, rel_path, embedding_f16 FROM chunks ORDER BY chunk_id"
+            ).fetchall()
             fts_second = conn.execute(
                 "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'memo' ORDER BY rowid"
             ).fetchall()

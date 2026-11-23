@@ -157,10 +157,10 @@ def test_yaw_config_for_optimization(tmp_path: Path) -> None:
     assert opt.optimize_auto == cfg.optimize_auto
     assert opt.react_max_iters == cfg.react_max_iters
 
-    optuna = cfg.for_optimization(tmp_path / "custom" / "optuna_index.db")
-    assert optuna.db_path == (tmp_path / "custom" / "optuna_index.db").resolve()
-    assert optuna.status_path == (tmp_path / "custom" / "optuna_status.json").resolve()
-    assert optuna.compiled_program_path == (tmp_path / "custom" / "qa_program.json").resolve()
+    custom = cfg.for_optimization(tmp_path / "custom" / "optimize_yaw_custom.db")
+    assert custom.db_path == (tmp_path / "custom" / "optimize_yaw_custom.db").resolve()
+    assert custom.status_path == (tmp_path / "custom" / "optimize_status_custom.json").resolve()
+    assert custom.compiled_program_path == (tmp_path / "custom" / "optimize_program_custom.json").resolve()
     assert resolve_coco_state_root(tmp_path / "coco_state") == (tmp_path / "coco_state" / "coco_lmdb").resolve()
 
 

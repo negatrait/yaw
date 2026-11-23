@@ -21,18 +21,17 @@ from dspy.utils.exceptions import AdapterParseError, ContextWindowExceededError
 
 from .core import EmbedFn, HydratedPassage, QAResult, YawConfig, YawRuntimeError, format_query_for_embedding
 from .retrieval import (
-    SearchParams,
-    VectorSearch,
+    RetrievalIndex,
+    expand_citation_neighbors,
     hydrate_passage,
     hydrate_ranked_passages,
     lexical_search,
     open_readonly_db,
-    search_vectors,
+    search_index,
 )
 
 _MAX_TOP_K = 25
 _NO_MATCHES = "No matching passages found."
-_NO_ISLAND = (1, 1)  # ChunkPointer default: the chunk carries no AST island.
 _PASSAGE_HEAD_RE = re.compile(r"^\[chunk_id=(\d+)\]\s+\([^)\n]+\)\s+score=([-+]?\d+(?:\.\d+)?):$", re.MULTILINE)
 _CITATION_BLOCK_RE = re.compile(r"\[(?:chunk_id=\d+(?:\s*[,;]\s*(?:chunk_id=)?\d+)*)\]")
 _CHUNK_NUM_RE = re.compile(r"\d+")
@@ -113,29 +112,30 @@ def _require_top_k(top_k: int) -> int:
     return top_k
 
 
-def _require_chunk_pos(vs: VectorSearch, chunk_id: int) -> int:
+def _require_chunk_pos(index: RetrievalIndex, chunk_id: int) -> int:
     if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
         raise ValueError("chunk_id must be an integer.")
-    if (pos := vs.id_to_pos.get(chunk_id)) is None:
+    if (pos := index.id_to_pos.get(chunk_id)) is None:
         raise ValueError(f"Unknown chunk_id={chunk_id}.")
     return pos
 
 
 def _hydrate_ids(
-    vs: VectorSearch, ranked: Sequence[tuple[int, float]], corpus_root: Path
+    index: RetrievalIndex, ranked: Sequence[tuple[int, float]], corpus_root: Path
 ) -> tuple[HydratedPassage, ...]:
     """Hydrate exactly the requested chunk ids from disk, in order and without span deduplication."""
-    return tuple(hydrate_passage(vs.pointers[vs.id_to_pos[cid]], corpus_root, score=score) for cid, score in ranked)
+    return tuple(
+        hydrate_passage(index.pointers[index.id_to_pos[cid]], corpus_root, score=score) for cid, score in ranked
+    )
 
 
 def make_qa_tools(
-    vs: VectorSearch,
+    index: RetrievalIndex,
     corpus_root: Path,
     embed_fn: EmbedFn,
     conn: sqlite3.Connection | Path,
     *,
     task_mode: str = "distinct-titled",
-    search_params: SearchParams | None = None,
 ) -> list[dspy.Tool]:
     """Build closure-bound retrieval tools with explicit DSPy schemas for dspy.ReAct."""
 
@@ -148,60 +148,42 @@ def make_qa_tools(
             yield conn
 
     def search_passages(query: str, top_k: int = 8) -> str:
-        """Search corpus passages using hybrid vector and lexical ranking."""
+        """Search corpus passages using hybrid 1-bit RaBitQ, lexical, and citation diffusion ranking."""
         q, k = _require_query(query), _require_top_k(top_k)
-        if vs.size == 0:
+        if index.size == 0:
             return _NO_MATCHES
         raw_emb = np.asarray(embed_fn([format_query_for_embedding(q, task_mode)]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         with _tool_conn() as db_conn:
-            ranked = search_vectors(
-                vs, q_vec, query_text=q, conn=db_conn, top_k=max(k * 4, 50), **(search_params or {})
-            )
-        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
+            ranked = search_index(index, q_vec, query_text=q, conn=db_conn, top_k=max(k * 4, 50)).ranked
+        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
         """Run zero-embedder FTS5 keyword grep over indexed passages."""
         q, k = _require_query(query), _require_top_k(top_k)
-        if vs.size == 0:
+        if index.size == 0:
             return _NO_MATCHES
         # Over-fetch pool_k = max(k * 4, 50) to prevent sub-chunk starvation during MaxP span dedup.
         with _tool_conn() as db_conn:
-            ranked = lexical_search(vs, q, db_conn, top_k=max(k * 4, 50))
-        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
+            ranked = lexical_search(index, q, db_conn, top_k=max(k * 4, 50))
+        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
-        """Expand isotropic, shared-entity, and same-AST-island neighbor passages for chunk_id."""
-        idx, k = _require_chunk_pos(vs, chunk_id), _require_top_k(top_k)
-        if vs.size <= 1:
+        """Expand isotropic, lexical, citation-diffusion, and same-AST-island neighbor passages for chunk_id."""
+        _require_chunk_pos(index, chunk_id)
+        k = _require_top_k(top_k)
+        if index.size <= 1:
             return _NO_MATCHES
-        # Embeddings are unit-normalized, so the dot product is the cosine; entity_to_chunk is (entities x chunks).
-        scores = (vs.embeddings @ vs.embeddings[idx]).astype(np.float64)
-        if (shared := vs.entity_to_chunk[:, idx].nonzero()[0]).size:
-            overlap = np.asarray(vs.entity_to_chunk[shared].astype(bool).sum(axis=0)).ravel()
-            scores += 0.35 * overlap
-        ptr = vs.pointers[idx]
-        island = (ptr.rel_posix_path, ptr.ast_island_start, ptr.ast_island_end)
-        if (ptr.ast_island_start, ptr.ast_island_end) != _NO_ISLAND:
-            siblings = [
-                j
-                for j, p in enumerate(vs.pointers)
-                if (p.rel_posix_path, p.ast_island_start, p.ast_island_end) == island
-            ]
-            scores[siblings] += 0.50
-        scores[idx] = -np.inf
-        pool_k = min(max(k * 4, 50), vs.size - 1)
-        cutoff = float(np.partition(scores, -pool_k)[-pool_k])
-        ranked = sorted(
-            ((vs.chunk_ids[int(j)], float(scores[int(j)])) for j in np.flatnonzero(scores >= cutoff) if int(j) != idx),
-            key=lambda item: (-item[1], item[0]),
-        )[:pool_k]
-        return _format_passages(hydrate_ranked_passages(vs, ranked, corpus_root, top_k=k))
+        with _tool_conn() as db_conn:
+            ranked = expand_citation_neighbors(
+                index, chunk_id, corpus_root=corpus_root, conn=db_conn, top_k=max(k * 4, 50)
+            )
+        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
 
     def read_chunk(chunk_id: int) -> str:
         """Read the exact hydrated passage for a single chunk_id."""
-        _require_chunk_pos(vs, chunk_id)
-        return _format_passages(_hydrate_ids(vs, [(chunk_id, 1.0)], corpus_root))
+        _require_chunk_pos(index, chunk_id)
+        return _format_passages(_hydrate_ids(index, [(chunk_id, 1.0)], corpus_root))
 
     return [
         dspy.Tool(search_passages, arg_desc=_QUERY_DESC),
@@ -278,13 +260,13 @@ def build_qa_agent(
 
 
 def ask_question(
-    question: str, *, vs: VectorSearch, corpus_root: Path, agent: dspy.Module, max_citations: int = 5
+    question: str, *, index: RetrievalIndex, corpus_root: Path, agent: dspy.Module, max_citations: int = 5
 ) -> QAResult:
     if not isinstance(question, str) or not (q := question.strip()):
         raise YawRuntimeError("INVALID_INPUT", "question must be a non-empty string.")
     if not _valid_int(max_citations):
         raise YawRuntimeError("INVALID_INPUT", "max_citations must be >= 1.")
-    if vs.size == 0:
+    if index.size == 0:
         raise YawRuntimeError("EMPTY_INDEX", "Index contains 0 chunks.")
 
     try:
@@ -305,14 +287,14 @@ def ask_question(
     seen_scores = _extract_seen_chunks(history_msgs)
     inline_ids = extract_inline_chunk_ids(answer)
     for cid in inline_ids:
-        if cid not in seen_scores or cid not in vs.id_to_pos:
+        if cid not in seen_scores or cid not in index.id_to_pos:
             raise YawRuntimeError("MODEL_ERROR", f"Answer cites ungrounded chunk_id={cid}.")
 
     chosen_ids = (
         inline_ids
-        or [cid for cid, _ in sorted(seen_scores.items(), key=lambda x: (-x[1][0], x[1][1])) if cid in vs.id_to_pos]
+        or [cid for cid, _ in sorted(seen_scores.items(), key=lambda x: (-x[1][0], x[1][1])) if cid in index.id_to_pos]
     )[:max_citations]
-    citations = _hydrate_ids(vs, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root)
+    citations = _hydrate_ids(index, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root)
     if any(hp.stale_on_disk for hp in citations):
         raise YawRuntimeError("CONSISTENCY_ERROR", "Cited passage failed disk SHA-256 verification.")
 

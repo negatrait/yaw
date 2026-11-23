@@ -42,12 +42,12 @@ from yaw.pipeline import (
 )
 from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
 from yaw.retrieval import (
-    VectorSearch,
-    build_vector_search,
+    RetrievalIndex,
+    build_retrieval_index,
+    empty_retrieval_index,
     hydrate_ranked_passages,
     open_readonly_db,
-    resolve_retrieval_params,
-    search_vectors,
+    search_index,
 )
 
 _kernel32: Any = None
@@ -71,7 +71,7 @@ if os.name == "nt":
 
 @dataclass(slots=True)
 class YawRuntime:
-    """Mutable runtime state owning lock, live CocoIndex pipeline, semaphores, and VectorSearch."""
+    """Mutable runtime state owning lock, live CocoIndex pipeline, semaphores, and RetrievalIndex."""
 
     config: YawConfig
     pipeline: PipelineSession
@@ -80,7 +80,7 @@ class YawRuntime:
     lm_sem: threading.Semaphore
     query_sem: threading.BoundedSemaphore
     index_lock: threading.RLock
-    vector_search: VectorSearch
+    retrieval_index: RetrievalIndex
     index_data_version: int
     lifecycle: str
     last_error: str | None
@@ -172,31 +172,43 @@ def _read_data_version(rt: YawRuntime) -> int:
         return int(row[0]) if row else 0
 
 
-def get_vector_search(rt: YawRuntime, conn: sqlite3.Connection | None = None) -> VectorSearch:
-    """Return current VectorSearch, rebuilding outside index_lock when PRAGMA data_version changes."""
+def get_retrieval_index(rt: YawRuntime, conn: sqlite3.Connection | None = None) -> RetrievalIndex:
+    """Return current RetrievalIndex, rebuilding outside index_lock when PRAGMA data_version changes."""
     cur_ver = _read_data_version(rt)
     with rt.index_lock:
         if rt.index_data_version >= 0 and cur_ver == rt.index_data_version:
-            return rt.vector_search
+            return rt.retrieval_index
 
     db_path = require_path(rt.config.db_path, "db_path")
     with contextlib.nullcontext(conn) if conn is not None else contextlib.closing(open_readonly_db(db_path)) as ro_conn:
         if ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
-            return rt.vector_search
-        new_vs = build_vector_search(ro_conn)
+            with rt.index_lock:
+                return rt.retrieval_index
+        try:
+            new_idx = build_retrieval_index(
+                ro_conn,
+                expected_embedding_model=rt.config.embedding_model,
+                expected_task_mode=rt.config.embedding_task_mode,
+            )
+        except YawRuntimeError as exc:
+            if exc.code == "INDEX_NOT_READY":
+                with rt.index_lock:
+                    if rt.pipeline.live and rt.index_data_version >= 0:
+                        return rt.retrieval_index
+            raise
 
     updated = False
     with rt.index_lock:
         if cur_ver >= rt.index_data_version:
-            rt.vector_search = new_vs
+            rt.retrieval_index = new_idx
             rt.index_data_version = cur_ver
             updated = True
-        current_vs = rt.vector_search
+        current_idx = rt.retrieval_index
     if updated:
         now = time.time()
         with rt.state_lock:
             rt.last_sync_at = now
-    return current_vs
+    return current_idx
 
 
 def start_runtime(
@@ -238,7 +250,7 @@ def start_runtime(
             lm_sem=threading.Semaphore(1),
             query_sem=threading.BoundedSemaphore(cfg.queue_maxsize),
             index_lock=threading.RLock(),
-            vector_search=build_vector_search(probe_conn),
+            retrieval_index=empty_retrieval_index(),
             index_data_version=-1,
             lifecycle="starting",
             last_error=None,
@@ -288,7 +300,7 @@ def start_runtime(
 
 
 def wait_ready(rt: YawRuntime, timeout: float = 30.0) -> bool:
-    """Wait for initial indexing catch-up, build VectorSearch, and mark runtime ready."""
+    """Wait for initial indexing catch-up, build RetrievalIndex, and mark runtime ready."""
     try:
         if not rt.pipeline.live and not rt.pipeline.ready_event.is_set():
             update_pipeline_once(rt.pipeline)
@@ -306,7 +318,7 @@ def wait_ready(rt: YawRuntime, timeout: float = 30.0) -> bool:
     if not ready or rt.stop_event.is_set():
         return False
 
-    get_vector_search(rt)
+    get_retrieval_index(rt)
     now = time.time()
     with rt.state_lock:
         if rt.lifecycle in ("stopping", "stopped") or rt.stop_event.is_set():
@@ -391,7 +403,7 @@ def read_db_chunk_count(db_path: Path) -> int:
 
 
 @contextlib.contextmanager
-def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, VectorSearch, Path]]:
+def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, RetrievalIndex, Path]]:
     db_path = require_path(cfg.db_path, "db_path")
     if not db_path.is_file():
         raise YawRuntimeError("EMPTY_INDEX", f"Database not found: {db_path}")
@@ -399,46 +411,50 @@ def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, 
     with contextlib.closing(open_readonly_db(db_path)) as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             raise YawRuntimeError("EMPTY_INDEX", f"Index table 'chunks' not initialized in {db_path}")
-        yield conn, build_vector_search(conn), corpus_root
+        index = build_retrieval_index(
+            conn,
+            expected_embedding_model=cfg.embedding_model,
+            expected_task_mode=cfg.embedding_task_mode,
+        )
+        yield conn, index, corpus_root
 
 
 def _run_recall(
     cfg: YawConfig,
     conn: sqlite3.Connection,
-    vs: VectorSearch,
+    index: RetrievalIndex,
     corpus_root: Path,
     embed_fn: EmbedFn | None,
     query: str,
     top_k: int,
 ) -> tuple[HydratedPassage, ...]:
-    params = resolve_retrieval_params(cfg)
-    if vs.size == 0:
+    if index.size == 0:
         return ()
     active_embed = embed_fn or make_dspy_embed_fn(cfg)
     formatted = format_query_for_embedding(query, cfg.embedding_task_mode)
     raw_emb = np.asarray(active_embed([formatted]), dtype=np.float32)
     q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-    ranked = search_vectors(vs, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50), **params)
-    return hydrate_ranked_passages(vs, ranked, corpus_root, top_k=top_k)
+    res = search_index(index, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50))
+    return hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
 
 
 def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
-    """Execute zero-LLM hybrid VectorSearch retrieval with MaxP disk hydration."""
+    """Execute zero-LLM hybrid RetrievalIndex search with MaxP disk hydration."""
     q = _validate_recall_args(query, top_k)
     _ensure_ready(rt)
 
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "recall"), contextlib.closing(open_readonly_db(db_path)) as conn:
-        vs = get_vector_search(rt, conn)
-        return _run_recall(rt.config, conn, vs, corpus_root, rt.embed_fn, q, top_k)
+        index = get_retrieval_index(rt, conn)
+        return _run_recall(rt.config, conn, index, corpus_root, rt.embed_fn, q, top_k)
 
 
 def recall_once(cfg: YawConfig, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
     """Execute standalone read-only zero-LLM recall without acquiring the daemon lock."""
     q = _validate_recall_args(query, top_k)
-    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
-        return _run_recall(cfg, conn, vs, corpus_root, None, q, top_k)
+    with _open_indexed_search(cfg) as (conn, index, corpus_root):
+        return _run_recall(cfg, conn, index, corpus_root, None, q, top_k)
 
 
 def resolve_program_path(cfg: YawConfig) -> Path | None:
@@ -472,7 +488,7 @@ def serialize_passage(rank: int, hp: HydratedPassage) -> dict[str, Any]:
 def _run_qa(
     cfg: YawConfig,
     conn: sqlite3.Connection,
-    vs: VectorSearch,
+    index: RetrievalIndex,
     corpus_root: Path,
     embed_fn: EmbedFn,
     lm: dspy.LM,
@@ -480,16 +496,13 @@ def _run_qa(
     *,
     lm_lock: AbstractContextManager[Any] | None = None,
 ) -> QAResult:
-    if vs.size == 0:
+    if index.size == 0:
         raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
-    search_params = resolve_retrieval_params(cfg)
-    tools = make_qa_tools(
-        vs, corpus_root, embed_fn, conn, task_mode=cfg.embedding_task_mode, search_params=search_params
-    )
+    tools = make_qa_tools(index, corpus_root, embed_fn, conn, task_mode=cfg.embedding_task_mode)
     agent = build_qa_agent(tools, max_iters=cfg.react_max_iters, artifact_path=resolve_program_path(cfg))
     lock_ctx = lm_lock if lm_lock is not None else contextlib.nullcontext()
     with lock_ctx, dspy.context(lm=lm):
-        return ask_question(question, corpus_root=corpus_root, vs=vs, agent=agent)
+        return ask_question(question, corpus_root=corpus_root, index=index, agent=agent)
 
 
 def ask(rt: YawRuntime, question: str) -> QAResult:
@@ -500,9 +513,9 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "qa"), contextlib.closing(open_readonly_db(db_path)) as conn:
-        vs = get_vector_search(rt, conn)
+        index = get_retrieval_index(rt, conn)
         try:
-            result = _run_qa(rt.config, conn, vs, corpus_root, rt.embed_fn, rt.lm, q, lm_lock=rt.lm_sem)
+            result = _run_qa(rt.config, conn, index, corpus_root, rt.embed_fn, rt.lm, q, lm_lock=rt.lm_sem)
         except YawRuntimeError as exc:
             if exc.code in ("MODEL_ERROR", "CONSISTENCY_ERROR"):
                 with rt.state_lock:
@@ -516,13 +529,13 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
 def ask_once(cfg: YawConfig, question: str) -> QAResult:
     """Execute standalone read-only ReAct QA without acquiring the daemon lock."""
     q = _validate_text_input(question, "Question")
-    with _open_indexed_search(cfg) as (conn, vs, corpus_root):
-        return _run_qa(cfg, conn, vs, corpus_root, make_dspy_embed_fn(cfg), create_lm(cfg), q)
+    with _open_indexed_search(cfg) as (conn, index, corpus_root):
+        return _run_qa(cfg, conn, index, corpus_root, make_dspy_embed_fn(cfg), create_lm(cfg), q)
 
 
 def get_status(rt: YawRuntime) -> DaemonStatus:
     """Return lock-free redacted DaemonStatus snapshot and persist status.json atomically."""
-    num_chunks = rt.vector_search.size
+    num_chunks = rt.retrieval_index.size
     lc, raw_err = _sync_pipeline_error(rt)
     with rt.state_lock:
         queue_depth = rt.active_queries

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -18,7 +17,8 @@ def test_empty_workspace_handles_missing_dbs_locks_and_artifacts(tmp_path: Path)
     out_dir = tmp_path / "dashboard"
     snap = watchdog.run_once(artifact_dir=out_dir, workspace_root=tmp_path)
 
-    for db_name in ("yaw.db", "optimize_yaw.db", "optuna_index.db"):
+    assert set(snap["databases"]) == {"yaw.db", "optimize_yaw.db"}
+    for db_name in ("yaw.db", "optimize_yaw.db"):
         info = snap["databases"][db_name]
         assert info["exists"] is False
         assert info["chunks"] is None
@@ -28,12 +28,13 @@ def test_empty_workspace_handles_missing_dbs_locks_and_artifacts(tmp_path: Path)
     assert snap["locks"] == {
         "yaw.db.lock": False,
         "optimize_yaw.db.lock": False,
-        "optuna_index.db.lock": False,
     }
     assert not any((tmp_path / ".yaw").glob("*.lock")) if (tmp_path / ".yaw").exists() else True
     assert snap["llm_metrics"] is None
-    for key in ("status", "dspy_status", "dspy_gepa_audit", "optuna_status", "optuna_best_params"):
+    for key in ("status", "dspy_status", "dspy_gepa_audit"):
         assert snap[key] is None
+    assert "optuna_status" not in snap
+    assert "optuna_best_params" not in snap
 
     svg_root = ElementTree.fromstring((out_dir / "score_progress.svg").read_text(encoding="utf-8"))
     assert "Waiting for optimization scores..." in " ".join(svg_root.itertext())
@@ -74,20 +75,17 @@ def test_torn_invalid_and_nondict_json_resilience(tmp_path: Path) -> None:
     (yaw_dir / "status.json").write_text('{"lifecycle": "ready"', encoding="utf-8")
     (yaw_dir / "dspy_status.json").write_text("[1, 2, 3]", encoding="utf-8")
     (yaw_dir / "dspy_gepa_audit.json").write_bytes(b"\xff\xfe{")
-    (yaw_dir / "optuna_status.json").write_text('"scalar"', encoding="utf-8")
-    (yaw_dir / "optuna_best_params.json").write_text(
-        json.dumps({"best_score": 0.9125, "total_trials": 8}), encoding="utf-8"
-    )
 
     snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
     assert snap["status"] is None
     assert snap["dspy_status"] is None
     assert snap["dspy_gepa_audit"] is None
-    assert snap["optuna_status"] is None
-    assert snap["optuna_best_params"] == {"best_score": 0.9125, "total_trials": 8}
+    assert "optuna_status" not in snap
+    assert "optuna_best_params" not in snap
 
-    svg_path = tmp_path / "optuna_best.svg"
-    watchdog.generate_score_svg(svg_path, snap)
+    # Scalar best_val_score fallback in dspy_status renders cleanly without Optuna
+    svg_path = tmp_path / "dspy_best.svg"
+    watchdog.generate_score_svg(svg_path, {"dspy_status": {"state": "completed", "best_val_score": 0.9125}})
     svg_text = " ".join(ElementTree.fromstring(svg_path.read_text(encoding="utf-8")).itertext())
     assert "0.9125" in svg_text
     assert not watchdog.plt.get_fignums()

@@ -1,17 +1,14 @@
-"""Checks for the active optimizer's scoring, bare-ReAct proposer, lazy optuna, and workspace boundaries."""
+"""Checks for the active DSPy optimizer's scoring, bare-ReAct proposer, Optuna removal, and workspace boundaries."""
 
 from __future__ import annotations
 
 import ast
-import contextlib
 import hashlib
 import json
 import re
-import sqlite3
 import subprocess
 import sys
 import threading
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -26,7 +23,7 @@ from numpy.typing import NDArray
 import yaw.optimize
 from yaw.core import YawConfig, YawRuntimeError
 from yaw.datasets import prepare_dataset_bundle, score_retrieval_recalls
-from yaw.optimize import make_react_instruction_proposer, optimize_dspy, optimize_optuna, qa_gepa_metric
+from yaw.optimize import make_react_instruction_proposer, optimize_dspy, qa_gepa_metric
 from yaw.qa import ABSTAIN_REPLY, QASignature, create_lm
 
 
@@ -217,31 +214,20 @@ def test_gepa_abstention_error_tool_calls_and_deduped_gold_docs() -> None:
 
 def test_optimizers_reject_held_out_overlap_before_indexing(tmp_path):
     cfg = YawConfig(workspace_root=tmp_path)
-    for optimize in (optimize_dspy, optimize_optuna):
-        with pytest.raises(YawRuntimeError, match="held-out"):
-            optimize(cfg, datasets="2wikimultihopqa", query_offset=0)
-        with pytest.raises(
-            YawRuntimeError, match=r"Prepared dataset bundle not found.*scripts/download-datasets\.py --dataset"
-        ) as exc_missing:
-            optimize(cfg, datasets="hotpotqa", query_offset=10)
-        assert exc_missing.value.code == "INVALID_INPUT"
+    with pytest.raises(YawRuntimeError, match="held-out"):
+        optimize_dspy(cfg, datasets="2wikimultihopqa", query_offset=0)
+    with pytest.raises(
+        YawRuntimeError, match=r"Prepared dataset bundle not found.*scripts/download-datasets\.py --dataset"
+    ) as exc_missing:
+        optimize_dspy(cfg, datasets="hotpotqa", query_offset=10)
+    assert exc_missing.value.code == "INVALID_INPUT"
 
     guard_cfg = YawConfig(workspace_root=tmp_path / "int_guard")
-    for bad_val in (0, -5, True, False):
-        with pytest.raises(YawRuntimeError, match="trials") as exc_t:
-            optimize_optuna(guard_cfg, datasets="sample", trials=bad_val)
-        assert exc_t.value.code == "INVALID_INPUT"
     for bad_q in (0, -1, True, False):
-        with pytest.raises(YawRuntimeError, match="max_queries") as exc_oq:
-            optimize_optuna(guard_cfg, datasets="sample", max_queries=bad_q)
-        assert exc_oq.value.code == "INVALID_INPUT"
         with pytest.raises(YawRuntimeError, match="max_queries") as exc_dq:
             optimize_dspy(guard_cfg, datasets="sample", max_queries=bad_q)
         assert exc_dq.value.code == "INVALID_INPUT"
     for bad_off in (-1, True, False):
-        with pytest.raises(YawRuntimeError, match="query_offset") as exc_oo:
-            optimize_optuna(guard_cfg, datasets="sample", query_offset=bad_off)
-        assert exc_oo.value.code == "INVALID_INPUT"
         with pytest.raises(YawRuntimeError, match="query_offset") as exc_do:
             optimize_dspy(guard_cfg, datasets="sample", query_offset=bad_off)
         assert exc_do.value.code == "INVALID_INPUT"
@@ -267,16 +253,17 @@ def test_gepa_rejects_competing_writer(tmp_path):
         optimize_dspy(cfg, datasets="2wikimultihopqa", query_offset=10)
 
 
-def test_optimize_lazy_optuna_import_and_shared_em_f1_metric(tmp_path: Path) -> None:
+def test_optimize_optuna_removed_and_shared_em_f1_metric(tmp_path: Path) -> None:
     opt_path = Path(yaw.optimize.__file__)
     tree = ast.parse(opt_path.read_text(encoding="utf-8"), filename=str(opt_path))
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             assert all(alias.name != "optuna" and not alias.name.startswith("optuna.") for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             assert (node.module or "") != "optuna" and not (node.module or "").startswith("optuna.")
 
     for retired in (
+        "optimize_optuna",
         "normalize_qa_answer",
         "compute_em",
         "compute_f1",
@@ -293,16 +280,9 @@ def test_optimize_lazy_optuna_import_and_shared_em_f1_metric(tmp_path: Path) -> 
             "-c",
             (
                 "import sys\n"
-                "from pathlib import Path\n"
                 "import yaw.optimize\n"
                 "assert 'optuna' not in sys.modules\n"
-                "from yaw.core import YawConfig, YawRuntimeError\n"
-                "cfg = YawConfig(workspace_root=Path(sys.argv[1]))\n"
-                "try:\n"
-                "    yaw.optimize.optimize_optuna(cfg, datasets='2wikimultihopqa', query_offset=0)\n"
-                "except YawRuntimeError:\n"
-                "    pass\n"
-                "assert 'optuna' in sys.modules\n"
+                "assert not hasattr(yaw.optimize, 'optimize_optuna')\n"
             ),
             str(tmp_path),
         ],
@@ -512,137 +492,7 @@ def test_react_instruction_proposer_rejects_empty_overlong_and_handles_forced_su
     assert skip_reqs == []
 
 
-def test_optimize_optuna_uses_maxp_pool_and_persists_best_params(tmp_path: Path) -> None:
-    def _eval_int_ast(node: ast.AST) -> int:
-        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
-            return node.value
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-            return _eval_int_ast(node.left) * _eval_int_ast(node.right)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "max":
-            return max(_eval_int_ast(arg) for arg in node.args)
-        raise AssertionError(f"Unexpected top_k AST expression: {ast.dump(node)}")
-
-    opt_path = Path(yaw.optimize.__file__)
-    tree = ast.parse(opt_path.read_text(encoding="utf-8"), filename=str(opt_path))
-    opt_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "optimize_optuna")
-    search_calls = [
-        n
-        for n in ast.walk(opt_fn)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "search_vectors"
-    ]
-    assert len(search_calls) >= 1
-    for call in search_calls:
-        kw = next((k for k in call.keywords if k.arg == "top_k"), None)
-        assert kw is not None
-        assert _eval_int_ast(kw.value) >= 50
-
-    corpus = [
-        {
-            "idx": "d1",
-            "title": "Apollo Mission",
-            "text": "Neil Armstrong commanded Apollo 11 to the Moon in July 1969.",
-        },
-        {
-            "idx": "d2",
-            "title": "Voyager Probe",
-            "text": "Voyager 1 entered interstellar space in August 2012.",
-        },
-    ]
-    questions = [
-        {
-            "question": "Who commanded Apollo 11 to the Moon?",
-            "answer": "Neil Armstrong",
-            "gold_docs": ["Apollo Mission\nNeil Armstrong commanded Apollo 11 to the Moon in July 1969."],
-        },
-        {
-            "question": "When did Voyager 1 enter interstellar space?",
-            "answer": "August 2012",
-            "gold_docs": ["Voyager Probe\nVoyager 1 entered interstellar space in August 2012."],
-        },
-    ]
-    corpus_path = tmp_path / "corpus.json"
-    questions_path = tmp_path / "questions.json"
-    corpus_path.write_text(json.dumps(corpus), encoding="utf-8")
-    questions_path.write_text(json.dumps(questions), encoding="utf-8")
-    bundle = prepare_dataset_bundle("sample", corpus_path, questions_path, tmp_path / "bundles")
-
-    def _embed(texts: list[str]) -> NDArray[np.float32]:
-        topics = (
-            ("apollo", "armstrong", "moon", "commanded"),
-            ("voyager", "interstellar", "space", "2012"),
-        )
-        rows = np.zeros((len(texts), 16), dtype=np.float32)
-        for idx, text in enumerate(texts):
-            low = text.lower()
-            digest = hashlib.sha256(text.encode("utf-8")).digest()
-            vec = (np.frombuffer(digest * 2, dtype=np.uint8)[:16].astype(np.float32) - 127.5) * 0.05
-            for t_idx, kws in enumerate(topics):
-                for kw in kws:
-                    if kw in low:
-                        vec[t_idx] += 2.0
-            rows[idx] = vec / max(float(np.linalg.norm(vec)), 1e-12)
-        return rows
-
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    cfg = YawConfig(workspace_root=ws, chunk_size=240, chunk_overlap=0, min_chunk_size=20)
-    payload = optimize_optuna(
-        cfg,
-        datasets=str(bundle.root),
-        trials=1,
-        max_queries=2,
-        query_offset=0,
-        fresh=True,
-        embed_fn=_embed,
-    )
-
-    assert payload["best_score"] > 0.0
-    assert payload["total_trials"] == 1
-    assert {"hybrid_alpha", "ppr_alpha", "seed_top_k"} <= set(payload["best_params"])
-
-    opt_db = cfg.for_optimization(".yaw/optuna_index.db").db_path
-    assert opt_db is not None
-    opt_dir = opt_db.parent
-    params_path = opt_dir / "optuna_best_params.json"
-    status_path = opt_dir / "optuna_status.json"
-    study_db = opt_dir / "optuna_study.db"
-    assert not (opt_dir / "optuna_corpus").exists()
-    assert params_path.is_file()
-    assert status_path.is_file()
-    assert study_db.is_file()
-    md_before = {p.name: p.read_bytes() for p in bundle.documents_root.glob("*.md")}
-    assert set(md_before) == {"d1.md", "d2.md"}
-
-    saved_params = json.loads(params_path.read_text(encoding="utf-8"))
-    saved_status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert saved_params["best_score"] == pytest.approx(payload["best_score"])
-    assert saved_params["best_params"] == payload["best_params"]
-    assert saved_status["state"] == "completed"
-    assert saved_status["total_trials"] == 1
-
-    with contextlib.closing(sqlite3.connect(f"file:{study_db.as_posix()}?mode=ro", uri=True)) as s_conn:
-        study_names = [r[0] for r in s_conn.execute("SELECT study_name FROM studies").fetchall()]
-        trial_count = s_conn.execute("SELECT count(*) FROM trials").fetchone()[0]
-    assert "yaw_retrieval_ppr" in study_names
-    assert trial_count == 1
-
-    # Consecutive fresh=True run succeeds without staging copies or mutating bundle .md files
-    payload_2 = optimize_optuna(
-        cfg,
-        datasets=str(bundle.root),
-        trials=1,
-        max_queries=2,
-        query_offset=0,
-        fresh=True,
-        embed_fn=_embed,
-    )
-    assert payload_2["best_score"] == pytest.approx(payload["best_score"])
-    assert payload_2["total_trials"] == 1
-    assert not (opt_dir / "optuna_corpus").exists()
-    assert {p.name: p.read_bytes() for p in bundle.documents_root.glob("*.md")} == md_before
-
-
-def test_optimize_optuna_and_dspy_locks_and_redacted_failure_status(tmp_path: Path) -> None:
+def test_optimize_dspy_locks_and_redacted_failure_status(tmp_path: Path) -> None:
     corpus = [
         {"idx": "d1", "title": "Apollo", "text": "Neil Armstrong commanded Apollo 11."},
         {"idx": "d2", "title": "Voyager", "text": "Voyager 1 entered interstellar space."},
@@ -669,56 +519,28 @@ def test_optimize_optuna_and_dspy_locks_and_redacted_failure_status(tmp_path: Pa
     secret = "secret-token-123"
     cfg = YawConfig(workspace_root=ws, api_key=secret, chunk_size=240, chunk_overlap=0, min_chunk_size=20)
 
-    # 1. Optuna lock contention raises BUSY without writing failed status
-    optuna_cfg = cfg.for_optimization(".yaw/optuna_index.db")
-    assert optuna_cfg.lock_path is not None and optuna_cfg.db_path is not None
-    optuna_cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(optuna_cfg.lock_path), timeout=0), pytest.raises(YawRuntimeError, match="BUSY"):
-        optimize_optuna(
-            cfg,
-            datasets=str(bundle.root),
-            trials=1,
-            max_queries=2,
-            query_offset=0,
-            embed_fn=lambda ts: np.ones((len(ts), 8), dtype=np.float32),
-        )
-    optuna_status = optuna_cfg.db_path.parent / "optuna_status.json"
-    assert not optuna_status.exists()
-
-    # 2. Pre-running held-out validation must NOT write optuna_status.json or dspy_status.json
-    with pytest.raises(YawRuntimeError, match="held-out"):
-        optimize_optuna(cfg, datasets="2wikimultihopqa", query_offset=0)
-    assert not optuna_status.exists()
+    # 1. Pre-running held-out validation must NOT write dspy_status.json
     dspy_cfg = cfg.for_optimization()
-    assert dspy_cfg.db_path is not None
+    assert dspy_cfg.lock_path is not None and dspy_cfg.db_path is not None
     dspy_status = dspy_cfg.db_path.parent / "dspy_status.json"
     with pytest.raises(YawRuntimeError, match="held-out"):
         optimize_dspy(cfg, datasets="2wikimultihopqa", query_offset=0)
     assert not dspy_status.exists()
 
-    # 3. Post-running failure in optimize_optuna writes failed + redacted error (secret stripped)
-    def _fail_on_query_embed(texts: list[str]) -> NDArray[np.float32]:
-        if any(t.startswith("task:") for t in texts):
-            raise RuntimeError(f"boom {secret}")
-        return np.ones((len(texts), 8), dtype=np.float32)
-
-    with pytest.raises(RuntimeError, match=secret):
-        optimize_optuna(
+    # 2. Lock contention raises BUSY without writing failed status
+    dspy_cfg.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(dspy_cfg.lock_path), timeout=0), pytest.raises(YawRuntimeError, match="BUSY"):
+        optimize_dspy(
             cfg,
             datasets=str(bundle.root),
-            trials=1,
+            max_metric_calls=2,
             max_queries=2,
             query_offset=0,
-            fresh=True,
-            embed_fn=_fail_on_query_embed,
+            embed_fn=lambda ts: np.ones((len(ts), 8), dtype=np.float32),
         )
-    st_opt = json.loads(optuna_status.read_text(encoding="utf-8"))
-    assert st_opt["state"] == "failed"
-    assert st_opt["pid"] is None
-    assert secret not in st_opt["error"]
-    assert "[REDACTED]" in st_opt["error"]
+    assert not dspy_status.exists()
 
-    # 4. Post-running failure in optimize_dspy writes failed + redacted error (secret stripped)
+    # 3. Post-running failure in optimize_dspy writes failed + redacted error (secret stripped)
     def _fail_on_doc_embed(texts: list[str]) -> NDArray[np.float32]:
         if texts == ["dimension probe"]:
             return np.ones((1, 8), dtype=np.float32)
@@ -739,24 +561,6 @@ def test_optimize_optuna_and_dspy_locks_and_redacted_failure_status(tmp_path: Pa
     assert st_dspy["pid"] is None
     assert secret not in st_dspy["error"]
     assert "[REDACTED]" in st_dspy["error"]
-
-    # 5. _compile_dspy reads optuna_best_params.json via resolve_retrieval_params
-    opt_params_file = optuna_cfg.db_path.parent / "optuna_best_params.json"
-    opt_params_file.write_text("{corrupt json", encoding="utf-8")
-    dummy_lm = create_lm(replace(cfg, base_url="http://127.0.0.1:1/v1"))
-    with pytest.raises(YawRuntimeError) as exc_dspy_cfg:
-        optimize_dspy(
-            cfg,
-            datasets=str(bundle.root),
-            max_metric_calls=2,
-            max_queries=2,
-            query_offset=0,
-            fresh=True,
-            embed_fn=lambda ts: np.ones((len(ts), 8), dtype=np.float32),
-            student_lm=dummy_lm,
-            reflection_lm=dummy_lm,
-        )
-    assert exc_dspy_cfg.value.code == "CONSISTENCY_ERROR"
 
 
 def test_optimize_dspy_multithreaded_uses_per_call_readonly_sqlite(tmp_path: Path) -> None:

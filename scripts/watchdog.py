@@ -132,7 +132,7 @@ def _inspect_sqlite_db(db_path: Path) -> dict[str, Any]:
     try:
         with contextlib.closing(open_readonly_db(db_path)) as conn:
             raw = [str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
-            info["tables"] = [t for t in raw if not t.startswith(("chunks_", "chunk_fts_", "sqlite_"))]
+            info["tables"] = [t for t in raw if not t.startswith(("chunk_fts_", "sqlite_"))]
             row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
             info["chunks"] = int(row[0]) if row else 0
     except (YawRuntimeError, sqlite3.Error) as exc:
@@ -160,12 +160,6 @@ def get_active_snapshot(workspace_root: Path | None = None, *, include_llm_metri
     specs = (
         ("yaw.db", "status", cfg, "status.json"),
         ("optimize_yaw.db", "dspy_status", cfg.for_optimization() if cfg else None, "dspy_status.json"),
-        (
-            "optuna_index.db",
-            "optuna_status",
-            cfg.for_optimization(base_dir / "optuna_index.db") if cfg else None,
-            "optuna_status.json",
-        ),
     )
     dbs, locks, statuses = {}, {}, {}
     for key, st_key, sub, st_name in specs:
@@ -180,7 +174,6 @@ def get_active_snapshot(workspace_root: Path | None = None, *, include_llm_metri
         "locks": locks,
         **statuses,
         "dspy_gepa_audit": _read_json_safe(base_dir / "dspy_gepa_audit.json"),
-        "optuna_best_params": _read_json_safe(base_dir / "optuna_best_params.json"),
         "llm_metrics": llm_metrics,
         "resources": get_pipeline_resource_metrics(),
         "gpu_temp_c": get_gpu_temperature(),
@@ -197,9 +190,11 @@ def _extract_scores(snapshot: dict[str, Any]) -> tuple[list[float], float | None
         raw = src.get("val_aggregate_scores") if isinstance(src, dict) else None
         if isinstance(raw, list) and (scores := [f for v in raw if (f := _finite_float(v)) is not None]):
             return scores, max(scores)
-    for key in ("dspy_gepa_audit", "dspy_status", "optuna_best_params", "optuna_status"):
-        field = "best_val_score" if key.startswith("dspy") else "best_score"
-        if isinstance(src := snapshot.get(key), dict) and (best := _finite_float(src.get(field))) is not None:
+    for key in ("dspy_gepa_audit", "dspy_status"):
+        if (
+            isinstance(src := snapshot.get(key), dict)
+            and (best := _finite_float(src.get("best_val_score"))) is not None
+        ):
             return [], best
     return [], None
 
@@ -245,8 +240,7 @@ def generate_report_markdown(snapshot: dict[str, Any]) -> str:
     """Format a concise mobile Markdown status report from a snapshot."""
     dbs, locks = snapshot.get("databases") or {}, snapshot.get("locks") or {}
     st, dspy_st = snapshot.get("status") or {}, snapshot.get("dspy_status") or {}
-    audit, opt_st = snapshot.get("dspy_gepa_audit") or {}, snapshot.get("optuna_status") or {}
-    opt_best, llm = snapshot.get("optuna_best_params") or {}, snapshot.get("llm_metrics") or {}
+    audit, llm = snapshot.get("dspy_gepa_audit") or {}, snapshot.get("llm_metrics") or {}
     res, temp = snapshot.get("resources") or {}, snapshot.get("gpu_temp_c")
 
     def _db(name: str) -> str:
@@ -257,8 +251,6 @@ def generate_report_markdown(snapshot: dict[str, Any]) -> str:
 
     d_best = _fmt(audit.get("best_val_score", dspy_st.get("best_val_score")), ".4f")
     d_cands = audit.get("num_candidates", len(audit.get("val_aggregate_scores") or ()))
-    o_best = _fmt(opt_best.get("best_score", opt_st.get("best_score")), ".4f")
-    o_trials = _fmt(opt_best.get("total_trials", opt_st.get("total_trials")), ",")
     llm_st = "up" if llm.get("server_up") else ("down" if "server_up" in llm else "n/a")
     tps = f"{_fmt(llm.get('llm_tps'), '.1f')} tok/s" if llm.get("llm_tps") is not None else "n/a"
     ram = f"{_fmt(res.get('pipeline_ram_gb'), '.2f')} GB"
@@ -266,9 +258,8 @@ def generate_report_markdown(snapshot: dict[str, Any]) -> str:
     lc, sync, pid = st.get("lifecycle", "stopped"), st.get("sync_state", "idle"), st.get("pid") or "none"
     rows = [
         ("Daemon", f"`{lc}` • `{sync}` • pid `{pid}`"),
-        *[(n, _db(n)) for n in ("yaw.db", "optimize_yaw.db", "optuna_index.db")],
+        *[(n, _db(n)) for n in ("yaw.db", "optimize_yaw.db")],
         ("DSPy GEPA", f"`{dspy_st.get('state', 'idle')}` • cands `{d_cands or 0}` • best `{d_best}`"),
-        ("Optuna", f"`{opt_st.get('state', 'idle')}` • trials `{o_trials}` • `{o_best}`"),
         ("LLM / GPU", f"server `{llm_st}` (`{tps}`) • GPU `{_fmt(temp, '.0f')}°C` • RAM `{ram}` • VRAM `{vram}`"),
     ]
     table = "\n".join(f"| **{k}** | {v} |" for k, v in rows)

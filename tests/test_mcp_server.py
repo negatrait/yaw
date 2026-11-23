@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import filelock
-import httpx
+import httpx2 as httpx
 import numpy as np
 import pytest
 import uvicorn

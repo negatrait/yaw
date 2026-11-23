@@ -1,4 +1,4 @@
-"""Live Native YAW VectorSearch & ReAct QA benchmark runner.
+"""Live Native YAW RetrievalIndex & ReAct QA benchmark runner.
 
 Tier 0 (sample):
   uv run --locked python benchmark.py --dataset sample --mode all
@@ -77,11 +77,10 @@ from yaw.qa import (  # noqa: E402
     strip_inline_citations,
 )
 from yaw.retrieval import (  # noqa: E402
-    build_vector_search,
+    build_retrieval_index,
     hydrate_ranked_passages,
     open_readonly_db,
-    resolve_retrieval_params,
-    search_vectors,
+    search_index,
 )
 
 __all__ = [
@@ -280,7 +279,7 @@ def run_yaw_benchmark(
     embed_fn: EmbedFn | None = None,
     lm: Any = None,
 ) -> dict[str, Any]:
-    """Execute live benchmark directly over prepared v2 Markdown bundles, VectorSearch, and ReAct QA."""
+    """Execute live benchmark directly over prepared v2 Markdown bundles, RetrievalIndex, and ReAct QA."""
     bundle = resolve_dataset_bundle(dataset, workspace_root=PROJECT_ROOT)
     selected_ids = list(dict.fromkeys(document_ids)) if document_ids else [d.document_id for d in bundle.documents]
     corpus_dir, slice_patterns = resolve_slice_corpus_scope([(bundle, selected_ids)])
@@ -309,8 +308,12 @@ def run_yaw_benchmark(
     report["indexing_seconds"] = round(perf_counter() - index_start, 2)
 
     with contextlib.closing(open_readonly_db(db_path)) as conn:
-        vs = build_vector_search(conn)
-        num_chunks = vs.size
+        index = build_retrieval_index(
+            conn,
+            expected_embedding_model=config.embedding_model,
+            expected_task_mode=config.embedding_task_mode,
+        )
+        num_chunks = index.size
         has_chunks = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
         num_indexed_docs = (
             int(conn.execute("SELECT COUNT(DISTINCT rel_path) FROM chunks").fetchone()[0]) if has_chunks else 0
@@ -318,11 +321,23 @@ def run_yaw_benchmark(
         report["graph"] = {
             "num_passage_nodes": num_chunks,
             "num_indexed_docs": num_indexed_docs,
-            "num_entity_nodes": len(vs.entity_keys),
-            "num_edges": int(vs.entity_to_chunk.nnz),
+            "num_entity_nodes": index.num_pmi_terms,
+            "num_edges": index.num_citation_edges,
         }
 
-        search_params = resolve_retrieval_params(config)
+        if num_chunks > 0:
+            emb_rows = conn.execute("SELECT embedding_f16 FROM chunks ORDER BY chunk_id ASC").fetchall()
+            if len(emb_rows) != num_chunks:
+                raise RuntimeError(f"Chunk embedding row count mismatch: {len(emb_rows)} != {num_chunks}")
+            dpr_raw = np.frombuffer(b"".join(bytes(r[0]) for r in emb_rows), dtype="<f2").reshape(num_chunks, index.dim)
+            dpr_f32 = dpr_raw.astype(np.float32)
+            dpr_norms = np.linalg.norm(dpr_f32, axis=1, keepdims=True)
+            if np.any(dpr_norms <= 1e-12) or not np.all(np.isfinite(dpr_f32)):
+                raise RuntimeError("Indexed float16 embeddings contain zero-norm or non-finite vectors")
+            dpr_embeddings = (dpr_f32 / dpr_norms).astype(np.float32, copy=False)
+        else:
+            dpr_embeddings = np.zeros((0, 0), dtype=np.float32)
+
         eval_start = perf_counter()
         records: list[dict[str, Any]] = []
         all_retrieved_passages: list[list[str]] = []
@@ -342,12 +357,11 @@ def run_yaw_benchmark(
         if include_qa:
             qa_lm = lm or create_lm(config)
             tools = make_qa_tools(
-                vs,
+                index,
                 corpus_dir,
                 active_embed,
                 conn,
                 task_mode=config.embedding_task_mode,
-                search_params=search_params,
             )
             compiled_path = Path(compiled_program) if compiled_program else None
             agent = build_qa_agent(tools, max_iters=config.react_max_iters, artifact_path=compiled_path)
@@ -357,20 +371,20 @@ def run_yaw_benchmark(
         for q_idx, query in enumerate(queries):
             q_unit = q_vecs[q_idx]
             t_q0 = perf_counter()
-            ranked = search_vectors(vs, q_unit, query_text=query, conn=conn, top_k=pool_k, **search_params)
-            hydrated = hydrate_ranked_passages(vs, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
+            ranked = search_index(index, q_unit, query_text=query, conn=conn, top_k=pool_k).ranked
+            hydrated = hydrate_ranked_passages(index, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
             retrieval_elapsed = perf_counter() - t_q0
 
-            if vs.size > 0:
-                dpr_scores = (vs.embeddings @ q_unit).astype(np.float32, copy=False)
-                dpr_k = min(vs.size, pool_k)
-                if dpr_k < vs.size:
+            if index.size > 0:
+                dpr_scores = (dpr_embeddings @ q_unit).astype(np.float32, copy=False)
+                dpr_k = min(index.size, pool_k)
+                if dpr_k < index.size:
                     top_pos = np.argpartition(-dpr_scores, dpr_k - 1)[:dpr_k]
                     top_pos = top_pos[np.argsort(-dpr_scores[top_pos], kind="stable")]
                 else:
                     top_pos = np.argsort(-dpr_scores, kind="stable")
-                dpr_ranked = [(vs.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
-                dpr_hydrated = hydrate_ranked_passages(vs, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
+                dpr_ranked = [(index.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
+                dpr_hydrated = hydrate_ranked_passages(index, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
             else:
                 dpr_hydrated = ()
 
@@ -386,7 +400,7 @@ def run_yaw_benchmark(
             if include_qa and agent is not None and qa_lm is not None:
                 t_qa0 = perf_counter()
                 with dspy.context(lm=qa_lm):
-                    qa_res = ask_question(query, vs=vs, corpus_root=corpus_dir, agent=agent)
+                    qa_res = ask_question(query, index=index, corpus_root=corpus_dir, agent=agent)
                 qa_answer = clean_qa_answer(strip_inline_citations(qa_res.answer))
                 qa_elapsed = perf_counter() - t_qa0
                 qa_answers.append(qa_answer)

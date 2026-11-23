@@ -607,7 +607,17 @@ class ArchitectureTests(unittest.TestCase):
         agent_files = {p.parent.name: p for p in AGENTS_DIR.glob("*/agent.md")}
         self.assertEqual(set(agent_files.keys()), expected_agents)
 
-        retired_markers = ("sample-llm-wiki", "pyshacl.validate", "lean-ctx", "audit_report.md")
+        retired_markers = (
+            "sample-llm-wiki",
+            "pyshacl.validate",
+            "lean-ctx",
+            "audit_report.md",
+            "vec0",
+            "DatabaseSink",
+            "ppr.py",
+            "hmm.py",
+            "spacy",
+        )
         for agent_name, agent_path in sorted(agent_files.items()):
             rel = agent_path.relative_to(PROJECT_ROOT)
             meta, body = _parse_yaml_frontmatter(agent_path)
@@ -636,8 +646,9 @@ class ArchitectureTests(unittest.TestCase):
                     "Critic subagent must remain read-only (no write_file or edit_file)",
                 )
 
+            body_cf = body.casefold()
             for marker in retired_markers:
-                self.assertNotIn(marker, body, f"Subagent {rel} contains retired reference '{marker}'")
+                self.assertNotIn(marker.casefold(), body_cf, f"Subagent {rel} contains retired reference '{marker}'")
 
     def test_every_repo_target_file_matches_at_least_one_rule_glob(self):
         """Rule 9: Every repo target file matches its owning .agents/rules glob without unintended overlap."""
@@ -757,7 +768,11 @@ class ArchitectureTests(unittest.TestCase):
         self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must not exist")
 
         total_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in py_files)
-        self.assertLessEqual(total_loc, 5500, f"yaw/ total LOC {total_loc} exceeds 5,500 ceiling")
+        self.assertLessEqual(
+            total_loc,
+            8000,
+            f"yaw/ total LOC {total_loc} exceeds 8,000 ceiling (calibrated per docs/epic-3-performance.md#decisions)",
+        )
         core_files = sorted((YAW_DIR / "core").glob("*.py"))
         core_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in core_files)
         self.assertLessEqual(core_loc, 960, f"yaw/core/* LOC {core_loc} exceeds 960 ceiling")
@@ -787,16 +802,16 @@ class ArchitectureTests(unittest.TestCase):
                             f"{rel}:{node.lineno}: class {node.name} must not subclass {base_txt}",
                         )
 
-        http_mods = {"httpx", "openai", "urllib", "http", "socket", "requests"}
+        http_mods = {"httpx", "httpx2", "openai", "urllib", "http", "socket", "requests"}
         layer_rules: dict[str, tuple[set[str], set[str]]] = {
             # filename: (allowed_top_level_packages, allowed_yaw_internal_modules)
             "datasets.py": (stdlib | {"filelock", "numpy", "yaw"}, {"yaw.core"}),
             "retrieval.py": (
-                stdlib | {"numpy", "scipy", "spacy", "sqlite3", "sqlite_vec", "yaw"},
+                stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
                 {"yaw.core"},
             ),
             "pipeline.py": (
-                stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "sqlite_vec", "yaw"},
+                stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "yaw"},
                 {"yaw.core", "yaw.retrieval"},
             ),
             "qa.py": (stdlib | {"dspy", "numpy", "sqlite3", "yaw"}, {"yaw.core", "yaw.retrieval"}),
@@ -809,7 +824,7 @@ class ArchitectureTests(unittest.TestCase):
                 {"yaw.core", "yaw.runtime"},
             ),
             "optimize.py": (
-                stdlib | {"dspy", "filelock", "numpy", "optuna", "sqlite3", "yaw"},
+                stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
                 {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval"},
             ),
             "cli.py": (
@@ -821,9 +836,9 @@ class ArchitectureTests(unittest.TestCase):
         forbidden_explicit: dict[str, set[str]] = {
             "datasets.py": {"dspy", "cocoindex", "sqlite3"} | http_mods,
             "retrieval.py": {"dspy", "cocoindex"} | http_mods,
-            "qa.py": {"cocoindex", "spacy", "sqlite_vec"} | http_mods,
-            "runtime.py": {"cocoindex", "fastmcp", "starlette", "uvicorn", "optuna"},
-            "cli.py": {"dspy", "sqlite3", "cocoindex", "optuna", "fastmcp", "starlette", "uvicorn", "numpy"},
+            "qa.py": {"cocoindex"} | http_mods,
+            "runtime.py": {"cocoindex", "fastmcp", "starlette", "uvicorn"},
+            "cli.py": {"dspy", "sqlite3", "cocoindex", "fastmcp", "starlette", "uvicorn", "numpy"},
         }
 
         for mod_name, (allowed_top, allowed_yaw) in layer_rules.items():
@@ -842,33 +857,49 @@ class ArchitectureTests(unittest.TestCase):
                         f"{mod_name}:{lineno} violates DAG by importing '{mod}' (allowed: {sorted(allowed_yaw)})",
                     )
 
-        # Verify lazy top-level exclusions in cli.py and optimize.py
+        # Verify lazy top-level exclusions in cli.py
         cli_tree = ast.parse((YAW_DIR / "cli.py").read_text(encoding="utf-8"))
         for stmt in cli_tree.body:
             if isinstance(stmt, ast.Import):
                 for alias in stmt.names:
                     self.assertFalse(
-                        alias.name.startswith(("yaw.optimize", "yaw.datasets", "optuna")),
+                        alias.name.startswith(("yaw.optimize", "yaw.datasets")),
                         f"cli.py:{stmt.lineno} must lazy-import {alias.name}",
                     )
             elif isinstance(stmt, ast.ImportFrom) and stmt.module:
                 self.assertFalse(
-                    stmt.module.startswith(("yaw.optimize", "yaw.datasets", "optuna")),
+                    stmt.module.startswith(("yaw.optimize", "yaw.datasets")),
                     f"cli.py:{stmt.lineno} must lazy-import {stmt.module}",
                 )
 
-        opt_tree = ast.parse((YAW_DIR / "optimize.py").read_text(encoding="utf-8"))
-        for stmt in opt_tree.body:
-            if isinstance(stmt, ast.Import):
-                for alias in stmt.names:
-                    self.assertFalse(
-                        alias.name == "optuna" or alias.name.startswith("optuna."),
-                        f"optimize.py:{stmt.lineno} must lazy-import optuna",
-                    )
-            elif isinstance(stmt, ast.ImportFrom) and stmt.module:
-                self.assertFalse(
-                    stmt.module == "optuna" or stmt.module.startswith("optuna."),
-                    f"optimize.py:{stmt.lineno} must lazy-import optuna",
-                )
-
         self.assertLessEqual(len((YAW_DIR / "__main__.py").read_text(encoding="utf-8").splitlines()), 10)
+
+    def test_purged_dependencies_banned_across_yaw(self):
+        """Rule 13: Purged dependencies (sqlite_vec, spacy, en_core_web_sm, optuna) are absent across all yaw/**."""
+        banned_pkgs = {"sqlite_vec", "spacy", "en_core_web_sm", "optuna"}
+        banned_re = re.compile(r"(sqlite_vec|sqlite-vec|spacy|en_core_web_sm|en-core-web-sm|optuna)", re.IGNORECASE)
+        source_files = sorted(
+            p
+            for p in YAW_DIR.rglob("*")
+            if p.is_file() and "__pycache__" not in p.parts and "outputs" not in p.parts and p.suffix != ".pyc"
+        )
+        self.assertGreater(len(source_files), 0)
+
+        violations: list[str] = []
+        for file_path in source_files:
+            rel = file_path.relative_to(PROJECT_ROOT)
+            text = file_path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if m := banned_re.search(line):
+                    violations.append(f"{rel}:{lineno}: banned dependency reference {m.group(0)!r}")
+            if file_path.suffix == ".py":
+                for lineno, mod in parse_module_imports(file_path):
+                    top = mod.split(".")[0]
+                    if top in banned_pkgs:
+                        violations.append(f"{rel}:{lineno}: banned import '{mod}'")
+
+        self.assertEqual(
+            violations,
+            [],
+            "Purged dependency references found under yaw/:\n" + "\n".join(violations),
+        )
