@@ -43,6 +43,7 @@ def test_preflight_reports_all_failures_and_reuses_testmon(tmp_path: Path):
                 str(output),
                 *args,
             ],
+            check=False,
             cwd=tmp_path,
             env=env,
             capture_output=True,

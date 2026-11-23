@@ -15,7 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import filelock
 import httpx2 as httpx
@@ -162,6 +162,7 @@ def _start_openai_stub(
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -221,7 +222,7 @@ def test_mcp_server_containment_bind_validation_and_tool_inventory(tmp_path: Pat
             bad_factory_cfg,
             live=False,
             wait_for_ready=True,
-            embed_fn=lambda ts: _topic_embed(ts),
+            embed_fn=_topic_embed,
             lm=create_lm(bad_factory_cfg),
         )
     )
@@ -240,7 +241,7 @@ def test_mcp_server_containment_bind_validation_and_tool_inventory(tmp_path: Pat
     cfg = _make_cfg(tmp_path / "ok")
     assert cfg.corpus_root is not None
     cfg.corpus_root.mkdir(parents=True)
-    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=lambda ts: _topic_embed(ts), lm=create_lm(cfg))
+    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(cfg))
     try:
         with pytest.raises(YawRuntimeError) as exc_both:
             create_mcp_app(rt=rt, runtime_factory=lambda: rt)
@@ -411,9 +412,7 @@ def test_predispatch_host_origin_guard_and_health_readiness_lifecycle(tmp_path: 
     empty_cfg = _make_cfg(tmp_path / "empty_tcp")
     assert empty_cfg.corpus_root is not None
     empty_cfg.corpus_root.mkdir(parents=True)
-    rt_empty = start_runtime(
-        empty_cfg, live=False, wait_for_ready=True, embed_fn=lambda ts: _topic_embed(ts), lm=create_lm(empty_cfg)
-    )
+    rt_empty = start_runtime(empty_cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(empty_cfg))
     try:
         _, tcp_app = create_mcp_app(rt=rt_empty)
         port = _free_port()
@@ -621,9 +620,7 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
     e_cfg = _make_cfg(tmp_path / "empty_tool")
     assert e_cfg.corpus_root is not None
     e_cfg.corpus_root.mkdir(parents=True)
-    rt_e = start_runtime(
-        e_cfg, live=False, wait_for_ready=True, embed_fn=lambda ts: _topic_embed(ts), lm=create_lm(e_cfg)
-    )
+    rt_e = start_runtime(e_cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(e_cfg))
     try:
         mcp_e, _ = create_mcp_app(rt=rt_e)
 
@@ -673,8 +670,9 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
         queue_maxsize=32,
     )
     assert cfg.corpus_root is not None and cfg.lock_path is not None
-    cfg.corpus_root.mkdir(parents=True)
-    (cfg.corpus_root / "apollo.md").write_text(
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "apollo.md").write_text(
         "# Apollo 11 Mission\nNeil Armstrong was the Apollo 11 Lunar Module commander.\n",
         encoding="utf-8",
     )
@@ -684,7 +682,7 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
     def _run_srv() -> None:
         try:
             serve_http(cfg)
-        except BaseException as exc:
+        except (OSError, RuntimeError, ValueError, SystemExit) as exc:
             srv_errors.append(exc)
 
     t_srv = threading.Thread(target=_run_srv, daemon=True)
@@ -776,7 +774,7 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
                     assert len((await c_fresh.call_tool("recall", {"query": "Apollo 11"})).data["results"]) >= 1
 
                 # 4. Live CocoIndex file creation detected and searchable over TCP without restart
-                (cfg.corpus_root / "live_tcp.md").write_text(
+                (corpus_root / "live_tcp.md").write_text(
                     "# XylophoneZither Bio\nNeil Armstrong played XylophoneZither in Ohio.\n",
                     encoding="utf-8",
                 )
@@ -832,7 +830,7 @@ def test_live_post_ready_pipeline_failure_flips_readyz_503_and_not_ready_mcp(tmp
     def _run_srv() -> None:
         try:
             serve_http(cfg)
-        except BaseException as exc:
+        except (OSError, RuntimeError, ValueError, SystemExit) as exc:
             srv_errors.append(exc)
 
     t_srv = threading.Thread(target=_run_srv, daemon=True)

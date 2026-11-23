@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import dspy
 import fastmcp
@@ -116,6 +116,7 @@ def _start_chat_server(responder: Any) -> tuple[ThreadingHTTPServer, list[dict[s
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -321,7 +322,8 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
 
 def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path, queue_maxsize=2, api_key="super-secret-xyz987")
-    assert cfg.corpus_root is not None and cfg.lock_path is not None and cfg.status_path is not None
+    assert cfg.corpus_root is not None and cfg.db_path is not None and cfg.lock_path is not None
+    assert cfg.status_path is not None
     cfg.corpus_root.mkdir(parents=True)
     (cfg.corpus_root / "doc.md").write_text(
         "# Xylophone Fact\nNeil Armstrong played the XylophoneZither in Ohio.\n",
@@ -356,8 +358,8 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
         )
 
     srv, _ = _start_chat_server(chat_responder)
-    rt: YawRuntime | None = None
-    try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(srv.shutdown)
         lm = dspy.LM(
             model="openai/gemma-4-e4b",
             model_type="chat",
@@ -368,6 +370,8 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
             num_retries=0,
         )
         rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=slow_embed, lm=lm)
+        stack.callback(close_runtime, rt)
+        stack.callback(release_all.set)
 
         # Saturate queue_maxsize=2 -> 3rd concurrent recall and ask fail immediately with BUSY
         hold_enabled.set()
@@ -457,11 +461,6 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
             while not rt.stop_event.is_set() and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert rt.stop_event.is_set() is True
-    finally:
-        release_all.set()
-        if rt is not None:
-            close_runtime(rt)
-        srv.shutdown()
 
 
 def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_path: Path) -> None:
@@ -499,6 +498,112 @@ def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_pa
         assert exc_nr.value.code == "NOT_READY"
     finally:
         close_runtime(rt)
+
+
+def test_live_initial_base_exception_transitions_to_error_and_redacts_status(tmp_path: Path) -> None:
+    class _SimulatedRustPanic(BaseException):
+        pass
+
+    secret_tok = "tok-initial-panic-secret888"
+    cfg = _make_cfg(tmp_path, api_key=secret_tok)
+    assert cfg.corpus_root is not None and cfg.status_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "panic.md").write_text("# Panic\nTrigger initial live non-Exception panic.\n", encoding="utf-8")
+
+    def panicking_embed(texts: list[str]) -> NDArray[np.float32]:
+        if any("Trigger initial live non-Exception panic" in t for t in texts):
+            raise _SimulatedRustPanic(f"rust panic with key={secret_tok}")
+        return _topic_embed(texts, dim=64)
+
+    rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=panicking_embed, lm=create_lm(cfg))
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if rt.lifecycle == "error":
+                break
+            time.sleep(0.05)
+        assert rt.lifecycle == "error"
+        assert isinstance(rt.pipeline.error, RuntimeError)
+        assert isinstance(rt.pipeline.error.__cause__, BaseException)
+        st = get_status(rt)
+        assert st.lifecycle == "error"
+        assert st.sync_state == "error"
+        assert st.provider_ready is False
+        assert st.last_error is not None
+        assert "RuntimeError" in st.last_error
+        assert "_SimulatedRustPanic" in st.last_error
+        assert secret_tok not in st.last_error
+        disk_text = cfg.status_path.read_text(encoding="utf-8")
+        assert '"lifecycle": "error"' in disk_text
+        assert secret_tok not in disk_text
+        with pytest.raises(YawRuntimeError) as exc_nr:
+            recall(rt, "anything")
+        assert exc_nr.value.code == "NOT_READY"
+    finally:
+        close_runtime(rt)
+
+
+def test_live_initial_http_500_transitions_to_error_and_redacts_status(tmp_path: Path) -> None:
+    secret_tok = "tok-initial-http500-secret555"
+
+    class _FailingEmbedHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            body = json.dumps({"error": {"message": f"upstream 500 for key={secret_tok}"}}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FailingEmbedHandler)
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        cfg = replace(_make_cfg(tmp_path, api_key=secret_tok), base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        assert cfg.corpus_root is not None and cfg.status_path is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "http500.md").write_text(
+            "# HTTP 500\nTrigger real DSPy HTTP 500 embedding failure.\n",
+            encoding="utf-8",
+        )
+        rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=None, lm=create_lm(cfg))
+        try:
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if rt.lifecycle == "error":
+                    break
+                time.sleep(0.05)
+            assert rt.lifecycle == "error"
+            assert isinstance(rt.pipeline.error, RuntimeError)
+            assert rt.pipeline.error.__cause__ is not None
+            assert type(rt.pipeline.error.__cause__).__name__ == "InternalServerError"
+            st = get_status(rt)
+            assert st.lifecycle == "error"
+            assert st.sync_state == "error"
+            assert st.provider_ready is False
+            assert st.last_error is not None
+            assert "RuntimeError" in st.last_error
+            assert "InternalServerError" in st.last_error
+            assert secret_tok not in st.last_error
+            disk_text = cfg.status_path.read_text(encoding="utf-8")
+            assert '"lifecycle": "error"' in disk_text
+            assert secret_tok not in disk_text
+            with pytest.raises(YawRuntimeError) as exc_nr:
+                recall(rt, "anything")
+            assert exc_nr.value.code == "NOT_READY"
+        finally:
+            close_runtime(rt)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        srv_thread.join(timeout=5.0)
 
 
 def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path: Path) -> None:
@@ -572,6 +677,7 @@ def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -690,6 +796,7 @@ def test_live_post_ready_pipeline_failure_transitions_to_error_and_blocks_querie
         chunk_overlap=20,
         min_chunk_size=20,
     )
+    assert cfg.corpus_root is not None and cfg.status_path is not None
     rt = start_runtime(cfg, live=True, wait_for_ready=True, embed_fn=post_ready_failing_embed, lm=create_lm(cfg))
     try:
         assert get_status(rt).lifecycle == "ready"

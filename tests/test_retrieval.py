@@ -97,7 +97,7 @@ def test_retrieval_module_isolation_and_unicode61_normalization() -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imported.add(alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported.add(node.module.split(".")[0])
     assert {"sqlite_vec", "spacy", "optuna", "dspy", "fastmcp", "cocoindex", "sentence_transformers"}.isdisjoint(
         imported
@@ -198,7 +198,7 @@ def test_missing_fts_vocab_corrupt_blobs_and_conn_none_raise_consistency_error(t
             search_index(idx, q_vec, query_text="sample", conn=None)
         assert exc_s_none.value.code == "CONSISTENCY_ERROR"
         with pytest.raises(YawRuntimeError) as exc_l_none:
-            lexical_search(idx, "sample", None)  # type: ignore[arg-type]
+            lexical_search(idx, "sample", None)
         assert exc_l_none.value.code == "CONSISTENCY_ERROR"
         with pytest.raises(YawRuntimeError) as exc_e_none:
             expand_citation_neighbors(idx, idx.chunk_ids[0], corpus_root=cfg.corpus_root, conn=None)

@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import numpy as np
 import pytest
@@ -314,6 +314,7 @@ def test_loopback_dspy_embedder_pipeline(tmp_path: Path) -> None:
     seen_inputs: list[str] = []
 
     class _EmbedHandler(BaseHTTPRequestHandler):
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -681,6 +682,7 @@ def _loopback_embed_server(
     handler_fn: Callable[[str, list[str]], NDArray[np.float32]],
 ) -> Generator[int]:
     class _EmbedHandler(BaseHTTPRequestHandler):
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -1009,6 +1011,7 @@ def test_model_change_invalidates_memo_cache(tmp_path: Path) -> None:
 
         calls_b = [c for c in seen_calls[count_before_b:] if "model-b" in c[0] and any("waveguide" in t for t in c[1])]
         assert len(calls_b) == 1
+        assert cfg_b.db_path is not None
         with _open_ro(cfg_b.db_path) as conn:
             blob_b = conn.execute("SELECT embedding_f16 FROM chunks").fetchone()[0]
             assert np.allclose(np.frombuffer(blob_b, dtype="<f2").astype(np.float32), [0.0, 1.0, 0.0, 0.0], atol=1e-3)

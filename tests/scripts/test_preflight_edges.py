@@ -52,7 +52,6 @@ def test_run_check_force_stops_an_owned_child_ignoring_interrupts(tmp_path):
         "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\n"
         "time.sleep(30)\n"
     )
-    child_pid = None
     try:
         result = run_check(
             "stubborn", [sys.executable, "-c", script, str(marker)], tmp_path, tmp_path, dict(os.environ), 5
@@ -63,13 +62,13 @@ def test_run_check_force_stops_an_owned_child_ignoring_interrupts(tmp_path):
         assert not psutil.pid_exists(child_pid)
     finally:
         # Only this test's positively identified child is eligible for cleanup.
-        if child_pid is not None:
+        if marker.exists():
             try:
-                child = psutil.Process(child_pid)
+                child = psutil.Process(int(marker.read_text(encoding="utf-8")))
                 if str(marker) in child.cmdline():
                     child.kill()
                     child.wait(timeout=5)
-            except psutil.NoSuchProcess:
+            except psutil.NoSuchProcess, ValueError:
                 pass
 
 
@@ -185,6 +184,7 @@ raise SystemExit(main(['--output-dir',sys.argv[2],'--timeout','90']))
     try:
         result = subprocess.run(
             [sys.executable, "-c", script, str(ready), str(output)],
+            check=False,
             cwd=tmp_path,
             env={**os.environ, "PYTHONPATH": str(root), "PYTHONIOENCODING": "utf-8"},
             capture_output=True,

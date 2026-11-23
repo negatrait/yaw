@@ -39,6 +39,9 @@ dev = [
 package = true
 preview-features = ["content-addressed-cache"]
 
+[tool.setuptools]
+py-modules = ["benchmark"]
+
 [tool.setuptools.packages.find]
 include = ["yaw*", "scripts*"]
 
@@ -48,13 +51,50 @@ line-length = 120
 target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+exclude = ["docs/reviews/inference-backend-probes/**"]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "C4",
+    "PIE",
+    "RET",
+    "PGH",
+    "DTZ",
+    "S110",
+    "S112",
+    "BLE",
+    "PLE",
+    "PLW",
+    "PERF",
+    "PTH",
+    "ERA",
+    "ARG",
+    "A",
+    "RUF100",
+    "ANN001",
+    "ANN201",
+    "ANN202",
+    "ANN204",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN001", "ANN201", "ANN202", "ANN204", "A002"]
 
 [tool.ruff.format]
 exclude = ["docs/**"]
 
 [tool.ty.src]
 exclude = ["docs/reviews/inference-backend-probes/**"]
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.ty.rules]
+all = "error"
 
 [tool.pytest.ini_options]
 addopts = ["--testmon"]

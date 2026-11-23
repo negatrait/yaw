@@ -19,7 +19,7 @@ import urllib.request
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import filelock
 import numpy as np
@@ -143,6 +143,7 @@ def _start_openai_stub(
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -277,14 +278,14 @@ def _prepare_sample_bundle(root: Path, *, dataset_name: str = "sample", total_qu
             ],
         },
     ]
-    for idx in range(len(question_rows), total_questions):
-        question_rows.append(
-            {
-                "question": f"OffsetCheck question {idx}: who commanded Apollo 11?",
-                "answer": "Neil Armstrong",
-                "gold_docs": ["Apollo Mission\nNeil Armstrong served as commander of Apollo 11 on the lunar surface."],
-            }
-        )
+    question_rows.extend(
+        {
+            "question": f"OffsetCheck question {idx}: who commanded Apollo 11?",
+            "answer": "Neil Armstrong",
+            "gold_docs": ["Apollo Mission\nNeil Armstrong served as commander of Apollo 11 on the lunar surface."],
+        }
+        for idx in range(len(question_rows), total_questions)
+    )
     src_dir = root / f"_raw_src_{dataset_name}"
     src_dir.mkdir(parents=True, exist_ok=True)
     c_path = src_dir / "corpus.json"
@@ -959,6 +960,7 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
     def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "yaw", *args],
+            check=False,
             cwd=str(tmp_path),
             capture_output=True,
             text=True,

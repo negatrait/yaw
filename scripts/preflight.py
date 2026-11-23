@@ -15,6 +15,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
 
@@ -26,7 +27,7 @@ def run_check(
     env: dict[str, str],
     timeout: float,
     verbose: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Stream a child to its own log; keep checking after ordinary failures."""
     started = time.monotonic()
     log = output / f"{name}.log"
@@ -59,12 +60,12 @@ def run_check(
             try:
                 deadline = started + timeout if timeout else None
                 while True:
-                    interval = min(30, max(0.01, deadline - time.monotonic())) if deadline else 30
+                    interval = min(30, max(0.01, deadline - time.monotonic())) if deadline is not None else 30
                     try:
                         result["exit_code"] = process.wait(timeout=interval)
                         break
                     except subprocess.TimeoutExpired:
-                        if deadline and time.monotonic() >= deadline:
+                        if deadline is not None and time.monotonic() >= deadline:
                             raise
                         print(f"[{name}] Running ({time.monotonic() - started:.0f}s)", flush=True)
                 result["status"] = "passed" if result["exit_code"] == 0 else "failed"
@@ -90,7 +91,7 @@ def run_check(
     return result
 
 
-def write_report(output: Path, report: dict) -> None:
+def write_report(output: Path, report: dict[str, Any]) -> None:
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     lines = [
         "# Preflight",
@@ -100,8 +101,10 @@ def write_report(output: Path, report: dict) -> None:
         "| Check | Status | Exit | Seconds |",
         "| --- | --- | ---: | ---: |",
     ]
-    for result in report["checks"]:
-        lines.append(f"| {result['name']} | {result['status']} | {result.get('exit_code')} | {result['seconds']:.1f} |")
+    lines.extend(
+        f"| {result['name']} | {result['status']} | {result.get('exit_code')} | {result['seconds']:.1f} |"
+        for result in report["checks"]
+    )
     for name, diagnostics in report.get("diagnostics", {}).items():
         lines += [
             "",
@@ -164,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     lock = root / "uv.lock"
     identity = hashlib.sha256(lock.read_bytes() if lock.exists() else b"").hexdigest()[:16]
     mode = "full" if args.full else "incremental"
-    report: dict = {
+    report: dict[str, Any] = {
         "mode": mode,
         "live": True,
         "checks": [],

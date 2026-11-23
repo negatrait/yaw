@@ -33,6 +33,7 @@ from yaw.core import (
     write_text_atomic,
 )
 from yaw.pipeline import (
+    WORKER_ERROR_TYPES,
     PipelineSession,
     close_pipeline,
     make_dspy_embed_fn,
@@ -145,14 +146,14 @@ def _close_win32_stop_event(rt: YawRuntime) -> None:
         return
     handle = rt.win32_stop_handle
     rt.win32_stop_handle = None
-    if handle:
+    if handle is not None and handle != 0:
         with contextlib.suppress(OSError):
             _kernel32.SetEvent(handle)
     waiter = rt.win32_waiter_thread
     if waiter is not None and waiter.is_alive() and waiter is not threading.current_thread():
         waiter.join(timeout=1.0)
     rt.win32_waiter_thread = None
-    if handle:
+    if handle is not None and handle != 0:
         with contextlib.suppress(OSError):
             _kernel32.CloseHandle(handle)
 
@@ -274,7 +275,8 @@ def start_runtime(
                 if not rt.stop_event.is_set() and rt.lifecycle == "starting":
                     try:
                         wait_ready(rt, timeout=0.0)
-                    except Exception as exc:
+                    # Transition async startup waiter to error state and persist redacted error to status.json.
+                    except WORKER_ERROR_TYPES as exc:
                         msg = redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key)
                         with rt.state_lock:
                             rt.last_error = msg
@@ -350,7 +352,7 @@ def _sync_pipeline_error(rt: YawRuntime) -> tuple[str, str | None]:
         err_msg = f"Pipeline reported {pipe_num_errors} component error(s)."
     with rt.state_lock:
         if err_msg is not None:
-            if not rt.last_error or pipe_err is not None:
+            if rt.last_error is None or not rt.last_error or pipe_err is not None:
                 rt.last_error = err_msg
             if rt.lifecycle not in ("stopping", "stopped"):
                 rt.lifecycle = "error"
@@ -541,8 +543,10 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
         queue_depth = rt.active_queries
         active_op = rt.active_op
         last_sync_at = rt.last_sync_at
-    redacted_err = redact_secrets(raw_err, rt.config.api_key) if raw_err else None
-    sync_state = "error" if redacted_err else ("syncing" if lc == "starting" else "idle")
+    redacted_err = redact_secrets(raw_err, rt.config.api_key) if raw_err is not None and bool(raw_err) else None
+    sync_state = (
+        "error" if redacted_err is not None and bool(redacted_err) else ("syncing" if lc == "starting" else "idle")
+    )
     status = DaemonStatus(
         lifecycle=lc,
         provider_ready=lc in ("starting", "ready") and not rt.stop_event.is_set(),

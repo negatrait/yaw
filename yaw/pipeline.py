@@ -12,7 +12,7 @@ import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast, override
 
 import cocoindex as coco
 import dspy
@@ -23,6 +23,7 @@ from cocoindex.connectors import localfs, sqlite
 from cocoindex.ops.code import CodeSource
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
+from dspy.utils.exceptions import DSPyError
 from numpy.typing import NDArray
 
 from yaw.core import (
@@ -237,6 +238,7 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
                     inserts,
                 )
 
+    @override
     def reconcile(
         self,
         key: coco.StableKey,
@@ -301,6 +303,7 @@ _FTS_TABLE_SINK = coco.TargetActionSink[_FtsTableAction].from_fn(
 
 
 class _FtsTableHandler(coco.TargetHandler[str, str, _FtsRowHandler]):
+    @override
     def reconcile(
         self,
         key: coco.StableKey,
@@ -600,6 +603,34 @@ def reconcile_index_tables(
     return True
 
 
+WORKER_ERROR_TYPES: tuple[type[Exception], ...] = (
+    YawRuntimeError,
+    sqlite3.Error,
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    LookupError,
+    ArithmeticError,
+    AttributeError,
+    TimeoutError,
+    DSPyError,
+)
+
+
+def _normalize_worker_error(exc: BaseException) -> Exception:
+    if isinstance(exc, WORKER_ERROR_TYPES):
+        return exc
+    detail = (
+        f"{type(exc).__name__}: {exc} ({'; '.join(f'{type(sub).__name__}: {sub}' for sub in exc.exceptions)})"
+        if isinstance(exc, BaseExceptionGroup)
+        else f"{type(exc).__name__}: {exc}"
+    )
+    err = RuntimeError(detail)
+    err.__cause__ = exc
+    return err
+
+
 @dataclass(slots=True)
 class PipelineSession:
     """Handle bundle owning a CocoIndex Environment, worker thread/loop, and SQLite connection."""
@@ -617,7 +648,7 @@ class PipelineSession:
     thread: threading.Thread
     loop: asyncio.AbstractEventLoop
     stop_async: asyncio.Event
-    error: BaseException | None = None
+    error: Exception | None = None
 
 
 async def _watch_pipeline(
@@ -631,8 +662,6 @@ async def _watch_pipeline(
         snaps = handle.watch()
         async for snap in snaps:
             if session.error is not None:
-                session.ready_event.set()
-                stop_async.set()
                 break
             if snap.stats.total.num_errors:
                 had_errors = snap.stats.total.num_errors
@@ -653,18 +682,14 @@ async def _watch_pipeline(
                 "CONSISTENCY_ERROR",
                 f"CocoIndex live update reported {had_errors} component error(s).",
             )
-            session.ready_event.set()
-            stop_async.set()
-    except asyncio.CancelledError:
-        return
-    except BaseException as exc:
-        if session.error is None:
-            session.error = exc
-        session.ready_event.set()
-        stop_async.set()
     finally:
-        if isinstance(snaps, AsyncGenerator):
-            await snaps.aclose()
+        try:
+            if session.error is not None:
+                session.ready_event.set()
+                stop_async.set()
+        finally:
+            if isinstance(snaps, AsyncGenerator):
+                await snaps.aclose()
 
 
 def start_pipeline(
@@ -692,10 +717,12 @@ def start_pipeline(
     holder: dict[str, Any] = {}
 
     def _on_component_error(exc: BaseException, _ctx: coco.ExceptionContext) -> None:
+        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise exc
         with err_lock:
             session = holder.get("session")
             if session is not None and session.error is None:
-                session.error = exc
+                session.error = _normalize_worker_error(exc)
         ready_event.set()
         raise exc
 
@@ -720,7 +747,9 @@ def start_pipeline(
         loop = asyncio.get_running_loop()
         stop_async = asyncio.Event()
         env: coco.Environment | None = None
-        try:
+
+        async def _init_session() -> PipelineSession:
+            nonlocal env
             ctx = coco.ContextProvider()
             ctx.provide(CORPUS_ROOT, corpus_root)
             ctx.provide(SQLITE_DB, conn_mgr)
@@ -742,7 +771,7 @@ def start_pipeline(
                 cfg.embedding_task_mode,
                 live,
             )
-            session = PipelineSession(
+            return PipelineSession(
                 db_path=db_path,
                 state_dir=state_dir,
                 corpus_root=corpus_root,
@@ -757,20 +786,32 @@ def start_pipeline(
                 loop=loop,
                 stop_async=stop_async,
             )
-            holder["session"] = session
+
+        (init_res,) = await asyncio.gather(_init_session(), return_exceptions=True)
+        cur = asyncio.current_task()
+        if isinstance(init_res, (KeyboardInterrupt, SystemExit)) or (
+            isinstance(init_res, asyncio.CancelledError) and cur is not None and cur.cancelling() > 0
+        ):
+            holder["init_error"] = init_res
+            if env is not None:
+                env.close()
             init_event.set()
-        except BaseException as exc:
-            holder["init_error"] = exc
+            raise init_res
+        if isinstance(init_res, BaseException):
+            holder["init_error"] = _normalize_worker_error(init_res)
             if env is not None:
                 env.close()
             init_event.set()
             return
+        session = init_res
+        holder["session"] = session
+        init_event.set()
 
         if not live:
             await stop_async.wait()
             return
 
-        handle = app.update(live=True)
+        handle = session.app.update(live=True)
         watch_task = asyncio.create_task(_watch_pipeline(session, handle, stop_async))
         stop_task = asyncio.create_task(stop_async.wait())
         _, pending = await asyncio.wait({watch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -778,23 +819,27 @@ def start_pipeline(
             task.cancel()
         results = await asyncio.gather(watch_task, stop_task, return_exceptions=True)
         for res in results:
+            if isinstance(res, (KeyboardInterrupt, SystemExit)):
+                raise res
             if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
                 if session.error is None:
-                    session.error = res
+                    session.error = _normalize_worker_error(res)
                 session.ready_event.set()
-        cur = asyncio.current_task()
         other = [t for t in asyncio.all_tasks(loop) if t is not cur and not t.done()]
         for t in other:
             t.cancel()
         if other:
             await asyncio.gather(*other, return_exceptions=True)
-        try:
-            await asyncio.wait_for(handle.result(), timeout=5.0)
-        except asyncio.CancelledError, TimeoutError:
-            pass
-        except BaseException as exc:
+        (shutdown_res,) = await asyncio.gather(asyncio.wait_for(handle.result(), timeout=5.0), return_exceptions=True)
+        if isinstance(shutdown_res, (KeyboardInterrupt, SystemExit)) or (
+            isinstance(shutdown_res, asyncio.CancelledError) and cur is not None and cur.cancelling() > 0
+        ):
+            raise shutdown_res
+        if isinstance(shutdown_res, BaseException) and not isinstance(
+            shutdown_res, (TimeoutError, asyncio.CancelledError)
+        ):
             if session.error is None:
-                session.error = exc
+                session.error = _normalize_worker_error(shutdown_res)
             session.ready_event.set()
         del handle
 

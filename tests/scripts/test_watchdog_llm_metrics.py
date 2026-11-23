@@ -2,6 +2,7 @@
 
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import override
 
 import pytest
 
@@ -25,8 +26,9 @@ def metrics_server():
             self.end_headers()
             self.wfile.write(METRICS.encode())
 
-        def log_message(self, format: str, *args) -> None:
-            return
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            _ = format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

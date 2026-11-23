@@ -90,7 +90,7 @@ def qa_gepa_metric(
     else:
         cite_score = len(valid_cites) / len(cites)
 
-    if gold_docs:
+    if gold_docs is not None and bool(gold_docs):
         k_ev = max(len(obs_blocks), 1)
         ev_recall = score_retrieval_recalls([gold_docs], [obs_blocks], k_list=(k_ev,))[0][f"Recall@{k_ev}"]
         score = 0.55 * f1 + 0.15 * em + 0.15 * cite_score + 0.15 * ev_recall
@@ -218,7 +218,7 @@ def make_react_instruction_proposer(
         return {
             comp: propose_component(comp, candidate[comp], rows)
             for comp in components_to_update
-            if comp in candidate and (rows := reflective_dataset.get(comp))
+            if comp in candidate and (rows := reflective_dataset.get(comp)) is not None and bool(rows)
         }
 
     return propose

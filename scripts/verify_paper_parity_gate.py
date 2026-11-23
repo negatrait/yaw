@@ -23,21 +23,21 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import benchmark
+from benchmark import BASELINES
+from scripts.evaluation import evaluate_benchmark_gate
+from yaw.core.config import load_config
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+
 reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
 if callable(reconfigure_stdout):
     reconfigure_stdout(encoding="utf-8", errors="replace")
-
-import benchmark  # noqa: E402
-from benchmark import BASELINES  # noqa: E402
-from scripts.evaluation import evaluate_benchmark_gate  # noqa: E402
-from yaw.core.config import load_config  # noqa: E402
 
 DEFAULT_DATASETS: tuple[str, ...] = (
     "popqa",
@@ -222,7 +222,7 @@ def compare_engine_reports(
 
 
 def aggregate_gate_summary(
-    dataset_results: dict[str, dict[str, Any]],
+    dataset_results: Mapping[str, Any],
     *,
     mode: str = "eval",
 ) -> dict[str, Any]:
@@ -553,14 +553,14 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
         ]
     )
 
-    for r in rows["telemetry"]:
-        lines.append(
-            f"| `{r['dataset']}` | {r['dpr_r5']} "
-            f"| {r['h_seeds']} | {r['y_seeds']} "
-            f"| {r['h_fb']} | {r['y_fb']} "
-            f"| {r['h_idx']} | {r['y_idx']} "
-            f"| {r['h_eval']} | {r['y_eval']} |"
-        )
+    lines.extend(
+        f"| `{r['dataset']}` | {r['dpr_r5']} "
+        f"| {r['h_seeds']} | {r['y_seeds']} "
+        f"| {r['h_fb']} | {r['y_fb']} "
+        f"| {r['h_idx']} | {r['y_idx']} "
+        f"| {r['h_eval']} | {r['y_eval']} |"
+        for r in rows["telemetry"]
+    )
 
     lines.extend(
         [
@@ -577,10 +577,10 @@ def format_gate_markdown(gate_payload: dict[str, Any]) -> str:
         ]
     )
 
-    for r in rows["paper"]:
-        lines.append(
-            f"| `{r['dataset']}` | {r['r2']} | {r['r5']} | {r['em']} | {r['f1']} | {r['std_r5']} | {r['std_f1']} |"
-        )
+    lines.extend(
+        f"| `{r['dataset']}` | {r['r2']} | {r['r5']} | {r['em']} | {r['f1']} | {r['std_r5']} | {r['std_f1']} |"
+        for r in rows["paper"]
+    )
 
     lines.append("")
     return "\n".join(lines)
@@ -1101,14 +1101,14 @@ def _can_reuse_dataset_entry(
     if not isinstance(entry, dict):
         return False
     qa_match = True
-    if mode == "eval" and qa_model:
+    if mode == "eval" and qa_model is not None and bool(qa_model):
         hippo_qa = entry.get("hipporag", {}).get("qa_model")
         yaw_qa = entry.get("yaw", {}).get("qa_model")
         if hippo_qa and hippo_qa != qa_model:
             qa_match = False
         if yaw_qa and yaw_qa != qa_model:
             qa_match = False
-    return (
+    return bool(
         entry.get("status") == "completed"
         and bool(entry.get("gate_passed"))
         and entry.get("queries_per_dataset") == queries_per_dataset
@@ -1155,7 +1155,7 @@ def _persist_gate_outputs(
 
     # Mirror to optional artifact directory if configured
     artifact_dir_raw = os.environ.get("YAW_ARTIFACT_DIR")
-    if artifact_dir_raw:
+    if artifact_dir_raw is not None and bool(artifact_dir_raw):
         brain_dir = Path(artifact_dir_raw)
         if brain_dir.exists():
             (brain_dir / "paper_parity_quality.svg").write_text(quality_svg_str, encoding="utf-8")
@@ -1174,7 +1174,7 @@ def wipe_benchmark_indexes(dataset: str | None = None) -> None:
     idx_root = PROJECT_ROOT / "outputs" / "benchmarks" / "indexes"
     if not idx_root.exists():
         return
-    pattern = f"{dataset}_*" if dataset else "*"
+    pattern = f"{dataset}_*" if dataset is not None and bool(dataset) else "*"
     for d in idx_root.glob(pattern):
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)

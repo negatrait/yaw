@@ -10,7 +10,7 @@ import threading
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import numpy as np
 import pytest
@@ -38,7 +38,7 @@ def benchmark_inference_server():
             if kw in low:
                 vector[idx] += 2.0
         vector /= max(float(np.linalg.norm(vector)), 1e-12)
-        return vector.tolist()
+        return [float(x) for x in vector]
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -130,8 +130,9 @@ def benchmark_inference_server():
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: object) -> None:
-            return
+            _ = format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -543,8 +544,9 @@ def test_run_yaw_benchmark_and_main_fail_fast_on_qa_runtime_error(
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: object) -> None:
-            return
+            _ = format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), BadCiteHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

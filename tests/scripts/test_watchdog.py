@@ -9,7 +9,7 @@ import threading
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, override
 from xml.etree import ElementTree
 
 import filelock
@@ -54,8 +54,9 @@ def prometheus_server():
             self.end_headers()
             self.wfile.write(body)
 
+        @override
         def log_message(self, format: str, *args: object) -> None:
-            return
+            _ = format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

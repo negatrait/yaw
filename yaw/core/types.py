@@ -119,9 +119,7 @@ class ChunkPointer:
     @property
     def span_label(self) -> str:
         base = f"{self.rel_posix_path}:{self.start_line}-{self.end_line}"
-        if self.char_start or self.char_end:
-            return f"{base}@{self.char_start}-{self.char_end}"
-        return base
+        return f"{base}@{self.char_start}-{self.char_end}" if (self.char_start or self.char_end) else base
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,9 +177,9 @@ _DOCUMENT_PREFIX = "title: none | text: "
 
 def render_document_text(title: str, body: str) -> str:
     """Render benchmark dataset fields once, preserving an already present title line."""
-    if title and body != title and not body.startswith((title + "\n", title + "\r\n")):
-        return f"{title}\n{body}"
-    return body
+    return (
+        f"{title}\n{body}" if title and body != title and not body.startswith((title + "\n", title + "\r\n")) else body
+    )
 
 
 def format_query_for_embedding(query: str, task_mode: str = "distinct-titled") -> str:

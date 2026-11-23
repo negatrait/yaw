@@ -135,7 +135,7 @@ def _compute_metric_confidence(yaw_val: float, base_val: float, n: int) -> dict[
 
 
 def evaluate_benchmark_gate(
-    dataset_reports: Mapping[str, Mapping[str, Any]],
+    dataset_reports: Mapping[str, Any],
     gate_spec: Mapping[str, Any],
     *,
     mode: Literal["eval", "retrieval"] = "eval",
@@ -184,7 +184,7 @@ def evaluate_benchmark_gate(
             qa_block = raw_qa if isinstance(raw_qa, Mapping) else {}
             dpr_block = eval_metrics.get("standard_dpr", {})
             dpr_ret = dpr_block.get("retrieval", {}) if isinstance(dpr_block, Mapping) else {}
-            rec_mem = eval_metrics.get("recognition_memory", {}) if isinstance(eval_metrics, Mapping) else {}
+            rec_mem = eval_metrics.get("recognition_memory", {})
         elif "yaw_hipporag" in rep and isinstance(rep["yaw_hipporag"], Mapping):
             yh = rep["yaw_hipporag"]
             ret_block = yh
@@ -453,9 +453,9 @@ def evaluate_benchmark_gate(
     summary_failures: list[str] = []
     if not completed:
         summary_failures.append("No datasets completed")
-    for d in completed:
-        if not d["gate_passed"]:
-            summary_failures.append(f"{d['dataset']}: {'; '.join(d['failure_reasons'])}")
+    summary_failures.extend(
+        f"{d['dataset']}: {'; '.join(d['failure_reasons'])}" for d in completed if not d["gate_passed"]
+    )
 
     if completed:
         if bool(gate_spec.get("require_mean_recall5_parity", True)):
@@ -532,7 +532,7 @@ def check_benchmark_integrity(
         errors.append(f"Index passage count mismatch: {num_indexed} != {expected_doc_count}")
     raw_chunks = graph_info.get("num_passage_nodes", 0)
     num_chunks = int(raw_chunks) if isinstance(raw_chunks, (int, float)) and not isinstance(raw_chunks, bool) else 0
-    if (expected_doc_count or records) and num_chunks <= 0:
+    if (bool(expected_doc_count) or bool(records)) and num_chunks <= 0:
         errors.append("No chunks indexed in SQLite index")
     if include_qa:
         for idx, record in enumerate(records):

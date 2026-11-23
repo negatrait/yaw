@@ -41,7 +41,7 @@ _OMITTED_LINES_RE = re.compile(r"\n?\[\.\.\.\s*lines\s+\d+-\d+\s+omitted\s*\.\.\
 
 
 def _dataset_spec(name: str | Path | None) -> dict[str, Any]:
-    if not name or not (raw := str(name).strip()):
+    if name is None or not bool(name) or not (raw := str(name).strip()):
         return {}
     lowered = raw.lower()
     if lowered in _DATASET_SPECS:
@@ -140,7 +140,7 @@ class DatasetBundle:
     def _doc_row(self, doc: DatasetDocument) -> dict[str, Any]:
         md = (self.root / doc.path).read_text(encoding="utf-8")
         row = {self.title_key: doc.title, self.body_key: _strip_markdown_h1(md, doc.title), "idx": doc.document_id}
-        if self.id_key and self.id_key != "idx":
+        if self.id_key is not None and bool(self.id_key) and self.id_key != "idx":
             row[self.id_key] = doc.document_id
         return row
 
@@ -184,7 +184,7 @@ def document_identity(
     body_key: str = "text",
 ) -> str:
     """Return deterministic document identity from `id_key` or SHA-256[:16] of Markdown."""
-    if id_key and row.get(id_key) is not None:
+    if id_key is not None and bool(id_key) and row.get(id_key) is not None:
         return str(row[id_key])
     if row.get("idx") is not None:
         return str(row["idx"])
@@ -226,7 +226,7 @@ def prepare_dataset_bundle(
             raise ValueError(f"Document fields {title_key!r}/{body_key!r} must be strings")
         rendered = render_document_markdown(title_val, body_val)
         digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-        raw_id = row.get(id_key) if id_key else None
+        raw_id = row.get(id_key) if id_key is not None and bool(id_key) else None
         doc_id = str(raw_id) if raw_id is not None else digest[:16]
         if not doc_id:
             raise ValueError(f"Empty document ID in corpus record {index}")
@@ -507,7 +507,9 @@ def get_gold_docs(
     if spec.get("qa_only"):
         return None
     separator = str(spec.get("sentence_separator", " "))
-    id_map: dict[str, str] = dict(corpus_by_id) if corpus_by_id else _corpus_lookup(corpus)
+    id_map: dict[str, str] = (
+        dict(corpus_by_id) if corpus_by_id is not None and bool(corpus_by_id) else _corpus_lookup(corpus)
+    )
     return [
         list(dict.fromkeys(_extract_sample_passages(s, separator=separator, supporting_only=True, corpus_by_id=id_map)))
         for s in samples

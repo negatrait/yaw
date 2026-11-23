@@ -8,7 +8,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import numpy as np
 from numpy.typing import NDArray
@@ -42,6 +42,7 @@ def selected_texts(ids: list[str], corpus: list[dict[str, Any]]) -> list[str]:
 
 
 class DatasetSliceTests(unittest.TestCase):
+    @override
     def setUp(self) -> None:
         self.musique_samples = [
             {

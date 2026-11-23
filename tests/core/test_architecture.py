@@ -64,10 +64,15 @@ def _parse_yaml_frontmatter(md_path: Path) -> tuple[dict[str, object], str]:
         raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} is missing closing YAML frontmatter '---'")
     raw_yaml = text[4:end_idx]
     body = text[end_idx + 5 :]
-    loaded = yaml.safe_load(raw_yaml)
+    loaded: object = yaml.safe_load(raw_yaml)
     if not isinstance(loaded, dict):
         raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} frontmatter did not parse to a mapping")
-    return loaded, body
+    meta: dict[str, object] = {}
+    for key, value in loaded.items():
+        if not isinstance(key, str):
+            raise AssertionError(f"{md_path.relative_to(PROJECT_ROOT)} frontmatter key {key!r} is not a string")
+        meta[key] = value
+    return meta, body
 
 
 def _strip_fenced_lines(markdown_text: str) -> list[str]:
@@ -153,8 +158,7 @@ def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append((node.lineno, alias.name))
+            imports.extend((node.lineno, alias.name) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level > 0:
                 # Relative import: resolve against current_pkg_parts
@@ -163,9 +167,9 @@ def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
                 drop = node.level - 1
                 base_parts = [] if drop > len(current_pkg_parts) else current_pkg_parts[: len(current_pkg_parts) - drop]
                 mod = ".".join(base_parts)
-                full_mod = (f"{mod}.{node.module}" if mod else node.module) if node.module else mod
+                full_mod = (f"{mod}.{node.module}" if mod else node.module) if node.module is not None else mod
                 imports.append((node.lineno, full_mod))
-            elif node.module:
+            elif node.module is not None:
                 imports.append((node.lineno, node.module))
 
     return imports
@@ -203,6 +207,13 @@ def is_leaf_package(package_dir: Path) -> bool:
     return all(not (child.is_dir() and (child / "__init__.py").exists()) for child in package_dir.iterdir())
 
 
+def _resolve_graph_target(name: str, module_map: dict[str, Path]) -> str | None:
+    cand: str | None = name
+    while cand is not None and cand not in module_map:
+        cand = cand.rsplit(".", 1)[0] if "." in cand else None
+    return cand
+
+
 def build_internal_import_graph() -> dict[str, set[str]]:
     """Build the directed module-level import graph for all Python modules in yaw/."""
     module_map: dict[str, Path] = {}
@@ -225,31 +236,25 @@ def build_internal_import_graph() -> dict[str, set[str]]:
                 for alias in node.names:
                     name = alias.name
                     if name.startswith("yaw.") or name == "yaw":
-                        cand = name
-                        while cand and cand not in module_map:
-                            cand = cand.rsplit(".", 1)[0] if "." in cand else None
-                        if cand and cand != mod:
+                        cand = _resolve_graph_target(name, module_map)
+                        if cand is not None and cand != mod:
                             graph[mod].add(cand)
             elif isinstance(node, ast.ImportFrom):
                 if node.level > 0:
                     drop = node.level - 1
                     base = pkg_parts[: len(pkg_parts) - drop] if drop <= len(pkg_parts) else []
                     m_str = ".".join(base)
-                    full = f"{m_str}.{node.module}" if node.module else m_str
-                    cand = full
-                    while cand and cand not in module_map:
-                        cand = cand.rsplit(".", 1)[0] if "." in cand else None
-                    if cand and cand != mod:
+                    full = f"{m_str}.{node.module}" if node.module is not None else m_str
+                    cand = _resolve_graph_target(full, module_map)
+                    if cand is not None and cand != mod:
                         graph[mod].add(cand)
                     for alias in node.names:
                         alias_full = f"{full}.{alias.name}" if full else alias.name
                         if alias_full in module_map and alias_full != mod:
                             graph[mod].add(alias_full)
-                elif node.module and (node.module.startswith("yaw.") or node.module == "yaw"):
-                    cand = node.module
-                    while cand and cand not in module_map:
-                        cand = cand.rsplit(".", 1)[0] if "." in cand else None
-                    if cand and cand != mod:
+                elif node.module is not None and (node.module.startswith("yaw.") or node.module == "yaw"):
+                    cand = _resolve_graph_target(node.module, module_map)
+                    if cand is not None and cand != mod:
                         graph[mod].add(cand)
                     for alias in node.names:
                         alias_full = f"{node.module}.{alias.name}"
@@ -522,12 +527,12 @@ class ArchitectureTests(unittest.TestCase):
                         bool(node.module) and (node.module.startswith("yaw.") or node.module == "yaw")
                     )
                     if is_internal:
-                        for alias in node.names:
-                            if alias.name.startswith("_"):
-                                violations.append(
-                                    f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
-                                    f"cross-module import of protected/private symbol '{alias.name}' is forbidden"
-                                )
+                        violations.extend(
+                            f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
+                            f"cross-module import of protected/private symbol '{alias.name}' is forbidden"
+                            for alias in node.names
+                            if alias.name.startswith("_")
+                        )
 
         self.assertEqual(
             violations,
@@ -819,8 +824,9 @@ class ArchitectureTests(unittest.TestCase):
         for md_file in checked_files:
             rel_source = md_file.relative_to(PROJECT_ROOT)
             prose = _strip_fenced_code_blocks(md_file.read_text(encoding="utf-8"))
-            for match in _WIKI_LINK_RE.finditer(prose):
-                wiki_violations.append(f"{rel_source}: forbidden wiki-link {match.group(0)}")
+            wiki_violations.extend(
+                f"{rel_source}: forbidden wiki-link {match.group(0)}" for match in _WIKI_LINK_RE.finditer(prose)
+            )
 
             for match in _MD_LINK_RE.finditer(prose):
                 raw_target = match.group(1).strip()
@@ -1010,7 +1016,7 @@ class ArchitectureTests(unittest.TestCase):
 
         http_mods = {"httpx", "httpx2", "openai", "urllib", "http", "socket", "requests"}
         layer_rules: dict[str, tuple[set[str], set[str]]] = {
-            # filename: (allowed_top_level_packages, allowed_yaw_internal_modules)
+            # Maps module filename to (allowed_top_level_packages, allowed_yaw_internal_modules).
             "datasets.py": (stdlib | {"filelock", "numpy", "yaw"}, {"yaw.core"}),
             "retrieval.py": (
                 stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
@@ -1072,7 +1078,7 @@ class ArchitectureTests(unittest.TestCase):
                         alias.name.startswith(("yaw.optimize", "yaw.datasets")),
                         f"cli.py:{stmt.lineno} must lazy-import {alias.name}",
                     )
-            elif isinstance(stmt, ast.ImportFrom) and stmt.module:
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module is not None:
                 self.assertFalse(
                     stmt.module.startswith(("yaw.optimize", "yaw.datasets")),
                     f"cli.py:{stmt.lineno} must lazy-import {stmt.module}",

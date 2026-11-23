@@ -106,18 +106,16 @@ def resolve_coco_state_root(state_dir: Path | str) -> Path:
 
 
 def _resolve_path(base_dir: Path, raw: object, default_rel: str, *, field_name: str = "path") -> Path:
-    if raw is None:
+    if raw is None or (isinstance(raw, str) and not (raw := raw.strip())):
         val = Path(default_rel)
-    elif isinstance(raw, str):
-        val = Path(stripped) if (stripped := raw.strip()) else Path(default_rel)
-    elif isinstance(raw, Path):
-        val = raw
+    elif isinstance(raw, (str, Path)):
+        val = Path(raw)
     else:
         raise _invalid(f"Configuration field {field_name!r} must be a path string or Path, got {raw!r}")
     return val.resolve() if val.is_absolute() else (base_dir / val).resolve()
 
 
-def _normalize_str_tuple(raw: Any, default: tuple[str, ...], *, field_name: str) -> tuple[str, ...]:
+def _normalize_str_tuple(raw: object, default: tuple[str, ...], *, field_name: str) -> tuple[str, ...]:
     if raw is None:
         return default
     if isinstance(raw, str):
@@ -241,8 +239,7 @@ class YawConfig:
         if db_override is None:
             opt_db, status_name, prog_name = base_dir / "optimize_yaw.db", "dspy_status.json", "qa_program.json"
         else:
-            raw_path = str(db_override).strip()
-            if not raw_path:
+            if not (raw_path := str(db_override).strip()):
                 raise _invalid("for_optimization(): Optimization database path cannot be empty.")
             opt_db = _resolve_path(self.workspace_root, raw_path, raw_path, field_name="db_override")
             base_dir = opt_db.parent
@@ -262,10 +259,10 @@ class YawConfig:
 
 _SEQUENCE_FIELDS: frozenset[str] = frozenset({"included_patterns", "excluded_patterns", "optimize_datasets"})
 _OPTIONAL_INT_FIELDS: frozenset[str] = frozenset({"max_output_tokens"})
-_INT_FIELDS: frozenset[str] = frozenset(
-    {"chunk_size", "chunk_overlap", "min_chunk_size", "embed_batch_size", "embed_max_in_flight"}
+_INT_FIELDS: frozenset[str] = (
+    _OPTIONAL_INT_FIELDS
+    | {"chunk_size", "chunk_overlap", "min_chunk_size", "embed_batch_size", "embed_max_in_flight"}
     | {"react_max_iters", "queue_maxsize", "http_port", "optimize_max_queries", "optimize_query_offset"}
-    | _OPTIONAL_INT_FIELDS
 )
 _STRING_PATH_FIELDS: frozenset[str] = (
     (frozenset(_FIELD_TO_SECTION) | {"workspace_root"}) - _SEQUENCE_FIELDS - _INT_FIELDS
@@ -334,7 +331,8 @@ def _toml_bracket_delta(line: str) -> int:
 def _resolve_toml_target(
     path: Path | str | None, workspace_override: Path | str | None, *, require_exists: bool, caller: str
 ) -> tuple[Path, Path | None]:
-    base_dir = Path(workspace_override).resolve() if workspace_override else Path.cwd().resolve()
+    has_ws = workspace_override is not None and bool(workspace_override)
+    base_dir = Path(workspace_override).resolve() if has_ws else Path.cwd().resolve()
     if path is not None:
         toml_file = Path(path).resolve()
         if not toml_file.exists():
@@ -365,9 +363,8 @@ def load_config(path: Path | str | None = None, *, workspace_override: Path | st
         if "embed_batch_chars" in section:
             raise _invalid("load_config(): embed_batch_chars is retired; use embed_batch_size and embed_max_in_flight")
         if sec_name not in _ALLOWED_SECTIONS:
-            for k in section:
-                if k in _FIELD_TO_SECTION:
-                    raise _invalid(f"load_config(): {k} belongs in [{_FIELD_TO_SECTION[k]}], not [{sec_name}]")
+            if wrong := next((k for k in section if k in _FIELD_TO_SECTION), None):
+                raise _invalid(f"load_config(): {wrong} belongs in [{_FIELD_TO_SECTION[wrong]}], not [{sec_name}]")
             raise _invalid(f"load_config(): Unknown or retired section: [{sec_name}]")
 
         for k, v in section.items():
@@ -390,7 +387,7 @@ def load_config(path: Path | str | None = None, *, workspace_override: Path | st
     ws_raw = kwargs.pop("workspace_root", None)
     kwargs["workspace_root"] = (
         _resolve_path(base_dir, ws_raw, ".", field_name="workspace_root")
-        if ws_raw is not None and not workspace_override
+        if ws_raw is not None and (workspace_override is None or not bool(workspace_override))
         else base_dir
     )
     return YawConfig(**kwargs)

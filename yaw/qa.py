@@ -200,7 +200,9 @@ def iter_tool_observations(history_msgs: Sequence[Any]) -> Iterator[str]:
             continue
         calls = _field(tc, "tool_calls") or ()
         tcr = _field(tc, "tool_call_results")
-        results = tcr if isinstance(tcr, list | tuple) else (_field(tcr, "tool_call_results") or ())
+        results = tcr if isinstance(tcr, list | tuple) else _field(tcr, "tool_call_results")
+        if not results:
+            continue
         by_id = {cid: _field(c, "name", "") for c in calls if (cid := _field(c, "id")) is not None}
         for i, res in enumerate(results):
             pos_name = _field(calls[i], "name", "") if i < len(calls) else ""

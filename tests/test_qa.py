@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, override
 
 import dspy
 import numpy as np
@@ -182,6 +182,7 @@ def _start_loopback_chat_server(
                 with lock:
                     concurrency["in_flight"] -= 1
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -524,6 +525,7 @@ def test_ask_question_multihop_submit_and_zero_db_writes(tmp_path: Path) -> None
         captured_preds: list[dspy.Prediction] = []
 
         class _CapturePred(BaseCallback):
+            @override
             def on_module_end(self, call_id: str, outputs: Any | None, exception: BaseException | None = None) -> None:
                 _ = (call_id, exception)
                 if isinstance(outputs, dspy.Prediction) and hasattr(outputs, "answer") and hasattr(outputs, "history"):
@@ -793,11 +795,12 @@ def test_ask_question_grounding_consistency_and_error_boundaries(tmp_path: Path)
 
         # Stale/mutated cited file -> CONSISTENCY_ERROR
         alpha_cid = next(int(p.chunk_id) for p in idx.pointers if p.rel_posix_path == "alpha.md")
+        corpus_root = cfg.corpus_root
 
         def stale_responder(turn_idx: int, _p: dict[str, Any]) -> tuple[int, str]:
             if turn_idx == 0:
                 return 200, _xml_tool_reply("Read alpha", [{"name": "read_chunk", "args": {"chunk_id": alpha_cid}}])
-            (cfg.corpus_root / "alpha.md").write_text("# Mutated\nChanged after read!\n", encoding="utf-8")
+            (corpus_root / "alpha.md").write_text("# Mutated\nChanged after read!\n", encoding="utf-8")
             return 200, _xml_tool_reply(
                 "Cite alpha", [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={alpha_cid}]"}}]
             )

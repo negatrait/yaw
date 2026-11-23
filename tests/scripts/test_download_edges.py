@@ -8,7 +8,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, override
 
 import pytest
 
@@ -46,8 +46,9 @@ def download_server():
             self.end_headers()
             self.wfile.write(state["payload"])
 
+        @override
         def log_message(self, format: str, *args: object) -> None:
-            return
+            _ = format, args
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -137,6 +138,7 @@ def test_downloader_cli_reports_real_bundle_integrity_without_external_network(t
         arguments += ["--dataset", "all"]
     result = subprocess.run(
         [sys.executable, downloader.__file__, *arguments],
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",

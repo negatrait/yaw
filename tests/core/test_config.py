@@ -269,7 +269,7 @@ def test_default_patterns_and_write_text_atomic(tmp_path: Path, monkeypatch: pyt
     assert attempts == 2
     assert target.read_text(encoding="utf-8") == '{"status": "recovered"}\n'
 
-    def always_locked_replace(src: Any, dst: Any) -> None:
+    def always_locked_replace(_src: Any, _dst: Any) -> None:
         raise PermissionError("Simulated persistent Windows file lock")
 
     monkeypatch.setattr(os, "replace", always_locked_replace)
@@ -306,7 +306,9 @@ def test_project_yaw_toml_bijection_with_yaw_config(monkeypatch: pytest.MonkeyPa
     for line in raw_text.splitlines():
         stripped = line.strip()
         if sec_match := _SECTION_HEADER_RE.match(stripped):
-            cur_section = sec_match.group(1)
+            sec_name_match = sec_match.group(1)
+            assert isinstance(sec_name_match, str)
+            cur_section = sec_name_match
             continue
         if cur_section is not None and (opt_match := _OPTIONAL_COMMENT_KV_RE.match(stripped)):
             commented_optional.add((cur_section, opt_match.group(1)))

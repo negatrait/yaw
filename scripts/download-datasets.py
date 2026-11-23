@@ -3,19 +3,13 @@
 
 from __future__ import annotations
 
-import sys
+import argparse
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import argparse  # noqa: E402
-
-from yaw.datasets import (  # noqa: E402
+from yaw.datasets import (
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
     HF_BASE_URL,
@@ -80,7 +74,7 @@ def download_dataset_file(
                 print(f"  Downloading {filename} from {url}...")
             t0 = time.perf_counter()
             req = urllib.request.Request(url, headers={"User-Agent": "YAW-DatasetDownloader/1.0"})
-            with urllib.request.urlopen(req) as resp, open(tmp_target, "wb") as out_f:
+            with urllib.request.urlopen(req) as resp, tmp_target.open("wb") as out_f:
                 while True:
                     chunk = resp.read(1024 * 1024)
                     if not chunk:

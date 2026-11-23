@@ -5,17 +5,16 @@ import logging
 import os
 from collections import deque
 from pathlib import Path
+from typing import override
+
+_QUIET_PREFIXES = ("httpx", "httpx2", "httpcore", "openai", "urllib3", "litellm", "LiteLLM")
 
 
 class FIFOLineRotatingHandler(logging.Handler):
     """A logging handler that maintains at most `max_lines` in a FIFO ring buffer on disk."""
 
     def __init__(
-        self,
-        filename: str | Path,
-        max_lines: int = 500,
-        encoding: str = "utf-8",
-        flush_interval: int = 50,
+        self, filename: str | Path, max_lines: int = 500, encoding: str = "utf-8", flush_interval: int = 50
     ) -> None:
         super().__init__()
         self.filename = Path(filename)
@@ -29,11 +28,11 @@ class FIFOLineRotatingHandler(logging.Handler):
         self._load_existing()
 
     def _load_existing(self) -> None:
-        if self.filename.exists():
-            with contextlib.suppress(OSError):
-                lines = self.filename.read_text(encoding=self.encoding).splitlines()
-                self._buffer.extend(lines[-self.max_lines :])
+        with contextlib.suppress(OSError):
+            lines = self.filename.read_text(encoding=self.encoding).splitlines()
+            self._buffer.extend(lines[-self.max_lines :])
 
+    @override
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
@@ -42,13 +41,16 @@ class FIFOLineRotatingHandler(logging.Handler):
             self._unflushed += 1
             if self._unflushed >= self.flush_interval or record.levelno >= logging.ERROR:
                 self.flush()
-        except Exception:
+        except RecursionError:
+            raise
+        # logging.Handler.emit delegates format/flush failures to handleError without crashing callers.
+        except OSError, ValueError, TypeError, LookupError, ArithmeticError, UnicodeError:
             self.handleError(record)
 
+    @override
     def flush(self) -> None:
-        if self._unflushed == 0 and self.filename.exists():
-            return
-        if not self._buffer and not self.filename.exists():
+        exists = self.filename.exists()
+        if (self._unflushed == 0 and exists) or (not self._buffer and not exists):
             return
         try:
             tmp_path = self.filename.with_suffix(self.filename.suffix + ".tmp")
@@ -59,6 +61,7 @@ class FIFOLineRotatingHandler(logging.Handler):
         except OSError:
             pass
 
+    @override
     def close(self) -> None:
         if self._unflushed > 0:
             self.flush()
@@ -68,22 +71,11 @@ class FIFOLineRotatingHandler(logging.Handler):
 class SuppressThirdPartyInfoFilter(logging.Filter):
     """Filter to suppress noisy INFO chatter from upstream litellm, httpx, httpx2, and openai."""
 
-    _SUPPRESSED_PREFIXES = (
-        "httpx",
-        "httpx2",
-        "httpcore",
-        "openai",
-        "urllib3",
-        "litellm",
-        "LiteLLM",
-    )
-
+    @override
     def filter(self, record: logging.LogRecord) -> bool:
         return not (
             record.levelno < logging.WARNING
-            and any(
-                record.name == prefix or record.name.startswith(f"{prefix}.") for prefix in self._SUPPRESSED_PREFIXES
-            )
+            and any(record.name == prefix or record.name.startswith(f"{prefix}.") for prefix in _QUIET_PREFIXES)
         )
 
 
@@ -109,28 +101,16 @@ def configure_logging(
     os.environ.setdefault("LITELLM_TELEMETRY", "False")
 
     if quiet_third_party:
-        for name in (
-            "httpx",
-            "httpx2",
-            "httpcore",
-            "openai",
-            "urllib3",
-            "litellm",
-            "LiteLLM",
-            "LiteLLM Router",
-            "LiteLLM Proxy",
-        ):
+        for name in (*_QUIET_PREFIXES, "LiteLLM Router", "LiteLLM Proxy"):
             logging.getLogger(name).setLevel(logging.WARNING)
 
-    stream_handler = logging.StreamHandler()
-    if quiet_third_party:
-        stream_handler.addFilter(SuppressThirdPartyInfoFilter())
-    handlers: list[logging.Handler] = [stream_handler]
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_file is not None:
-        file_handler = FIFOLineRotatingHandler(log_file, max_lines=max_lines)
-        if quiet_third_party:
-            file_handler.addFilter(SuppressThirdPartyInfoFilter())
-        handlers.append(file_handler)
+        handlers.append(FIFOLineRotatingHandler(log_file, max_lines=max_lines))
+    if quiet_third_party:
+        flt = SuppressThirdPartyInfoFilter()
+        for h in handlers:
+            h.addFilter(flt)
 
     # force=True reconfigures any previously installed handlers
     logging.basicConfig(level=level, handlers=handlers, force=True)

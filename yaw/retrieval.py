@@ -568,8 +568,8 @@ def _extract_markdown_h1(raw_head: str) -> str:
         return ""
     title = _TITLE_TRAILING_SEP_RE.sub("", first.lstrip("#").strip()).strip()
     if m := _TITLE_TAG_PREFIX_RE.match(title):
-        stripped = m.group(1).strip()
-        if stripped:
+        raw_grp = m.group(1)
+        if isinstance(raw_grp, str) and (stripped := raw_grp.strip()):
             title = stripped
     return title
 
@@ -1044,7 +1044,7 @@ def _build_citation_graph(
     tbfw_clean = _build_title_index(pointers, doc_titles_norm, prop_nouns=prop_nouns)
 
     tk_to_docs: dict[tuple[str, ...], tuple[int, ...]] = {}
-    for _, (_, sub_tbl) in tbfw_clean.items():
+    for _, sub_tbl in tbfw_clean.values():
         for tk, pos_tup in sub_tbl.items():
             if len(pos_tup) <= db:
                 tk_to_docs[tk] = tuple(sorted({int(path_idx_arr[p]) for p in pos_tup}))
@@ -1067,7 +1067,7 @@ def _build_citation_graph(
                         cand = tuple(ltoks[i : i + span_len])
                         if cand in sub_tbl:
                             docs = tk_to_docs.get(cand)
-                            if docs:
+                            if docs is not None:
                                 for di in docs:
                                     if di != du:
                                         targets.add(di)
@@ -1082,7 +1082,7 @@ def _build_citation_graph(
                 for j in range(rl):
                     for span_len in range(min(8, rl - j), 1, -1):
                         docs = tk_to_docs.get((run[j : j + span_len],))
-                        if docs:
+                        if docs is not None:
                             for di in docs:
                                 if di != du:
                                     targets.add(di)
@@ -1412,12 +1412,14 @@ def _build_diffusion_operators(
             pr_sum = b_pmi.sum(axis=1).astype(np.float32)
             pc_sum = b_pmi.sum(axis=0).astype(np.float32)
             c2p = (sp.diags_array(np.where(pr_sum > 0.0, 1.0 / np.maximum(pr_sum, 1e-12), 0.0)) @ b_pmi).tocsr()
-            p2c = (b_pmi @ sp.diags_array(np.where(pc_sum > 0.0, 1.0 / np.maximum(pc_sum, 1e-12), 0.0))).tocsr()
+            p2c = sp.csr_array(
+                (b_pmi @ sp.diags_array(np.where(pc_sum > 0.0, 1.0 / np.maximum(pc_sum, 1e-12), 0.0))).tocsr()
+            )
             self_pmi = c2p.multiply(p2c).sum(axis=1).astype(np.float32)
             non_self_pmi = np.maximum(1.0 - self_pmi, 0.0).astype(np.float32)
             has_pmi = (el & (non_self_pmi > 1e-6)).astype(np.float32)
             pmi_scale = np.where(has_pmi > 0.0, 1.0 / np.maximum(non_self_pmi, 1e-6), 0.0).astype(np.float32)
-            c2p_t = c2p.T.tocsr()
+            c2p_t = sp.csr_array(c2p.T.tocsr())
 
     m_cnt = has_fwd + has_rev + has_pmi
     inv_m = np.where(el & (m_cnt > 0.0), 1.0 / np.maximum(m_cnt, 1.0), 0.0).astype(np.float32)
@@ -1558,9 +1560,9 @@ def _eligible_mask(
     masked_rel_paths: Collection[str] | None = None,
 ) -> NDArray[np.bool_]:
     n = idx.size
-    if path_glob is None and not masked_rel_paths:
+    if path_glob is None and (masked_rel_paths is None or not bool(masked_rel_paths)):
         return np.ones(n, dtype=bool)
-    masked_set = {p.replace("\\", "/") for p in masked_rel_paths} if masked_rel_paths else set()
+    masked_set = {p.replace("\\", "/") for p in masked_rel_paths} if masked_rel_paths is not None else set()
     allowed_paths = np.array(
         [
             (p not in masked_set) and (path_glob is None or PurePosixPath(p).full_match(path_glob))
@@ -1904,7 +1906,7 @@ def _extract_multilingual_anchors(
                 word_postings.setdefault(raw_w, set()).update(pts)
                 _add_anchor(raw_w, pts)
 
-        if not word_postings.get(raw_w) and (rev := _umlaut_reverse_variant(raw_w)) is not None:
+        if not bool(word_postings.get(raw_w)) and (rev := _umlaut_reverse_variant(raw_w)) is not None:
             if _vocab_prunes_variant(rev):
                 if len(rev) >= 6 and (rev, False, False) not in oversized:
                     decomp_candidates.append((rev, set()))
@@ -1929,7 +1931,7 @@ def _extract_multilingual_anchors(
             seen_pairs.add(pair)
             p1 = word_postings.get(w1)
             p2 = word_postings.get(w2)
-            if not p1 or not p2:
+            if p1 is None or not p1 or p2 is None or not p2:
                 continue
             if 2 * len(p1) > n_eff or 2 * len(p2) > n_eff:
                 continue
@@ -1995,7 +1997,7 @@ def _extract_multilingual_anchors(
                     sub = run[i : i + span_len]
                     b_left = bigrams.get(sub[:2])
                     b_right = bigrams.get(sub[-2:])
-                    if not b_left or not b_right:
+                    if b_left is None or not b_left or b_right is None or not b_right:
                         continue
                     s_pts = _lookup_u61_postings(
                         conn,
@@ -2126,7 +2128,7 @@ def lexical_search(
     masked_rel_paths: Collection[str] | None = None,
 ) -> list[tuple[int, float]]:
     """Rank eligible chunks by pure RSJ IDF over multilingual unicode61 + PMI + decompounded anchors."""
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0 or idx.size == 0 or not query_text.strip():
+    if isinstance(top_k, bool) or top_k <= 0 or idx.size == 0 or not query_text.strip():
         return []
     if conn is None:
         raise YawRuntimeError("CONSISTENCY_ERROR", "lexical_search requires an active SQLite connection.")
@@ -2406,7 +2408,7 @@ def search_index(
 
     eligible = _eligible_mask(idx, path_glob=path_glob, masked_rel_paths=masked_rel_paths)
     excl_pos: list[int] = []
-    if exclude_chunk_ids:
+    if exclude_chunk_ids is not None:
         for cid in exclude_chunk_ids:
             if (p := idx.id_to_pos.get(int(cid))) is not None:
                 eligible[p] = False

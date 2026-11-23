@@ -15,7 +15,6 @@ import contextlib
 import gc
 import hashlib
 import json
-import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import replace
@@ -27,17 +26,13 @@ import dspy
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from scripts.evaluation import (  # noqa: E402
+from scripts.evaluation import (
     QAExactMatch,
     QAF1Score,
     RetrievalRecall,
     check_benchmark_integrity,
 )
-from yaw.core import (  # noqa: E402
+from yaw.core import (
     EmbedFn,
     YawConfig,
     configure_logging,
@@ -47,7 +42,7 @@ from yaw.core import (  # noqa: E402
     redact_secrets,
     write_text_atomic,
 )
-from yaw.datasets import (  # noqa: E402
+from yaw.datasets import (
     DATASET_REGISTRY,
     DATASET_SOURCE_FIELDS,
     DATASETS,
@@ -60,28 +55,30 @@ from yaw.datasets import (  # noqa: E402
     resolve_dataset_bundle,
     resolve_slice_corpus_scope,
 )
-from yaw.datasets import (  # noqa: E402
+from yaw.datasets import (
     load_dataset_files as _datasets_load_dataset_files,
 )
-from yaw.pipeline import (  # noqa: E402
+from yaw.pipeline import (
     close_pipeline,
     make_dspy_embed_fn,
     start_pipeline,
     update_pipeline_once,
 )
-from yaw.qa import (  # noqa: E402
+from yaw.qa import (
     ask_question,
     build_qa_agent,
     create_lm,
     make_qa_tools,
     strip_inline_citations,
 )
-from yaw.retrieval import (  # noqa: E402
+from yaw.retrieval import (
     build_retrieval_index,
     hydrate_ranked_passages,
     open_readonly_db,
     search_index,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 __all__ = [
     "BASELINES",
@@ -363,7 +360,7 @@ def run_yaw_benchmark(
                 conn,
                 task_mode=config.embedding_task_mode,
             )
-            compiled_path = Path(compiled_program) if compiled_program else None
+            compiled_path = Path(compiled_program) if compiled_program is not None and bool(compiled_program) else None
             agent = build_qa_agent(tools, max_iters=config.react_max_iters, artifact_path=compiled_path)
 
         pool_k = max(RETRIEVAL_TOP_K * 4, 50)

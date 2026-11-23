@@ -205,7 +205,7 @@ def test_dataset_name_resolution() -> None:
         resolve_dataset_name("unknown_invalid_dataset")
 
 
-def test_schemas_and_slicing(tmp_path: Path) -> None:
+def test_schemas_and_slicing() -> None:
     # HotpotQA schema: supporting_facts + context
     hotpot_samples = [
         {
@@ -370,7 +370,6 @@ def test_regression_fixes() -> None:
     extracted = extract_gold_answers(sample_both)
     assert extracted == ["Primary Answer"]
 
-    # compute_qa_em_f1("", ["Paris"]) == (0.0, 0.0)
     assert compute_qa_em_f1("", ["Paris"]) == (0.0, 0.0)
     assert compute_qa_em_f1("   ", ["Paris"]) == (0.0, 0.0)
 

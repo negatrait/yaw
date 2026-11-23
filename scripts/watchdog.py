@@ -38,7 +38,7 @@ plt.rcParams.update({"axes.grid": True, "axes.labelcolor": "#e2e8f0", "grid.colo
 
 
 def _resolve_artifact_dir() -> Path:
-    if custom := os.environ.get("YAW_ARTIFACT_DIR"):
+    if (custom := os.environ.get("YAW_ARTIFACT_DIR")) is not None and bool(custom):
         return Path(custom)
     brain = Path.home() / ".gemini" / "antigravity" / "brain"
     with contextlib.suppress(OSError):

@@ -11,7 +11,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import dspy
 import numpy as np
@@ -76,6 +76,7 @@ def _start_loopback_chat_server(responder: Any) -> tuple[ThreadingHTTPServer, li
             self.end_headers()
             self.wfile.write(raw)
 
+        @override
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -364,6 +365,7 @@ def test_react_instruction_proposer_untruncated_tools_stripped_and_native_errors
     captured_preds: list[dspy.Prediction] = []
 
     class _CaptureReAct(BaseCallback):
+        @override
         def on_module_end(self, call_id: str, outputs: Any | None, exception: BaseException | None = None) -> None:
             _ = (call_id, exception)
             if isinstance(outputs, dspy.Prediction) and hasattr(outputs, "improved_instruction"):

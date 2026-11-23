@@ -41,7 +41,7 @@ from yaw.runtime import (
 )
 
 _kernel32: Any = None
-_console_handler: Any = None
+_console_handlers: list[Any] = []
 if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
@@ -249,7 +249,7 @@ def _daemon_start(cfg: YawConfig, config_path: Path | None) -> dict[str, Any]:
         )
     else:
         popen_kwargs["start_new_session"] = True
-    with open(stderr_log, "wb") as stderr_fh:
+    with stderr_log.open("wb") as stderr_fh:
         proc = subprocess.Popen(cmd, stderr=stderr_fh, **popen_kwargs)
 
     raw_host = cfg.http_host[1:-1] if cfg.http_host.startswith("[") and cfg.http_host.endswith("]") else cfg.http_host
@@ -479,7 +479,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def cli_entrypoint() -> None:
     """Run the CLI with graceful interruption and a repeated-signal escape hatch."""
-    global _console_handler
     interrupted_signal: int | None = None
     console_signal: int | None = None
 
@@ -511,11 +510,12 @@ def cli_entrypoint() -> None:
             # Let CPython receive the first console event and unwind when its wait returns.
             return False
 
-        _console_handler = handler_type(console_interrupt)
+        handler = handler_type(console_interrupt)
         _kernel32.SetConsoleCtrlHandler.argtypes = [handler_type, ctypes.c_int]
         _kernel32.SetConsoleCtrlHandler.restype = ctypes.c_int
-        if not _kernel32.SetConsoleCtrlHandler(_console_handler, 1):
+        if not _kernel32.SetConsoleCtrlHandler(handler, 1):
             raise ctypes.WinError()
+        _console_handlers.append(handler)
     try:
         code = main()
     except KeyboardInterrupt:
@@ -524,10 +524,10 @@ def cli_entrypoint() -> None:
     finally:
         # Keep the escape hatch installed while Python waits for worker threads on exit.
         if interrupted_signal is None and console_signal is None:
-            if _console_handler is not None:
-                if not _kernel32.SetConsoleCtrlHandler(_console_handler, 0):
+            while _console_handlers:
+                active_handler = _console_handlers.pop()
+                if not _kernel32.SetConsoleCtrlHandler(active_handler, 0):
                     raise ctypes.WinError()
-                _console_handler = None
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
     raise SystemExit(code)
