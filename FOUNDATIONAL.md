@@ -51,5 +51,5 @@ yaw/
 
 ## 6. Governing Specs
 
-- Active clean-slate sprint ledger (`CS-0`..`CS-6`, closed on `3cd3952`): [docs/reviews/bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) *(ablation-gated candidate spec — zero production code changes until undisputed benchmark proof: [docs/reviews/mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md))*
-- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where older epic text references pre-cutover OpenIE/SHACL/PPR details, §§1–5 above take precedence)*.
+- Governing Sprint & Cutover Ledgers: [bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) (`CS-0`..`CS-6` clean-slate cutover, closed on `3cd3952`); [mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md) (`EVAL-0`..`EVAL-5` shipped frozen `M_FINAL_1B` on `dev` at `5c4b115`; post-merge `EVAL-6` `SearchResult.completeness` calibration and lazy `.yaw/wiki/` Graph Scout deferred next).
+- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where historical `## Decisions` preserve pre-cutover rationale verbatim, §§1–5 above govern active production code)*.

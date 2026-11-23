@@ -1,8 +1,10 @@
+> [!NOTE] Archived (Retired per [FOUNDATIONAL.md](../../FOUNDATIONAL.md#2-non-goals--retired-stack)). Retained for historical decisions and review cross-links.
+
 # Pre-Epic 2 Architectural Refactoring Memo
 
-**Status**: Approved Architectural Decisions (Deferred to Post-Benchmark Cleanup)  
-**Owner**: [`FOUNDATIONAL.md`](../FOUNDATIONAL.md)  
-**Related**: [Epic 1](epic-1-hipporag-daemon.md), [Epic 2](epic-2-fastmcp-http.md)
+- **Status**: Approved Architectural Decisions (Deferred to Post-Benchmark Cleanup)
+- **Owner**: [`FOUNDATIONAL.md`](../../FOUNDATIONAL.md)
+- **Related**: [Epic 1](../epic-1-hipporag-daemon.md), [Epic 2](../epic-2-fastmcp-http.md)
 
 ---
 
@@ -98,7 +100,7 @@ In classical IR (Dai & Callan, SIGIR 2019), MaxP designates the relevance of a p
 ## 4. Reference Implementation
 
 ### 4.1 Greedy Priority AST Expansion & Coalesced Deduplication
-In [`yaw/daemon/graph/storage/hydration.py`](../yaw/daemon/graph/storage/hydration.py):
+In `yaw/daemon/graph/storage/hydration.py`:
 
 ```python
 from dataclasses import dataclass
@@ -256,7 +258,7 @@ def hydrate_budgeted_passages(
 ```
 
 ### 4.3 Unified QA Context Formatting
-In [`yaw/daemon/graph/engine.py`](../yaw/daemon/graph/engine.py):
+In `yaw/daemon/graph/engine.py`:
 
 ```python
 def format_qa_context(

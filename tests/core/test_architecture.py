@@ -37,17 +37,14 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
         "epic-1-hipporag-daemon.md",
         "epic-2-fastmcp-http.md",
         "epic-3-performance.md",
-        "epistemic-confidence-spec.md",
         "evaluation-graph-storage.md",
         "evaluation-inference.md",
         "evaluation-ingestion.md",
         "evaluation-testing.md",
         "evaluation.md",
         "model-evaluation.md",
-        "native-cocoindex-indexing.md",
         "native-cocoindex-graph.md",
-        "pre-epic2-memo.md",
-        "w3c-improvements.md",
+        "native-cocoindex-indexing.md",
     }
 )
 _MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
@@ -87,8 +84,8 @@ def _strip_fenced_lines(markdown_text: str) -> list[str]:
 
 
 def _strip_fenced_code_blocks(markdown_text: str) -> str:
-    """Remove fenced code blocks and inline code spans before scanning prose links."""
-    return "\n".join(re.sub(r"`[^`]*`", "", line) for line in _strip_fenced_lines(markdown_text))
+    """Remove fenced code blocks and mask inline code spans before scanning prose links."""
+    return "\n".join(re.sub(r"`[^`]*`", "CODE", line) for line in _strip_fenced_lines(markdown_text))
 
 
 def _collect_anchors_and_line_count(target: Path) -> tuple[set[str], int]:
@@ -113,6 +110,33 @@ def _collect_anchors_and_line_count(target: Path) -> tuple[set[str], int]:
         heading_counts[base] = idx + 1
         anchors.add(base if idx == 0 else f"{base}-{idx}")
     return anchors, total_lines
+
+
+def _parse_opening_relation_table(doc_file: Path) -> dict[str, str]:
+    """Parse the opening '| Relation | Links |' navigation table before any '##' section."""
+    lines = doc_file.read_text(encoding="utf-8").splitlines()
+    table_start: int | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            break
+        if re.match(r"^\|\s*Relation\s*\|\s*Links\s*\|$", stripped):
+            table_start = idx
+            break
+    if table_start is None:
+        return {}
+
+    rows: dict[str, str] = {}
+    for line in lines[table_start + 1 :]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            break
+        if re.match(r"^\|\s*:?-{3,}:?\s*\|\s*:?-{3,}:?\s*\|$", stripped):
+            continue
+        parts = [part.strip() for part in stripped.strip("|").split("|")]
+        if len(parts) >= 2:
+            rows[parts[0]] = " | ".join(parts[1:])
+    return rows
 
 
 def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
@@ -302,7 +326,6 @@ class ArchitectureTests(unittest.TestCase):
             get_logger,
             inclusive_end_line,
             load_config,
-            normalize_entity,
             parse_dataset_list,
             redact_secrets,
             render_document_text,
@@ -325,7 +348,6 @@ class ArchitectureTests(unittest.TestCase):
             get_logger,
             inclusive_end_line,
             load_config,
-            normalize_entity,
             parse_dataset_list,
             redact_secrets,
             render_document_text,
@@ -835,7 +857,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
 
     def test_every_doc_is_reachable_from_rules_and_canonical_inventory(self):
-        """Rule 11: docs/ matches the canonical 19-file inventory and every doc is reachable from .agents/rules/*.md."""
+        """Rule 11: docs/ matches the canonical 16-file inventory, every doc is reachable, and nav rows stay current."""
         actual_docs = {p.name for p in DOCS_DIR.glob("*.md")}
         self.assertEqual(
             actual_docs,
@@ -863,6 +885,86 @@ class ArchitectureTests(unittest.TestCase):
             [],
             f"docs/*.md files not reachable from domain rules {domain_rules}: {unreachable}",
         )
+
+        stale_nav: list[str] = []
+        for doc_name in sorted(_CANONICAL_DOCS_INVENTORY):
+            doc_file = DOCS_DIR / doc_name
+            for lineno, line in enumerate(doc_file.read_text(encoding="utf-8").splitlines(), start=1):
+                stripped = line.lstrip()
+                if re.match(r"^\|\s*(?:Owns code|Rules)\s*\|", stripped) and re.search(
+                    r"\byaw/daemon(?:/|\b)", stripped
+                ):
+                    stale_nav.append(f"docs/{doc_name}:{lineno}: retired yaw/daemon path in navigation row")
+        self.assertEqual(
+            stale_nav,
+            [],
+            "Retired yaw/daemon/ paths found in canonical docs navigation tables:\n" + "\n".join(stale_nav),
+        )
+
+        tier2_specs = (
+            "epic-1-hipporag-daemon.md",
+            "epic-2-fastmcp-http.md",
+            "epic-3-performance.md",
+            "native-cocoindex-indexing.md",
+            "native-cocoindex-graph.md",
+            "dspy-improvements.md",
+            "enterprise-rag-bench-training-plan.md",
+            "coverage-plan.md",
+        )
+        yaw_files = sorted(p.relative_to(PROJECT_ROOT).as_posix() for p in YAW_DIR.rglob("*.py"))
+        self.assertEqual(len(yaw_files), 14, f"Expected exact 14 Python files in yaw/, got {len(yaw_files)}")
+        owners_by_yaw_file: dict[str, list[str]] = {rel: [] for rel in yaw_files}
+        peers_by_spec: dict[str, set[str]] = {}
+        for spec_name in tier2_specs:
+            rows = _parse_opening_relation_table(DOCS_DIR / spec_name)
+            self.assertTrue(rows, f"docs/{spec_name} must open with a '| Relation | Links |' navigation table")
+            for required_rel in ("Owns code", "Rules", "Peers"):
+                self.assertIn(
+                    required_rel,
+                    rows,
+                    f"docs/{spec_name} opening navigation table is missing required row {required_rel!r}",
+                )
+            owns_cell = rows["Owns code"]
+            self.assertFalse(
+                "{" in owns_cell or "}" in owns_cell,
+                f"docs/{spec_name} Owns code row must list explicit paths or '*' globs without brace expansion",
+            )
+            for token in re.findall(r"\byaw/[A-Za-z0-9_./*-]+", owns_cell):
+                matched = [rel for rel in yaw_files if PurePosixPath(rel).full_match(token)]
+                self.assertTrue(matched, f"docs/{spec_name} Owns code token {token!r} matched 0 files under yaw/")
+                for rel in matched:
+                    owners_by_yaw_file[rel].append(spec_name)
+
+            peer_targets: set[str] = set()
+            for match in _MD_LINK_RE.finditer(rows["Peers"]):
+                raw_target = match.group(1).split("#", 1)[0].strip()
+                resolved = (DOCS_DIR / raw_target).resolve()
+                self.assertEqual(
+                    resolved.parent,
+                    DOCS_DIR.resolve(),
+                    f"docs/{spec_name} Peers link {raw_target!r} must target an active Tier-2 spec in docs/",
+                )
+                self.assertIn(
+                    resolved.name,
+                    tier2_specs,
+                    f"docs/{spec_name} Peers link {raw_target!r} is not an active Tier-2 spec",
+                )
+                self.assertNotEqual(resolved.name, spec_name, f"docs/{spec_name} Peers row must not self-link")
+                peer_targets.add(resolved.name)
+            peers_by_spec[spec_name] = peer_targets
+
+        unowned = [rel for rel, owners in owners_by_yaw_file.items() if not owners]
+        multi_owned = [f"{rel}: {owners}" for rel, owners in owners_by_yaw_file.items() if len(owners) > 1]
+        self.assertEqual(unowned, [], f"yaw/ modules with no Owns code spec owner: {unowned}")
+        self.assertEqual(multi_owned, [], f"yaw/ modules with multiple Owns code spec owners: {multi_owned}")
+
+        asymmetric_peers = [
+            f"docs/{a} lists {b} in Peers, but docs/{b} omits {a}"
+            for a in tier2_specs
+            for b in sorted(peers_by_spec[a])
+            if a not in peers_by_spec[b]
+        ]
+        self.assertEqual(asymmetric_peers, [], "Asymmetric Tier-2 Peers rows:\n" + "\n".join(asymmetric_peers))
 
     def test_canonical_module_purity_and_behavioral_contracts(self):
         """Rule 12: Clean-slate 14-file architecture obeys LOC cap, zero wrappers/legacy terms, and L0-L5 DAG."""

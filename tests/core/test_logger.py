@@ -1,8 +1,10 @@
+import inspect
 import logging
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 from yaw.core.logger import FIFOLineRotatingHandler, configure_logging
 
@@ -80,6 +82,46 @@ class LoggerTests(unittest.TestCase):
 
             logger.removeHandler(handler)
             handler.close()
+
+    def test_configure_logging_treats_level_named_path_as_file_without_shim(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            info_path = tmp_path / "info"
+            prev_cwd = Path.cwd()
+            handlers: list[logging.Handler] = []
+            try:
+                handlers = configure_logging(info_path)
+                self.assertEqual(len(handlers), 2)
+                self.assertIsInstance(handlers[1], FIFOLineRotatingHandler)
+                assert isinstance(handlers[1], FIFOLineRotatingHandler)
+                self.assertEqual(handlers[1].filename, info_path)
+                self.assertEqual(logging.getLogger().level, logging.INFO)
+                logging.getLogger("yaw.test_info_path").info("wrote info file")
+                handlers[1].flush()
+                self.assertIn("wrote info file", info_path.read_text(encoding="utf-8"))
+                for h in handlers:
+                    h.close()
+                handlers.clear()
+
+                os.chdir(tmp_path)
+                handlers = configure_logging("error")
+                self.assertEqual(len(handlers), 2)
+                self.assertIsInstance(handlers[1], FIFOLineRotatingHandler)
+                assert isinstance(handlers[1], FIFOLineRotatingHandler)
+                self.assertEqual(handlers[1].filename, Path("error"))
+                self.assertEqual(logging.getLogger().level, logging.INFO)
+                logging.getLogger("yaw.test_error_path").info("wrote error file")
+                handlers[1].flush()
+                self.assertIn("wrote error file", (tmp_path / "error").read_text(encoding="utf-8"))
+
+                self.assertNotIn("log_file_path", inspect.signature(configure_logging).parameters)
+                with self.assertRaises(TypeError):
+                    cast(Any, configure_logging)(log_file_path=tmp_path / "unused.log")
+            finally:
+                os.chdir(prev_cwd)
+                for h in handlers:
+                    h.close()
+                logging.basicConfig(handlers=[], force=True)
 
 
 if __name__ == "__main__":

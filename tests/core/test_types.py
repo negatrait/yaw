@@ -21,7 +21,6 @@ from yaw.core.types import (
     format_doc_for_embedding,
     format_query_for_embedding,
     inclusive_end_line,
-    normalize_entity,
     redact_secrets,
     render_document_text,
     resolve_corpus_path,
@@ -132,7 +131,6 @@ class TypesTests(unittest.TestCase):
         err = YawRuntimeError("INVALID_INPUT", "bad input")
         self.assertEqual(str(err), "[INVALID_INPUT] bad input")
 
-        self.assertEqual(normalize_entity("  New   York "), "new york")
         masked = redact_secrets(
             "Bearer abc123 sk-secret123456 https://user:pass@host/api api_key=tok_99 my-raw-secret",
             "my-raw-secret",
@@ -161,7 +159,6 @@ class TypesTests(unittest.TestCase):
             "format_doc_for_embedding",
             "format_query_for_embedding",
             "inclusive_end_line",
-            "normalize_entity",
             "redact_secrets",
             "render_document_text",
             "resolve_corpus_path",

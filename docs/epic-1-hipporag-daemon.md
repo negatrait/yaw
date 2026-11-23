@@ -1,266 +1,84 @@
-# Epic 1: Native `yaw.db` Engine & CocoIndex Daemon
+# Epic 1: Native `yaw.db` Engine & CocoIndex Live Pipeline
 
 Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Results: [evaluation](evaluation.md) | Next: [Epic 2](epic-2-fastmcp-http.md)
 
+| Relation | Links |
+| --- | --- |
+| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md) |
+| Rules | [core.md](../.agents/rules/core.md): `yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/__init__.py`, `yaw/core/config.py`, `yaw/core/logger.py`, `yaw/core/types.py` |
+| Peers | [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/pipeline.py` & `yaw/datasets.py` (consumes `yaw.core` config, types, chunk IDs, embedding formatters); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval.py` (consumes `yaw.core` types, errors, path guards); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` (consumes `YawConfig.for_optimization`, `YawRuntimeError`, types); [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/mcp_server.py`, `yaw/runtime.py` & `yaw/cli.py` (consumes `yaw.core` contracts & receives `yaw/__main__.py` dispatch); [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `benchmark.py` & `scripts/{download-datasets,verify_paper_parity_gate,evaluation}.py` (consumes `yaw.core` config, logging & formatters); [epic-3-performance.md](epic-3-performance.md): owns `scripts/{watchdog,preflight}.py` & inherits Epic 1 `M_FINAL_1B` baseline; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (verifies `yaw/core/`, `yaw/__init__.py`, `yaw/__main__.py`) |
+| References | [arxiv-2405.14831v3-hipporag.md](arxiv-2405.14831v3-hipporag.md), [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md), [model-evaluation.md](model-evaluation.md) |
+| Supersedes / superseded by | Legacy `yaw/daemon/**`, OpenIE/W3C/SHACL/PPR/HMM, `sqlite-vec`/`vec0`, `optuna`, `spacy`, and `VectorSearch` retired under [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md) and `EVAL-5` ([mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), `5c4b115`) |
+| Records | [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md), [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), [evaluation.md](evaluation.md) |
+
 ## Hard Gates
 
-Bounded Kraus Sheaf Pure-Chunk HMM shootout (`E1-M1`, planned 2026-11-14; Pass-3 evaluated 2026-11-15 — historical `Retain & Refine`; Pass-4 pure-chunk `"manifold-v3"` evaluated 2026-11-15 — **`Retain & Replace Default`** per `Decisions 18–19`): the bounded exception in
-[Epic 3](epic-3-performance.md#early-epic-1-exception-sub-state-manifold-shootout-e1-m1)
-permits `yaw/daemon/graph/hmm.py` (Kraus Sheaf Pure-Chunk HMM with Myerson Coalitional Reranking under Pass-4 `"manifold-v3"`, pure-chunk storage `chunks + chunk_fts + chunk_vec` with zero sub-span tables/embeddings per user direction, reduced to `499` lines `<= 500` and the `5`-parameter Hydrodynamic / RMT / Null-Sketch boundary formulation with zero internal fallback paths),
-bounded `E1-M1` `spacy>=3.8.18` + `en_core_web_sm` (`3.8.0`) NLP support (chunk entity/bridge extraction without sub-span splitting — retained per benchmark proof alongside parked `optuna>=5.0.0` per [FOUNDATIONAL.md](../FOUNDATIONAL.md)),
-single-study Optuna `5.0.0` `TPESampler(seed=42, multivariate=True, constant_liar=True)` diagnostics tooling in `yaw/daemon/manifold_optuna.py` (`597` lines `<= 600`, optimizing all 5 `Recall@{1, 2, 5, 10, 20}` objectives with native `trial.set_constraint(...)` and `PedAnovaImportanceEvaluator`), and
-`retriever_mode="manifold"` (`--retriever {graph,manifold,shootout}`) alongside
-`yaw/daemon/graph/ppr.py` (`retriever_mode="graph"`, untouched in `E1-M1` and slated for default replacement + deletion in `Decision 18` / `BB-2`) for empirical
-head-to-head evaluation against `Current YAW`, `monkeypatched_hipporag`, and
-`PAPER_BASELINES`. Pass-4 live 4-dataset held-out shootouts (`offset=0`, `n=40`, `10/10` seeds per dataset) demonstrated macro deltas over `Current YAW` of `+0.0937 R@1`, `+0.1062 R@2`, `+0.1125 R@5`, `+0.0646 R@10`, `+0.0604 R@20`, `+0.0500 EM`, `+0.0574 F1` (with `MuSiQue R@5 = 0.6333 vs 0.3583 = +0.2750`), clearing `PAPER_BASELINES` `Recall@5` (`0.8146 >= 0.7828`). While un-evolved `YawProgram()` cleared `0/4` upstream QA/retrieval parity gates, the user authorized **`Retain & Replace Default`** (`Decisions 18–19`, refined under `Decision 20`): retiring `ppr.py` and the heavyweight OpenIE/W3C/SHACL stack in the clean-slate [Bare-Bones YAW Replacement Sprint](reviews/bare-bones-replacement-sprint.md), keeping zero-LLM `Recall@N` pass-through via `VectorSearch` (renamed from `SubStateManifoldHMM`), routing `QA` through bare `dspy.ReAct` over CocoIndex live indexing + FastMCP/CLI (`Decision 20` supersedes `dspy.RLM`), and deferring Optuna sweeps & fancier math to [Epic 3](epic-3-performance.md). See the [shootout specification](reviews/substate-manifold-shootout.md),
-[research note](reviews/hmm-graph-substate-manifold-research.md), and the
-[graph & storage evaluation ledger](evaluation-graph-storage.md#2026-11-15-pass-4-e1-m1-pure-chunk-manifold-v3-probes-64-trial-5-horizon-optuna-study--live-4-dataset-shootout). This bounded shootout
-does not modify `ppr.py` or establish `D1-A6` parity.
-
-Early performance pilot (`E1-P6`, planned 2026-11-09): the bounded exception in
-[Epic 3](epic-3-performance.md#early-epic-1-exception-audit-json-pilot-e1-p6)
-permits evaluating msgspec for optimizer audit publication and watchdog audit
-reading during Epic 1. The [review plan](reviews/msgspec-audit-pilot.md) fixes its
-scope and acceptance gates before implementation. This pilot does not replace
-or establish the outstanding `D1-A6` parity and ingestion gates.
-
-Graph target revision (2026-11-05): [native graph publication](native-cocoindex-graph.md)
-requires total scheme removal, comparable cumulative time for 64+64 versus 128
-chunks, and exact fixed-evidence canonical graph/count equality. It owns the
-paired thresholds and evidence gates; prior indexing checkmarks do not pass them.
-Schemes may return only with demonstrated held-out Recall@N, EM or F1 benefit and
-acceptable resource/other-quality costs. Implementation acceptance remains open.
-
-Accepted replacement packet (2026-10-28): [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
-Both inference and live-ingestion gates are required within unfinished D1-A6,
-superseding the earlier `EmbeddingLane` / `indexing_overlap` overlap packet.
-
-Accepted compact synonym judgment invariant (2026-10-27): replaces verbose model
-dossiers with compact shared evidence batches while preserving candidate/evidence
-coverage, native DSPy prompts, graph commit cadence, caches and SHACL acceptance.
-Its llama.cpp GBNF grammar binds every candidate pair ID to one mandatory decision
-in input order and constrains canonical entity IDs strictly to that pair's two
-entities. Its bounded pilot establishes stage performance, not Tier 2 parity.
-
-Runtime model update, 2026-10-22: the user selected `gemma-4-E4B-it-qat-q4_0-gguf-Q4_0`
-(`unsloth/gemma-4-E4B-it-qat-q4_0-gguf-Q4_0:Q4_K_M`) for extraction, QA and reflection on the
-existing external llama.cpp GPU service (32,768 context). This supersedes Qwen
-as the runtime default in the packet descriptions below. GBNF worker / plain
-RLM separation, embedding selection, and historical benchmark targets remain.
-
-- **Zero Cross-Domain Edges (`E1-S1`):** Lock the containment tree and AST boundary test (`tests/core/test_architecture.py`) **before** writing engine code. Sibling packages never import each other (`0` horizontal edges).
-- **Lean Architecture (No Code-Golfing, No LOC Quotas):** Eliminate dead abstractions and multi-file synchronization sprawl (retire the 7-file Parquet/Pickle/JSON store and multi-provider wrappers). Write direct, readable, strongly-typed code without line-count obsession or code-golfing.
-- **Dev Gate (`E1-S4`):** Native `yaw.daemon.graph` engine matches or beats upstream `hipporag` on **Tier 1** (`sample`, `2wikimultihopqa`, `musique` 10-query slices) on the 3-model local setup.
-- **Epic Gate (`E1-S6`):** Native `yaw.daemon.graph` engine matches or beats upstream `hipporag` baseline on our exact 3-model local setup on **Tier 2** full-corpus benchmarks (`Recall@2`, `Recall@5`, `QA EM`, `QA F1`), with published paper figures recorded in [evaluation](evaluation.md) as reference.
+- **Clean-Slate `14`-File Architecture (`L0`–`L6` DAG, [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md)):** Collapses the retired multi-package `yaw/daemon/**` OpenIE/W3C/SHACL/PPR stack into 14 flat Python files within `<= 8,000` LOC (`yaw/core/* <= 960` LOC, `scripts/watchdog.py <= 350` LOC, `yaw/__main__.py <= 10` LOC), zero wrapper subclasses (`Module`, `BaseLM`, `Adapter`), zero `hipporag` imports, and zero purged stack references (`sqlite-vec`, `spacy`, `optuna`).
+- **Frozen `M_FINAL_1B` Retrieval Engine (`EVAL-5`, `5c4b115`, [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md)):** Plain 5-table SQLite schema (`chunks` ROWID `<f2>` `embedding_f16`, contentless `unicode61` `chunk_fts` + `chunk_vocab` `fts5vocab`, single-row `rabitq_index` + `citation_graph`), `RetrievalIndex` zero-LLM recall (`search_index`, `expand_citation_neighbors`), `?mode=ro` WAL SHA-256 disk hydration (`Pool_k = max(top_k * 4, 50)`), and `INDEX_NOT_READY` vs `CONSISTENCY_ERROR` fail-fast validation.
+- **Tier-1 Benchmark QA (`yaw/qa.py`, `yaw/optimize.py`):** Unwrapped `dspy.ReAct` over 4 read-only tools via `dspy.lm15` (`temperature = 1.0`), strict `[chunk_id=<int>]` tool-observation grounding, and `dspy.GEPA` optimization against prepared v2 `.md` dataset bundles (`query_offset >= 10` parity guard).
+- **Benchmark Targets (`evaluation.md`):** Evaluate against Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES` in `outputs/benchmarks/consolidated_historical_baselines.json`) and Target 2 (`PAPER_BASELINES`). On untouched `Tier E` (`N = 400`, `n = 200` live `gemma-4-e4b` QA), `M_FINAL_1B` cleared `P0`–`P4` (`Pool R@5 = 0.8006`, `MH AH@5 = 0.7100`, `EM = 0.4500`, `F1 = 0.6219`, `3.78x` RAM cut).
 
 ---
 
-## 1. Containment Tree & Import Law
+## 1. Containment Tree & Import Law (`tests/core/test_architecture.py`)
 
 ```text
-yaw/
-  core/                    types.py, config.py, logger.py          (imports: stdlib only)
-  daemon/                  runtime.py, cli.py, mcp_server.py, manifold_optuna.py (imports: daemon.*, core)
-    ingestion/             corpus.py, datasets.py, bundles.py      (imports: core, cocoindex; plus spacy during bounded E1-M1 prose sentence segmentation)
-    graph/                 engine.py, ppr.py, hmm.py               (imports: graph.*, core, numpy, scipy; ppr.py: stdlib/numpy/scipy/core only; hmm.py: NumPy/SciPy + spacy [bounded E1-M1] Kraus Sheaf Sub-Span HMM with Myerson Coalitional Reranking)
-      storage/             db.py, vectors.py, graph_ops.py, shacl.py, hydration.py, candidate_cache.py (imports: core, sqlite3, sqlite_vec)
-      inference/           models.py, prompts.py, embedding.py, chat.py, grammars.py, parsers.py, invariants.py, adapter.py, rlm.py, retriever.py, proposer.py, diagnostics.py, reflection.py, optimizer.py, program.py (imports: core, dspy)
-  __main__.py                                                      (imports: daemon.cli)
+L0  yaw/core/            __init__.py, types.py, config.py, logger.py   (stdlib only; <= 960 LOC)
+L1  yaw/datasets.py      v2 .md bundles, slicing, pure EM/F1/Recall    (stdlib, filelock, numpy, yaw.core)
+L1  yaw/retrieval.py     M_FINAL_1B RetrievalIndex & disk hydration    (stdlib, numpy, scipy, sqlite3, yaw.core)
+L2  yaw/pipeline.py      CocoIndex >= 1.2.0 5-table live/catch-up sync (cocoindex, dspy, numpy, sqlite3, core, retrieval)
+L2  yaw/qa.py            Bare dspy.ReAct + lm15 + 4 read-only tools    (dspy, numpy, sqlite3, core, retrieval)
+L3  yaw/runtime.py       YawRuntime, FileLock, data_version swaps      (dspy, filelock, numpy, sqlite3, core, pipeline, qa, retrieval)
+L4  yaw/mcp_server.py    FastMCP HTTP + Host/Origin 403 + 3 tools      (fastmcp, pydantic, starlette, uvicorn, core, runtime)
+L4  yaw/optimize.py      dspy.GEPA QA prompt compilation               (dspy, filelock, numpy, sqlite3, core, datasets, pipeline, qa, retrieval)
+L5  yaw/cli.py           yaw {daemon,recall,qa,optimize,config} CLI    (stdlib, filelock, core, runtime, mcp_server, lazy optimize)
+L6  yaw/__main__.py      CLI entrypoint (<= 10 LOC)                    (yaw.cli)
+    yaw/__init__.py      0-statement intermediate package marker
 ```
 
-- **Containment Law (`tests/core/test_architecture.py`):**
-  1. **Empty Intermediate Packages:** Intermediate parent package initializers (`yaw/`, `yaw/daemon/`, `yaw/daemon/graph/`) contain zero executable statements and trigger zero parent-package import side-effects.
-  2. **Constricted Leaf Facades:** Leaf domain packages (`yaw.core`, `yaw.daemon.graph.inference`, `yaw.daemon.graph.storage`, `yaw.daemon.ingestion`) provide constricted public API facades (`_PUBLIC_API` + lazy `__getattr__` + `__dir__`) allowing leaf mutation into single-responsibility modules while keeping a stable public API contract.
-  3. **Strict Domain Containment:** A module in package `P` imports **only** `P.*` (its own descendants) and `yaw.core.*`. **Zero horizontal edges:** `ingestion` $\not\leftrightarrow$ `graph`, and `storage` $\not\leftrightarrow$ `inference` $\not\leftrightarrow$ `ppr` $\not\leftrightarrow$ `hmm`. Only a parent orchestrator (`daemon/runtime.py` or `graph/engine.py`) bridges its direct children.
-  4. **Zero Protected (`_`) or Private (`__`) Cross-Module Imports or Facade Exports:** Any symbol starting with a leading underscore is strictly module-internal. No `name.startswith("_")` may ever appear in a leaf `_PUBLIC_API` facade, in cross-module imports (`from .mod import _helper`), or in cross-module attribute accesses.
-  5. **Zero `hipporag` imports anywhere in the repository:** `hipporag` is permanently retired from `pyproject.toml`, `uv.lock`, `yaw/`, `benchmark.py`, `scripts/`, and `tests/`. Benchmark evaluation compares native `yaw` against Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`) and Target 2 (`PAPER_BASELINES`).
+- **Zero Private Cross-Module Access:** No cross-module `_private` imports or cross-object `_attr` accesses (including `._provider`).
+- **Zero Circular Dependencies:** Strict acyclic DAG verified across `yaw/` by `find_import_cycles`.
 
 ---
 
-## 2. Sprint-by-Sprint Implementation Plan (One Node at a Time, Zero Spaghetti)
+<a id="2-sprint-by-sprint-implementation-plan-one-node-at-a-time-zero-spaghetti"></a>
 
-2026-11-05 D1-A6 implementation scope: preserve validated graph contributions for
-append-only source growth, checkpoint input identities with atomic publication,
-and retain SHACL as the commit gate. Full delta handling for replacements/removals
-and graph-wide memory bounds remain open; this packet establishes no Tier 2 parity.
+## 2. Core Contract Specification (`yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/*`) & Peer Map
 
-Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until Sprint $k$'s exit gate passes.
+All `6` owned files (`yaw/__init__.py`, `yaw/__main__.py`, and the stdlib-only `yaw/core/` layer within `<= 960` LOC) expose the foundational configuration, data contracts, IDs, formatters, and logging primitives shared across the `14`-file DAG:
 
----
-
-### Sprint 1 (`E1-S1`): `yaw/core/` & Containment Tree Lock
-- **Files:** `yaw/core/{types.py, logger.py}`, empty `__init__.py` tree (`yaw/{core,daemon/{ingestion,graph/{storage,inference}}}/__init__.py`), `tests/core/test_architecture.py`.
-- **Allowed imports:** `stdlib` only (`dataclasses`, `logging`, `pathlib`, `typing`, `collections`).
-- **Copy/Adapt From:**
-  - Move legacy `yaw/logger.py` (`FIFOLineRotatingHandler(max_lines=500)`) $\to$ [`yaw/core/logger.py`](../yaw/core/logger.py).
-  - Move current [`yaw/{models,embedding,chat}.py`](../yaw/) $\to$ `yaw/daemon/graph/inference/` and update imports in `benchmark.py` & `tests/`.
-  - Adapt data structures from `git show d1bc65e:src/yaw/indexer/pipeline.py` (`MarkdownChunk`) and `hipporag/utils/misc_utils.py` (`Chunk`, `QuerySolution`, `NerRawOutput`, `TripleRawOutput`) into frozen `@dataclass(slots=True, frozen=True)` types in `yaw/core/types.py`:
-    - `ChunkPointer(chunk_id, rel_posix_path, start_line, end_line, title, content_hash)`
-    - `HydratedPassage(pointer, text, score, stale_on_disk=False)`
-    - `StructuredTriple(subj, pred, obj, spo_def="", subj_def="", obj_def="")`
-    - `SHACLViolation(focus_node, source_shape, result_path, message, value="", severity="sh:Violation")`
-    - `OpenIERecord(chunk_id, entities: tuple[str, ...], triples: tuple[tuple[str, str, str], ...], entity_definitions: tuple[tuple[str, str], ...] = (), structured_triples: tuple[StructuredTriple, ...] = ())`
-    - `RetrievalResult(question, passages: tuple[HydratedPassage, ...], answer: str | None = None)`
-    - `SyncDelta(added_chunks: tuple[tuple[ChunkPointer, str], ...], deleted_chunk_ids: tuple[str, ...])`
-    - `IndexStats(chunks, entities, facts, edges, config_fingerprint="", openie_checkpoints=0, entity_labels=0, shacl_conforms=True)`
-- **Drop (Anti-Spaghetti):** Drop `d1bc65e:src/yaw/utils.py`, global mutable singletons, and upstream's mutable `QuerySolution.to_dict()` / numpy array fields.
-- **Exit Gate (`D1-A1`):** `uv run --locked python -m unittest discover -s tests -v` passes with `tests/core/test_architecture.py` verifying `0` cross-domain imports and empty `__init__.py`s across all `yaw/**/*.py`.
-
----
-
-### Sprint 2 (`E1-S2`): `yaw/daemon/graph/inference/` — Native DSPy (`dspy.LM`, `dspy.Embedder`, Canonical 12 `dspy.Signature`s, First-Class Embedding Trail, `dspy.RLM`, `dspy.GEPA`)
-- **Files:** `pyproject.toml`, `uv.lock`, `yaw/daemon/graph/inference/{models.py, embedding.py, chat.py, grammars.py, prompts.py, templates.py, parsers.py, program.py}`, `tests/daemon/graph/inference/test_prompts.py`.
-- **Allowed imports:** `yaw.core.*`, `dspy`, `pydantic`, `numpy`, `difflib`, `hashlib`, `json`, `re`, `ast`. (Zero `hipporag` imports in `yaw/**`).
-- **Design & Capabilities:**
-  - **`embedding.py` (`dspy.Embedder` + First-Class Telemetry Trail):**
-    - Wrap `dspy.Embedder(model="openai/...", api_base=..., api_key=..., batch_size=..., caching=True, encoding_format="float")` for Lemonade (`embeddinggemma-300m-GGUF`) or `ollama/...` for Ollama.
-    - Apply `distinct-titled` passage prefix (`title: {title} | text: {body}`), fact query prefix (`task: fact verification | query: {query}`), and passage query prefix (`task: search result | query: {query}`) + L2 normalization (`np.float32`).
-    - Emit structured telemetry (`self.telemetry`, `bind_telemetry_hook`) on every `encode` / `batch_encode` invocation (`stage`, `predictor="embedder"`, `task_mode`, `active_prefix`, `num_inputs`, `num_pieces`, `num_batches`, `tokens_used`, `usage`) and wire into `YawProgram.telemetry` and `YawProgram.embedding_audit_trail`.
-  - **`chat.py` (`dspy.LM` & `create_dspy_rlm_pair`):**
-    - Drive `dspy.LM` against Lemonade (`openai/...`) or Ollama (`ollama_chat/...`) on unified `Qwen3-4B-Instruct-2507-GGUF` (`llamacpp` on Vulkan GPU, `8192–16384` context window, `temp=0.2`, `freq_penalty=0.5`) with role- and recipe-aware GBNF capability flags (`_yaw_supports_gbnf`):
-      - **Direct Extraction, QA Reader & RLM Worker (`role in ("extraction", "qa", "reflection_worker")`):** `_yaw_supports_gbnf=True` (`extra_body={"grammar": ...}`).
-      - **RLM Python REPL Orchestrator (`role in ("rlm", "reflection")`):** `_yaw_supports_gbnf=False` so `dspy.RLM` emits unconstrained Python REPL code inside `dspy.PythonInterpreter` (`dspy[deno]>=3.0.0`).
-      - `create_dspy_rlm_pair()` constructs `(orchestrator_lm, sub_lm)` pairing an unconstrained `Qwen3-4B` RLM orchestrator (`_yaw_supports_gbnf=False`) with a GBNF-enabled `Qwen3-4B` sub-LM worker (`_yaw_supports_gbnf=True`).
-  - **`grammars.py`, `prompts.py`, `parsers.py`, `invariants.py`, `adapter.py`, `rlm.py`, `retriever.py`, `proposer.py`, `diagnostics.py`, `reflection.py`, `optimizer.py`, `program.py` (Canonical 12 DSPy Signatures, `/dspy-rlm-module` Discipline, Polymorphic `ExtractEntities` & `ExtractTriples` GBNF, `DefineMissingEntities`, & `compute_task_quality_score`):**
-    - Enforce the **Canonical 12 `dspy.Signature` classes** (9 runtime predictors in `YawProgram`: 7 core direct GBNF predictors `ExtractEntities`, `ExtractTriples`, `DefineMissingEntities`, `JudgeSynonyms`, `ExtractQueryIntent`, `FilterTriples`, `AnswerQuestion` + 2 SHACL healing predictors `HealSHACLViolations` in `dspy.RLM` and `ProposeSHACLRepairs`; plus 3 reflection predictors in `RLMInstructionProposer`: `ReflectiveInnerDistillerSignature` in `dspy.RLM`, `ProposeInstructionSignature`, `CompressInstructionSignature`).
-    - Following `/dspy-rlm-module`, `dspy.RLM` is strictly reserved for multi-step data-exploration / large-context Python REPL loops (`shacl_healer_rlm` and `RLMInstructionProposer.inner_rlm`) backed by `dspy.PythonInterpreter` (`dspy[deno]>=3.0.0`), with kwargs-only sandbox tool dispatch and explicit `sub_lm` wiring (`execution_mode` and `qa_mode` toggles are retired).
-    - `ExtractEntities` emits 2-element `[entity_name, contextual_definition]` pairs (`DSPY_NER_GBNF_GRAMMAR`) handed off into Stage 2; `ExtractTriples` emits 4-field `{"sub", "pred", "obj", "def"}` objects where known Stage 1 entities are strings and newly introduced Stage 2 entities are 2-element `[entity_name, contextual_definition]` pairs (`entity-slot ::= known-entity | new-entity-pair`); `DefineMissingEntities` synthesizes definitions for any triple entities lacking definitions (`build_dspy_missing_entity_defs_grammar`, zero heuristic `spo_def` copying); `JudgeSynonyms` adjudicates candidate entity pairs into `skos:altLabel`, `skos:hiddenLabel`, `skos:related`, or `owl:differentFrom`; `ProposeSHACLRepairs` proposes bounded repairs for closed-world SHACL violations.
-    - `compute_task_quality_score` (`yaw/daemon/graph/inference/parsers.py`, `task-quality-arithmetic-mean-v2`) implements the unweighted arithmetic mean ($\text{score} = \frac{1}{|M|}\sum_{m \in M} m$) over available `Recall@1/2/5/10/20`, `EM`, and `F1` while preserving all 7 raw metrics in `objective_scores`, with zero cost/token/SHACL terms in the optimization reward.
-    - Keep stateless helpers `compute_mdhash_id(content, prefix)`, `text_processing(text)`, `filter_invalid_triples(triples)`, and `match_facts_to_candidate_indices(candidate_facts, matched_facts)`.
-- **Drop (Anti-Spaghetti):** Drop `hipporag.llm.openai_gpt.CacheOpenAI`, `hipporag.embedding_model.base.BaseEmbeddingModel`, `hipporag/prompts/prompt_template_manager.py`, and `d1bc65e:src/yaw/nlp/*`.
-- **Exit Gate (`D1-A2`):** `tests/daemon/graph/inference/` passes unmocked tests for `dspy.Embedder` (including telemetry trail hooks), `dspy.LM`, `create_dspy_rlm_pair`, all 12 canonical `dspy.Signature` modules, `compute_task_quality_score`, `.save()`/`.load()` state round-tripping, and `test_architecture.py` enforces `0` `hipporag` imports inside `yaw/`.
-
----
-
-### Sprint 3 (`E1-S3`): `yaw/daemon/graph/storage/{db.py, vectors.py, graph_ops.py, shacl.py, hydration.py, candidate_cache.py}` — Closed-World SKOS/RDF/OWL `yaw.db` & Line Hydration
-- **Files:** `yaw/daemon/graph/storage/{db.py, vectors.py, graph_ops.py, shacl.py, hydration.py, candidate_cache.py}`, `tests/daemon/graph/storage/{test_db.py, test_hydration.py, test_candidate_cache.py}`.
-- **Allowed imports:** `yaw.core.*`, `sqlite3`, `sqlite_vec`, `numpy`, `hashlib`, `itertools`, `pathlib`.
-- **Copy/Adapt From:**
-  - **SQLite WAL, `ManagedConnection` & `sqlite-vec` setup (`db.py`):** Provide `open_managed_yaw_db(db_path)` (`isolation_level=None`, `ManagedConnection.transaction()` explicit `BEGIN IMMEDIATE` / `SAVEPOINT` nesting, `synchronous=NORMAL`, `temp_store=MEMORY`, `busy_timeout=30000`, `foreign_keys=ON`) and `sqlite_vec.load(conn)`.
-  - **Closed-World SKOS/RDF/OWL Schema (`db.py`):**
-    ```sql
-    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, rel_posix_path TEXT NOT NULL, start_line INT NOT NULL, end_line INT NOT NULL, title TEXT NOT NULL);
-    CREATE TABLE openie_chunks (chunk_id TEXT PRIMARY KEY, entities_json TEXT NOT NULL, triples_json TEXT NOT NULL, structured_triples_json TEXT NOT NULL DEFAULT '[]'); -- openie_chunks.entities_json stores [name, definition] 2-element pairs alongside triples_json / structured_triples_json storing structured triples
-    CREATE TABLE entities (entity_id TEXT PRIMARY KEY, name TEXT NOT NULL, definition TEXT NOT NULL DEFAULT '');
-    CREATE TABLE entity_labels (
-        label_norm TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        label_kind TEXT NOT NULL CHECK (label_kind IN ('skos:prefLabel', 'skos:altLabel', 'skos:hiddenLabel')),
-        raw_label TEXT NOT NULL,
-        chunk_id TEXT NOT NULL,
-        PRIMARY KEY (label_norm, entity_id, chunk_id)
-    );
-    CREATE TABLE facts (fact_id TEXT PRIMARY KEY, subj_id TEXT NOT NULL, pred TEXT NOT NULL, obj_id TEXT NOT NULL, raw_triple_json TEXT NOT NULL, definition TEXT NOT NULL DEFAULT '');
-    CREATE TABLE edges (src_id TEXT NOT NULL, dst_id TEXT NOT NULL, kind TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY (src_id, dst_id, kind));
-    CREATE TABLE edge_sources (src_id TEXT NOT NULL, dst_id TEXT NOT NULL, kind TEXT NOT NULL, chunk_id TEXT NOT NULL, PRIMARY KEY (src_id, dst_id, kind, chunk_id));
-    CREATE VIRTUAL TABLE chunk_fts USING fts5(chunk_id UNINDEXED, title, body, content='', contentless_delete=1);
-    CREATE VIRTUAL TABLE fact_fts USING fts5(fact_id UNINDEXED, text, content='', contentless_delete=1);
-    -- + sqlite-vec float32 tables: chunk_vec(chunk_id, embedding), entity_vec(entity_id, embedding), fact_vec(fact_id, embedding)
-    ```
-  - **SKOS Label Resolution, Merging, Closed-World SHACL Linting & Turtle Export (`db.py`, `shacl.py`):**
-    - `find_entity_disambiguation_candidates` (2-channel dense KNN + lexical prefix/acronym/trigram blocking + unadjudicated same-`label_norm` distinct-`entity_id` pairs), `upsert_entity_labels` (enforcing SKOS `S13` & `S14` across all `chunk_id` rows), `resolve_entity_labels` (homograph query-vector cosine disambiguation), `merge_entities`, `upsert_semantic_edges` (`skos:related` / `owl:differentFrom` with `owl:differentFrom` dominance and exclusion from `load_graph_topology`), `delete_chunks` (including homograph `owl:differentFrom` preservation upon `skos:prefLabel` promotion), `lint_graph_shacl` (all 6 shapes), and `serialize_graph_turtle`.
-    - **In-Process SQLite SHACL & Taxonomy Guards (`shacl.py`):** Recursive `skos:broader` cycle-detection CTEs must omit `depth` from the recursive `UNION` projection so cyclic graphs terminate finitely; enforce deterministic lexical subsumption direction (`ConceptShape/lexicalSubsumption`: compound concepts narrower than root sub-tokens) and coordinate sibling separation (`ConceptShape/siblingNotBroader`: numbered siblings use `skos:related`, not `skos:broader`).
-  - **1-Indexed Line Hydration (`hydration.py`):** Adapt `hydrate_disk_slice` from `git show d1bc65e:src/yaw/retrieval/retriever.py:30-75` (`itertools.islice(f, start_line - 1, end_line)` + `resolved.is_relative_to(corpus_root)` path guard), with missing file/span `stale_on_disk` detection, plus a callable `hydrate_chunk(chunk_id)` tool helper for `dspy.RLM` on-demand passage inspection.
-- **Drop (Anti-Spaghetti):** Drop all 7 upstream files (`EmbeddingStore` Parquet rewrite loops, `openie_results_*.json`, `chunk_metadata.json`, `graph.pickle`) AND drop `d1bc65e:src/yaw/storage/{rdf.py, schema.py}` (`unified_edges` SQL views, `compiled_violations`, `aliases`, `canon_verdicts`).
-- **Exit Gate (`D1-A3`):** Unmocked `test_db.py` & `test_hydration.py` pass top-$k$ `sqlite-vec` KNN, contentless `FTS5` BM25 (`1 / rank` L1-normalized), SKOS `S13`/`S14`, `owl:differentFrom` dominance, 6-shape SHACL linting, Turtle serialization, atomic `chunk_id` deletion cascading through `edge_sources` $\to$ `edges`/`entities`/`entity_labels`/`facts` (with homograph promotion `owl:differentFrom` preservation), and `stale_on_disk` detection.
-
----
-
-### Sprint 4 (`E1-S4`): `yaw/daemon/graph/{ppr.py, engine.py}` — Sparse HMM, EDC + SKOS/SHACL Graph Engine & Tier 1 Parity
-- **Files:** `yaw/daemon/graph/{ppr.py, engine.py}`, `tests/daemon/graph/{test_ppr.py, test_engine.py}`.
-- **Allowed imports:** `ppr.py` imports `yaw.core.*`, `numpy`, `scipy.sparse` only; `engine.py` imports `yaw.daemon.graph.{storage,inference,ppr}` and `yaw.core.*`. (Zero external graph frameworks).
-- **Copy/Adapt From:**
-  - **Sparse entity-state HMM (`ppr.py`):** Maintain separate entity transitions
-    and passage emissions. Apply relation policy after within-kind Noisy-OR,
-    preserve node likelihoods independently, and use the forward/backward and
-    passage ranking contract in [H1](reviews/hmm-retrieval.md). Historical PPR
-    results are not evidence of HMM retrieval parity.
-  - **HippoRAG 2 + EDC + SKOS/SHACL Graph Construction (`engine.py`):**
-    - Stage 1 OpenIE via `YawProgram.extract_openie(passage)` cached in `openie_chunks` with Stage 1 `entity_definitions` (`[name, definition]`) and Stage 2 `StructuredTriple` contextual definitions (`subj_def`, `obj_def`, `spo_def`). Materialize all Stage 1 NER entities (including standalone entities that do not appear in Stage 2 triples) into `entities`, `entity_labels`, and bidirectional `(chunk <-> entity)` `passage` edges.
-    - **Provisional Same-Label Sense-Split Gate:** Before assigning `compute_mdhash_id(label_norm, prefix="entity-")`, compare contextual embeddings (`# {name}\n{definition}`); if $\cos \ge 0.85$ (`same_sense_cosine_gate`), reuse the existing `entity_id`; if $\cos < 0.85$, mint a provisional `sense_id` (`compute_mdhash_id(f"{label_norm}::{defn.lower()}", prefix="entity-")`) **without** writing any `owl:differentFrom` edge in Step 4 so that `find_entity_disambiguation_candidates` surfaces the pair to `judge_semantics`.
-    - **Atomic Closed-World Transaction (Zero Deterministic Fallbacks):** Inside `with self.managed_conn.transaction() as conn:`, commit nodes/vectors/edges, run 2-channel + same-`label_norm` candidate generation + `self.program.judge_semantics(candidates)` (`merge_entities` / `upsert_semantic_edges`), and run `lint_graph_shacl(conn, auto_heal=False)` + `self.program.heal_shacl_violations(violations, focus_context=...)`.
-  - **HippoRAG 2 Retrieval & DSPy Multi-Step QA (`engine.py`):**
-    - Fact linking & Recognition Memory (`HippoRAG.py:2125-2175`): query `fact_vec` + `fact_fts` RRF $\to$ filter via `YawProgram.filter_triples`.
-    - HMM seeding: resolve surface mentions via `resolve_entity_labels(conn, surface_mentions, query_vec=query_fact_vec)`; entity weight $w(e) = \text{mean\_fact\_score}(e) / \max(1, \text{doc\_freq}(e))$; passage weight $w(c) = 0.05 \cdot (\widehat{s}_{\text{vec}}(c) + \widehat{s}_{\text{fts}}(c))$ $\to$ `ppr.run_hmm` $\to$ rank emitted passages $\to$ hydrate **only** top-$k$ chunks via `storage/hydration.py`.
-    - QA reader: run `YawProgram.answer_question` (`qa` `dspy.ChainOfThought(AnswerQuestion)` with pure-JSON GBNF grammar).
-  - **End-to-End DSPy Trace Hook (`engine.py`) & Disjoint Benchmark Split (`benchmark.py`):**
-    - Wire `engine.retrieve_and_answer(question)` through `YawProgram` so a single `dspy.Module.forward(question)` trace captures `FilterTriples` (`triple_filter`) $\to$ sparse HMM + line hydration $\to$ `AnswerQuestion` (`qa`).
-    - Add `--engine {hipporag, yaw}`, `--query-offset <M>`, `--evolve {none, miprov2, gepa, hybrid}`, `--train-queries <K>`, and `--compiled-program <path>` to `benchmark.py` to support strict disjoint learning (`[0:K]`) vs. holdout (`[K:N]`) evaluation.
-- **Drop (Anti-Spaghetti):** Drop `python-igraph` (`self.graph`, vertex deletion index-shifting bugs, `graph.pickle`) and drop `d1bc65e`'s `compute_upward_conductance`, `in_degrees**0.5` hub dampening, and `InMemoryLookupKB`.
-- **Exit Gate (`D1-A4` — Tier 1 Dev Parity Gate):** `uv run --locked python benchmark.py --engine yaw --dataset {sample,2wikimultihopqa,musique} --max-queries 10` matches or beats upstream `hipporag` on `Recall@2`, `Recall@5`, `QA EM`, and `QA F1`.
-
----
-
-### Sprint 5 (`E1-S5`): `yaw/daemon/ingestion/corpus.py` — CocoIndex Incremental Line-Pointer Pipeline & Target Sink Compiler Hook
-- **2026-10-27 replacement packet:** see [native CocoIndex indexing and live ingestion](native-cocoindex-indexing.md).
-  Dataset preparation emits isolated document files (`outputs/datasets/<dataset>/{documents/*.json,evaluation/questions.json,manifest.json}`);
-  persistent CocoIndex snapshots replace fresh-state reconstruction. The exit
-  condition includes warm snapshots without reparsing, unchanged source values,
-  loader-owned Enterprise stratification (seed 42, 150 train / 100 val) and no
-  legacy discovery/projection consumers. The packet supersedes benchmark-shape
-  parsing and automatic benchmark JSON projection settings described elsewhere.
-- **Files:** `yaw/daemon/ingestion/corpus.py`, `tests/daemon/ingestion/test_corpus.py`.
-- **Allowed imports:** `yaw.core.*`, `cocoindex`, `spacy` (bounded `E1-M1` prose sentence boundaries), `hashlib`, `pathlib`. (Zero imports from `graph/`).
-- **Copy/Adapt From:**
-  - Adapt `chunk_markdown` from `git show d1bc65e:src/yaw/indexer/pipeline.py:122-167`:
-    - Walk `corpus.root` using `cocoindex>=1.0.0` (`localfs.walk_`, `PatternFilePathMatcher` for `*.md`, `*.txt`, `RecursiveSplitter`).
-    - Compute 1-indexed inclusive `start_line = content[:c.start].count("\n") + 1`, `end_line = start_line + c.text.count("\n")`, and `content_hash = sha256(c.text)`.
-    - Diff against committed `chunk_id` set to produce a single coalesced `SyncDelta(added_chunks, deleted_chunk_ids)` and invoke the registered `on_delta: Callable[[SyncDelta], None] | None` callback inside `_ChunkTargetHandler._apply_actions` before CocoIndex commits state to `coco_lmdb` (if `on_delta` raises, CocoIndex aborts the state commit so the next `poll()` retries).
-- **Drop (Anti-Spaghetti):** Never import `graph/`, `storage/`, or `inference/` inside `corpus.py`. `corpus.py` bridges to `YawGraphEngine` exclusively through the `Callable[[SyncDelta], None]` injected by `Runtime`.
-- **Exit Gate (`D1-A5`):** Unmocked `tests/daemon/ingestion/test_corpus.py` passes file add, edit, rename, delete, memoized zero-op re-scans, and `on_delta` target sink rollback on compiler failure.
-
----
-
-### Sprint 6 (`E1-S6`): `yaw/daemon/{runtime.py, cli.py}`, Two-Phase `MIPROv2` + `GEPA` Evolution & Tier 2 Holdout Gate
-- **Canonical `optimize_*` sandbox, default-resume & `--fresh` packet (2026-11-08, superseding 2026-10-22 timestamped `--resume`):** `yaw dspy optimize` defaults to resuming/initializing the single canonical `.yaw/optimize_yaw.db` sandbox (`optimize_yaw.db`, `optimize_status.json`, `optimize_program.json`, `optimize_program_audit.json`, `optimize_program_eval.json`, `optimize_program_pools.json`, `optimize_program_telemetry/`, `optimize_telemetry.json`, `optimize_kg_frames/`, `optimize_coco/<dataset>/`, and unified `.yaw/coco_lmdb`) so databases are never wiped accidentally (`--resume` and timestamped `*_optimize_<datestamp>*` sandboxes are retired). When `.yaw/optimize_yaw.db` exists, default `yaw dspy optimize` recovers its saved output path and CLI invocation from `meta['optimization_run']`, preserves the GEPA candidate frontier/budget, and reuses only database checkpoints with matching durable prompt provenance; incompatible run identities fail without deleting checkpoints. Explicit `yaw dspy optimize --fresh` verifies `.yaw/optimize_yaw.db.lock` is unlocked and wipes `.yaw/optimize_yaw.db` and `.yaw/optimize_*` sidecars in-place while preserving shared `.yaw/coco_lmdb`, `.yaw/optimize_coco/`, and `.yaw/dspy_cache`. Observable exit: real SQLite/CocoIndex/DSPy/GEPA restart and `--fresh` lifecycle tests (`CG-OPT-1`) retain a previously saved superior candidate on default resume and start clean on `--fresh` while reusing `.yaw/coco_lmdb`.
-  This packet does not satisfy the separate Tier 2 parity acceptance gate.
-- **Candidate-stage disk-cache packet (2026-10-22):** replace growing in-memory
-  embedding/OpenIE/synonym/SHACL cache dictionaries with a shared, bounded SQLite
-  cache in `yaw.db`. Preserve typed DSPy/RLM traces and logical token costs;
-  hash complete inference inputs/settings and hydrate source content rather than
-  copying passages into cache payloads. Observable exit: independent Python
-  processes rebuild identical graphs with zero additional loopback inference
-  requests, while changed prompts/models/sampling/source content force misses.
-  This packet does not eliminate GEPA seed reevaluation or claim Tier 2 parity.
-- **Priority 2 response-cache packet (2026-10-22):** enable DSPy's native disk
-  request cache during evolution with its memory tier disabled. Keep this change
-  in `inference/chat.py` (public cache-interface usage accounting) and `engine.py`
-  (configuration). Replay logical usage without altering native response history,
-  retain endpoints in request keys, and preserve explicit cache bypass. Observable
-  exit: separate-process loopback requests hit disk with no new HTTP calls, and
-  independent real GEPA runs produce equal live/cached scores and token costs.
-- **Files:** `yaw/core/config.py`, `yaw/daemon/{runtime.py, cli.py}`, `yaw/__main__.py`, `yaw.toml`, `tests/daemon/test_runtime.py`.
-- **Allowed imports:** `runtime.py` & `cli.py` import `yaw.daemon.{ingestion,graph}`, `yaw.core.*`, `filelock`, `tomllib`, `argparse`, `queue`, `threading`.
-- **Copy/Adapt From:**
-  - Adapt `DaemonLifecycle` and graceful signal handling from `git show d1bc65e:src/yaw/server/daemon.py:260-340` (using `filelock.FileLock("yaw.db.lock")` instead of raw `msvcrt`/PID-alive checks).
-  - Adapt CLI commands into hierarchical grammar `python -m yaw <domain> <action> [--flags]` (`yaw daemon {start|stop|status|run}`, `yaw graph {build|rebuild|lint [--turtle]}`, `yaw dspy {optimize|load|benchmark}`, `yaw config {get|set}`). `yaw graph lint [--turtle]` opens `yaw.db` in read-only URI mode (`mode=ro`) without acquiring `yaw.db.lock`.
-  - Wire single-owner 32-slot bounded FIFO worker thread in `runtime.py`: binds `CorpusIngestor(..., on_delta=self._apply_delta)` so `self._ingestor.poll()` compiles and validates each `SyncDelta` inside the CocoIndex target sink transaction, and serves `retrieve`/`rag_qa` requests with non-blocking cached `status()`/`stats()`.
-  - **Zero-Lock-In `MIPROv2` + `GEPA` + `SIMBA` Evolution (`engine.evolve_prompts` & `python -m yaw dspy optimize` / `benchmark.py --evolve`):**
-    1. **Anti-Overfitting Rule:** Never run prompt evolution on full Tier 2 benchmark corpora (`musique`, `2wikimultihopqa`, `hotpotqa` full sets) to prevent benchmark lock-in.
-    2. **Task-Quality Fitness Objective (`compute_task_quality_score`, `yaw/daemon/graph/inference/parsers.py`, `task-quality-arithmetic-mean-v2`):**
-       - Unweighted arithmetic mean ($\text{score} = \frac{1}{|M|}\sum_{m \in M} m$) over available quality metrics (`Recall@1, 2, 5, 10, 20`, `EM`, `F1`) with all 7 raw metrics in `objective_scores` for GEPA's validation-set Pareto frontier and compile-time `use_merge=True` (`MergeProposer`). Tokens, latency, SHACL, and repairs are diagnostic telemetry only (never Pareto objectives or penalties). `YawProgram` is a single textbook `dspy.Module` (`best_candidate` returned by `gepa.compile()`); custom self-cloning ensemble wrappers (`ParetoProgramEnsemble`) are retired in favor of textbook `dspy.GEPA` compile-time merging and native `dspy.Ensemble(reduce_fn=dspy.majority)`.
-    3. **Full Optimizable Surface, First-Class Embedding Trail & Single-Level Reflection RLM:** Expose all 12 canonical signatures (`YawProgram` 9 runtime predictors + `RLMInstructionProposer` 3 reflection predictors), `EmbeddingGemma` query/passage instructions (with full embedding telemetry recorded in `YawProgram.telemetry` and `YawProgram.embedding_audit_trail`), and parametric GBNF grammar bounds to canonical `"hybrid"` optimization (`dspy.MIPROv2` warm-up + `dspy.GEPA` handoff + always-on `dspy.SIMBA`). Drive `dspy.GEPA(reflection_lm=...)` via the unified RLM pair (`create_dspy_rlm_pair`: unconstrained RLM REPL orchestrator + GBNF sub-LM worker), persisting canonical `.yaw/optimize_program.json` alongside `.yaw/optimize_program_audit.json` (`<stem>_audit.json`), `.yaw/optimize_program_eval.json` (`<stem>_eval.json`), `.yaw/optimize_program_pools.json` (`<stem>_pools.json`), and `.yaw/optimize_program_telemetry/` (`<stem>_telemetry/`), with DSPy predictor audit trails persisted once in SQLite `meta['dspy_trails_state']` and predictor/stage fingerprints computed via CocoIndex's `fingerprint_object(payload).hex()` (`graph_plan_fingerprints`).
-    4. **Evolve on Tier 1 Calibration Slices or External OOD Corpora:** Run `dspy.MIPROv2` + `dspy.GEPA` (`enable_gbnf=True` for `llama.cpp` GBNF grammar enforcement via `config={"extra_body": {"grammar": ...}}`) strictly on the small **Tier 1 benchmark sets** (`--max-queries 10`) and/or **external out-of-distribution corpora** (`onyx-dot-app/EnterpriseRAG-Bench`, `microsoft/graphrag-benchmarking-datasets`) to produce one universal, generalizable `compiled_program.json`.
-    5. **Run Unseen Holdout Benchmarks Zero-Shot:** Evaluate `uv run yaw dspy benchmark --gate benchmark_gate.json` / `--engine yaw --compiled-program compiled_program.json --query-offset 10` on the remaining unseen Tier 2 holdout queries (`10..N`).
-    6. **Target Consumer-Hardware Victory:** Beat our un-evolved `hipporag` baseline and target the HippoRAG 2 paper (`Llama-3.3-70B` + `NV-Embed-v2`) benchmarks on consumer hardware (`Qwen3-4B-Instruct-2507-GGUF` + `embeddinggemma-300m-GGUF`). Once Tier 2 HippoRAG 2 parity/beat is confirmed, upstream `hipporag` will be permanently removed.
-- **Exit Gate (`D1-A6` — Epic 1 Acceptance Gate):**
-  1. `tests/daemon/test_runtime.py` passes lock contention, 32-slot `BUSY` overflow, Stage 1 crash-resume, and inference outage recovery.
-  2. Native `yaw.daemon.graph` engine + universal `MIPROv2`/`GEPA`-evolved `YawProgram` (trained only on Tier 1 slices / external OOD corpora) matches or beats our upstream `hipporag` 3-model baseline on **Tier 2** disjoint holdout benchmarks in [evaluation](evaluation.md).
+1. **Package Boundaries (`yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/__init__.py`):**
+   - `yaw/__init__.py`: strictly `0`-statement empty intermediate package marker (`Rule 1`).
+   - `yaw/__main__.py` (`<= 10` LOC): invokes `yaw.cli.cli_entrypoint()` on `python -m yaw`.
+   - `yaw/core/__init__.py`: declarative `_PUBLIC_API` lazy-import facade (`27` public symbols via `__all__`, `__getattr__`, `__dir__`) with zero third-party imports and zero `_private` re-exports (`Rule 1b`).
+2. **Configuration & Atomic TOML Bijection (`yaw/core/config.py`):**
+   - Frozen slotted `YawConfig` with exact `31`-field `1:1` mapping across `5` `yaw.toml` sections: `[paths]` (`8` fields: `workspace_root`, `corpus_root="corpus"`, `db_path=".yaw/yaw.db"`, `lock_path=".yaw/yaw.db.lock"`, `state_dir=".yaw/coco_lmdb"`, `log_path=".yaw/yaw.log"`, `status_path=".yaw/status.json"`, `compiled_program_path=".yaw/compiled_program.json"`), `[ingestion]` (`6` fields: `included_patterns=DEFAULT_INCLUDED_PATTERNS`, `excluded_patterns=DEFAULT_EXCLUDED_PATTERNS`, `chunk_size=1000`, `chunk_overlap=150`, `min_chunk_size=100`, `embed_batch_size=5`), `[inference]` (`9` fields: `base_url="http://127.0.0.1:8888/v1"`, `api_key` from `UNSLOTH_STUDIO_AUTH_TOKEN` / `OPENAI_API_KEY`, `provider="openai"`, `embedding_model="embeddinggemma-2"`, `embedding_task_mode="distinct-titled"`, `embed_max_in_flight=2`, `qa_model="gemma-4-e4b"`, `max_output_tokens=None`, `react_max_iters=6`), `[runtime]` (`4` fields: `queue_maxsize=32`, `http_host="127.0.0.1"`, `http_port=13306`, `http_path="/mcp"`), and `[optimization]` (`4` fields: `optimize_datasets=("enterprise_rag_bench",)`, `optimize_max_queries=162`, `optimize_query_offset=0`, `optimize_auto="light"`, aliased in TOML as `datasets`, `max_queries`, `query_offset`, `auto`).
+   - `YawConfig.__post_init__` validates types (rejecting booleans for ints), numeric bounds (`0 <= chunk_overlap < chunk_size`, `1 <= http_port <= 65535`, `http_path.startswith("/")`, `optimize_query_offset >= 0`), enums (`optimize_auto in {"light", "medium", "heavy"}`, `embedding_task_mode in {"search", "titled", "qa", "distinct", "distinct-titled", "fact"}`), and non-empty `optimize_datasets`, raising `YawRuntimeError("INVALID_INPUT", ...)`.
+   - `YawConfig.for_optimization(db_override=None)` derives an isolated optimization config: `corpus_root=workspace_root`, `db_path=optimize_yaw.db`, `lock_path=optimize_yaw.db.lock`, `status_path=dspy_status.json` (or `optimize_status_<suffix>.json`), `state_dir=base_dir / "coco_lmdb"`, and `compiled_program_path=qa_program.json` (or `optimize_program_<suffix>.json`), rejecting blank `db_override`.
+   - `load_config` (strict `tomllib` load rejecting retired `embed_batch_chars`, unknown keys/sections, and cross-section misplacements), `get_config_value`, `set_config_value` (validates via `load_config` on temporary file before atomic commit), `write_via_temp_atomic` / `write_text_atomic` (sibling temp + 6-attempt Windows `PermissionError` backoff), `parse_dataset_list`, and `resolve_coco_state_root` (`<state_dir>/coco_lmdb`).
+3. **Typed Contracts, Coordinates & Formatting (`yaw/core/types.py`):**
+   - `ErrorCode` (`8` literal codes: `"BUSY"`, `"CONSISTENCY_ERROR"`, `"EMPTY_INDEX"`, `"INDEX_NOT_READY"`, `"INVALID_INPUT"`, `"MODEL_ERROR"`, `"NOT_READY"`, `"SHUTTING_DOWN"`), `YawRuntimeError`, and `EmbedFn = Callable[[list[str]], Any]`.
+   - Frozen slotted dataclasses: `ChunkPointer` (`chunk_id`, `rel_path`, `source_hash`, `start_line`, `end_line`, `char_start=0`, `char_end=0`, `ast_island_start=1`, `ast_island_end=1`, `title=""`; properties `rel_posix_path`, `span_label`), `HydratedPassage` (`pointer`, `text`, `score`, `stale_on_disk=False`), `QAResult` (`question`, `answer`, `citations=()`, `passages=()`, `latency_ms=0.0`, `turns=0`), and `DaemonStatus` (`lifecycle="stopped"`, `provider_ready=False`, `sync_state="idle"`, `queue_depth=0`, `active_op=None`, `last_error=None`, `last_sync_at=None`, `pid=None`, `num_chunks=0`, `to_dict()`).
+   - Pure deterministic helpers: `redact_secrets(text, api_key="")` (masks explicit `api_key`, `Bearer` tokens, `sk-...` keys, URL `user:pass@`, and `api_key=...`), `canonical_chunk_span_key`, `compute_chunk_int_id` (positive signed 63-bit SHA-256), `inclusive_end_line`, `resolve_corpus_path` (strictly confines relative paths inside `corpus_root`), `render_document_text`, `format_query_for_embedding`, and `format_doc_for_embedding` (rejecting pre-prefixed inputs).
+4. **FIFO Logging & Noise Suppression (`yaw/core/logger.py`):**
+   - `FIFOLineRotatingHandler(filename, max_lines=500, encoding="utf-8", flush_interval=50)` reloads existing tail lines into a bounded `deque`, buffers writes across `flush_interval` (flushing immediately on `ERROR+`), and writes atomically via `.tmp` replace.
+   - `SuppressThirdPartyInfoFilter` suppresses `< WARNING` chatter from `httpx`, `httpx2`, `httpcore`, `openai`, `urllib3`, `litellm`, and `LiteLLM`.
+   - `get_logger(name="yaw")` and `configure_logging(log_file: str | Path | None = None, level: int | str = logging.INFO, max_lines: int = 500, quiet_third_party: bool = True, disable_tqdm: bool = True)` with zero positional-arg or `log_file_path` compatibility shims.
+5. **Cross-Spec Peer Architecture:**
+   - [native-cocoindex-indexing.md](native-cocoindex-indexing.md) (`yaw/pipeline.py`, `yaw/datasets.py`): declarative 5-table CocoIndex `1.2.0` sync (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`) and v2 `.md` dataset bundles.
+   - [native-cocoindex-graph.md](native-cocoindex-graph.md) (`yaw/retrieval.py`): read-only `M_FINAL_1B` `RetrievalIndex` (`search_index`, `lexical_search`, `expand_citation_neighbors`, `hydrate_ranked_passages`).
+   - [dspy-improvements.md](dspy-improvements.md) (`yaw/qa.py`, `yaw/optimize.py`): bare `dspy.ReAct` QA (`create_lm` via `dspy.lm15`, `temperature=1.0`) and `dspy.GEPA` optimization saving `.yaw/qa_program.json`.
+   - [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md) (`yaw/mcp_server.py`, `yaw/runtime.py`, `yaw/cli.py`): `YawRuntime` (`BoundedSemaphore(32)`, `Semaphore(1)`, `PRAGMA data_version` swaps), FastMCP Streamable HTTP, and `yaw` CLI.
 
 ---
 
 ## 3. Checklist Summary
 
-- [ ] **E1-P6 (early audit JSON pilot):** implement and evaluate optimizer audit encoding and watchdog audit decoding under the [review plan](reviews/msgspec-audit-pilot.md); retain only after compatibility, performance, memory and project gates pass. Parent ownership: [Epic 3](epic-3-performance.md#early-epic-1-exception-audit-json-pilot-e1-p6).
-
-- [x] **D1-A0 (`D1-01`):** Embedding repeatability (`cosine >= 0.999`), $T=0.2$ floors, GBNF, 500-line FIFO logger, paper datasets downloaded.
-- [x] **D1-A1 (`E1-S1`):** `yaw/core/` + containment tree locked; `test_architecture.py` enforces `0` horizontal/cross-domain imports.
-- [x] **D1-A2 (`E1-S2`):** `inference/` refactored onto native `dspy` (`dspy.LM`, `dspy.Embedder`, `dspy.Signature`s, `dspy.Predict`/`ChainOfThought`/`RLM`, GBNF grammar forwarding, `.save()`/`.load()`) with `0` `hipporag` imports in `yaw/`.
-- [x] **D1-A3 (`E1-S3`):** `storage/{db,hydration}.py` implements single-schema `yaw.db` (`sqlite-vec`, contentless `FTS5`, provenance edges) and 1-indexed `itertools.islice` line hydration.
-- [x] **D1-A4 (`E1-S4`):** `graph/{ppr,engine}.py` + `storage/*` + `--query-offset`/`--evolve` hooks achieve **Tier 1 benchmark parity** vs. upstream `hipporag` on the 3-model local setup (YAW Recall@2: 0.8250 vs upstream: 0.8000; Recall@5: 1.0000 vs upstream: 1.0000; EM: 0.20 vs 0.20).
-- [x] **D1-A5 (`E1-S5`):** `ingestion/corpus.py` (`cocoindex>=1.0.25`) emits pure coalesced line-pointer `SyncDelta`s across add/edit/rename/delete.
-- [ ] **D1-A6 (`E1-S6`):** `daemon/{runtime,cli}.py` (`yaw <domain> <action>` CLI & isolated sandbox `dspy optimize` / `load`) passes lifecycle/lock/recovery tests AND native engine + universal `MIPROv2`/`GEPA`/`RLM` program (trained on Tier 1 / OOD corpora) passes the clean-slate 7-dataset slice-based paper parity gate (`scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh`). Full-corpus multi-day scaling on the massive academic benchmarks is deferred to [Epic 3](epic-3-performance.md).
+- [x] **D1-A0..D1-A5 (Historical Pre-Cutover Foundation & Architecture Lock):** Completed (`yaw/core/`, containment tests, datasets, initial CocoIndex & DSPy substrates).
+- [x] **`CS-0`..`CS-6` (Clean-Slate `14`-File Replacement Sprint, `3cd3952`):** Retired `yaw/daemon/**`, wrappers, `ppr.py`, `hmm.py`, OpenIE/W3C/SHACL into clean 14-file architecture ([bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md)).
+- [x] **`EVAL-0`..`EVAL-5` (`M_FINAL_1B` Production Cutover, `5c4b115`):** Shipped 5-table plain SQLite `<f2>` `chunks` + `chunk_fts` + `chunk_vocab` + `rabitq_index` + `citation_graph` and purged `sqlite-vec`/`vec0`, `optuna`, `spacy` ([mdl-dag-sprint.md](reviews/mdl-dag-sprint.md)).
+- [ ] **`D1-A6` / Full-Corpus Scale (`Epic 3`):** Post-cutover full-corpus Tier-2 benchmarking and `EVAL-6` (`SearchResult.completeness` calibration, lazy `.yaw/wiki/` Graph Scout) tracked in [epic-3-performance.md](epic-3-performance.md).
 
 ---
 
@@ -272,7 +90,7 @@ Execute strictly in order `E1-S1` $\to$ `E1-S6`. Never start Sprint $k+1$ until 
   3. *"Yes please, but Matryoshka reduction IMO not needed exactly right now."* (User) -> full `768d` vectors in `vec0` + symmetric ABTT isotropization in memory.
   4. *"Yes, 4 dataset matrix sounds good for dev purposes, it would be nice to know quick if the whole concept is a dud. If the first try is unsuccesful, we can just force a goal of beating the OpenIE solution, which should make you explore unexplored avenues of N-dimensional HMM systems or even deeper levels of math."* (User) -> 4-dataset dev shootout against `Current YAW`, `monkeypatched_hipporag`, and `PAPER_BASELINES`.
   5. *"I don’t think you need the V1 at all. How about you go straight for the V2 as V1."* (User) -> retire single-vector V1 manifold math in place with zero legacy flags and adopt the N-dimensional **Kraus Sheaf Sub-Span HMM with Myerson Coalitional Reranking** (Gavish–Donoho ABTT/CSLS + persisted `chunk_vec` blend in full ambient `R^d`, heterogeneous Barbero 1-hop CSLS orthonormal stalks `r_c`, orthogonal intra-chunk Kraus generators, Noisy-OR dual-channel inter-chunk edges with ambiguity-conditional hinge scaling, Shannon clarity fusion, PSD Kraus forward-backward propagation with Bayesian log-evidence gating and Lüders projection, sequential Myerson coalitional reranking, and connected max-product witness chains) recorded in [substate-manifold-shootout.md](reviews/substate-manifold-shootout.md).
-  6. **Post-`E1-M1` Clean CocoIndex Parity (Once Math Freezes):** Extract each sub-span's normalized unigram/bigram token hashes in `process_chunk` ([`yaw/daemon/indexing.py`](../yaw/daemon/indexing.py)) while `s_txt` is in memory (`0` raw text stored in SQLite, `0` disk hydration needed again); incrementally maintain declarative sheaf tables (`chunk_stalks`, `csls_radii`, `manifold_edges` via `subspan_vec` $k$-NN neighborhood healing) inside `plan_graph_publication` ([`yaw/daemon/graph/planner.py`](../yaw/daemon/graph/planner.py)) within CocoIndex's `64`-chunk batch pipeline; and collapse `_ensure_substate_manifold()` ([`yaw/daemon/graph/engine.py`](../yaw/daemon/graph/engine.py)) to a flat SQLite table load into CSR matching `_ensure_csr_graph()` line-for-line so [`scripts/watchdog.py`](../scripts/watchdog.py) works out of the box from `yaw.db` alone.
+  6. **Post-`E1-M1` Clean CocoIndex Parity (Once Math Freezes):** Extract each sub-span's normalized unigram/bigram token hashes in `process_chunk` (`yaw/daemon/indexing.py`) while `s_txt` is in memory (`0` raw text stored in SQLite, `0` disk hydration needed again); incrementally maintain declarative sheaf tables (`chunk_stalks`, `csls_radii`, `manifold_edges` via `subspan_vec` $k$-NN neighborhood healing) inside `plan_graph_publication` (`yaw/daemon/graph/planner.py`) within CocoIndex's `64`-chunk batch pipeline; and collapse `_ensure_substate_manifold()` (`yaw/daemon/graph/engine.py`) to a flat SQLite table load into CSR matching `_ensure_csr_graph()` line-for-line so [`scripts/watchdog.py`](../scripts/watchdog.py) works out of the box from `yaw.db` alone.
   7. **5-Point `Recall@{1, 2, 5, 10, 20}` Optuna MOTPE Horizon & Live `stderr` Telemetry:** *"You should maybe extend the optimization process to recall@10 and recall@20, since gepa optimizes against those targets as well."* / *"Option 1, then extend to 1, 2, 5, 10, 20."* / *"Just keep it running - this is excellent, it just wasn't giving any telemetry to stdout so I was uncertain what was going on."* (User) -> extend `yaw dspy optuna` (`yaw/daemon/manifold_optuna.py`) and benchmark retrieval evaluation (`benchmark.py`, `evaluate_program`) to 5-point `Recall@{1, 2, 5, 10, 20}` matching `YawOptimizer` (`optimizer.py`), emit live trial telemetry to `stderr`, support custom dataset directory roots via `datasets=str(bundle.root)`, and enforce strict held-out `val` non-regression across both `val["combined"]` and `val["r5"]`.
   8. **Pass-3 Algebraic Remediations, Generalized $B$-Particle Branching, Convergent Join BP & Sinkhorn–Knopp:** *"Good to hear. I still think you’ll need to add these tuning knobs: [Join BP & Sinkhorn-Knopp]"* / *"Also: why num_particles == 2, what does that mean?"* / *"yes. Send The implementer. I believe a spec is needed."* (User) -> remediate all 5 symbol-level Pass-2 failure modes in `yaw/daemon/graph/hmm.py` and `yaw/daemon/manifold_optuna.py`, generalize multi-anchor seeding to $B \in \{1, \dots, \text{max\_particles}\}$ with `max_particles = 3`, expose Convergent Factor-Graph Join Belief Propagation (`join_bp_weight`, `join_bp_hop_decay`) and Build-Time Sinkhorn–Knopp Doubly-Stochastic Normalization (`sinkhorn_iters`, `sinkhorn_mix`) alongside `kraus_isotropic_rescue`, `hop0_anchor_protect`, and `hop_post_scale` in `ManifoldHyperparams`, and complete the full evidence-grounded shootout spec ([substate-manifold-shootout.md](reviews/substate-manifold-shootout.md)) prior to code changes.
   9. **Tree/DAG Sheaf Tensor-Network Formulation, Scanline `np.add.reduceat` & Post-`E1-M1` Agnus/Blitter Contractions:** *(from interactive Amiga Agnus/Blitter & Sheaf Tensor-Network analysis, 2026-11-14)* -> Codify the **Tree/DAG Sheaf Tensor-Network** formulation (hidden-state `4`-tensor $\mathcal{P}_h$, sheaf connection `3`-tensor $\mathcal{T}_e$, bilinear Lüders contraction $L_h \rho_h L_h^\top$, and multi-particle Join BP star contraction $\operatorname{Tr}(\bar{\rho}_{h_a}^{(a)}[c]\, \bar{\rho}_{h_b}^{(b)}[c])$) plus **build-sorted scanline `np.add.reduceat` segmented reductions** replacing unbuffered `np.add.at` scatter loops inside [substate-manifold-shootout.md](reviews/substate-manifold-shootout.md) for `E1-M1`; and record full-corpus Copper display-list frontier compaction (`(B, |A_h|, 16, 16)` `float32` = `384 KiB` `[target]` for `B=3`, `|A_h|=128`, `16 x 16` `[target]`), square-root factor transport ($\rho_s = F_s F_s^\top$), and dual-semiring tropical `np.maximum.reduceat` reductions under Goal 2 Demoscene Execution Speed in [epic-3-performance.md](epic-3-performance.md#34-goal-2--demoscene-execution-speed-msgspec-dis-bytecode--vectorized-csr).

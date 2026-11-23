@@ -98,15 +98,8 @@ def configure_logging(
     max_lines: int = 500,
     quiet_third_party: bool = True,
     disable_tqdm: bool = True,
-    *,
-    log_file_path: str | Path | None = None,
 ) -> list[logging.Handler]:
     """Configure stream and FIFO-rotating file handlers, silencing chatty third-party loggers."""
-    if isinstance(log_file, str) and log_file.upper() in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        level = getattr(logging, log_file.upper())
-        log_file = log_file_path
-    elif log_file is None and log_file_path is not None:
-        log_file = log_file_path
     if disable_tqdm:
         os.environ.setdefault("TQDM_DISABLE", "1")
 

@@ -51,11 +51,6 @@ def redact_secrets(text: str, api_key: str = "") -> str:
     return _API_KEY_KV_RE.sub(r"\1[REDACTED]", cleaned)
 
 
-def normalize_entity(text: str) -> str:
-    """Normalize an entity mention to lowercase single-spaced form."""
-    return " ".join(text.strip().lower().split())
-
-
 def canonical_chunk_span_key(
     rel_path: str, start_line: int, end_line: int, char_start: int = 0, char_end: int = 0, source_hash: str = ""
 ) -> str:
@@ -228,7 +223,6 @@ __all__ = [
     "format_doc_for_embedding",
     "format_query_for_embedding",
     "inclusive_end_line",
-    "normalize_entity",
     "redact_secrets",
     "render_document_text",
     "resolve_corpus_path",

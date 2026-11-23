@@ -5,7 +5,7 @@ initial investigation and superseded proposals are retained as historical eviden
 `1b33dac86558c094cf152b438c300f9946df4ad2`, with pre-existing working-tree edits
 preserved, including `graph_ops.py`. Controlling contracts:
 [native graph publication](../native-cocoindex-graph.md),
-[W3C improvements](../w3c-improvements.md),
+[W3C improvements](../archive/w3c-improvements.md),
 [incremental publication review](incremental-publication-work.md), and
 [Epic 3](../epic-3-performance.md). This proposes a bounded Epic 1 throughput
 repair, not starting the remaining Epic 3 program.

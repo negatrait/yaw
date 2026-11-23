@@ -23,7 +23,6 @@ _PUBLIC_API: dict[str, str] = {
     "get_logger": ".logger",
     "inclusive_end_line": ".types",
     "load_config": ".config",
-    "normalize_entity": ".types",
     "parse_dataset_list": ".config",
     "redact_secrets": ".types",
     "render_document_text": ".types",

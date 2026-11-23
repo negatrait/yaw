@@ -1,22 +1,24 @@
+> [!NOTE] Archived (Retired per [FOUNDATIONAL.md](../../FOUNDATIONAL.md#2-non-goals--retired-stack)). Retained for historical decisions and review cross-links.
+
 # Technical Specification: Unified Logarithmic Opinion Pool & Bayesian Markov Graph Engine
 
-> **2026-11-13 P2 update:** Historical hierarchy/related model stages and their Boolean votes below are superseded by one oriented `JudgeRelations` enum decision. Pool only actually measured identity and relation votes; fact-derived constraints do not fabricate votes. [P2 review](reviews/prompt-context-integrity.md) records current evidence and gates.
+> **2026-11-13 P2 update:** Historical hierarchy/related model stages and their Boolean votes below are superseded by one oriented `JudgeRelations` enum decision. Pool only actually measured identity and relation votes; fact-derived constraints do not fabricate votes. [P2 review](../reviews/prompt-context-integrity.md) records current evidence and gates.
 
 Status: active, 2026-11-08. Pinned code: `c98aebe`.
 
-- Controls: [types.py](../yaw/core/types.py), [__init__.py](../yaw/core/__init__.py), [config.py](../yaw/core/config.py), [pipeline.py](../yaw/pipeline.py), [retrieval.py](../yaw/retrieval.py), [runtime.py](../yaw/runtime.py), [test_architecture.py](../tests/core/test_architecture.py) *(historical `yaw/daemon/...` OpenIE/W3C/SHACL modules retired in [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md))*
-- Depends on: [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [retrieval.md](../.agents/rules/retrieval.md), [qa.md](../.agents/rules/qa.md), [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](native-cocoindex-graph.md)
-- Updated with: [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](native-cocoindex-graph.md), [epistemic-confidence-spec.md](epistemic-confidence-spec.md), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md)
+- Controls: [types.py](../../yaw/core/types.py), [__init__.py](../../yaw/core/__init__.py), [config.py](../../yaw/core/config.py), [pipeline.py](../../yaw/pipeline.py), [retrieval.py](../../yaw/retrieval.py), [runtime.py](../../yaw/runtime.py), [test_architecture.py](../../tests/core/test_architecture.py) *(historical `yaw/daemon/...` OpenIE/W3C/SHACL modules retired in [bare-bones-replacement-sprint.md](../reviews/bare-bones-replacement-sprint.md))*
+- Depends on: [FOUNDATIONAL.md](../../FOUNDATIONAL.md), [AGENTS.md](../../AGENTS.md), [retrieval.md](../../.agents/rules/retrieval.md), [qa.md](../../.agents/rules/qa.md), [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md)
+- Updated with: [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md), [epistemic-confidence-spec.md](epistemic-confidence-spec.md), [shacl-healer-publication.md](../reviews/shacl-healer-publication.md), [incremental-publication-work.md](../reviews/incremental-publication-work.md)
 
 | Relation | Links |
 | --- | --- |
-| Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
-| Rules | [retrieval.md](../.agents/rules/retrieval.md): `yaw/retrieval.py`; [qa.md](../.agents/rules/qa.md): `yaw/qa.py`, `yaw/optimize.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` *(replaces historical `graph-storage.md` / `inference.md`)* |
+| Governed by | [FOUNDATIONAL.md](../../FOUNDATIONAL.md), [AGENTS.md](../../AGENTS.md), [epic-1-hipporag-daemon.md](../epic-1-hipporag-daemon.md) |
+| Rules | [retrieval.md](../../.agents/rules/retrieval.md): `yaw/retrieval.py`; [qa.md](../../.agents/rules/qa.md): `yaw/qa.py`, `yaw/optimize.py`; [tests.md](../../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../../.agents/rules/docs.md): `docs/**/*.md` *(replaces historical `graph-storage.md` / `inference.md`)* |
 | Owns code | `yaw/daemon/graph/storage/graph_ops.py:pool_confidences`, `yaw/daemon/graph/storage/graph_ops.py:bayesian_noisy_or`, `yaw/daemon/graph/storage/shacl.py:auto_heal_deterministic_shacl`, `yaw/daemon/graph/ppr.py:build_transition_matrix` |
-| Peers | [w3c-improvements.md](w3c-improvements.md): owns two-stage `JudgeLabels` / `JudgeRelations` cascade (`W1`), same-norm pre-consolidation (`W2`), universal statement irreflexivity (`W3`), Tier 3 deterministic fact definition synthesis (`W4`), and non-transitive `1`-hop `skos:broader` (`W5`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns incremental graph publication and `DatabaseSink` atomicity; [dspy-improvements.md](dspy-improvements.md): constrains GBNF adapter and RLM healer architecture; [Epic 3](epic-3-performance.md): consumes `pool_confidences` and `bayesian_noisy_or` for post-Epic 2 functional-property distractor down-weighting and `prov:wasDerivedFrom` co-provenance reinforcement |
-| References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
+| Peers | [w3c-improvements.md](w3c-improvements.md): owns two-stage `JudgeLabels` / `JudgeRelations` cascade (`W1`), same-norm pre-consolidation (`W2`), universal statement irreflexivity (`W3`), Tier 3 deterministic fact definition synthesis (`W4`), and non-transitive `1`-hop `skos:broader` (`W5`); [native-cocoindex-graph.md](../native-cocoindex-graph.md): owns incremental graph publication and `DatabaseSink` atomicity; [dspy-improvements.md](../dspy-improvements.md): constrains GBNF adapter and RLM healer architecture; [Epic 3](../epic-3-performance.md): consumes `pool_confidences` and `bayesian_noisy_or` for post-Epic 2 functional-property distractor down-weighting and `prov:wasDerivedFrom` co-provenance reinforcement |
+| References | [arxiv-2502.14802v1-hipporag2.md](../arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](../model-evaluation.md): anchors local `llama.cpp` serving constraints (`parallel = 1` `[target]`) |
 | Supersedes / superseded by | Supersedes heuristic `COUNT(*)` edge weights and `.5` modulo hacks; multi-hop `broader_tc` S27 closure (§1.1, §1.3) and `is_modifier_head_specialization` in `planner.py` (§2.4) are superseded on `2026-11-08` by Invariants `W1`–`W5` ([w3c-improvements.md §§12–13](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates)) |
-| Records | [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-inference.md](evaluation-inference.md) |
+| Records | [shacl-healer-publication.md](../reviews/shacl-healer-publication.md), [incremental-publication-work.md](../reviews/incremental-publication-work.md), [evaluation-graph-storage.md](../evaluation-graph-storage.md), [evaluation-inference.md](../evaluation-inference.md) |
 
 > [!IMPORTANT]
 > **Architectural Goal**: Replace—do not layer on top of—all heuristic edge weights (`1.0`, `0.5`, `max(0.5, sim)`, linear `COUNT(*)` inflation, `.5` modulo hacks, and `max`/`sum`/`capped_sum` branches) with **strictly two mathematical operators** across the entire engine and **zero magic threshold constants**, serialized in standard W3C vocabularies (`skos:`, `rdf:`, `rdfs:`, `owl:`, `prov:`, `xsd:`, and `@prefix : <urn:graph:>` — **zero `yaw:` or `dct:` namespaces**).
@@ -58,14 +60,14 @@ multiple fields and measured stages on the selected cascade path use the
 existing geometric opinion pool. Tokens crossing a value boundary contribute
 their token probability; this is model confidence, not demonstrated empirical
 calibration. Unavailable measurements remain None and malformed metadata fails.
-Deterministic constraint deductions add no vote. See [CP1](reviews/constraint-propagation.md).
+Deterministic constraint deductions add no vote. See [CP1](../reviews/constraint-propagation.md).
 NER and OpenIE use the same collector on their existing calls, measuring semantic
 string values with per-value token-length normalization. Retained source-sense
 and chunk vectors supply NER coherence; statements pool their resource-role
 cosines against that chunk. Preserve one complete source observation per
 owner/chunk and aggregate surviving chunks with Noisy-OR. The semantic vote is
 required, so absent logprobs do not produce NULL edge weights. See
-[EX1](reviews/extraction-confidence.md).
+[EX1](../reviews/extraction-confidence.md).
 Whenever we combine $K$ confidence measurements $x_1, \dots, x_K \in (0, 1]$ of a **single assertion, state transition, query seed, or adjudicated edge**, we use the **Logarithmic Opinion Pool** (geometric mean over the non-`None` known values $\mathcal{S} = \{x_k \mid x_k \neq \text{None}\}$):
 $$\text{pool\_confidences}(x_1, \dots, x_K) = \begin{cases} \exp\left(\frac{1}{|\mathcal{S}|} \sum_{x \in \mathcal{S}} \log x\right) = \left(\prod_{x \in \mathcal{S}} x\right)^{1 / |\mathcal{S}|} & \text{if } |\mathcal{S}| \ge 1 \\ \text{None} & \text{if } |\mathcal{S}| = 0 \end{cases}$$
 
@@ -88,7 +90,7 @@ $$\text{pool\_confidences}(x_1, \dots, x_K) = \begin{cases} \exp\left(\frac{1}{|
 ### 1.2 Operator 2: `bayesian_noisy_or` — Additive Shannon Evidence Across Independent Observations
 
 Provenance restoration is not a new independent observation. The
-[assertion-backed repair](native-cocoindex-graph.md#evidence-backed-provenance-restoration)
+[assertion-backed repair](../native-cocoindex-graph.md#evidence-backed-provenance-restoration)
 preserves existing source rows and reconstructs missing observations from raw
 assertion model votes and retained source-role/context vectors. Duplicate
 assertions from one chunk never create multiple source observations. Missing
@@ -188,9 +190,9 @@ class RelationTraversalPolicy:
 ### 2.4 W3C Semantic Guardrails & Canonical Gemma 4 Ontology SSOT (`planner.py` & `prompts.py`)
 
 1. **Guardrail 1: Explicit distinctness for admitted pairs (`apply_synonym_adjudication`)**:
-   - Retain Stage 3 `related: false` as `owl:differentFrom`. Candidate admission already bounds the pool. The former homograph/mean-altLabel lexical gate was retired by [CP1](reviews/constraint-propagation.md): it depended on unrelated votes sharing a micro-batch and was incompatible with constraint pruning and fixed-evidence batch parity.
+   - Retain Stage 3 `related: false` as `owl:differentFrom`. Candidate admission already bounds the pool. The former homograph/mean-altLabel lexical gate was retired by [CP1](../reviews/constraint-propagation.md): it depended on unrelated votes sharing a micro-batch and was incompatible with constraint pruning and fixed-evidence batch parity.
 2. **Guardrail 2 (Superseded `2026-11-08` by Invariants `W1` & `W2` in [w3c-improvements.md §12](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates)): Strict `JudgeLabels` Equivalence & Same-Norm Pre-Consolidation Only**:
-   - *Superseded*: Post-hoc Python prefix-token rewriting (`_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`) and cross-label auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` are retired because they violated `graph-storage.md` (now [retrieval.md](../.agents/rules/retrieval.md), **Canonical Gemma 4 Ontology SSOT**) and inverted English `[Modifier, Head]` compounds (`"Tenant-id"`, `"Retention policy"`, `"Telemetry-team"`, `"CustomerName"`) into false `skos:broader` assertions (`Tenant-id skos:broader Tenant`).
+   - *Superseded*: Post-hoc Python prefix-token rewriting (`_is_acronym`, `is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`) and cross-label auto-merge gates (`auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` are retired because they violated `graph-storage.md` (now [retrieval.md](../../.agents/rules/retrieval.md), **Canonical Gemma 4 Ontology SSOT**) and inverted English `[Modifier, Head]` compounds (`"Tenant-id"`, `"Retention policy"`, `"Telemetry-team"`, `"CustomerName"`) into false `skos:broader` assertions (`Tenant-id skos:broader Tenant`).
    - *Active Contract (`W1` & `W2`)*: Pre-LLM consolidation in `prepare_synonym_candidates` merges $(A, B)$ if and only if $\text{text\_processing}(\text{name}_A) = \text{text\_processing}(\text{name}_B) \land d_{\text{sim}}(A, B) \ge \tau_{\text{syn}} \land \neg\text{is\_active\_fact\_pole}(A, B)$. Cross-label candidates advance to `JudgeLabels`, where a `2`-branch `equiv-branch` GBNF grammar (`max_reasoning_chars = 360` `[target]`) enforces $\text{merge}(A, B) \iff \text{equivalent}(A, B) = \text{true}$ and routes all `equivalent: false` pairs (including distinct `owl:NamedIndividual`s and modifier-head specializations falsified in `JudgeLabels` `reasoning`) to Stage 2 (`JudgeHierarchy`).
 3. **Guardrail 3: Evidence-based identity across batches**:
    - Label/case/cosine matches generate candidates. Reuse an unchanged accepted binding or obtain an evidence-keyed identity decision; preserve distinct senses and select canonical representatives independently of arrival order.
@@ -202,7 +204,7 @@ class RelationTraversalPolicy:
 ### 2.5 Scheme-free incremental confidence aggregation
 
 The former ConceptScheme clustering/definer/seeding/QA proposal is removed.
-[Native graph publication](native-cocoindex-graph.md) owns scheme removal and
+[Native graph publication](../native-cocoindex-graph.md) owns scheme removal and
 batch independence; its paired 64+64/128 gates also apply to confidence inputs.
 Retain source-supported entity, fact and edge confidence with the existing two
 operators. There is no scheme confidence, centroid, embedding, membership or
@@ -314,11 +316,11 @@ No speculative scheme code or dependency remains for such an experiment.
 
 ## Decisions
 
-- 2026-11-08: Supersedes multi-hop `broader_tc` S27 closure (§1.1, §1.3) and post-hoc Python token overrides (`is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `_is_acronym`, `auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` (§2.4) under Invariants `W1`–`W5` ([w3c-improvements.md §§12–13](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates), [native-cocoindex-graph.md §4](native-cocoindex-graph.md#4-semantics-and-invariants)): `skos:broader` is strictly `1`-hop non-transitive under W3C SKOS (`03-SEMANTIC-RELATIONS.md:45-59`), `ConceptShape/S27-disjointBroaderRelated` and `auto_heal_deterministic_shacl` operate strictly on direct `1`-hop `skos:broader` vs. `skos:related` collisions (`w_broader` vs. `w_rel`), and `planner.py` enforces same-norm pre-consolidation only (`W2`) while `JudgeLabels` enforces `merge(A, B) <=> equivalent(A, B) = true` (`W1`).
+- 2026-11-08: Supersedes multi-hop `broader_tc` S27 closure (§1.1, §1.3) and post-hoc Python token overrides (`is_modifier_head_specialization`, `_has_disjoint_non_acronym_tokens`, `_is_acronym`, `auto_merge_cosine_gate`, `auto_merge_difflib_gate`) in `planner.py` (§2.4) under Invariants `W1`–`W5` ([w3c-improvements.md §§12–13](w3c-improvements.md#12-strict-judgelabels-identity-equivalence--canonical-gemma-4-3-stage-cascade-without-python-token-overrides-or-auto-merge-gates), [native-cocoindex-graph.md §4](../native-cocoindex-graph.md#4-semantics-and-invariants)): `skos:broader` is strictly `1`-hop non-transitive under W3C SKOS (`03-SEMANTIC-RELATIONS.md:45-59`), `ConceptShape/S27-disjointBroaderRelated` and `auto_heal_deterministic_shacl` operate strictly on direct `1`-hop `skos:broader` vs. `skos:related` collisions (`w_broader` vs. `w_rel`), and `planner.py` enforces same-norm pre-consolidation only (`W2`) while `JudgeLabels` enforces `merge(A, B) <=> equivalent(A, B) = true` (`W1`).
 
 ## H1 retrieval contract (2026-11-13)
 
-The user-approved [decoupled graph-HMM contract](reviews/hmm-retrieval.md) supersedes
+The user-approved [decoupled graph-HMM contract](../reviews/hmm-retrieval.md) supersedes
 the PPR propagation target. Entity confidence is a separate observation likelihood
 and must survive degree normalization; unknown confidence is neutral. Entity
 state relevance and passage emission relevance are separate layers, neither a

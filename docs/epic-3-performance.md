@@ -1,367 +1,118 @@
-# Epic 3: Performance, Symbolic Pruning & Full-Corpus Scale
+# Epic 3: Performance, Scaling & Post-`EVAL-5` Evolution
 
 Owner: [FOUNDATIONAL](../FOUNDATIONAL.md) | Prerequisite: [Epic 2](epic-2-fastmcp-http.md) | Results: [evaluation](evaluation.md)
 
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md) |
-| Prerequisite | [Epic 1](epic-1-hipporag-daemon.md): owns core `yaw.db` engine and `7`-dataset `[target]` slice-based paper parity gate (`D1-A6`); [Epic 2](epic-2-fastmcp-http.md): owns `FastMCP` Streamable HTTP transport, `5` `[target]` MCP tool contracts, and `source_content_hash` provenance |
-| Rules | [core.md](../.agents/rules/core.md): `yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/*.py`; [retrieval.md](../.agents/rules/retrieval.md): `yaw/retrieval.py`; [pipeline.md](../.agents/rules/pipeline.md): `yaw/pipeline.py`, `yaw/datasets.py`; [runtime.md](../.agents/rules/runtime.md): `yaw/runtime.py`, `yaw/mcp_server.py`, `yaw/cli.py`; [qa.md](../.agents/rules/qa.md): `yaw/qa.py`, `yaw/optimize.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`, `benchmark.py`, `scripts/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md`, `FOUNDATIONAL.md`, `README.md` |
-| Owns code | Post-Epic 2 performance scaling, deterministic W3C/OWL/SKOS/PROV-O distractor pruning (`yaw/daemon/graph/storage/shacl.py`, `yaw/daemon/graph/ppr.py`), adaptive retrieval & novel DSPy orchestration (`yaw/daemon/graph/inference/program.py`, `yaw/daemon/graph/inference/retriever.py`, `yaw/daemon/graph/engine.py`), `msgspec` / bytecode hot-path execution, and post-Epic 2 codebase reduction across `yaw/` and `scripts/` (pinned baseline commit: `deddf36`). E3-P5 specifically supersedes its graph-era targets with the bare-bones `yaw/pipeline.py`, `yaw/retrieval.py`, `yaw/runtime.py` design; execution remains gated. |
-| Peers | [w3c-improvements.md](w3c-improvements.md): owns `3`-stage `[target]` Gemma 4 ontology cascade (`W1`–`W5`) and Active EDC canonicalization; [epistemic-confidence-spec.md](epistemic-confidence-spec.md): owns `pool_confidences`, `bayesian_noisy_or`, and `1`-hop `[target]` S27 confidence resolution; [dspy-improvements.md](dspy-improvements.md): owns zero-shot `dspy.GEPA` + external `dspy.Ensemble` contract and `dspy.Flex` notes; [native-cocoindex-graph.md](native-cocoindex-graph.md): owns declarative `DatabaseSink` graph publication and scheme-free `64+64` vs. `128` `[target]` chunk invariance; [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `64`-chunk `[target]` micro-batch source ingestion and persistent `coco_lmdb` memoization |
+| Prerequisite | [Epic 1](epic-1-hipporag-daemon.md): owns clean-slate 14-file engine & `M_FINAL_1B` baseline; [Epic 2](epic-2-fastmcp-http.md): owns `FastMCP` Streamable HTTP transport (`yaw/mcp_server.py`), 3 read-only tools, and `source_hash` disk verification |
+| Rules | [tests.md](../.agents/rules/tests.md): `tests/**/*.py`, `benchmark.py`, `scripts/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md`, `FOUNDATIONAL.md`, `README.md` |
+| Owns code | `scripts/watchdog.py`, `scripts/preflight.py` (telemetry & preflight tooling; deferred `EVAL-6` and scaling proposals track future experiments with zero active `yaw/` overlap) |
+| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`load_config`, `configure_logging`, `write_text_atomic` used by `scripts/watchdog.py`) & shipped `M_FINAL_1B` foundation; [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/mcp_server.py`, `yaw/runtime.py` & `yaw/cli.py` (monitored via `.yaw/status.json`; defers `EVAL-6` / `E3-P5` / `dspy.RLM`); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/pipeline.py` & `yaw/datasets.py` (5-table SQLite baseline for `E3-P5` proposals); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval.py` (`open_readonly_db` for `scripts/watchdog.py`; target of deferred `EVAL-6` `SearchResult.completeness` & Graph Scout); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` (`dspy_status.json` & `dspy_gepa_audit.json` telemetry; deferred `dspy.RLM` / `dspy.Flex` / `dspy.BetterTogether`); [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `benchmark.py`, verification scripts & `data/benchmarks/baselines.json` for shipped `M_FINAL_1B` parity targets; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`scripts/preflight.py` coverage runner & `tests/scripts/test_{watchdog*,preflight*}.py`) |
 | References | [HippoRAG (`2405.14831v3`)](arxiv-2405.14831v3-hipporag.md), [HippoRAG 2 (`2502.14802v1`)](arxiv-2502.14802v1-hipporag2.md), [model-evaluation.md](model-evaluation.md), `PolyG` (`arXiv:2504.02112v2`), `BetterTogether` (`arXiv:2407.10930`), `Think-on-Graph` (`arXiv:2307.07697`), `zilliztech/vector-graph-rag` Jev (`https://github.com/zilliztech/vector-graph-rag/blob/main/evaluation/jev/README.md`), `Youtu-GraphRAG` (`https://arxiv.org/html/2508.19855v3#A2`), `Youtu-Graph/AnonyRAG` (`SHA daef2d5c1eafb2d2f5327f4ae45fc0904d48942e`) |
-| Supersedes / superseded by | Extracts and governs the Epic 3 roadmap summarized in [epic-1-hipporag-daemon.md §Decisions](epic-1-hipporag-daemon.md#decisions) and the deferred optimization items in [epic-2-fastmcp-http.md §Deferred Epic 3 ideas](epic-2-fastmcp-http.md#deferred-epic-3-ideas--outside-this-epic); superseded in part for `ppr.py` and W3C/OWL/SKOS/`shacl.py` deletion + Epic 3 math deferral by [Epic 1 Decisions 18–19](epic-1-hipporag-daemon.md#decisions) and [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md) |
-| Records | [evaluation.md](evaluation.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-inference.md](evaluation-inference.md), [evaluation-ingestion.md](evaluation-ingestion.md), [evaluation-testing.md](evaluation-testing.md); [FTS + vector graphless retrieval experiment proposal](reviews/epic-3-fts-vec-graph-experiment.md) proposes the post-cutover research program and does not amend accepted implementation gates; [MDL-DAG ablation-gated transition spec](reviews/mdl-dag-sprint.md) governs isolated MDL-DAG ablation evaluation before any promotion to `dev` |
+| Supersedes / superseded by | Extracts and governs the Epic 3 roadmap summarized in [epic-1-hipporag-daemon.md §Decisions](epic-1-hipporag-daemon.md#decisions) and deferred items in [epic-2-fastmcp-http.md §Deferred Epic 3 ideas](epic-2-fastmcp-http.md#deferred-epic-3-ideas--outside-this-epic); historical pre-cutover OpenIE/SHACL/PPR/`vec0`/`DatabaseSink` specs ([archive/w3c-improvements.md](archive/w3c-improvements.md), [archive/epistemic-confidence-spec.md](archive/epistemic-confidence-spec.md)) superseded under [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md) and `EVAL-5` ([mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), `5c4b115`) |
+| Records | [evaluation.md](evaluation.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation-inference.md](evaluation-inference.md), [evaluation-ingestion.md](evaluation-ingestion.md), [evaluation-testing.md](evaluation-testing.md), [FTS + vector graphless retrieval experiment proposal](reviews/epic-3-fts-vec-graph-experiment.md), [MDL-DAG ablation-gated transition spec](reviews/mdl-dag-sprint.md), [mdl-dag-experiment-report.md](reviews/mdl-dag-experiment-report.md) |
 
 ---
 
-## 1. Status, Entry Gate & Separation of Concerns
+## 1. Status, `EVAL-5` Baseline & `EVAL-6` Next
 
-Epic 3 is the post-feature-completion **performance, symbolic pruning, and full-corpus scaling** epic (`"a shady map is better than no map at all"` — [Decisions](#decisions), `2026-11-08`). It does **not** begin until both prerequisite epics pass their acceptance gates:
+- **`EVAL-5` Shipped on `dev` (`5c4b115`, [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md)):**
+  - Production `yaw/retrieval.py` (`RetrievalIndex`, `CitationGraph`, `DiffusionOperators`, `SearchResult`, `IndexArtifacts`, `search_index`, `expand_citation_neighbors`) and `yaw/pipeline.py` run frozen **`M_FINAL_1B`**: 1-bit Extended Rotated SoA RaBitQ (`rabitq_index`), tangent-steered cyclic title-ref + self-loop-cancelled 1-bit PMI diffusion (`citation_graph` + `16,384`-bin Beta-tail LUT), conditional Noisy-OR, Rank-1 Cholesky 1-bit DPP, `pool_k = max(top_k * 4, 50)` MaxP span deferral, and multilingual `unicode61` / umlaut / Koehn–Knight / CJK FTS5 over the plain 5-table SQLite `<f2>` schema (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`).
+  - `sqlite-vec`/`vec0`, `optuna`, `spacy`/`en-core-web-sm`, `SearchParams`, `resolve_retrieval_params`, `optimize_optuna`, and `VectorSearch` are completely purged from `yaw/**`, `pyproject.toml`, `uv.lock`, `yaw.toml`, and `scripts/watchdog.py`.
+- **`EVAL-6` Next (Post-Merge Scope, [mdl-dag-experiment-report.md](reviews/mdl-dag-experiment-report.md#92-approved-eval-5-production-cutover-specification--post-merge-eval-6-scope)):**
+  - `SearchResult.completeness` confidence/sufficiency calibration (for query rejection/abstention and multi-hop loop guidance).
+  - Lazy `.yaw/wiki/` Graph Scout for corpus-level navigational summaries without mutating `yaw.db`'s 5-table schema.
 
-1. **[Epic 1 (`D1-A6`)](epic-1-hipporag-daemon.md):** Passes the clean-slate `7`-dataset `[target]` slice-based paper parity gate (`scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh`) against Target 1 (`monkeypatched_hipporag`) and Target 2 (`paper_70b`).
-2. **[Epic 2 (`E2-A1`..`E2-A3`)](epic-2-fastmcp-http.md):** Completes the clean-slate `FastMCP` Streamable HTTP transport (`yaw/mcp_server.py`), the `3` `[target]` read-only MCP tool contracts (`recall`, `qa`, `daemon_status`), and `ChunkPointer.source_hash` source-freshness provenance.
-
-### Early Epic 1 exception: sub-state manifold shootout (`E1-M1`)
-
-The user authorized a bounded Epic 1 retrieval shootout on 2026-11-14 under
-[Epic 1 Hard Gates](epic-1-hipporag-daemon.md#hard-gates). It isolates all
-**Kraus Sheaf Sub-Span HMM with Myerson Coalitional Reranking** math inside
-`yaw/daemon/graph/hmm.py` (`retriever_mode="manifold"`,
-`--retriever {graph,manifold,shootout}`) while keeping `yaw/daemon/graph/ppr.py`
-(`retriever_mode="graph"`, default) and the `AnswerQuestion` signature untouched,
-persisting full `768d` vectors in `vec0` (under Pass-4 `"manifold-v2"`, title-framed chunk
-vectors paired with de-titled `spaCy` `doc.sents` sub-span body vectors) with symmetric ABTT
-isotropization in memory, authorizing bounded `E1-M1` `spacy>=3.8.18` + `en_core_web_sm`
-(`3.8.0`) NLP (`doc.sents`, `token.is_stop`, `token.lemma_`, `doc.noun_chunks`, and `PRON`
-anaphora replacing hand-rolled heuristics, plus reuse of existing `chunk_fts(title, body)` and
-`hydrate_budgeted_passages` OpenIE AST/MaxP expansion — permanent retention gated on `Checkpoint 8`
-benchmark proof per [FOUNDATIONAL.md](../FOUNDATIONAL.md)), collapsing runtime controls to the `5` irreducible physical boundary
-parameters of the Hydrodynamic / RMT / Null-Sketch Reduction (`yaw.toml` `[manifold]` cleared `{}`
-with zero Optuna knob-twisting sweeps and textbook single-study Optuna `5.0.0` `TPESampler`
-diagnostics in `yaw/daemon/manifold_optuna.py`),
-and evaluating a 4-dataset dev matrix against `Current YAW`, `monkeypatched_hipporag`,
-and `PAPER_BASELINES`. Scope, mathematical operators, invariants, Pass-4 structural healing
-(`Checkpoints 6–9`, `Decision 16`), and acceptance gates live in
-[substate-manifold-shootout.md](reviews/substate-manifold-shootout.md) and the prior
-[research note](reviews/hmm-graph-substate-manifold-research.md), with
-empirical results recorded in the
-[graph & storage evaluation ledger](evaluation-graph-storage.md). Once
-`E1-M1` clears its `Checkpoint 8` benchmark proof gate and math freezes, clean CocoIndex parity moves `spaCy` lemma/noun-chunk feature
-extraction into `process_chunk` (`indexing.py` with `0` SQLite raw text and `0`
-disk hydration), maintains declarative sheaf tables (`chunk_stalks`,
-`csls_radii`, `manifold_edges` via `subspan_vec` $k$-NN neighborhood healing)
-incrementally inside `plan_graph_publication` (`planner.py`, `64`-chunk batch
-pipeline), and collapses `_ensure_substate_manifold()` (`engine.py`) to a flat
-SQLite-to-CSR load matching `_ensure_csr_graph()` line-for-line so
-[`scripts/watchdog.py`](../scripts/watchdog.py) works directly from `yaw.db`.
-This bounded shootout does not modify `ppr.py`, begin the rest of Epic 3, or waive
-Epic 1 / Epic 2 acceptance gates.
-
-### Early Epic 1 exception: audit JSON pilot (`E1-P6`)
-
-The user authorized planning a bounded early experiment on 2026-11-09. Only the
-optimizer's incremental/final `optimize_program_audit.json` encoding and the
-watchdog's audit decoding are candidates. [Epic 1](epic-1-hipporag-daemon.md)
-tracks this pilot; its scope, restart checklist and predefined gates are in the
-[audit JSON review plan](reviews/msgspec-audit-pilot.md). Implementation remains
-pending. This exception does not start the rest of Epic 3 or satisfy `E3-P6`,
-`E3-C3`, Epic 1 parity, or Epic 2 transport acceptance.
-
-Early Epic 1 candidate-search exception (2026-11-10): investigate and propose a
-minimal replacement for cosine/difflib candidate discovery under
-[native graph publication](native-cocoindex-graph.md).
-Prioritize speed, memory and one canonical API; old heuristic I/O parity is not
-required. Preserve fixed-evidence 64+64 versus 128 canonical graph equality.
-The [review proposal](reviews/synonym-candidate-search.md) records diagnostics and
-the lightweight acceptance scope. Implementation and gate evidence are recorded under CS1 in that review.
-
-Further candidate-search work is deferred to Epic 3: maintain a revision-safe
-read-only source projection and evaluate indexed lookup to avoid reconstructing
-vectors/lexical features per call. Retain the same source-evidence and batch
-contracts; do not substitute an insertion-order-sensitive approximate index
-without evidence. The present CS1 cutover takes the measured first order of
-magnitude improvement and introduces no maintained projection cache.
-
-Additional non-LLM adjudication/SHACL candidates (2026-11-10; proposals,
-not implemented or benchmarked by CS1):
-
-- Extend deterministic repair from authoritative evidence: for example, restore
-  a missing fact-source link when preserved assertions identify its support
-  unambiguously. Never invent provenance or rewrite a definition to satisfy a shape.
-- Propagate existing identity/separation and shape constraints through the three
-  judge stages. Skip a stage only when its admissible outcomes are already
-  determined; absence of a relation is not proof of distinctness. Measure saved
-  model calls before expanding the rule set.
-- Explore a small teacher-trained classifier over existing embeddings, lexical
-  scores and graph evidence. A float32 linear classifier could run in NumPy
-  without another dependency, but semantic accuracy and a conservative admission
-  margin require calibration on held-out judgments. This is an experiment,
-  especially for irreversible merges, not a certified replacement for the judge.
-
-Existing shortcuts are the separate extreme cosine/label/definition merge gate,
-direct/shared-role fact resolution to related after hierarchy, and deterministic
-SHACL handling of scalar orphans, irreflexive facts, hierarchy cycles and S27
-conflicts. Judgment and healing functions are already CocoIndex-memoized;
-adding another judgment cache would duplicate that mechanism. Prioritize the
-remaining violation/model-call distribution rather than reimplementing these paths.
+<a id="early-epic-1-exception-sub-state-manifold-shootout-e1-m1"></a>
+<a id="early-epic-1-exception-audit-json-pilot-e1-p6"></a>
 
 ### 1.1 How Epic 2 Ties Into Epic 3 (Architectural Decoupling)
 
-- **Locked External Boundary, Mutable Internal Engine:** In [Epic 2](epic-2-fastmcp-http.md), `yaw/mcp_server.py` imports only `yaw.runtime` and `yaw.core.*`, delegating retrieval and QA to `runtime.recall(rt, query, top_k=...)` and `runtime.ask(rt, question)` while validating physical source freshness via `ChunkPointer.source_hash`.
-- Because MCP tool schemas, `/healthz`/`/readyz` checks, and `PassageDict` citation envelopes are frozen at the `runtime.py` boundary in Epic 2, Epic 3 can freely swap internal retrieval operators (`VectorSearch` extensions, higher-order spectral refinements, Optuna parameter sweeps) without breaking a single MCP client or transport test.
+- In [Epic 2](epic-2-fastmcp-http.md), `yaw/mcp_server.py` imports only `yaw.runtime` and `yaw.core.*`, delegating to `runtime.recall(rt, query, top_k=...)` and `runtime.ask(rt, question)` while verifying physical source freshness via `ChunkPointer.source_hash`.
+- Because MCP tool schemas, `/healthz`/`/readyz` checks, and `PassageDict` citation envelopes are frozen at `yaw/runtime.py`, Epic 3 experiments (`EVAL-6`, backend comparisons, adaptive traversal) can evolve internal `RetrievalIndex` operators inside `yaw/retrieval.py` without breaking MCP clients or transport tests.
 
-### 1.2 Baseline Already in Place from Epic 1 (Do Not Re-Invent)
-At pinned commit `deddf36`, YAW already implements the following mechanisms from Epic 1 and [w3c-improvements.md](w3c-improvements.md); Epic 3 builds upon them rather than re-proposing them:
-- **Non-Linear 1-Lipschitz PPR & Degree Normalization (`arXiv:2609.32929v1`):** [`apply_graph_activation`](../yaw/daemon/graph/ppr.py#L28-L48) (`"scaled_tanh"` default parameter `5.0` `[observed: yaw/daemon/graph/ppr.py:21, deddf36]`), [`build_transition_matrix`](../yaw/daemon/graph/ppr.py#L75-L85) ($\beta = 0.5$ `[observed: yaw/daemon/graph/ppr.py:80, deddf36]` symmetric degree normalization $W(\beta) = D_{\text{in}}^{-\beta} A D_{\text{out}}^{-(1-\beta)}$), and `run_hmm` `[y, z]` dual-feature combination (`dual_weight = 0.5` `[observed: yaw/daemon/graph/ppr.py:245, deddf36]`).
-- **`1`-Hop `[target]` SKOS S27 Bayes-Factor Weighting & Cagle Reification:** [`pool_confidences`](../yaw/daemon/graph/storage/shacl.py#L20-L29) and `bayesian_noisy_or` (`yaw/core`) with `1`-hop `[target]` non-transitive `skos:broader` S27 disjointness in `yaw/daemon/graph/storage/shacl.py` (`deddf36`).
-- **Induced W3C Subgraph QA Grounding:** `format_subgraph_for_qa` in [`yaw/daemon/graph/storage/hydration.py`](../yaw/daemon/graph/storage/hydration.py) (`deddf36`), injecting structured entity definitions and reified `rdf:Statement` facts alongside hydrated disk passages.
-- **High-Throughput SQLite Connection PRAGMAs (`2026-11-08`):** `_configure_connection_pragmas` (`open_yaw_db`, `open_managed_yaw_db`, and `open_readonly_yaw_db` in `yaw/daemon/graph/storage/db.py`) configures `PRAGMA cache_size = -65536` (`64` `[target]` MiB page cache) and `PRAGMA mmap_size = 268435456` (`256` `[target]` MiB memory-mapped I/O) alongside `PRAGMA synchronous = NORMAL` and `PRAGMA temp_store = MEMORY`.
-- **Candidate search (`CS1`, 2026-11-10; supersedes the pinned baseline below):**
-  - One `find_entity_candidates` API serves staged adjudication and pre-staging
-    neighborhood discovery. Pair-local cosine thresholds in 16-row blocks and
-    sparse character-trigram Dice replace full stable sorting, reverse top-k
-    rescans and Python all-pairs difflib. Fuzzy source labels remain searchable
-    after display-name changes. `auto_merge_threshold` separately protects the
-    small extreme-agreement shortcut over labels AND definitions.
-  - `candidate_volume_ratio` calibrates fixed cutoffs offline against frozen
-    baseline volume (±10%); it is not a per-batch quota. See the
-    [implementation record](reviews/synonym-candidate-search.md) for scope,
-    measured latency/memory and exact fixed-evidence batch checks.
-  - `deserialize_f32_vector` (`yaw/daemon/graph/storage/vectors.py`) returns a zero-copy `np.frombuffer(blob, dtype=np.float32)` view without redundant buffer `.copy()`.
-  - `YawGraphEngine.retrieve_with_seeds` (`yaw/daemon/graph/engine.py`) fetches kept fact metadata and `fact_sources` chunk provenance in a single `FROM facts f LEFT JOIN fact_sources s ON f.fact_id = s.fact_id` query.
+<a id="12-baseline-already-in-place-from-epic-1-do-not-re-invent"></a>
+
+### 1.2 Shipped Baseline Already in Place (Do Not Re-Invent)
+
+- **Plain 5-Table SQLite Schema (`yaw/pipeline.py`):** `chunks` ROWID w/ `<f2>` `embedding_f16 BLOB` (zero raw text), contentless `chunk_fts` (`unicode61 remove_diacritics 1`) + `chunk_vocab` (`fts5vocab`), and single-row materialized `rabitq_index` + `citation_graph`.
+- **Zero-Parameter `M_FINAL_1B` Retrieval (`yaw/retrieval.py`):** 1-bit SoA RaBitQ byte-LUT cosine scoring, Shannon spectral $d_{\text{eff}}$, tangent-steered cyclic citation + 1-bit PMI diffusion with `16,384`-bin Beta-tail LUT, conditional Noisy-OR, Rank-1 Cholesky 1-bit DPP, and `?mode=ro` WAL SHA-256 disk hydration (`Pool_k = max(top_k * 4, 50)`).
+- **Bare `dspy.ReAct` QA & `dspy.GEPA` (`yaw/qa.py`, `yaw/optimize.py`):** `dspy.lm15` OpenAI-compatible chat client (`temperature = 1.0`), 4 read-only corpus tools, strict `[chunk_id=<int>]` grounding, and prepared v2 `.md` bundle slicing.
 
 ---
+
+<a id="2-falsifiable-spec-goals"></a>
 
 ## 2. Falsifiable Spec Goals
 
-Thresholds declared below are never loosened after seeing a benchmark run. Every experimental mechanism in Epic 3 is evaluated via paired ablation and retained **if and only if** it yields a statistically meaningful improvement without regressing non-targeted metrics.
+Every Epic 3 mechanism (`EVAL-6` and beyond) is evaluated in isolated harnesses against frozen `M_FINAL_1B` + budget-matched random-after-seeds controls (`[epic-3-fts-vec-graph-experiment.md](reviews/epic-3-fts-vec-graph-experiment.md#81-mandatory-random-after-seeds-controls)`) and retained **if and only if** it yields statistically verified gains without regressing cost, memory, or held-out quality.
 
-### Goal 1 — SOTA Recall@N, EM & F1 (Easy Deterministic Wins First, Heavyweight Weight-Tuning Last)
-- **Measure:** Disjoint held-out retrieval `Recall@1`, `Recall@2`, `Recall@5`, `Recall@10`, `Recall@20` and QA `EM`, `F1` (plus the unweighted arithmetic mean `compute_task_quality_score` over all `7` `[target]` metrics in [`yaw/daemon/graph/inference/parsers.py`](../yaw/daemon/graph/inference/parsers.py) at commit `deddf36`) across the `7` `[target]` paper benchmark datasets (`sample`, `musique`, `2wikimultihopqa`, `hotpotqa`, `popqa`, `nq_rear`, `triviaqa`)—first on the `10`-query `[target]` per-dataset slice gate (`70` `[target]` total slice queries) and subsequently on the full-corpus unseen holdout sets.
-- **Reference:** Paired evaluation on identical consumer hardware (`gemma-4-e4b` + `embeddinggemma-2` `[target]`, `parallel = 1` `[target]`) against:
-  1. The post-Epic 2 YAW baseline commit (`[target]`),
-  2. Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES` in `data/benchmarks/baselines.json`, e.g., `2wikimultihopqa` `Recall@5 = 0.9091` `[observed: data/benchmarks/baselines.json, deddf36]`, `musique` `Recall@5 = 0.6818` `[observed: data/benchmarks/baselines.json, deddf36]`),
-  3. Target 2 (`PAPER_BASELINES` from [HippoRAG 2 (`2502.14802v1`)](arxiv-2502.14802v1-hipporag2.md) in `data/benchmarks/baselines.json`, e.g., `2wikimultihopqa` `Recall@5 = 0.904` `[observed: data/benchmarks/baselines.json, deddf36]`, `musique` `Recall@5 = 0.747` `[observed: data/benchmarks/baselines.json, deddf36]`), and
-  4. Contemporary GraphRAG SOTA reference points: `zilliztech/vector-graph-rag` Jev (`Recall@5 = 0.8661` `[observed: zilliztech/vector-graph-rag evaluation/jev README]` mean across `musique` `0.7466` `[observed: zilliztech/vector-graph-rag evaluation/jev README]`, `2wikimultihopqa` `0.9026` `[observed: zilliztech/vector-graph-rag evaluation/jev README]`, and `hotpotqa` `0.9490` `[observed: zilliztech/vector-graph-rag evaluation/jev README]`), `Youtu-GraphRAG` (`https://arxiv.org/html/2508.19855v3#A2`, with `DeepSeek-V3-0324` `671B` @ `32` threads: `HotpotQA` `86.50 / 81.20` `@20` & `83.40 / 78.90` `@10`, `2Wiki` `85.50 / 77.60` `@20` & `82.30 / 72.60` `@10`, `MuSiQue` `53.60 / 47.50` `@20` & `52.10 / 46.90` `@10`, `GraphRAG-Bench` `86.54` `@20` & `83.50` `@10`, `AnonyRAG-CHS` `42.88` `@20` & `38.08` `@10`, `AnonyRAG-ENG` `43.26` `@20` & `42.57` `@10` `[observed: arXiv:2508.19855v3 Tables 1, 2, Appendix B Table 4]`) + `Youtu-Graph/AnonyRAG` (`SHA daef2d5c1eafb2d2f5327f4ae45fc0904d48942e`: `1,397` QA pairs across `4` anonymized corpora where `952 / 1,397 = 68.1%` require strictly `>4` hops — `163` Objective `<=4`, `131` Objective `>4`, `282` Anonymous Reversion `<=4`, `821` Anonymous Reversion `>4` `[observed: arXiv:2508.19855v3 & Youtu-Graph/AnonyRAG]` — where `HippoRAG2` collapses to `12.92%` / `13.52%` on `AnonyRAG-CHS`), plus `PolyG` (`arXiv:2504.02112v2`) as an architectural traversal-taxonomy reference (`PolyBench`).
-- **Passes when:** Each retained Tier A / Tier B / Tier C mechanism achieves a strictly positive paired gain ($\Delta \text{score} > 0.0$ `[target]`) on the `7`-dataset `[target]` slice harness without regressing other datasets, and the resulting system beats `MONKEYPATCHED_HIPPORAG_BASELINES` (`[target]`) and matches or beats `PAPER_BASELINES` (`[target]`) on full-corpus holdout evaluation.
-- **Fails if / does not count:** Retaining any mechanism whose paired ablation delta is neutral or negative; fitting query-space cluster centroids, prompts, or traversal weights on the evaluation split (`[train_queries:max_queries]`) instead of the disjoint train split (`[0:train_queries]`); dropping parser-accepted `facts` rows during publication in violation of [FOUNDATIONAL.md §4.4](../FOUNDATIONAL.md); fabricating cross-batch edges to eliminate legitimate semantic islands; loosening acceptance tolerances post-run; or citing loopback fake-provider tests as retrieval/QA quality evidence.
+### Goal 1 — SOTA Recall@N, EM & F1 & Full-Corpus Benchmarks
 
-### Goal 2 — Demoscene Execution Speed
-- **Measure:** Wall-clock execution latency and peak RSS memory across `4` `[target]` hot paths:
-  1. `64`-chunk `[target]` incremental publication (`plan_graph_publication` + `DatabaseSink`),
-  2. Sparse CSR transition matrix assembly (`build_transition_matrix`) and `run_hmm` power iteration (`yaw/daemon/graph/ppr.py`, commit `deddf36`),
-  3. `1`-indexed `[target]` disk line hydration and span coalescing (`yaw/daemon/graph/storage/hydration.py`, commit `deddf36`), and
-  4. Optimization checkpoint, audit-trail, and telemetry sidecar serialization (`yaw/daemon/graph/inference/optimizer.py`, commit `deddf36`).
-- **Reference:** Paired warm-cache vs. warm-cache and cold-cache vs. cold-cache benchmark runs on the same host machine against the post-Epic 2 baseline commit.
-- **Passes when:** Paired wall-clock time decreases ($R_{\text{time}} < 1.0$ `[target]`) and peak RSS memory does not increase ($R_{\text{mem}} \le 1.0$ `[target]`) across all `4` `[target]` hot paths while producing bit-identical canonical `yaw.db` graph state and identical top-$k$ retrieval rankings.
-- **Fails if / does not count:** Comparing warm runs against cold runs; loosening PPR convergence tolerance (`tol = 1e-6` `[observed: yaw/daemon/graph/ppr.py:243, deddf36]`) or SHACL fixed-point iteration bounds to game latency; bypassing SHACL validation (`lint_graph_shacl`) or Epic 2 `source_content_hash` verification to save CPU cycles; introducing an unsynchronized secondary vector store (E3-P5 uses the bare-bones generation/publication contract in Section 3.2.1, not graph cache keys); holding SQLite write transactions across LLM HTTP calls; or mutating floating-point normalization in ways that break fixed-evidence `64+64` vs. `128` `[target]` canonical graph equality.
+- **Measure:** Disjoint held-out retrieval `Recall@{1,2,5,10,20}`, multi-hop `All-Hops@5`, `Reject AUROC`, and paired `gemma-4-e4b` (`temperature = 1.0`) QA `EM` / `F1` across benchmark cohorts (`2wikimultihopqa`, `musique`, `hotpotqa`, `popqa`, `enterprise_rag_bench`, `nq`, `lveval`, `narrativeqa`).
+- **Reference:** Frozen `M_FINAL_1B` (`Tier E`: `Pool R@5 = 0.8006`, `MH AH@5 = 0.7100`, `EM = 0.4500`, `F1 = 0.6219`, `RAM = 24.73 MiB`, `p50/p95 = 22.1/38.8 ms`), Target 1 (`MONKEYPATCHED_HIPPORAG_BASELINES`), Target 2 (`PAPER_BASELINES`), and external SOTA references (`Jev`, `Youtu-GraphRAG`, `AnonyRAG`, `PolyG`).
+- **Passes when:** Each promoted mechanism delivers statistically supported paired improvements over `M_FINAL_1B` and budget-matched random controls without `[0, 10)` split contamination or post-run threshold loosening.
 
-### Goal 3 — Radical Codebase Reduction & Maintainability
-- **Measure:** Net production line count (`yaw/**/*.py` and `scripts/*.py`), module count, and cyclomatic/import complexity after Epic 2 completes.
-- **Reference:** Post-Epic 2 baseline commit on `dev`.
-- **Passes when:** Net production LOC across `yaw/` and `scripts/` decreases ($\Delta \text{LOC} < 0$ `[target]`), `0` `[target]` duplicate helper pipelines or dormant feature switches remain, `100%` `[target]` of the real-substrate test suite passes, and `uv run ty check`, `uv run ruff check`, and `tests/core/test_architecture.py` report `0` `[target]` violations.
-- **Fails if / does not count:** Code-golfing (compressing readable multi-line statements into opaque one-liners), stripping runtime invariant assertions or SHACL shapes to lower line counts, or leaving retired code behind `=None` flags instead of deleting it outright.
+### Goal 2 — Demoscene Execution Speed & Memory Efficiency
+
+- **Measure:** Wall-clock indexing (`reconcile_index_tables`), query `p50`/`p95` latency (`search_index`, `hydrate_ranked_passages`), and resident RAM (`MiB`) relative to shipped `M_FINAL_1B`.
+- **Passes when:** Latency/memory shrinks or stays within preregistered operational budgets while preserving deterministic `RetrievalIndex` parity and strict SHA-256 disk hydration.
+
+### Goal 3 — Radical Codebase Reduction & Containment
+
+- **Measure:** Production LOC (`yaw/` `<= 8,000`, `yaw/core/* <= 960`, `scripts/watchdog.py <= 350`), flat `14`-file `L0`–`L6` DAG purity, and zero `ruff`/`ty`/`pytest` regressions.
+- **Passes when:** Superseded codepaths are deleted atomically in the same commit as any winning promotion with zero compatibility shims.
 
 ---
 
-## 3. Ordered Experimental Toolbox & Technical Design
+## 3. Experimental Toolbox & Protocols
 
-To respect consumer-hardware constraints (`parallel = 1` `[target]` local `llama.cpp` slot), Goal 1 experiments are ordered strictly by **Return on Investment (ROI)**: deterministic zero-LLM-cost W3C symbolic pruning first, low-cost inference and adaptive routing second, and weight-distillation finetuning (`dspy.BetterTogether`) strictly as a heavyweight last resort.
+### 3.1 `EVAL-6`: `SearchResult.completeness` & Lazy `.yaw/wiki/` Graph Scout
 
-```mermaid
-flowchart LR
-    G0["Prerequisite Gates\nEpic 1 (D1-A6 Slice Gate)\n+ Epic 2 (FastMCP HTTP)"] --> TA["Tier A: Zero-LLM-Cost W3C/OWL/SKOS/PROV-O\n• owl:FunctionalProperty / InverseFunctional\n• Non-transitive skos:related barrier\n• owl:AsymmetricProperty / propertyDisjointWith\n• prov:wasDerivedFrom co-provenance boost"]
-    TA --> TB["Tier B: Low-Cost Inference & Adaptive Retrieval\n• QA GBNF worker ablation (program.py)\n• Dev-slice query clustering -> step hyperparams\n• dspy.Flex + PolyG 4-class <s,p,o> routing\n• E3-P5: SQLite vs SQLite+FAISS vs LanceDB"]
-    TB --> TC["Tier C: Heavyweight Last Resort\n• dspy.BetterTogether ('p -> w -> p')\n• LoRA -> llama-quantize GGUF reload"]
-    TC --> FC["Full-Corpus Multi-Day Holdout Benchmarks\n(7 Paper Datasets, Unseen Queries)"]
-```
+1. **`SearchResult.completeness` Calibration:** Calibrate retrieval confidence/completeness from `log_bf`, `max_chunk_score`, `top1_cosine`, `d_eff`, and `n_candidates` to expose calibrated uncertainty for abstain/follow-up decisions without altering frozen `M_FINAL_1B` ranking scores.
+2. **Lazy `.yaw/wiki/` Graph Scout:** Optional read-only Markdown corpus summary/index exploration generated outside `yaw.db` (zero extra SQLite schema tables, zero corpus file mutation), subject to paired ablation proof in `evaluation.md`.
 
-### 3.1 Goal 1, Tier A — Deterministic Zero-LLM-Cost W3C / OWL / SKOS / PROV-O Disambiguation & Distractor Pruning (`shacl.py`, `ppr.py`)
+<a id="321-e3-p5-backend-experiment-and-promotion-contract"></a>
 
-Multi-hop GraphRAG failures on `musique` and `2wikimultihopqa` come primarily from **hub-entity flooding** (generic concepts absorbing PPR mass) and **bridge-fact dilution** (distractor passages sharing a surface predicate with the true bridge entity). Tier A attacks both using closed-world SQLite SQL and CSR matrix algebra at `0` `[target]` additional LLM calls while strictly preserving [FOUNDATIONAL.md §4.4](../FOUNDATIONAL.md) (no dropped parser-accepted statements during publication) and [w3c-improvements.md `W2`](w3c-improvements.md) (no cross-label auto-merges bypassing Gemma 4):
+### 3.2 `E3-P5` Backend Experiment & Promotion Contract (SQLite vs. SQLite + FAISS vs. Embedded LanceDB)
 
-1. **OWL 2 RL `owl:FunctionalProperty` & `owl:InverseFunctionalProperty` (`sh:maxCount 1` `[target]` Cardinality & Candidate Mining in `shacl.py` & `ppr.py`):**
-   - *Functional properties (`P rdf:type owl:FunctionalProperty` — e.g., `birthPlace`, `capitalOf`, `foundedInYear`, `authoredBy`, `headquarteredIn`):* Formally, $(x, P, y_1) \land (x, P, y_2) \implies y_1 = y_2$. When a subject $x$ has multiple objects $y_1, y_2$ under a functional predicate $P$:
-     - If $(y_1, y_2)$ are already linked by `owl:differentFrom` (or incompatible scalar literals), all parser-accepted `facts` rows remain persisted in `yaw.db` ([FOUNDATIONAL.md §4.4](../FOUNDATIONAL.md)), and `build_transition_matrix` (`yaw/daemon/graph/ppr.py`) down-weights the lower-confidence competing fact edge (`bayesian_noisy_or` over `fact_sources` + `edge_sources` provenance count) so contradicted distractors do not bleed PPR conductance `[assumption, probe E3-P1]`.
-     - If $(y_1, y_2)$ are unadjudicated resources with compatible types, surface $(y_1, y_2)$ as a high-priority candidate pair in `find_entity_synonym_candidates` for Stage 1 `JudgeLabels` adjudication.
-   - *Inverse-functional properties (`P rdf:type owl:InverseFunctionalProperty` — e.g., unique identifiers, tax/ticker codes, official titles):* $(x_1, P, y) \land (x_2, P, y)$ deterministically mines $(x_1, x_2)$ into `find_entity_synonym_candidates` even when their surface labels have low lexical/dense similarity, routing split bridge nodes to Gemma 4 (`JudgeLabels`) without violating Invariant `W2` `[assumption, probe E3-P1]`.
-2. **SKOS Non-Transitive Associative Barrier (`skos:related` `2`-Hop `[target]` Decay in `ppr.py`):**
-   - Under W3C SKOS S23/S24, `skos:related` is symmetric (`owl:SymmetricProperty`) but explicitly **not** transitive (unlike `skos:broaderTransitive`).
-   - In [`build_transition_matrix`](../yaw/daemon/graph/ppr.py#L75-L120) (`deddf36`), treating `skos:related` as an unconstrained Markov transition allows $A \xrightarrow{\text{skos:related}} B \xrightarrow{\text{skos:related}} C$ `2`-hop `[target]` associative drift across loosely coupled hubs.
-   - *Mechanism:* Separate transition state or apply a non-backtracking / `2`-hop `[target]` associative barrier so `skos:related` edges can expand `1` `[target]` hop from a seed or fact-reached entity, but consecutive `skos:related` $\to$ `skos:related` transitions are zeroed (`0.0` `[target]`), forcing multi-hop conductance to travel through reified `rdf:Statement` (`fact`) edges `[assumption, probe E3-P2]`.
-3. **OWL 2 RL `owl:AsymmetricProperty` & `owl:propertyDisjointWith` (Directional & Mutually Exclusive Path Pruning in `ppr.py` & `shacl.py`):**
-   - For asymmetric relations (causal, temporal, hierarchical, partitive), $P(x, y) \implies \neg P(y, x)$; for disjoint properties ($P_1 \text{ owl:propertyDisjointWith } P_2$), $P_1(x, y) \implies \neg P_2(x, y)$.
-   - Enforce `owl:propertyDisjointWith` deterministically in `auto_heal_deterministic_shacl` (generalizing the existing S27 `skos:broader` $\cap$ `skos:related` = $\emptyset$ Bayes-factor check) and orient `RelationTraversalPolicy` multipliers by query polarity so forward vs. inverse hops (`head -> tail` vs. `tail -> head`) do not bleed probability mass backward `[assumption, probe E3-P2]`.
-4. **W3C PROV-O (`prov:wasDerivedFrom`) Co-Provenance Bridge Reinforcement (`ppr.py`):**
-   - Every YAW `rdf:Statement` (`facts`) and semantic edge (`edges`) carries exact chunk provenance in `fact_sources` and `edge_sources` (`prov:wasDerivedFrom`).
-   - During multi-hop entity-to-entity transitions $e_1 \xrightarrow{f_1} e_2 \xrightarrow{f_2} e_3$, weight the bridge node $e_2$'s outgoing transition by provenance coherence (shared document / AST section island in `fact_sources` or high `bayesian_noisy_or` multi-chunk corroboration), penalizing single-mention uncorroborated distractor islands `[assumption, probe E3-P2]`.
-
-### 3.2 Goal 1, Tier B — Low-Cost Inference & Adaptive Retrieval Enhancements (`program.py`, `engine.py`, `retriever.py`)
-
-1. **Forcing `build_dspy_qa_grammar` GBNF on the QA Reader (`yaw/daemon/graph/inference/program.py`):**
-   - *Current behavior at commit `deddf36`:* In [`YawProgram._bind_predictor_lms`](../yaw/daemon/graph/inference/program.py#L270-L289) (`deddf36`), `self.qa.set_lm(orchestrator)` (line `288` at `deddf36`) binds `self.qa` (`dspy.ChainOfThought(AnswerQuestion)`) to the unconstrained `orchestrator` LM (`_yaw_supports_gbnf=False`) instead of the GBNF-enabled `worker` LM (`_yaw_supports_gbnf=True`). Even though `YawGBNFAdapter.resolve_grammar` maps `AnswerQuestion` (`{"reasoning", "answer"}`) to `build_dspy_qa_grammar()`, binding `self.qa` to `orchestrator` skips `extra_body={"grammar": ...}` at runtime.
-   - *Experiment:* Evaluate binding `self.qa` to `worker` (`_yaw_supports_gbnf=True`, enforcing `build_dspy_qa_grammar()`) vs. `orchestrator` (`_yaw_supports_gbnf=False`) on the `7`-dataset `[target]` slice harness, measuring held-out `EM`, `F1`, and JSON parse reliability `[assumption, probe E3-P3]`.
-2. **Query-Space Embedding, Clustering & Per-Step Hyperparameter Routing (`engine.py`, `retriever.py`):**
-   - Reuse the already-computed `768`-dim `[observed: yaw/core/config.py, deddf36]` `EmbeddingGemma` query vector (`query_passage_vec`, `0` `[target]` additional model invocations) to compare incoming queries against $K$ cluster centroids fitted strictly on the disjoint training split (`[0:train_queries]`).
-   - Each cluster centroid stores hand-tuned or GEPA-discovered step hyperparameters ($\beta$, `damping`, `dual_weight`, `linking_top_k`, `passage_node_weight`, and `RelationTraversalPolicy` weights), routing each query via in-memory cosine similarity to its specialized traversal profile without sandbox overhead `[assumption, probe E3-P3]`.
-3. **`dspy.Flex` + PolyG (`arXiv:2504.02112v2`) `4`-Class `[target]` $\langle s, p, o \rangle$ Adaptive Traversal & Sub-Question Decomposition:**
-   - Following `PolyG` (*Adaptive Graph Traversal for Diverse GraphRAG Questions*, `arXiv:2504.02112v2`), decompose queries by their missing $\langle s, p, o \rangle$ elements and expose YAW's deterministic SQLite/CSR primitives as bounded tools to `dspy.Flex` ([dspy-improvements.md §5](dspy-improvements.md#5-post-epic-2-roadmap-tool-driven-orchestration-via-dspyflex)):
-     - **Class 1 — $\langle s, p, o \rangle$ (Verification / Boolean):** Direct SQLite `facts` + `entity_labels` lookup (`1`-hop `[target]` check).
-     - **Class 2 — $\langle s, p, * \rangle$ or $\langle *, p, o \rangle$ (Targeted Attribute / Role Walk):** Directional `RelationTraversalPolicy` weighting edges whose predicate matches $p$ (forward `fact_forward` for $\langle s, p, * \rangle$, reverse `fact_reverse` for $\langle *, p, o \rangle$).
-     - **Class 3 — $\langle s, *, o \rangle$ (Multi-Hop Bridge Discovery):** Bidirectional PPR seeding ($p_0[s] = 0.5$ `[target]`, $p_0[o] = 0.5$ `[target]`) to surface intersecting intermediate bridge entities $b$ on $s \leftrightarrow b \leftrightarrow o$.
-     - **Class 4 — $\langle s, *, * \rangle$ (Open-Ended Ego-Graph Summary):** `1`-hop `[target]` ego-graph inspection (`inspect_entity_or_fact`) + diverse passage hydration.
-   - For `3`–`4` `[target]` hop compositional chains (`musique`) and long-horizon `>4`-hop anonymized chains (`Youtu-Graph/AnonyRAG`, `68.1%` of `1,397` QA pairs strictly `>4` hops `[observed: arXiv:2508.19855v3]`), pair `dspy.Flex` with iterative sub-question decomposition and schema/agentic reflection (*Think-on-Graph* `arXiv:2307.07697` / *Self-Ask* / `Youtu-GraphRAG` `https://arxiv.org/html/2508.19855v3#A2`, noting `Youtu-GraphRAG` `Ours w/o Agent` drops `-19.80` pts on `2Wiki` `77.60 -> 57.80` and falls to `40.05` below `Naive RAG` `43.02` on `AnonyRAG-ENG` `[observed: arXiv:2508.19855v3]`), resolving hop `1` `[target]` (`q_1 -> e_1`) before re-seeding traversal from $e_1$ for hop `2` `[target]` (`q_2(e_1) -> e_2`) `[assumption, probe E3-P4]`.
-4. **`E3-P5`: SQLite vs. SQLite + FAISS vs. LanceDB under the bare-bones design:**
-   - Compare the accepted `yaw.db` `chunks` (`vec0`) + contentless `chunk_fts` baseline with an ephemeral FAISS projection of those same chunk vectors and an isolated embedded LanceDB index. The detailed protocol below supersedes E3-P5's historical `chunk_vec`/`fact_vec`/`entity_vec`, `_csr_graph`, `_current_csr_cache_key()`, `FilterTriples` and PPR dependencies. It targets [bare-bones](reviews/bare-bones-replacement-sprint.md) `yaw/pipeline.py`, `yaw/retrieval.py` and `yaw/runtime.py`; these paths describe the accepted design, not verified cutover completion.
-   - A Jev-inspired second-stage passage reranker remains a separate ablation after backend comparison: same frozen candidate passages and source-hydrated text, same reader, charged scoring calls/tokens, reranker off/on. No fact or persistent graph reconstruction is required, and reranker gains cannot be credited to the backend.
-
-### 3.2.1 E3-P5 backend experiment and promotion contract
-
-**Scope and definition of done.** This is a benchmark proposal, not authorization to install dependencies, change the current cutover or swap production storage. Freeze the accepted bare-bones baseline and satisfy Epic 3 entry gates before execution. Produce reproducible backend quality/cost curves, update/freshness evidence and a measured retention/rejection decision. Keep experiments in an isolated harness and ignored `outputs/`; no general backend abstraction, dual production writer or dormant backend flags. SQLite remains authoritative unless a winning replacement is separately promoted and the governing storage specifications are amended atomically.
+**Scope and definition of done.** This is an isolated benchmark proposal (not authorization to install dependencies or replace plain SQLite storage). Compare the shipped plain SQLite (`chunks` `<f2>` + contentless `chunk_fts` + `rabitq_index` + `citation_graph`) baseline against an ephemeral in-memory FAISS projection and an isolated embedded LanceDB index in `outputs/` and isolated worktrees (`0` dual production writers or dormant backend flags).
 
 | Arm | Retrieval substrate | Controlled purpose |
 | --- | --- | --- |
-| S0 | SQLite contentless FTS5 + sqlite-vec `vec0` exact cosine KNN | Accepted storage baseline |
-| S1-E / S1-A | Same SQLite FTS5 and chunk metadata + direct in-memory FAISS exact / approximate vector search | Isolate vector acceleration; ANN quality/cost sweep separate from exact search |
-| S1-D | Native `dspy.Embeddings` / `EmbeddingsWithScores` snapshot retriever + same SQLite lexical search | Measure native DSPy convenience and lifecycle cost against direct FAISS; record whether FAISS actually activates |
-| S2-E / S2-A | Embedded LanceDB native FTS + exact / approximate vector search, CocoIndex-owned experimental table | Measure a complete embedded index alternative, with lexical changes reported separately |
+| `S0` | Plain SQLite `<f2>` `chunks` + contentless `chunk_fts`/`chunk_vocab` + `rabitq_index` + `citation_graph` | Shipped `M_FINAL_1B` storage baseline |
+| `S1-E` / `S1-A` | Same SQLite FTS5 & chunk pointers + ephemeral in-memory FAISS exact / ANN lookup | Isolate vector lookup acceleration; no persistent FAISS sidecar |
+| `S1-D` | Native `dspy.Embeddings` / `EmbeddingsWithScores` snapshot retriever + SQLite lexical search | Measure native DSPy retriever overhead vs direct FAISS |
+| `S2-E` / `S2-A` | Embedded LanceDB native FTS + exact / ANN vector search (CocoIndex experimental table) | Measure embedded alternative (disclosing LanceDB raw-text storage vs contentless FTS5) |
 
-**Data and semantics.** All arms receive identical chunk IDs, full-precision source embeddings, source hashes/pointers, corpus/split manifests, query embeddings, candidate limits, filters, MaxP span deduplication and context packing. Reuse the indexing embedder's formatted inputs; do not compare differently embedded corpora. First compare exact vector search alone and lexical search alone; then use the same explicitly specified fusion and evidence algorithm across backends. Record tokenizer, BM25, distance, tie-breaking and score conventions; LanceDB defaults are not assumed equivalent to FTS5. Native hybrid fusion is a separate ablation. Measure ANN neighbor overlap against exact search as well as gold support recall: exact-neighbor overlap is not a substitute for task quality.
+**Invariants & Promotion Gate:** All arms share identical chunk IDs, embeddings, SHA-256 pointers, `pool_k = max(top_k * 4, 50)` MaxP deduplication, and `M_FINAL_1B` / random-after-seeds controls (`[epic-3-fts-vec-graph-experiment.md](reviews/epic-3-fts-vec-graph-experiment.md#81-mandatory-random-after-seeds-controls)`). No production backend swap occurs without measured Pareto gains (at least `20%` cost improvement at matched quality with other costs inside preregistered tolerances) across indexing, incremental updates, memory RSS, freshness, and full-corpus confirmation.
 
-**DSPy and FAISS constraints.** The inspected DSPy 3.5.0 retriever builds embeddings from corpus strings, uses NumPy below its default 20,000-row threshold, and otherwise trains IVF-PQ with exact reranking over retrieved candidates. Record backend activation, parameters, construction/training time, full embedding-matrix RAM and corpus-position-to-chunk-ID mapping. Charge any re-embedding to S1-D; a cached/precomputed embedder adapter must be explicit, preserve identical vectors and have its glue counted. Do not alter private DSPy fields or disguise NumPy as a FAISS benchmark. Probe pinned FAISS availability on native Windows/Python 3.14 before evaluation; its optional dependency is not supplied merely by installing DSPy. Public-source references: [DSPy retriever](https://dspy.ai/3.4.1/api/tools/Embeddings/) (documentation version differs from the inspected install), [FAISS](https://github.com/facebookresearch/faiss).
+### 3.3 Future Adaptive DSPy & Weight-Tuning (`dspy.Flex`, `dspy.RLM`, `dspy.BetterTogether`)
 
-**Publication, invalidation and hydration.** S1 is a disposable, read-only in-memory projection of committed `chunks`, never a persistent FAISS sidecar. Build chunk-ID mapping and vectors from one coherent SQLite snapshot; publish them atomically with the matching `VectorSearch` generation through `yaw/runtime.py`'s index-swap lifecycle. An admitted query must use a coherent generation of vectors, lexical candidates and source pointers; no mixed-generation IDs or silent stale hits after completed publication. Keep old snapshots alive only for queries already admitted against them, and account for overlapping old/new RAM during rebuilds. Reconcile invalidation with the bare-bones `db_data_version` design: SQLite `PRAGMA data_version` values are meaningful for change detection on the same connection, not comparable generation numbers across newly opened connections. Prove that detection and publication work before implementing this projection; do not restore graph cache keys. Source hydration remains 1-indexed and source-hash verified for every arm.
+- **`dspy.Flex` + PolyG 4-Class Adaptive Traversal (`E3-P4`):** Evaluate tool-driven adaptive sub-question decomposition (`dspy.Flex` / `dspy.RLM` for `>100K`-token raw contexts) over `RetrievalIndex` primitives strictly on paired multi-hop ablations (`>4`-hop `AnonyRAG`, `MuSiQue`) against bare `dspy.ReAct`.
+- **`dspy.BetterTogether` (`arXiv:2407.10930`, Tier C Last Resort):** Prompt + QLoRA weight co-evolution (`"p -> w -> p"`) over frozen `yaw.db` query/QA predictors remains strictly a last resort if `dspy.GEPA` prompt compilation and `EVAL-6` fail to clear full-corpus SOTA targets.
 
-SQLite's [data-version contract](https://www.sqlite.org/pragma.html#pragma_data_version) is the reference for the connection-local invalidation probe. A data-version counter is not a durable corpus identity; record corpus/vector hashes separately in the benchmark manifest.
+<a id="34-goal-2--demoscene-execution-speed-msgspec-dis-bytecode--vectorized-csr"></a>
 
-S2 uses one CocoIndex writer for its isolated experimental index and preserves incremental insert/edit/delete reconciliation and 64-chunk micro-batch inputs. The standard LanceDB FTS path requires a text column, unlike contentless FTS5: declare this experimental text duplication, charge its storage and ingestion cost, and retain source files as citation authority. Production adoption would require an explicit amendment of the no-raw-chunk-text contract. Prove reader freshness across handles and index maintenance; never use indexed-only search that omits newly committed rows. Optimization, compaction, index training, unindexed-tail scans and temporary disk/RAM all count. Audit connector failure propagation against fail-fast policy; swallowed maintenance failures cannot produce a passing run. References: [CocoIndex connector](https://cocoindex.io/docs/connectors/lancedb/), [embedded hybrid search](https://docs.lancedb.com/oss/v0-41-0/search/hybrid-search), [FTS freshness](https://docs.lancedb.com/oss/v0-41-0/search/full-text-search), [reader consistency](https://docs.lancedb.com/oss/v0-41-0/tables/consistency).
+### 3.4 Demoscene Execution Speed (`msgspec`, `dis` Bytecode & Vectorized Hot Paths)
 
-**Measurement sequence.** (1) Real-substrate capability and lifecycle probes, including empty/small corpora, duplicate vectors, invalid/missing ANN IDs, edit/delete/restart and concurrent reads during rebuild. (2) Identical precomputed query/action replay to isolate backend lookup cost, then frozen candidate replay to isolate downstream algorithm cost; record actual backend activation and whole-corpus scans. (3) End-to-end seed plus repeated-hop acquisition at matched search, embedding, hydration and reader budgets, with the [mandatory random-after-seeds controls](reviews/epic-3-fts-vec-graph-experiment.md#81-mandatory-random-after-seeds-controls). (4) Full fixed-corpus confirmation on sealed questions. Use nested corpus sizes capped at the actual corpus, cold start, warm reads, and sustained ingestion with 64-chunk batches; declare hardware, threads, precision, cache state, workload mix and tuning allowance in advance. Separate corpus-size scaling from question selection. Backend acceleration must not hide the bare-bones algorithm's full-matrix work: report lookup, in-memory scoring, hydration and reader time separately.
-
-**Required measurements and gate.** Report Recall@{1,2,5,10,20}, full-support recall, EM/F1, p50/p95 lookup and end-to-end retrieval latency, throughput, peak process RSS (including duplicate vector matrices), disk/temporary footprint, initial build/training, restart/rebuild, incremental update and maintenance cost, and time from source change to visible committed retrieval. Include amortized workload cost with break-even query count, per-question paired results, failure records, configurations and raw timing distributions. Keep reader/sampling settings fixed; develop ANN/fusion settings on development data only. Use the proposal's paired, dataset-stratified statistics and multiplicity correction, with repeated timing runs nested rather than treated as new questions.
-
-No backend swap without measured Pareto gains against S0 and the simplest surviving alternative. Before unsealing, preregister the deployment workload, operational caps, meaningful improvement and noninferiority margins for every quality/cost dimension. Proposed starting margins are the [research proposal's cost gate](reviews/epic-3-fts-vec-graph-experiment.md#112-confirmatory-thresholds): at least 20% supported improvement in a nominated cost dimension, at matched quality and with other declared costs within preregistered tolerances. Apply the same gate to indexing, updates, maintenance and freshness, not just warm lookup latency. Any nonzero tolerated regression must be disclosed as a tolerance-based operational decision, not strict mathematical Pareto domination; a faster lookup with worse support recovery or unacceptable rebuild/RAM cost does not pass. A quality/cost trade-off may remain a published frontier point, but does not authorize a swap. If a winner is promoted, replace the losing production path and update pipeline, retrieval, runtime, QA/tool consumers, telemetry and specs together; no permanent competing backends.
-
-### 3.3 Goal 1, Tier C — Heavyweight Last Resort: `dspy.BetterTogether` (`arXiv:2407.10930`)
-
-> [!WARNING] Consumer-Hardware Last Resort
-> `dspy.BetterTogether` requires external LoRA/QLoRA training in PyTorch (BF16/FP16 VRAM outside `llama.cpp`), `llama-quantize` GGUF conversion, and server hot-reloading. It is retained in the Epic 3 toolbox **strictly as a Tier C last resort** if and only if Tiers A and B do not clear full-corpus SOTA targets.
-
-#### Technical Primer: `dspy.BetterTogether` in `dspy[deno] == 3.4.1` `[measured: uv.lock, deddf36]` (`dspy/teleprompt/bettertogether.py`)
-1. **Core Algorithm (`arXiv:2407.10930`):** Jointly optimizes **prompt instructions/demos (`p`)** and **LM weights (`w`)** via an alternating strategy string (canonical default `"p -> w -> p"`):
-   - **Step 1 (`p`):** Optimizes predictor prompts so the base LM generates higher-reward multi-step reasoning traces (`FilterTriples`, `ExtractQueryIntent`, `AnswerQuestion`).
-   - **Step 2 (`w`):** Runs `BootstrapFinetune(metric=..., multitask=True)` over traces generated by the Step-1 prompt-optimized program, filtering trajectories by `metric` and finetuning the underlying model weights on passing `(input, output)` pairs.
-   - **Step 3 (`p`):** Re-optimizes prompts against the newly weight-tuned LM so instructions adapt to the updated weight distribution.
-2. **YAW Integration Mechanics (If Invoked in Tier C):**
-   - **Subclass or Wrap for `dspy.GEPA` + Zero-Shot (`exclude_demos=True`):** Upstream `BetterTogether.__init__` hardcodes `BootstrapFewShotWithRandomSearch` for `"p"` and `BootstrapFinetune` (without `exclude_demos=True`) for `"w"`. To honor YAW's zero-shot rule (`max_bootstrapped_demos = 0` `[target]`, [dspy-improvements.md §1](dspy-improvements.md#1-zero-shot-optimization-reward-contract--runtime-binding-active-epic-1-rules)), pass `dspy.GEPA` as the prompt optimizer and configure `BootstrapFinetune(..., exclude_demos=True)` so finetuning distills GEPA's instruction behavior directly into zero-shot weights.
-   - **Scope `train_kwargs` to Query-Time Predictors Only:** Never finetune graph-construction predictors (`ner`, `triples`, `label_judge`, `hierarchy_judge`, `related_judge`) inside a `"w"` step without rebuilding `yaw.db`. Scope `train_kwargs` strictly to `query_intent`, `triple_filter`, and `qa.predict` over a frozen `yaw.db` graph index.
-   - **Custom `YAWLlamaCppProvider(dspy.clients.Provider)`:** Because `dspy.LM` talks to `llama.cpp` over HTTP (`openai/...`), `BetterTogether` requires a custom `Provider` whose `FinetuneJob.run()` trains a Unsloth/PEFT QLoRA adapter on the JSONL trace dump in `outputs/`, merges and quantizes via `llama-quantize` to `Q4_K_M` / `Q4_0` GGUF, reloads the local `llama.cpp` server slot, and returns the updated `model` ID.
-   - **Mandatory Fail-Fast Check (`AGENTS.md` Prime Directive):** Upstream `BetterTogether._run_strategies` catches strategy exceptions and sets `student.flag_compilation_error_occurred = True`. Any YAW caller **must** immediately assert `assert not getattr(compiled, "flag_compilation_error_occurred", False)` and re-raise on failure.
-
-### 3.4 Goal 2 — Demoscene Execution Speed (`msgspec`, `dis` Bytecode & Vectorized CSR)
-
-1. **C-Backed `msgspec.Struct` Serialization (`optimizer.py`, `runtime.py`, `storage/`):**
-   - `msgspec == 0.22.0` `[measured: uv.lock, deddf36]` is already locked and installed in the workspace environment via `cocoindex == 1.1.0` `[measured: uv.lock, deddf36]`. Promote `msgspec` to a direct dependency in `pyproject.toml` and replace `json.loads` / `json.dumps` and `dataclasses.asdict` in high-frequency sidecar and cache paths (`.yaw/optimize_program_*.json`, `openie_chunks` JSON columns, `meta['dspy_trails_state']`, and runtime tool response payloads) with zero-copy C-extension `msgspec.Struct` and `msgspec.json.Encoder` / `Decoder` buffers `[assumption, probe E3-P6]`.
-2. **Python `dis` Bytecode & Opcode Reduction in Hot Loops (`ppr.py`, `hydration.py`, `shacl.py`):**
-   - Inspect inner loops with `python -m dis` (`dis.dis`) to eliminate per-edge and per-row Python object allocations, attribute lookups (`LOAD_ATTR`), closure cell dereferences (`LOAD_DEREF`), and generator overhead in `build_transition_matrix`, `coalesce_spans`, and `canonicalize_entity_labels_edc`.
-3. **Vectorized CSR Matrix Construction & Pre-Allocated Work Buffers (`ppr.py`):**
-   - Replace Python `dict[tuple[int, int], list[float]]` edge accumulation in [`build_transition_matrix`](../yaw/daemon/graph/ppr.py#L117-L120) (`deddf36`) with pre-allocated NumPy `int32` / `float64` coordinate arrays (`np.fromiter` / `scipy.sparse.coo_matrix` $\to$ `tocsr()` with vectorized degree scaling) and reuse pre-allocated `p` / `next_p` work vectors in `run_hmm` `[assumption, probe E3-P7]`.
-4. **Amiga Agnus (`Blitter` + `Copper`) Sheaf Tensor-Network Contractions (`hmm.py`, Post-`E1-M1` Full-Corpus Scale, Conditioned on Retaining/Hybridizing `manifold` after `E1-M1`):**
-   - *Copper Display-List Frontier Compaction:* Store active particle densities strictly in compact frontier coordinates `(B, |A_h|, R_max, R_max)` in `float32` instead of allocating full-corpus `(S, R_max, R_max)` `float64` zero-frames per hop (`3 * 128 * 16 * 16 * 4 = 393,216` bytes = `384 KiB` `[target]` design working set for `B=3` `[target]`, `frontier_cap=128` `[target]`, `max_stalk_dim=16` `[target]`, keeping all $B$ particles L2-resident inside a single batched `4D` `[target]` contraction without Python particle loops) `[assumption, probe E3-P8]`.
-   - *`16 x 16` (`2^4`) Cache-Line Tile Symmetry & Square-Root Factor Transport:* Exploit `max_stalk_dim = 16` `[target]` (`64`-byte `[target]` `float32` rows = `1` `[target]` x86-64 cache line / AVX-512 `zmm` tile) by propagating square-root/Cholesky factors $F_s \in \mathbb{R}^{16 \times k}$ ($\rho_s = F_s F_s^\top$), halving per-edge sheaf transport from `2` `[target]` $16 \times 16$ GEMMs ($T_e \rho_s T_e^\top$) to `1` `[target]` GEMM ($T_e F_s$) while guaranteeing $\rho_s \succeq 0$ by construction `[assumption, probe E3-P8]`.
-   - *Dual-Semiring Blitter Scanline Reductions (`np.add.reduceat` & Tropical `np.maximum.reduceat`):* Reduce marginal beliefs `(+, *)` and Viterbi causal witness / `kraus_synergy` edges `(max, *)` over the exact same destination-sorted edge table without Python `argsort`/`for` loops `[assumption, probe E3-P8]`.
-
-### 3.5 Goal 3 — Radical Codebase Reduction & Post-Epic 2 Consolidation
-
-After [Epic 2](epic-2-fastmcp-http.md) lands `mcp_server.py` and `source_content_hash`:
-- Audit every module across `yaw/core/`, `yaw/daemon/`, and `scripts/` to delete redundant serialization wrappers, duplicate SQL query builders, one-off CLI plumbing, and any remaining transitional shims from Epics 1 and 2.
-- Consolidate deferred CLI/config ergonomics from [Epic 2 §Deferred Epic 3 ideas](epic-2-fastmcp-http.md#deferred-epic-3-ideas--outside-this-epic) only where they strictly reduce net line count and cognitive surface.
+- **`E3-P6` (`msgspec` Serialization):** Evaluate zero-copy `msgspec.Struct` JSON serialization (`optimize` audits, watchdog telemetry, `YCG1` metadata) vs stdlib `json` on real-corpus artifacts (`R_time < 0.5`).
+- **`E3-P7` (Bytecode & Vectorized Kernels):** Profile `yaw/retrieval.py` (`_hydrate_corpus_chunks`, `_build_citation_graph`, `_apply_tangent_steer_ops`, `_rerank_dpp_1bit`) with `dis.dis` and `perf_counter` to trim allocations while preserving bit-identical `SearchResult` outputs (`atol = 1e-12`).
 
 ---
 
-## 4. Semantics, Invariants & Open Questions (`Open:`)
+## 4. Non-Negotiable Invariants & Verification
 
-### Non-Negotiable Invariants
-1. **Strict Containment & Transport Isolation:** All Epic 3 changes obey `tests/core/test_architecture.py` (`0` `[target]` cross-domain edges; `ppr.py` imports only `stdlib`, `numpy`, `scipy`, and `yaw.core.*`; `mcp_server.py` imports only `yaw.daemon.runtime`, `yaw.core.*`, and transport/stdlib APIs).
-2. **Batch-Independent Graph Equality ([native-cocoindex-graph.md](native-cocoindex-graph.md)):** Deterministic W3C/OWL/SKOS/PROV-O rules in Tier A must preserve exact fixed-evidence canonical graph equality between `64+64` `[target]` and `128` `[target]` chunk ingestion runs, with `0` `[target]` parser-accepted `facts` rows dropped during publication ([FOUNDATIONAL.md §4.4](../FOUNDATIONAL.md)).
-3. **Evidence-Gated Retention:** No Tier A, Tier B, or Tier C mechanism merges into `dev` without a paired ablation entry in [evaluation.md](evaluation.md) / [evaluation-graph-storage.md](evaluation-graph-storage.md) / [evaluation-inference.md](evaluation-inference.md) showing a statistically meaningful gain.
-
-### Open Questions (`Open:`)
-- `Open:` Which of the `7` `[target]` datasets in the Epic 1 slice-based parity gate (`D1-A6`) lag Target 1 (`monkeypatched_hipporag`) or Target 2 (`paper_70b`), and by what margin on `Recall@2`, `Recall@5`, `EM`, and `F1`?
-  - *Constraint:* Full-corpus multi-day Tier 2 benchmarking on a dataset runs only after the `10`-query `[target]` slice gate confirms whether current retrieval/QA accuracy already clears the target or requires Tier A / Tier B adjustments first.
-  - *Resolved by:* Completing the clean-slate Epic 1 slice gate (`scripts/verify_paper_parity_gate.py --compiled-program .yaw/compiled_program.json --mode eval --fresh`) and recording the per-dataset gap matrix in [evaluation.md](evaluation.md).
-- `Open:` Which specific predicates in the benchmark corpora qualify for closed-world `owl:FunctionalProperty`, `owl:InverseFunctionalProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith` declarations without over-downweighting legitimate multi-valued relations (e.g., a person having multiple `child` or `award` objects vs. `1` `[target]` `birthPlace` or `dateOfBirth`)?
-  - *Constraint:* Functional/asymmetric property rules must never drop `facts` rows from `yaw.db` or regress recall on single-hop and multi-hop dev queries (`0` `[target]` recall regression).
-  - *Resolved by:* Probe `E3-P1` (`ontologist` subagent audit of predicate distributions on the dev slice before wiring `shacl.py` and `ppr.py`).
-- `Open:` What cluster count $K$ and centroid routing schema should query-space hyperparameter routing use?
-  - *Constraint:* $2 \le K \le 8$ `[target]` centroids fitted strictly on the disjoint training split (`[0:train_queries]`) using `768`-dim `[observed: yaw/core/config.py, deddf36]` `EmbeddingGemma` query vectors (`0` `[target]` extra model calls).
-  - *Resolved by:* Probe `E3-P3` cross-validated ablation on the dev slice.
-- `Open:` Does `dspy.Flex` (`BridgeRuntime` Deno/Pyodide sandbox in `dspy[deno] == 3.4.1` `[measured: uv.lock, deddf36]`) outperform static `YawProgram` + query-space cluster routing on `Recall@5` and `F1` per unit of wall-clock latency on a single `parallel = 1` `[target]` `llama.cpp` slot?
-  - *Constraint:* Must improve held-out `compute_task_quality_score` without violating interactive daemon queue responsiveness (`<2 s` `[target]` status/health reads under [Epic 2](epic-2-fastmcp-http.md)).
-  - *Resolved by:* Probe `E3-P4` paired ablation on the `7`-dataset `[target]` slice harness.
-
----
-
-## 5. Capability Gates & Probes
-
-| Probe ID | Dependency / Capability | Real-Substrate Probe | Pass Criterion & Stop Rule |
-| --- | --- | --- | --- |
-| `E3-P1` | In-process SQLite `owl:FunctionalProperty` / `owl:InverseFunctionalProperty` in `shacl.py` & `ppr.py` (`sqlite3` stdlib) | Unmocked `pytest` + dev-slice ablation comparing graph state and `Recall@5` with/without functional distractor down-weighting and IFP candidate mining | `0` `[target]` dropped `facts` rows; `0` `[target]` un-adjudicated cross-label auto-merges; $\Delta \text{Recall@5} > 0.0$ `[target]`. Stop and restrict predicate whitelist if any true multi-valued relation is down-weighted. |
-| `E3-P2` | Non-transitive `skos:related` barrier & `prov:wasDerivedFrom` co-provenance boost in `ppr.py` (`numpy`, `scipy` locked in `uv.lock`) | Unmocked `tests/daemon/graph/test_ppr.py` + `7`-dataset `[target]` slice ablation | Consecutive `skos:related` hops receive `0.0` `[target]` direct transition mass; $\Delta \text{Recall@5} > 0.0$ `[target]` on multi-hop slices (`musique`, `2wikimultihopqa`). Stop and revert if single-hop recall regresses. |
-| `E3-P3` | QA GBNF `worker` binding (`program.py:288`, `deddf36`) & query-space clustering (`scipy` / `numpy` on `768`-dim `[observed: yaw/core/config.py, deddf36]` `EmbeddingGemma` vectors) | Paired dev-slice ablation for `self.qa.set_lm(worker)` and cross-validated $2 \le K \le 8$ `[target]` cluster routing fitted on `[0:train_queries]` | `0` `[target]` extra model calls for cluster routing and statistically meaningful $\Delta \text{score} > 0.0$ `[target]` on held-out slice queries. |
-| `E3-P4` | `dspy.Flex` (`dspy[deno] == 3.4.1` `[measured: uv.lock, deddf36]`) + PolyG `4`-class `[target]` $\langle s, p, o \rangle$ tool routing | Paired slice benchmark comparing `YawProgram` static flow vs. `dspy.Flex` tool orchestration | Strictly higher `Recall@5` / `F1` (`[target]`) on `musique` / `2wikimultihopqa` slices; abort and discard if `parallel = 1` `[target]` REPL turns degrade accuracy or cause timeouts. |
-| `E3-P5` | Bare-bones SQLite vs. SQLite + FAISS vs. embedded LanceDB ([protocol](#321-e3-p5-backend-experiment-and-promotion-contract)) | Exact/ANN, direct/native DSPy, frozen replay and live repeated-hop comparisons; snapshot invalidation, CocoIndex reconciliation and source hydration; separate reranker ablation | No swap without measured Pareto gains under preregistered workload, quality/cost tolerances and full-corpus confirmation; no stale/mixed-generation hits, silent failures or persistent FAISS sidecar. |
-| `E3-P6` | `msgspec == 0.22.0` `[measured: uv.lock, deddf36]` C-extension serialization (promote from transitive `cocoindex == 1.1.0` `[measured: uv.lock, deddf36]` dependency to direct `pyproject.toml` dependency) | Direct import + round-trip benchmark on `.yaw/optimize_program_*.json`, `openie_chunks`, and `scripts/watchdog.py` on Python `3.14.9` `[target]` | $R_{\text{time}} < 0.5$ `[target]` serialization latency vs. stdlib `json` with bit-identical decoded structures. |
-| `E3-P7` | Vectorized CSR construction & `dis` opcode reduction (`ppr.py`, `hydration.py`) | Paired `dis.dis` instruction count + `build_transition_matrix` / `run_hmm` wall-clock benchmark on $10^4+$ `[target]` edges | Bit-identical `CSRGraph.transition_t` (`np.allclose` at `atol=1e-12` `[target]`) and $R_{\text{time}} < 1.0$ `[target]`. |
-| `E3-P8` | Copper display-list frontier compaction (`(B, |A_h|, 16, 16)` `float32`), square-root factor transport ($\rho_s = F_s F_s^\top$), and dual-semiring `np.maximum.reduceat` scanlines in `hmm.py` (`numpy == 2.5.4` `[measured: uv.lock, 63c9c00]`) | Paired `50k+` `[target]` sub-span throughput & RSS memory benchmark comparing full-frame `float64` (`(S, R_max, R_max)`) vs. compacted `float32` factor frontier (`(B, |A_h|, 16, 16)`) | `np.allclose` at `atol=1e-5` `[target]` for `float32` frontier compaction, identical top-`20` `[target]` retrieval ranking, $R_{\text{time}} < 0.5$ `[target]`, and $R_{\text{mem}} < 0.25$ `[target]`. Stop and retain `float64` full-frame storage if precision drift alters top-`20` `[target]` rankings or manifold `E1-M1` is reverted. |
-
----
-
-## 6. Removal Inventory (Post-Epic 2 Consolidation Targets)
-
-Every retired construct below is deleted completely (zero `=None` flags or compatibility wrappers) during Checkpoints `E3-C3` and `E3-C4`:
-
-| Retired item | Location (`path:symbol`, commit `deddf36`) | Replacement | Exit check |
-| --- | --- | --- | --- |
-| Ad-hoc `json.loads` / `json.dumps` sidecar & audit-trail serialization helpers | `yaw/daemon/graph/inference/optimizer.py`, `yaw/daemon/graph/inference/program.py:dump_audit_trails`, `scripts/watchdog.py` | Typed `msgspec.Struct` schemas + `msgspec.json.encode` / `decode` | `Select-String -Path yaw\daemon\graph\inference\optimizer.py, scripts\watchdog.py -Pattern "json\.loads|json\.dumps"` matches only external DSPy `.save()`/`.load()` boundaries (`0` `[target]` hot-loop stdlib `json` calls) |
-| Per-edge Python `dict[tuple[int, int], list[float]]` accumulation loop | `yaw/daemon/graph/ppr.py:build_transition_matrix` (`L117-L120`, `deddf36`) | Vectorized NumPy coordinate arrays + `scipy.sparse.coo_matrix.tocsr()` | `0` `[target]` `pair_weights: dict` allocations in `yaw/daemon/graph/ppr.py` |
-| Duplicated chunk-span / hydration formatting plumbing across engine & storage | `yaw/daemon/graph/engine.py`, `yaw/daemon/graph/storage/hydration.py` | Single canonical span-coalescing and subgraph formatting pipeline in `storage/hydration.py` | Net $\Delta \text{LOC} < 0$ `[target]` across `yaw/` and `scripts/` with `100%` `[target]` test pass rate |
-
----
-
-## 7. Checkpoints & Subagent Orchestration Pipeline
-
-Status is tracked in `docs/reviews/epic-3-performance.md` (created when Epic 3 execution begins) and measured results are recorded in [evaluation.md](evaluation.md).
-
-| Checkpoint | Scope & Bounded Inputs | Subagent Pipeline | Exit Gate |
-| --- | --- | --- | --- |
-| `E3-C1` | **Tier A W3C/OWL/SKOS/PROV-O Pruning:** Prototype `E3-P1` (`owl:FunctionalProperty` distractor down-weighting in `ppr.py` & `owl:InverseFunctionalProperty` candidate mining in `shacl.py`) and `E3-P2` (non-transitive `skos:related` barrier, `owl:AsymmetricProperty`, `prov:wasDerivedFrom` co-provenance boost) in `shacl.py` and `ppr.py`. | `ontologist` (design W3C/OWL shapes & transition algebra) $\to$ `implementer` (implement in `shacl.py`, `ppr.py`) $\to$ `critic (Model="flash")` (verify invariants & paired ablation) | Unmocked unit tests + paired `7`-dataset `[target]` slice ablation recorded in [evaluation-graph-storage.md](evaluation-graph-storage.md); only mechanisms with $\Delta \text{score} > 0.0$ `[target]` survive. |
-| `E3-C2` | **Tier B Adaptive Retrieval, QA GBNF & Novel DSPy Experiments:** Evaluate `E3-P3` / `E3-P4` under their scoped contracts; `E3-P5` uses the bare-bones SQLite / SQLite + FAISS / LanceDB protocol in Section 3.2.1, with reranking isolated. | `research` (freeze baseline, workload and contrasts) $\to$ `implementer` (isolated bounded experiments) $\to$ `critic (Model="flash")` (audit lifecycle, holdout isolation and paired evidence) | Record development results and full-corpus confirmation in the evaluation ledgers; E3-P5 requires measured Pareto gains before any swap. Delete losing experimental paths; no production checkpoint based on a slice alone. |
-| `E3-C3` | **Goal 2 Demoscene Speed Pass (`msgspec`, Vectorized CSR, `dis` Bytecode, `E3-P8` Sheaf Tensor Scanlines):** Execute probes `E3-P6` and `E3-P7` across `ppr.py`, `hydration.py`, `shacl.py`, `optimizer.py`, and `scripts/watchdog.py`, plus `E3-P8` on `hmm.py` if `E1-M1` manifold retrieval is retained/hybridized. | `research` (profile hot paths & `dis` bytecode) $\to$ `implementer` (vectorize CSR & wire `msgspec` / `E3-P8`) $\to$ `critic (Model="flash")` (verify bit-identical outputs & paired timings) | $R_{\text{time}} < 1.0$ `[target]` and $R_{\text{mem}} \le 1.0$ `[target]` across all `4` `[target]` hot paths (plus $R_{\text{time}} < 0.5$ `[target]` / $R_{\text{mem}} < 0.25$ `[target]` for `E3-P8` when retained) recorded in [evaluation.md](evaluation.md). |
-| `E3-C4` | **Goal 3 Radical Codebase Reduction & Full-Corpus Holdout Gate:** Eliminate residual hand-rolled duplication across `yaw/` and `scripts/`; execute full-corpus disjoint holdout benchmarks across the `7` `[target]` paper datasets (invoking Tier C `dspy.BetterTogether` only if needed to clear full-corpus targets). | `critic (Model="flash")` (dead-code & duplication inventory) $\to$ `implementer` (atomic deletion & consolidation) $\to$ `critic (Model="flash")` (verify $\Delta \text{LOC} < 0$ `[target]` & `100%` `[target]` gates) | $\Delta \text{LOC} < 0$ `[target]`, all quality gates green, and full-corpus holdout results recorded in [evaluation.md](evaluation.md). |
-
----
-
-## 8. Verification Fixture Matrix & Quality Gates
-
-| Real-Substrate Fixture | Required Result |
-| --- | --- |
-| Fixed-evidence `64+64` vs. `128` `[target]` batch equivalence under Tier A W3C/OWL/SKOS/PROV-O rules (`tmp_path` SQLite + `coco_lmdb`) | Identical canonical `entities`, `entity_labels`, `facts`, and `edges` sets (`0` `[target]` dropped `facts` rows; `0` `[target]` SHACL violations in `lint_graph_shacl(conn, auto_heal=False)`) |
-| `owl:FunctionalProperty` & `owl:InverseFunctionalProperty` boundary trap (`tests/daemon/graph/storage/test_shacl.py`) | Competing objects on a functional property remain persisted in `facts` while lower-confidence contradicted edges are down-weighted in `CSRGraph`; inverse-functional matches surface in `find_entity_synonym_candidates` without bypassing `JudgeLabels` |
-| Non-transitive `skos:related` `2`-hop `[target]` barrier (`tests/daemon/graph/test_ppr.py`) | Path $A \xrightarrow{\text{skos:related}} B \xrightarrow{\text{skos:related}} C$ receives `0.0` `[target]` consecutive associative transition mass, while $A \xrightarrow{\text{fact}} B \xrightarrow{\text{skos:related}} C$ remains active |
-| Disjoint train/eval split isolation for query-cluster routing (`tests/daemon/graph/inference/test_optimizer.py`) | Cluster centroids fit exclusively on `[0:train_queries]`; passing overlapping train and eval query IDs raises `ValueError` immediately |
-| Bare-bones FAISS projection generation and source mapping (real SQLite/FAISS/filesystem; future retrieval/runtime integration tests) | Committed `chunks` insert/edit/delete triggers coherent vector/ID/`VectorSearch` rebuild and atomic publication; same-connection change detection verified; no mixed-generation lookup or post-publication stale hits; no persistent FAISS sidecar; invalid ANN IDs rejected. |
-| Embedded LanceDB lifecycle (real CocoIndex/LanceDB/filesystem in ignored outputs or temp dirs) | Equivalent logical chunk/pointer state for 64+64 vs. 128 inputs; edit/delete/restart and cross-handle freshness verified; new rows remain searchable before optimization; compaction cost recorded and maintenance errors abort. |
-| Vectorized CSR & `msgspec` round-trip equivalence (`tests/daemon/graph/test_ppr.py`, `tests/daemon/graph/inference/test_program.py`) | Vectorized `build_transition_matrix` matches reference CSR within `atol=1e-12` `[target]`; `msgspec` sidecar encode/decode round-trips `100%` `[target]` of fields identically |
-
-All Epic 3 checkpoints must pass the mandatory repository quality gates on real substrates (zero mocked SQLite, filesystem, or CSR matrices):
+1. **Strict Containment (`tests/core/test_architecture.py`):** Obey the flat `14`-file `L0`–`L6` DAG (`yaw/retrieval.py` imports `stdlib`, `numpy`, `scipy`, `sqlite3`, `yaw.core` only; `yaw/mcp_server.py` imports `yaw.runtime` and `yaw.core` only).
+2. **Evidence-Gated Promotion:** Zero changes merge onto `dev` without full $2^k$ / LOO ablations, budget-matched random controls, untouched holdout confirmation, and real-substrate tests recorded in [evaluation.md](evaluation.md).
+3. **Mandatory Quality Gates:**
 
 ```bash
-uv run ty check
-uv run ruff check --fix
-uv run ruff format
-uv run pytest
+uv run --offline --locked ty check
+uv run --offline --locked ruff check
+uv run --offline --locked ruff format --check
+uv run --offline --locked pytest -o addopts=""
 git diff --check
 ```
 
