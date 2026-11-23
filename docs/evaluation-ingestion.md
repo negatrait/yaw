@@ -1,6 +1,6 @@
 # Evaluation Record: Ingestion, CocoIndex & Daemon Runtime
 
-Domain evaluation ledger for CocoIndex file/inference/graph targets, dataset bundle preparation, bounded overlap pilots, and Epic 2 runtime specification reconciliation. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
+Domain evaluation ledger for CocoIndex file/inference/graph targets, dataset bundle preparation, bounded overlap pilots, and Epic 2 runtime specification reconciliation. See the [Evaluation Index](evaluation.md) for all other domain ledgers and [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md) for planned Sprint `3.2`–`3.3` singular `cocoindex.App` lifespan & `wiki_root` indexing milestones.
 
 ## Revalidation after intervening development (2026-11-04, `06b35d2`)
 

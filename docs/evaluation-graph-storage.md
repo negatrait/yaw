@@ -1,6 +1,6 @@
 # Evaluation Record: Graph, Storage & Benchmarks
 
-Domain evaluation ledger for `yaw.db` (`sqlite-vec`, contentless FTS5), sparse CSR Personalized PageRank, W3C SKOS/RDF/OWL/SHACL build-time validation, Tier 0 / Tier 1 HippoRAG 2 benchmark baselines, and the bounded `E1-M1` sub-state manifold shootout ([Epic 1 Hard Gates](epic-1-hipporag-daemon.md#hard-gates), [Epic 3 `E1-M1`](epic-3-performance.md#early-epic-1-exception-sub-state-manifold-shootout-e1-m1), [substate-manifold-shootout.md](reviews/substate-manifold-shootout.md)). See the [Evaluation Index](evaluation.md) for all other domain ledgers.
+Domain evaluation ledger for `yaw.db` (`sqlite-vec`, contentless FTS5), sparse CSR Personalized PageRank, W3C SKOS/RDF/OWL/SHACL build-time validation, Tier 0 / Tier 1 HippoRAG 2 benchmark baselines, and the bounded `E1-M1` sub-state manifold shootout ([Epic 1 Hard Gates](epic-1-hipporag-daemon.md#hard-gates), [Epic 3 `E1-M1`](epic-3-performance.md#early-epic-1-exception-sub-state-manifold-shootout-e1-m1), [substate-manifold-shootout.md](reviews/substate-manifold-shootout.md)). See the [Evaluation Index](evaluation.md) for all other domain ledgers and [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md) for planned Sprint `3.2`–`3.3` retrieval calibration & storage milestones.
 
 ## Installed baseline
 

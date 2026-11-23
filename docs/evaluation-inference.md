@@ -1,6 +1,6 @@
 # Evaluation Record: DSPy Inference & Optimization
 
-Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM orchestrator execution, GEPA / MIPROv2 / SIMBA optimization, candidate-stage & response caches, Gemma 4 128K capacity scaling, and external Pareto `dspy.Ensemble`. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
+Domain evaluation ledger for DSPy signatures, GBNF worker vs unconstrained RLM orchestrator execution, GEPA / MIPROv2 / SIMBA optimization, candidate-stage & response caches, Gemma 4 128K capacity scaling, and external Pareto `dspy.Ensemble`. See the [Evaluation Index](evaluation.md) for all other domain ledgers and [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md) for planned Sprint `3.3` sparse-slip, GEPA card-recall, and `ReAct` vs `RLM` evaluations.
 
 ## 20. Candidate-Indexed Optimizer Telemetry & Watchdog Staleness Fixes (2026-10-21)
 

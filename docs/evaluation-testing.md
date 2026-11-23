@@ -1,6 +1,17 @@
 # Evaluation Record: Testing, Preflight & Production Coverage
 
-Domain evaluation ledger for Python 3.14.9 toolchain, `uv run preflight`, Ruff/ty/pytest repairs, and 100% production coverage packets. See the [Evaluation Index](evaluation.md) for all other domain ledgers.
+Domain evaluation ledger for Python 3.14.9 toolchain, `uv run preflight`, Ruff/ty/pytest repairs, and 100% production coverage packets. See the [Evaluation Index](evaluation.md) for all other domain ledgers and [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md) for planned Sprint `3.1`–`3.3` modular architecture & verification fixtures.
+
+## 52. `uv.lock` Dependency Refresh & Offline Baseline Verification (`ebb444c+uv.lock`, 2026-11-23)
+
+- **Scope:** Ran `uv lock --upgrade` and `uv sync --locked` atop clean `ebb444c` (`0` edits to Python or `pyproject.toml`), bumping `27` of `104` locked packages (`fastmcp 4.2.0 -> 4.2.5`, `numpy 2.5.4 -> 2.5.5`, `filelock 4.2.10 -> 4.3.0`, `ruff 0.17.5 -> 0.17.6`, `ty 0.0.104 -> 0.0.108`; keeping `cocoindex 1.2.0`, `dspy 3.5.0`, `scipy 1.18.1`, `uvicorn 0.54.0`, `pytest 9.2.0`). Recorded `ruff check --select C901` complexity baseline across `yaw`, `scripts`, and `tests` (`10` production functions in `11..15`, including `7` at zero headroom `C901 == 15`; `19` production functions in `16..69`; `13` test functions in `11..15`; plus `tests/core/test_architecture.py:build_internal_import_graph` at `17` and `3` integration tests at `18..20`; `46` total diagnostics `> 10`).
+- **Verification (uncontended offline console run):**
+  - `uv lock --check --offline` -> exit `0`.
+  - `uv run --offline --locked ruff format --check` -> `56` files formatted (exit `0`).
+  - `uv run --offline --locked ruff check --no-fix` -> `0` diagnostics (exit `0`).
+  - `uv run --offline --locked ty check` -> `0` diagnostics (exit `0`).
+  - `uv run --offline --locked pytest -o addopts=""` -> **`369 passed in 142.53s` (`0` failed, `0` skipped)**.
+  - `git diff --check` -> exit `0` (`M uv.lock` only code/lock change).
 
 ## 51. 9-Rule Repo-Aligned Governance & Skill Modernization (2026-11-23)
 
