@@ -1,6 +1,6 @@
 # EnterpriseRAG-Bench Dataset, Benchmark & Evaluation Plan
 
-Status: active (clean-slate `14`-file `M_FINAL_1B`, `5c4b115`).
+Status: active (clean-slate modular `M_FINAL_1B`, `5c4b115`; Sprint `3.1` `L0`–`L6` DAG).
 
 | Relation | Links |
 | --- | --- |

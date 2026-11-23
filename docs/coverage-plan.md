@@ -1,6 +1,6 @@
 # Complete Production Coverage & Real-Substrate Test Plan (`tests/**/*.py`)
 
-Status: active (clean-slate `14`-file `yaw/` + `5` `scripts/*.py` under `M_FINAL_1B`, `5c4b115`).
+Status: active (modular `L0`–`L6` `yaw/` + `scripts/*.py` under `M_FINAL_1B`, `5c4b115`; Sprint `3.1` governance).
 
 | Relation | Links |
 | --- | --- |
@@ -15,16 +15,16 @@ Status: active (clean-slate `14`-file `yaw/` + `5` `scripts/*.py` under `M_FINAL
 
 ## 1. Scope & Target
 
-- **Acceptance Target:** `100%` executable-line coverage with meaningful behavioral assertions across all `19` active production Python files (`14` modules in `yaw/` and `5` scripts under `scripts/`), zero `# pragma: no cover` exclusions, zero skipped tests, zero Ruff/`ty` diagnostics, and `--testmon` disabled (`-o addopts=""`).
-- **Historical vs. Active Baseline:** The pre-cutover `2026-10-23` coverage sweep (`36` legacy files at `86.7169%`, recorded in [evaluation-testing.md](evaluation-testing.md)) predates the clean-slate `14`-file cutover (`CS-6`, `3cd3952`) and `M_FINAL_1B` (`EVAL-5`, `5c4b115`). On `dev`, the full uncontended offline suite (`tests/**/*.py`) runs cleanly via `uv run --offline --locked pytest -o addopts=""`; a fresh `19`-file `100%` line-coverage measurement via `uv run --offline --locked pytest -o addopts="" --cov=yaw --cov=scripts --cov-report=term-missing` remains open until executed and recorded in [evaluation-testing.md](evaluation-testing.md).
+- **Acceptance Target:** `100%` executable-line coverage with meaningful behavioral assertions across all active production Python files (`yaw/**/*.py` and `scripts/*.py`, currently `14` `yaw/` modules + `5` `scripts/*.py` in Sprint `3.1`), zero `# pragma: no cover` exclusions, zero `# noqa`/`C901` suppressions, zero skipped tests, zero Ruff/`ty` diagnostics, and `--testmon` disabled (`-o addopts=""`).
+- **Historical vs. Active Baseline:** The pre-cutover `2026-10-23` coverage sweep (`36` legacy files at `86.7169%`, recorded in [evaluation-testing.md](evaluation-testing.md)) predates the clean-slate cutover (`CS-6`, `3cd3952`) and `M_FINAL_1B` (`EVAL-5`, `5c4b115`). On `dev`, the full uncontended offline suite (`tests/**/*.py`) runs cleanly via `uv run --offline --locked pytest -o addopts=""`; a fresh `100%` line-coverage measurement via `uv run --offline --locked pytest -o addopts="" --cov=yaw --cov=scripts --cov-report=term-missing` remains open until executed and recorded in [evaluation-testing.md](evaluation-testing.md).
 
 ---
 
-## 2. Production-to-Test Matrix (`19` Production Modules / `26` Test Files)
+## 2. Production-to-Test Matrix (`yaw/**/*.py` + `scripts/*.py` -> `23` `test_*.py` + `3` Support Modules)
 
 | Owned Production Domain | Production Files | Verification Suites (`tests/**/*.py`) | Real-Substrate Invariants Covered |
 | :--- | :--- | :--- | :--- |
-| Core contracts, config, logging & architecture (`L0`/`L6`) | `yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/{__init__,config,logger,types}.py` | `tests/core/{test_architecture,test_config,test_config_edges,test_contract_edges,test_logger,test_types}.py` | `31`-field TOML bijection, `for_optimization()`, atomic commits, `FIFOLineRotatingHandler`, `63`-bit chunk IDs, path confinement, `L0`–`L6` DAG & disjoint Tier-2 ownership |
+| Core contracts, config, logging & architecture (`L0`/`L6`) | `yaw/__init__.py`, `yaw/__main__.py`, `yaw/core/{__init__,config,logger,types}.py` | `tests/core/{test_architecture,test_config,test_config_edges,test_contract_edges,test_logger,test_types}.py` | `31`-field TOML bijection, `for_optimization()`, atomic commits, `FIFOLineRotatingHandler`, `63`-bit chunk IDs, path confinement, monotonic `L0`–`L6` DAG, `scripts/*.py` `Rule 12`, static `importlib` & `# noqa` ban, disjoint Tier-2 ownership |
 | CocoIndex pipeline & dataset bundles (`L1`/`L2`) | `yaw/pipeline.py`, `yaw/datasets.py` | `tests/test_pipeline.py`, `tests/test_datasets.py` | Live/catch-up `_indexing_main`, `.yaw/coco_lmdb` cross-DB memo reuse, `<f2>` `chunks` + `unicode61` `chunk_fts` + `chunk_vocab` + `rabitq_index` + `citation_graph`, v2 `.md` manifest SHA-256 & EM/F1/Recall |
 | `M_FINAL_1B` retrieval engine (`L1`) | `yaw/retrieval.py` | `tests/test_retrieval.py` | `?mode=ro` WAL snapshots, `1`-bit SoA RaBitQ packing & `64 + 64 == 128` invariance, tangent-steered cyclic diffusion, Beta-tail LUT, conditional Noisy-OR, 1-bit DPP, umlaut/compound/CJK FTS5, `INDEX_NOT_READY` vs `CONSISTENCY_ERROR`, SHA-256 disk hydration |
 | Bare `dspy.ReAct` QA & `dspy.GEPA` (`L2`/`L4`) | `yaw/qa.py`, `yaw/optimize.py` | `tests/test_qa.py`, `tests/test_optimize.py` | Loopback `OpenAI`-compatible chat/tool server (`temperature=1.0`), 4 read-only corpus tools, `[chunk_id=<int>]` grounding, `stale_on_disk` `CONSISTENCY_ERROR`, `[0, 10)` slice guard, `FileLock` contention, `.yaw/qa_program.json` persistence |
@@ -53,5 +53,5 @@ git diff --check
 
 ## 4. Open Coverage Checklist
 
-- [x] **Offline Suite Green (`EVAL-5`, `5c4b115`):** All `26` active real-substrate test files pass uncontended offline with `-o addopts=""` (`0` skipped).
-- [ ] **Fresh 19-File `100%` Coverage Audit (`pytest --cov`):** Execute a clean unaccumulated `uv run --offline --locked pytest -o addopts="" --cov=yaw --cov=scripts --cov-report=term-missing` run across all `19` active production files (`14` `yaw/` + `5` `scripts/`), close any remaining uncovered error/platform branches with real-substrate tests, and record the exact line report in [evaluation-testing.md](evaluation-testing.md).
+- [x] **Offline Suite Green (`EVAL-5`, `5c4b115`):** All `23` `test_*.py` real-substrate test suites (`26` `.py` files under `tests/` including `3` support modules) pass uncontended offline with `-o addopts=""` (`0` skipped).
+- [ ] **Fresh Production `100%` Coverage Audit (`pytest --cov`):** Execute a clean unaccumulated `uv run --offline --locked pytest -o addopts="" --cov=yaw --cov=scripts --cov-report=term-missing` run across all active production files (`yaw/` and `scripts/`), close any remaining uncovered error/platform branches with real-substrate tests, and record the exact line report in [evaluation-testing.md](evaluation-testing.md).

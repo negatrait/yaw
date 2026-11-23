@@ -16,7 +16,7 @@ Status: active (frozen `M_FINAL_1B` shipped via `EVAL-5` at `5c4b115`).
 
 In scope: Read-only hybrid retrieval, 1-bit Extended SoA RaBitQ quantization, single-pass corpus hydration & `# Heading` title extraction, compressed `CitationGraph` & `DiffusionOperators`, tangent-steered cyclic citation + 1-bit PMI diffusion, conditional Noisy-OR evidence aggregation, Rank-1 Cholesky 1-bit DPP reranking, `pool_k = max(top_k * 4, 50)` MaxP span deferral, multilingual lexical search (`unicode61`, umlaut folding, Koehn–Knight compound splitting, CJK bigrams/PMI), `?mode=ro` WAL SHA-256 disk hydration, and strict `INDEX_NOT_READY` vs `CONSISTENCY_ERROR` failure contracts in `yaw/retrieval.py`.
 
-Non-goals: Persistent writes to `yaw.db` or `.yaw/coco_lmdb` (owned by `yaw/pipeline.py` in [native-cocoindex-indexing.md](native-cocoindex-indexing.md)); runtime locking/polling orchestration (`yaw/runtime.py` in [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); post-`EVAL-5` `SearchResult.completeness` calibration and `.yaw/wiki/` Graph Scout (`EVAL-6` in [epic-3-performance.md](epic-3-performance.md)).
+Non-goals: Persistent writes to `yaw.db` or `.yaw/coco_lmdb` (owned by `yaw/pipeline.py` in [native-cocoindex-indexing.md](native-cocoindex-indexing.md)); runtime locking/polling orchestration (`yaw/runtime.py` in [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); Sprint `3.2`–`3.3` lifespan unification, `SearchResult.coverage` / `next_candidates` sparse slip, and dual-root Librarian wiki ([epic-3-performance.md](epic-3-performance.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md)).
 
 - **Pure Kernel Containment (`Rule 12`):** `yaw/retrieval.py` imports **only** Python `stdlib`, `numpy`, `scipy`, `sqlite3`, and `yaw.core.*` — zero `dspy`, `cocoindex`, HTTP clients, or retired stack dependencies (`sqlite-vec`, `spacy`, `optuna`, OpenIE/SHACL).
 
@@ -117,7 +117,7 @@ Retired legacy OpenIE/W3C/SHACL/PPR/HMM storage (`yaw/daemon/graph/**`), `sqlite
 ## 8. Checkpoints
 
 - `EVAL-5` (`5c4b115`): `M_FINAL_1B` shipped on `dev` with plain SQLite 5-table schema (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`).
-- `EVAL-6` (next): `SearchResult.completeness` calibration and lazy `.yaw/wiki/` Graph Scout ([epic-3-performance.md](epic-3-performance.md)).
+- Sprint `3.1`–`3.3` (next): modular `L0`–`L6`/`L0`–`L7` DAG split, parameter-free `SearchResult.coverage` + `next_candidates` sparse slip, and dual-root Librarian `wiki_root` ([epic-3-performance.md](epic-3-performance.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md)).
 
 <a id="9-verification"></a>
 

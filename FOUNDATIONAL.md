@@ -18,12 +18,12 @@ The following remain permanently retired unless controlled benchmarks prove mate
 
 ## 3. Package Boundaries
 
-All production code lives inside a flat 14-file boundary:
+All production code obeys a strict monotonic layer DAG (`L0`–`L6`, verified by `tests/core/test_architecture.py` with `0` horizontal cross-domain imports, `0` cycles, and `0` `# noqa`/`C901` suppressions):
 
 ```text
 yaw/
-├── core/        # __init__.py, config.py, logger.py, types.py (Python stdlib only; 0 ML/DB imports)
-└── *.py         # __init__, __main__, cli, datasets, mcp_server, optimize, pipeline, qa, retrieval, runtime
+├── core/        # L0: __init__.py, config.py, logger.py, types.py (Python stdlib only; 0 ML/DB imports)
+└── ...          # L1 datasets, retrieval -> L2 pipeline, qa -> L3 runtime -> L4 mcp_server, optimize -> L5 cli -> L6 __main__
 ```
 
 - Modules never import another module's `_private` symbols or access foreign `_` attributes.
@@ -51,5 +51,5 @@ yaw/
 
 ## 6. Governing Specs
 
-- Governing Sprint & Cutover Ledgers: [bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) (`CS-0`..`CS-6` clean-slate cutover, closed on `3cd3952`); [mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md) (`EVAL-0`..`EVAL-5` shipped frozen `M_FINAL_1B` on `dev` at `5c4b115`; post-merge `EVAL-6` `SearchResult.completeness` calibration and lazy `.yaw/wiki/` Graph Scout deferred next).
+- Governing Sprint & Cutover Ledgers: [bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) (`CS-0`..`CS-6` clean-slate cutover, closed on `3cd3952`); [mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md) (`EVAL-0`..`EVAL-5` shipped frozen `M_FINAL_1B` on `dev` at `5c4b115`); [epic-3-librarian-wiki-sprint.md](docs/reviews/epic-3-librarian-wiki-sprint.md) (active Sprints `3.1`–`3.3`: modular DAG governance, unified CocoIndex/FastMCP lifespan, `log_bf` + `coverage` slip, and dual-root Librarian `wiki_root`).
 - Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where historical `## Decisions` preserve pre-cutover rationale verbatim, §§1–5 above govern active production code)*.

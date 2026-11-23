@@ -213,7 +213,7 @@ Quality gates ([AGENTS.md](../../AGENTS.md)): `uv run ty check`, `uv run ruff ch
 
 ## Checkpoint
 
-- [ ] U1: Sprint 3.1 governance (`tests/core/test_architecture.py#L217 @ ebb444c`, `L0`–`L6` + `scripts/` + `importlib` Rule 12, `# noqa` ban, `U1` doc/test fixes)
+- [x] U1: Sprint 3.1 governance (`tests/core/test_architecture.py` `C901 <= 15`, `L0`–`L6` + `scripts/` + `importlib` Rule 12, `# noqa` ban, `U1` doc/test fixes) — Critic `R1` `FINDINGS: ZERO`; offline `ty`/`ruff check`/`ruff format` clean, `pytest -o addopts=""` all green.
 - [ ] U2: Sprint 3.2 `cocoindex` Rust stop / idle `watch()` / async `_DspyBatchEmbedder.acall` / blocking `32`-slot `embed_gate` / `G3` guard & `cli` HTTP stop probes (`G2`, `G3`)
 - [ ] U3: Sprint 3.2 `L3` lifespan (`corpus_root`, awaiting `_DspyBatchEmbedder.acall`) + port liveness + `retrieval`/`pipeline`/`mcp_server` splits (`11` prod + MCP tests `<= 15 [target]`) + `U3` doc sync
 - [ ] U4: Sprint 3.3 `SearchResult` (`log_bf`, `coverage`, `next_candidates`), `build_recall_payload`/`format_recall_text` (`§4`, `_PASSAGE_HEAD_RE` + `CONSISTENCY_ERROR`), `benchmark.py#L368`, & `Tier F-U4` `[400, 450)` × `4` `n = 200` `qa` gate (`<= 0.85x` obs)

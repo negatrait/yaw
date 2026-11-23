@@ -1,6 +1,6 @@
 # Evaluation Record Index
 
-Measured verification outcomes, live-silicon benchmarks, and open failures for YAW are recorded below. The top ledger (`CS-5` onward) tracks the clean-slate `14`-file replacement architecture, while the four domain-specific ledgers below preserve historical pre-cutover evidence from the retired `yaw/daemon/` hierarchy:
+Measured verification outcomes, live-silicon benchmarks, and open failures for YAW are recorded below. The top ledger (`CS-5` onward) tracks the clean-slate modular replacement architecture, while the four domain-specific ledgers below preserve historical pre-cutover evidence from the retired `yaw/daemon/` hierarchy:
 
 | Historical Pre-Cutover Ledger | Retired Scope & Current Owning Rules | Key Recorded Milestones |
 | :--- | :--- | :--- |

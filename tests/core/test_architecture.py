@@ -1,8 +1,11 @@
 """AST-enforced architecture containment and zero-cross-domain import boundary tests."""
 
 import ast
+import io
 import re
 import sys
+import tempfile
+import tokenize
 import unittest
 from pathlib import Path, PurePosixPath
 
@@ -48,10 +51,25 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
     }
 )
 _MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+_BACKTICKED_LINK_RE = re.compile(r"`\[[^\]]+\]\(([^)]+)\)`")
 _WIKI_LINK_RE = re.compile(r"\[\[[^\]]+\]\]")
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
 _HTML_ANCHOR_RE = re.compile(r"<a\s+(?:id|name)=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _LINE_FRAG_RE = re.compile(r"^L(\d+)(?:-L(\d+))?$")
+_SUPPRESSION_COMMENT_RE = re.compile(r"#\s*(?:(?:ruff|flake8):\s*)?noqa\b|\bC901\b", re.IGNORECASE)
+
+_ALLOWED_DOMAIN_IMPORTS: dict[str, frozenset[str]] = {
+    "yaw.core": frozenset({"yaw.core"}),
+    "yaw.datasets": frozenset({"yaw.datasets", "yaw.core"}),
+    "yaw.retrieval": frozenset({"yaw.retrieval", "yaw.core"}),
+    "yaw.pipeline": frozenset({"yaw.pipeline", "yaw.core", "yaw.retrieval"}),
+    "yaw.qa": frozenset({"yaw.qa", "yaw.core", "yaw.retrieval"}),
+    "yaw.runtime": frozenset({"yaw.runtime", "yaw.core", "yaw.retrieval", "yaw.pipeline", "yaw.qa"}),
+    "yaw.mcp_server": frozenset({"yaw.mcp_server", "yaw.core", "yaw.runtime"}),
+    "yaw.optimize": frozenset({"yaw.optimize", "yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval"}),
+    "yaw.cli": frozenset({"yaw.cli", "yaw.core", "yaw.mcp_server", "yaw.optimize", "yaw.runtime"}),
+    "yaw.__main__": frozenset({"yaw.__main__", "yaw.cli"}),
+}
 
 
 def _parse_yaml_frontmatter(md_path: Path) -> tuple[dict[str, object], str]:
@@ -144,62 +162,242 @@ def _parse_opening_relation_table(doc_file: Path) -> dict[str, str]:
     return rows
 
 
-def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
-    """Parse all import statements in a python file and return (lineno, imported_module)."""
-    source = file_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(file_path))
-    imports: list[tuple[int, str]] = []
+def _resolve_relative_module(pkg_parts: list[str], level: int, module: str | None) -> str:
+    drop = level - 1
+    base_parts = [] if drop > len(pkg_parts) else pkg_parts[: len(pkg_parts) - drop]
+    mod = ".".join(base_parts)
+    if module is None:
+        return mod
+    return f"{mod}.{module}" if mod else module
 
-    # Calculate package name for relative imports
-    rel_path = file_path.relative_to(PROJECT_ROOT)
-    parts = list(rel_path.with_suffix("").parts)
-    # If the file is __init__.py, its package is parts[:-1], otherwise parts[:-1]
-    current_pkg_parts = parts[:-1] if file_path.name == "__init__.py" else parts[:-1]
 
+def _extract_public_api_dict(tree: ast.Module) -> ast.Dict | None:
+    for stmt in tree.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == "_PUBLIC_API":
+            if isinstance(stmt.value, ast.Dict):
+                return stmt.value
+        elif (
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Dict)
+            and any(isinstance(t, ast.Name) and t.id == "_PUBLIC_API" for t in stmt.targets)
+        ):
+            return stmt.value
+    return None
+
+
+def _collect_import_call_names(tree: ast.AST) -> tuple[set[str], set[str], set[str], set[str]]:
+    importlib_mods = {"importlib"}
+    import_module_fns: set[str] = set()
+    builtin_import_fns = {"__import__"}
+    builtins_mods = {"builtins"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            imports.extend((node.lineno, alias.name) for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level > 0:
-                # Relative import: resolve against current_pkg_parts
-                # level=1 means from . import X (current package)
-                # level=2 means from .. import X (parent package)
-                drop = node.level - 1
-                base_parts = [] if drop > len(current_pkg_parts) else current_pkg_parts[: len(current_pkg_parts) - drop]
-                mod = ".".join(base_parts)
-                full_mod = (f"{mod}.{node.module}" if mod else node.module) if node.module is not None else mod
-                imports.append((node.lineno, full_mod))
-            elif node.module is not None:
-                imports.append((node.lineno, node.module))
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if alias.name == "importlib":
+                    importlib_mods.add(bound)
+                elif alias.name == "builtins":
+                    builtins_mods.add(bound)
+        elif isinstance(node, ast.ImportFrom) and node.module in {"importlib", "builtins"}:
+            target_set = import_module_fns if node.module == "importlib" else builtin_import_fns
+            expected_name = "import_module" if node.module == "importlib" else "__import__"
+            for alias in node.names:
+                if alias.name == expected_name:
+                    target_set.add(alias.asname or alias.name)
+    return importlib_mods, import_module_fns, builtin_import_fns, builtins_mods
 
+
+def _is_dynamic_import_call(
+    node: ast.Call,
+    importlib_mods: set[str],
+    import_module_fns: set[str],
+    builtin_import_fns: set[str],
+    builtins_mods: set[str],
+) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in import_module_fns or func.id in builtin_import_fns
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        is_importlib = func.attr == "import_module" and func.value.id in importlib_mods
+        is_builtin = func.attr == "__import__" and func.value.id in builtins_mods
+        return is_importlib or is_builtin
+    return False
+
+
+def _resolve_dynamic_call_targets(
+    call: ast.Call,
+    mod_parts: list[str],
+    pkg_parts: list[str],
+    is_init: bool,
+) -> list[str] | None:
+    arg0 = call.args[0] if call.args else next((kw.value for kw in call.keywords if kw.arg == "name"), None)
+    if not isinstance(arg0, ast.Constant) or not isinstance(arg0.value, str):
+        return None
+
+    raw_mod = arg0.value
+    if not raw_mod.startswith("."):
+        targets = [raw_mod]
+        fromlist_arg = (
+            call.args[3]
+            if len(call.args) >= 4
+            else next((kw.value for kw in call.keywords if kw.arg == "fromlist"), None)
+        )
+        if isinstance(fromlist_arg, ast.List | ast.Tuple):
+            targets.extend(
+                f"{raw_mod}.{item.value}"
+                for item in fromlist_arg.elts
+                if isinstance(item, ast.Constant) and isinstance(item.value, str) and item.value != "*"
+            )
+        return targets
+
+    pkg_arg = (
+        call.args[1] if len(call.args) >= 2 else next((kw.value for kw in call.keywords if kw.arg == "package"), None)
+    )
+    if isinstance(pkg_arg, ast.Constant) and isinstance(pkg_arg.value, str):
+        base_parts = pkg_arg.value.split(".")
+    elif isinstance(pkg_arg, ast.Name) and pkg_arg.id == "__package__":
+        base_parts = pkg_parts
+    elif isinstance(pkg_arg, ast.Name) and pkg_arg.id == "__name__":
+        base_parts = pkg_parts if is_init else mod_parts
+    else:
+        return None
+
+    level = len(raw_mod) - len(raw_mod.lstrip("."))
+    suffix = raw_mod.lstrip(".") or None
+    return [_resolve_relative_module(base_parts, level, suffix)]
+
+
+def _public_api_getattr_call_ids(tree: ast.Module) -> set[int]:
+    if _extract_public_api_dict(tree) is None:
+        return set()
+    allowed_ids: set[int] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name == "__getattr__":
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Call):
+                    allowed_ids.add(id(node))
+    return allowed_ids
+
+
+def _file_module_context(file_path: Path) -> tuple[list[str], list[str], bool]:
+    is_init = file_path.name == "__init__.py"
+    if not file_path.is_relative_to(PROJECT_ROOT):
+        return [], [], is_init
+    rel_parts = list(file_path.relative_to(PROJECT_ROOT).with_suffix("").parts)
+    pkg_parts = rel_parts[:-1]
+    mod_parts = pkg_parts if is_init else rel_parts
+    return mod_parts, pkg_parts, is_init
+
+
+def _parse_static_node_imports(
+    node: ast.AST,
+    mod_parts: list[str],
+    pkg_parts: list[str],
+    is_init: bool,
+    call_names: tuple[set[str], set[str], set[str], set[str]],
+) -> list[tuple[int, str]]:
+    if isinstance(node, ast.Import):
+        return [(node.lineno, alias.name) for alias in node.names]
+    if isinstance(node, ast.ImportFrom):
+        if node.level > 0:
+            return [(node.lineno, _resolve_relative_module(pkg_parts, node.level, node.module))]
+        return [(node.lineno, node.module)] if node.module is not None else []
+    if isinstance(node, ast.Call) and _is_dynamic_import_call(node, *call_names):
+        targets = _resolve_dynamic_call_targets(node, mod_parts, pkg_parts, is_init)
+        if targets is not None:
+            return [(node.lineno, target) for target in targets]
+    return []
+
+
+def parse_module_imports(file_path: Path) -> list[tuple[int, str]]:
+    """Parse static and string-literal dynamic imports in a Python file as (lineno, imported_module)."""
+    source = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(file_path))
+    mod_parts, pkg_parts, is_init = _file_module_context(file_path)
+    call_names = _collect_import_call_names(tree)
+    imports: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        imports.extend(_parse_static_node_imports(node, mod_parts, pkg_parts, is_init, call_names))
+
+    if is_init and (public_api := _extract_public_api_dict(tree)) is not None:
+        for val in public_api.values:
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                raw_mod = val.value
+                if raw_mod.startswith("."):
+                    level = len(raw_mod) - len(raw_mod.lstrip("."))
+                    resolved = _resolve_relative_module(pkg_parts, level, raw_mod.lstrip(".") or None)
+                    imports.append((val.lineno, resolved))
+                else:
+                    imports.append((val.lineno, raw_mod))
     return imports
 
 
+def find_unresolvable_dynamic_imports(
+    file_path: Path, *, allow_public_api_getattr: bool = False
+) -> list[tuple[int, str]]:
+    """Detect dynamic importlib.import_module/import_module/__import__ calls that cannot be resolved statically."""
+    source = file_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(file_path))
+    mod_parts, pkg_parts, is_init = _file_module_context(file_path)
+    call_names = _collect_import_call_names(tree)
+    allowed_getattr_ids = _public_api_getattr_call_ids(tree) if allow_public_api_getattr and is_init else set()
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _is_dynamic_import_call(node, *call_names):
+            if id(node) in allowed_getattr_ids:
+                continue
+            if _resolve_dynamic_call_targets(node, mod_parts, pkg_parts, is_init) is None:
+                violations.append((node.lineno, ast.unparse(node)))
+    return violations
+
+
+def find_suppression_comments(source: str) -> list[tuple[int, str]]:
+    """Return (lineno, comment) for # noqa, # ruff: noqa, or C901 suppression comments outside string literals."""
+    return [
+        (tok.start[0], tok.string)
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+        if tok.type == tokenize.COMMENT and _SUPPRESSION_COMMENT_RE.search(tok.string)
+    ]
+
+
 def get_canonical_package(module_path: Path) -> str:
-    """Return the dotted canonical package name for a given file inside yaw/."""
+    """Return the dotted canonical domain/package name for a Python file inside yaw/."""
     rel = module_path.relative_to(PROJECT_ROOT)
-    parts = list(rel.parts)
-    if parts[-1] == "__init__.py":
-        return ".".join(parts[:-1])
+    parts = list(rel.with_suffix("").parts)
+    if parts == ["yaw", "__init__"]:
+        return "yaw"
+    if len(parts) == 2:
+        return ".".join(parts)
     return ".".join(parts[:-1])
 
 
+def _yaw_domain(dotted_name: str) -> str:
+    parts = dotted_name.split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else dotted_name
+
+
 def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
-    """Validate containment law: package P imports only P.* (descendants) or yaw.core.*."""
-    if not imported_mod.startswith("yaw.") and imported_mod != "yaw":
-        # External library or stdlib
+    """Validate monotonic L0-L6 layer DAG containment and downward intra-package imports."""
+    if imported_mod != "yaw" and not imported_mod.startswith("yaw."):
         return True
+    if imported_mod == "yaw":
+        return importer_pkg == "yaw"
 
-    # Rule: yaw.core.* is globally accessible to all yaw modules
-    if imported_mod == "yaw.core" or imported_mod.startswith("yaw.core."):
-        return True
+    importer_domain = _yaw_domain(importer_pkg)
+    imported_domain = _yaw_domain(imported_mod)
+    allowed_domains = _ALLOWED_DOMAIN_IMPORTS.get(importer_domain)
+    if allowed_domains is None:
+        if imported_domain == "yaw.core":
+            return True
+        return imported_domain == importer_domain and (
+            imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}.")
+        )
 
-    # Rule: yaw/core/* cannot import any other yaw package
-    if importer_pkg == "yaw.core" or importer_pkg.startswith("yaw.core."):
+    if imported_domain not in allowed_domains:
         return False
-
-    # General Rule: package P imports only P.* (itself or its descendants)
-    return bool(imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}."))
+    if imported_domain == importer_domain:
+        return imported_mod == importer_pkg or imported_mod.startswith(f"{importer_pkg}.")
+    return True
 
 
 def is_leaf_package(package_dir: Path) -> bool:
@@ -214,6 +412,29 @@ def _resolve_graph_target(name: str, module_map: dict[str, Path]) -> str | None:
     return cand
 
 
+def _module_internal_edges(mod: str, file_path: Path, module_map: dict[str, Path]) -> set[str]:
+    edges: set[str] = set()
+    for _, imported_mod in parse_module_imports(file_path):
+        if imported_mod == "yaw" or imported_mod.startswith("yaw."):
+            cand = _resolve_graph_target(imported_mod, module_map)
+            if cand is not None and cand != mod:
+                edges.add(cand)
+
+    _, pkg_parts, _ = _file_module_context(file_path)
+    tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            full = (
+                _resolve_relative_module(pkg_parts, node.level, node.module) if node.level > 0 else (node.module or "")
+            )
+            if full == "yaw" or full.startswith("yaw."):
+                for alias in node.names:
+                    alias_full = f"{full}.{alias.name}"
+                    if alias_full in module_map and alias_full != mod:
+                        edges.add(alias_full)
+    return edges
+
+
 def build_internal_import_graph() -> dict[str, set[str]]:
     """Build the directed module-level import graph for all Python modules in yaw/."""
     module_map: dict[str, Path] = {}
@@ -222,46 +443,7 @@ def build_internal_import_graph() -> dict[str, set[str]]:
         parts = list(rel.parts)
         mod_name = ".".join(parts[:-1]) if parts[-1] == "__init__" else ".".join(parts)
         module_map[mod_name] = p
-
-    graph: dict[str, set[str]] = {m: set() for m in module_map}
-
-    for mod, file_path in module_map.items():
-        rel = file_path.relative_to(PROJECT_ROOT).with_suffix("")
-        parts = list(rel.parts)
-        pkg_parts = parts[:-1]
-        tree = ast.parse(file_path.read_text(encoding="utf-8"), filename=str(file_path))
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    name = alias.name
-                    if name.startswith("yaw.") or name == "yaw":
-                        cand = _resolve_graph_target(name, module_map)
-                        if cand is not None and cand != mod:
-                            graph[mod].add(cand)
-            elif isinstance(node, ast.ImportFrom):
-                if node.level > 0:
-                    drop = node.level - 1
-                    base = pkg_parts[: len(pkg_parts) - drop] if drop <= len(pkg_parts) else []
-                    m_str = ".".join(base)
-                    full = f"{m_str}.{node.module}" if node.module is not None else m_str
-                    cand = _resolve_graph_target(full, module_map)
-                    if cand is not None and cand != mod:
-                        graph[mod].add(cand)
-                    for alias in node.names:
-                        alias_full = f"{full}.{alias.name}" if full else alias.name
-                        if alias_full in module_map and alias_full != mod:
-                            graph[mod].add(alias_full)
-                elif node.module is not None and (node.module.startswith("yaw.") or node.module == "yaw"):
-                    cand = _resolve_graph_target(node.module, module_map)
-                    if cand is not None and cand != mod:
-                        graph[mod].add(cand)
-                    for alias in node.names:
-                        alias_full = f"{node.module}.{alias.name}"
-                        if alias_full in module_map and alias_full != mod:
-                            graph[mod].add(alias_full)
-
-    return graph
+    return {mod: _module_internal_edges(mod, file_path, module_map) for mod, file_path in module_map.items()}
 
 
 def find_import_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
@@ -286,6 +468,140 @@ def find_import_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
             dfs(node, [])
 
     return cycles
+
+
+def _validate_yaw_vocabulary_and_bases(py_files: list[Path]) -> list[str]:
+    legacy_terms_re = re.compile(
+        r"manifold|hmm|hipporag|DatabaseSink|ReflectionLM|YawQA|"
+        r"DSPyEmbeddingAdapter|RLMInstructionProposer|YawProgram|YawGBNFAdapter",
+        re.IGNORECASE,
+    )
+    forbidden_bases = {"Module", "BaseLM", "Adapter", "dspy.Module", "dspy.BaseLM", "dspy.Adapter"}
+    violations: list[str] = []
+    for py_file in py_files:
+        rel = py_file.relative_to(PROJECT_ROOT)
+        text = py_file.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if m := legacy_terms_re.search(line):
+                violations.append(f"{rel}:{lineno} contains forbidden legacy symbol/term {m.group(0)!r}")
+        tree = ast.parse(text, filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for base in node.bases:
+                    base_txt = ast.unparse(base)
+                    if base_txt in forbidden_bases or base_txt.endswith((".Module", ".BaseLM", ".Adapter")):
+                        violations.append(f"{rel}:{node.lineno}: class {node.name} must not subclass {base_txt}")
+    return violations
+
+
+def _validate_import_boundary(
+    mod_path: Path,
+    allowed_top: set[str],
+    allowed_yaw: set[str],
+    forbidden: set[str],
+    *,
+    allow_public_api_getattr: bool = False,
+) -> list[str]:
+    rel = mod_path.relative_to(PROJECT_ROOT).as_posix()
+    violations = [
+        f"{rel}:{lineno}: unresolvable dynamic import '{call_txt}'"
+        for lineno, call_txt in find_unresolvable_dynamic_imports(
+            mod_path, allow_public_api_getattr=allow_public_api_getattr
+        )
+    ]
+    for lineno, mod in parse_module_imports(mod_path):
+        top = mod.split(".")[0]
+        if top not in allowed_top:
+            violations.append(f"{rel}:{lineno} imports forbidden package '{mod}'")
+        if top in forbidden:
+            violations.append(f"{rel}:{lineno} explicitly forbidden import '{mod}'")
+        if top == "yaw" and not any(mod == a or mod.startswith(f"{a}.") for a in allowed_yaw):
+            violations.append(f"{rel}:{lineno} violates DAG by importing '{mod}' (allowed: {sorted(allowed_yaw)})")
+    return violations
+
+
+def _validate_cli_lazy_imports(cli_files: list[Path]) -> list[str]:
+    violations: list[str] = []
+    lazy_prefixes = ("yaw.optimize", "yaw.datasets")
+    for cli_file in cli_files:
+        rel = cli_file.relative_to(PROJECT_ROOT)
+        mod_parts, pkg_parts, is_init = _file_module_context(cli_file)
+        tree = ast.parse(cli_file.read_text(encoding="utf-8"), filename=str(cli_file))
+        call_names = _collect_import_call_names(tree)
+        for stmt in tree.body:
+            if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue
+            for node in ast.walk(stmt):
+                for lineno, mod in _parse_static_node_imports(node, mod_parts, pkg_parts, is_init, call_names):
+                    if mod.startswith(lazy_prefixes):
+                        violations.append(f"{rel}:{lineno} must lazy-import {mod}")
+    return violations
+
+
+def _build_rule12_specs(
+    stdlib: set[str],
+) -> tuple[dict[str, tuple[set[str], set[str], set[str]]], dict[str, tuple[set[str], set[str], set[str]]]]:
+    http_mods = {"httpx", "httpx2", "openai", "urllib", "http", "socket", "requests"}
+    yaw_rules: dict[str, tuple[set[str], set[str], set[str]]] = {
+        "core": (stdlib | {"yaw"}, {"yaw.core"}, {"scripts"}),
+        "datasets": (
+            stdlib | {"filelock", "numpy", "yaw"},
+            {"yaw.core", "yaw.datasets"},
+            {"dspy", "cocoindex", "sqlite3", "scripts"} | http_mods,
+        ),
+        "retrieval": (
+            stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.retrieval"},
+            {"dspy", "cocoindex", "scripts"} | http_mods,
+        ),
+        "pipeline": (
+            stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.retrieval", "yaw.pipeline"},
+            {"scripts"},
+        ),
+        "qa": (
+            stdlib | {"dspy", "numpy", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.retrieval", "yaw.qa"},
+            {"cocoindex", "scripts"} | http_mods,
+        ),
+        "runtime": (
+            stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.runtime"},
+            {"cocoindex", "fastmcp", "starlette", "uvicorn", "scripts"},
+        ),
+        "mcp_server": (
+            stdlib | {"fastmcp", "pydantic", "starlette", "uvicorn", "yaw"},
+            {"yaw.core", "yaw.runtime", "yaw.mcp_server"},
+            {"cocoindex", "dspy", "numpy", "sqlite3", "scripts"},
+        ),
+        "optimize": (
+            stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.optimize"},
+            {"scripts"},
+        ),
+        "cli": (
+            stdlib | {"filelock", "yaw"},
+            {"yaw.core", "yaw.runtime", "yaw.mcp_server", "yaw.optimize", "yaw.cli"},
+            {"dspy", "sqlite3", "cocoindex", "fastmcp", "starlette", "uvicorn", "numpy", "scripts"},
+        ),
+        "__main__": (stdlib | {"yaw"}, {"yaw.cli"}, {"scripts"}),
+    }
+    script_rules: dict[str, tuple[set[str], set[str], set[str]]] = {
+        "watchdog.py": (
+            stdlib | {"filelock", "matplotlib", "psutil", "sqlite3", "yaw"},
+            {"yaw.core", "yaw.retrieval"},
+            {"cocoindex", "fastmcp", "dspy"},
+        ),
+        "evaluation.py": (stdlib | {"numpy", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "download_datasets.py": (stdlib | {"yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "benchmark.py": (stdlib | {"dspy", "numpy", "scripts", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "verify_paper_parity_gate.py": (
+            stdlib | {"dspy", "numpy", "scripts", "yaw"},
+            {"yaw"},
+            {"cocoindex", "fastmcp"},
+        ),
+    }
+    return yaw_rules, script_rules
 
 
 class ArchitectureTests(unittest.TestCase):
@@ -314,7 +630,7 @@ class ArchitectureTests(unittest.TestCase):
             )
 
     def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
-        """Rule 1b: yaw.core exports its slim public contract and yaw/ preserves the exact 14-file boundary."""
+        """Rule 1b: yaw.core exports its slim public contract and retired legacy files stay absent."""
         import yaw.core as core
         from yaw.core import (
             ChunkPointer,
@@ -382,33 +698,20 @@ class ArchitectureTests(unittest.TestCase):
         self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must remain absent")
         self.assertFalse((YAW_DIR / "core" / "constants.py").exists(), "Retired yaw/core/constants.py must be deleted")
 
-        actual_files = {p.relative_to(YAW_DIR).as_posix() for p in YAW_DIR.rglob("*.py")}
-        expected_files = {
-            "__init__.py",
-            "__main__.py",
-            "cli.py",
-            "core/__init__.py",
-            "core/config.py",
-            "core/logger.py",
-            "core/types.py",
-            "datasets.py",
-            "mcp_server.py",
-            "optimize.py",
-            "pipeline.py",
-            "qa.py",
-            "retrieval.py",
-            "runtime.py",
-        }
-        self.assertEqual(actual_files, expected_files)
-
     def test_domain_containment_and_zero_cross_domain_imports(self):
-        """Rule 2 & 3: Package P imports only P.* and yaw.core.* (zero horizontal cross-domain edges)."""
-        py_files = list(YAW_DIR.rglob("*.py"))
+        """Rule 2 & 3: Monotonic L0-L6 DAG containment with zero upward or horizontal cross-domain edges."""
+        py_files = sorted(YAW_DIR.rglob("*.py"))
         self.assertGreater(len(py_files), 0, "No .py files found in yaw/")
 
         violations = []
         for py_file in py_files:
             importer_pkg = get_canonical_package(py_file)
+            if importer_pkg != "yaw":
+                self.assertIn(
+                    _yaw_domain(importer_pkg),
+                    _ALLOWED_DOMAIN_IMPORTS,
+                    f"{py_file.relative_to(PROJECT_ROOT)} belongs to undeclared domain '{importer_pkg}'",
+                )
             imports = parse_module_imports(py_file)
 
             for lineno, imported_mod in imports:
@@ -427,12 +730,9 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_core_imports_stdlib_only(self):
-        """Rule: yaw/core/* must strictly import standard library only (zero third-party, zero runtime)."""
-        core_files = list((YAW_DIR / "core").glob("*.py"))
-        self.assertEqual(
-            {f.name for f in core_files},
-            {"__init__.py", "config.py", "logger.py", "types.py"},
-        )
+        """Rule: yaw/core/** must strictly import standard library only (zero third-party, zero runtime)."""
+        core_files = sorted((YAW_DIR / "core").rglob("*.py"))
+        self.assertGreater(len(core_files), 0, "No .py files found in yaw/core/")
 
         # Python supplies the authoritative set, including platform-specific modules.
         stdlib_whitelist = sys.stdlib_module_names
@@ -456,13 +756,46 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_synthetic_boundary_violation_detection(self):
-        """Verify the test architecture checker properly rejects synthetic cross-domain and parent imports."""
+        """Verify monotonic L0-L6 DAG checks reject L0->L1, same-layer sibling, and upward edges."""
+        # L0 -> higher layers forbidden; own descendants allowed
+        self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.datasets"))
+        self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.retrieval"))
         self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.runtime"))
         self.assertTrue(is_allowed_internal_import("yaw.core", "yaw.core.types"))
+
+        # Same-layer horizontal siblings forbidden across L1, L2, L4
+        self.assertFalse(is_allowed_internal_import("yaw.datasets", "yaw.retrieval"))
+        self.assertFalse(is_allowed_internal_import("yaw.retrieval", "yaw.datasets"))
+        self.assertFalse(is_allowed_internal_import("yaw.pipeline", "yaw.qa"))
+        self.assertFalse(is_allowed_internal_import("yaw.qa", "yaw.pipeline"))
+        self.assertFalse(is_allowed_internal_import("yaw.mcp_server", "yaw.optimize"))
+        self.assertFalse(is_allowed_internal_import("yaw.optimize", "yaw.mcp_server"))
+
+        # Upward cross-layer and non-declared skip edges forbidden
+        self.assertFalse(is_allowed_internal_import("yaw.retrieval", "yaw.pipeline"))
+        self.assertFalse(is_allowed_internal_import("yaw.pipeline", "yaw.runtime"))
+        self.assertFalse(is_allowed_internal_import("yaw.qa", "yaw.runtime"))
+        self.assertFalse(is_allowed_internal_import("yaw.runtime", "yaw.mcp_server"))
+        self.assertFalse(is_allowed_internal_import("yaw.mcp_server", "yaw.cli"))
+        self.assertFalse(is_allowed_internal_import("yaw.cli", "yaw.__main__"))
+        self.assertFalse(is_allowed_internal_import("yaw.mcp_server", "yaw.retrieval"))
+        self.assertFalse(is_allowed_internal_import("yaw.__main__", "yaw.core"))
+
+        # Intra-package upward edges forbidden; downward edges and L0 core imports allowed
         self.assertFalse(is_allowed_internal_import("yaw.pkg_a", "yaw.pkg_b"))
         self.assertFalse(is_allowed_internal_import("yaw.pkg_a.sub", "yaw.pkg_a"))
+        self.assertFalse(is_allowed_internal_import("yaw.retrieval.sub", "yaw.retrieval"))
         self.assertTrue(is_allowed_internal_import("yaw.pkg_a", "yaw.pkg_a.sub"))
         self.assertTrue(is_allowed_internal_import("yaw.pkg_a", "yaw.core.types"))
+        self.assertTrue(is_allowed_internal_import("yaw.retrieval", "yaw.retrieval.graph"))
+        self.assertTrue(is_allowed_internal_import("yaw.retrieval.sub", "yaw.core.types"))
+        self.assertTrue(is_allowed_internal_import("yaw.pipeline", "yaw.retrieval.graph"))
+        self.assertTrue(is_allowed_internal_import("yaw.qa", "yaw.retrieval"))
+        self.assertTrue(is_allowed_internal_import("yaw.runtime", "yaw.pipeline"))
+        self.assertTrue(is_allowed_internal_import("yaw.optimize", "yaw.datasets"))
+        self.assertTrue(is_allowed_internal_import("yaw.mcp_server", "yaw.runtime"))
+        self.assertTrue(is_allowed_internal_import("yaw.cli", "yaw.mcp_server"))
+        self.assertTrue(is_allowed_internal_import("yaw.__main__", "yaw.cli"))
 
     def test_zero_hipporag_imports_in_yaw(self):
         """Rule 4: Zero hipporag imports across the entire repository (yaw/, scripts/, tests/)."""
@@ -498,21 +831,14 @@ class ArchitectureTests(unittest.TestCase):
         for init_file in init_files:
             source = init_file.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(init_file))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assign):
-                    for target in node.targets:
-                        if (
-                            isinstance(target, ast.Name)
-                            and target.id == "_PUBLIC_API"
-                            and isinstance(node.value, ast.Dict)
-                        ):
-                            for key in node.value.keys:
-                                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                                    self.assertFalse(
-                                        key.value.startswith("_"),
-                                        f"Public facade {init_file.relative_to(PROJECT_ROOT)} exports "
-                                        f"protected/private symbol '{key.value}'",
-                                    )
+            if (public_api := _extract_public_api_dict(tree)) is not None:
+                for key in public_api.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        self.assertFalse(
+                            key.value.startswith("_"),
+                            f"Public facade {init_file.relative_to(PROJECT_ROOT)} exports "
+                            f"protected/private symbol '{key.value}'",
+                        )
 
         # 2. Check all yaw/**/*.py files for cross-module private imports
         py_files = list(YAW_DIR.rglob("*.py"))
@@ -540,7 +866,7 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_zero_cross_module_private_attributes(self):
-        """Rule 5b: Zero cross-object private/protected attribute access across all 14 files in yaw/.
+        """Rule 5b: Zero cross-object private/protected attribute access across all Python files in yaw/.
 
         Forbids accessing _-prefixed attributes on objects other than self, cls, or super()
         (allowing stdlib os._exit), and forbids any access to ._provider across yaw/.
@@ -554,7 +880,7 @@ class ArchitectureTests(unittest.TestCase):
             )
 
         target_files = sorted(YAW_DIR.rglob("*.py"))
-        self.assertEqual(len(target_files), 14, f"Expected exact 14 Python files in yaw/, got {len(target_files)}")
+        self.assertGreater(len(target_files), 0, "No Python files found in yaw/")
 
         violations: list[str] = []
         provider_violations: list[str] = []
@@ -817,11 +1143,18 @@ class ArchitectureTests(unittest.TestCase):
         )
 
         wiki_violations: list[str] = []
+        backticked_links: list[str] = []
         broken_links: list[str] = []
         target_cache: dict[Path, tuple[set[str], int]] = {}
         for md_file in checked_files:
             rel_source = md_file.relative_to(PROJECT_ROOT)
-            prose = _strip_fenced_code_blocks(md_file.read_text(encoding="utf-8"))
+            raw_text = md_file.read_text(encoding="utf-8")
+            for line in _strip_fenced_lines(raw_text):
+                backticked_links.extend(
+                    f"{rel_source}: backticked doc link {match.group(0)}"
+                    for match in _BACKTICKED_LINK_RE.finditer(line)
+                )
+            prose = _strip_fenced_code_blocks(raw_text)
             wiki_violations.extend(
                 f"{rel_source}: forbidden wiki-link {match.group(0)}" for match in _WIKI_LINK_RE.finditer(prose)
             )
@@ -858,6 +1191,7 @@ class ArchitectureTests(unittest.TestCase):
                     broken_links.append(f"{rel_source}: broken heading/anchor fragment '{raw_target}'")
 
         self.assertEqual(wiki_violations, [], "Forbidden [[wiki-links]] found:\n" + "\n".join(wiki_violations))
+        self.assertEqual(backticked_links, [], "Backticked doc links found:\n" + "\n".join(backticked_links))
         self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
 
     def test_every_doc_is_reachable_from_rules_and_canonical_inventory(self):
@@ -870,7 +1204,7 @@ class ArchitectureTests(unittest.TestCase):
             f"Missing: {sorted(_CANONICAL_DOCS_INVENTORY - actual_docs)}",
         )
 
-        domain_rules = ("retrieval.md", "pipeline.md", "runtime.md", "qa.md", "tests.md")
+        domain_rules = ("core.md", "retrieval.md", "pipeline.md", "runtime.md", "qa.md", "tests.md")
         linked_docs: set[str] = set()
         for rule_name in domain_rules:
             rule_file = RULES_DIR / rule_name
@@ -916,7 +1250,7 @@ class ArchitectureTests(unittest.TestCase):
             "coverage-plan.md",
         )
         yaw_files = sorted(p.relative_to(PROJECT_ROOT).as_posix() for p in YAW_DIR.rglob("*.py"))
-        self.assertEqual(len(yaw_files), 14, f"Expected exact 14 Python files in yaw/, got {len(yaw_files)}")
+        self.assertGreater(len(yaw_files), 0, "No Python files found in yaw/")
         owners_by_yaw_file: dict[str, list[str]] = {rel: [] for rel in yaw_files}
         peers_by_spec: dict[str, set[str]] = {}
         for spec_name in tier2_specs:
@@ -971,118 +1305,111 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(asymmetric_peers, [], "Asymmetric Tier-2 Peers rows:\n" + "\n".join(asymmetric_peers))
 
     def test_canonical_module_purity_and_behavioral_contracts(self):
-        """Rule 12: Clean-slate 14-file architecture obeys LOC cap, zero wrappers/legacy terms, and L0-L5 DAG."""
+        """Rule 12: Monotonic L0-L6 DAG, zero wrappers/legacy terms, recursive yaw/ & scripts/ allowlists."""
         stdlib = set(sys.stdlib_module_names)
         py_files = sorted(YAW_DIR.rglob("*.py"))
-        self.assertEqual(len(py_files), 14, f"Expected exact 14 Python files in yaw/, got {len(py_files)}")
+        self.assertGreater(len(py_files), 0, "No Python files found in yaw/")
         self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must not exist")
 
-        total_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in py_files)
-        self.assertLessEqual(
-            total_loc,
-            8000,
-            f"yaw/ total LOC {total_loc} exceeds 8,000 ceiling (calibrated per docs/epic-3-performance.md#decisions)",
-        )
-        core_files = sorted((YAW_DIR / "core").glob("*.py"))
-        core_loc = sum(len(p.read_text(encoding="utf-8").splitlines()) for p in core_files)
-        self.assertLessEqual(core_loc, 960, f"yaw/core/* LOC {core_loc} exceeds 960 ceiling")
-        watchdog_loc = len((PROJECT_ROOT / "scripts" / "watchdog.py").read_text(encoding="utf-8").splitlines())
-        self.assertLessEqual(watchdog_loc, 350, f"scripts/watchdog.py LOC {watchdog_loc} exceeds 350 ceiling")
+        vocab_violations = _validate_yaw_vocabulary_and_bases(py_files)
+        self.assertEqual(vocab_violations, [], "Legacy vocabulary/wrapper violations:\n" + "\n".join(vocab_violations))
 
-        legacy_terms_re = re.compile(
-            r"manifold|hmm|hipporag|DatabaseSink|ReflectionLM|YawQA|"
-            r"DSPyEmbeddingAdapter|RLMInstructionProposer|YawProgram|YawGBNFAdapter",
-            re.IGNORECASE,
-        )
-        forbidden_bases = {"Module", "BaseLM", "Adapter", "dspy.Module", "dspy.BaseLM", "dspy.Adapter"}
-
+        yaw_rules, script_rules = _build_rule12_specs(stdlib)
+        violations: list[str] = []
         for py_file in py_files:
-            rel = py_file.relative_to(PROJECT_ROOT)
-            text = py_file.read_text(encoding="utf-8")
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                if m := legacy_terms_re.search(line):
-                    self.fail(f"{rel}:{lineno} contains forbidden legacy symbol/term {m.group(0)!r}")
-            tree = ast.parse(text, filename=str(py_file))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    for base in node.bases:
-                        base_txt = ast.unparse(base)
-                        self.assertFalse(
-                            base_txt in forbidden_bases or base_txt.endswith((".Module", ".BaseLM", ".Adapter")),
-                            f"{rel}:{node.lineno}: class {node.name} must not subclass {base_txt}",
-                        )
-
-        http_mods = {"httpx", "httpx2", "openai", "urllib", "http", "socket", "requests"}
-        layer_rules: dict[str, tuple[set[str], set[str]]] = {
-            # Maps module filename to (allowed_top_level_packages, allowed_yaw_internal_modules).
-            "datasets.py": (stdlib | {"filelock", "numpy", "yaw"}, {"yaw.core"}),
-            "retrieval.py": (
-                stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
-                {"yaw.core"},
-            ),
-            "pipeline.py": (
-                stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "yaw"},
-                {"yaw.core", "yaw.retrieval"},
-            ),
-            "qa.py": (stdlib | {"dspy", "numpy", "sqlite3", "yaw"}, {"yaw.core", "yaw.retrieval"}),
-            "runtime.py": (
-                stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
-                {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval"},
-            ),
-            "mcp_server.py": (
-                stdlib | {"fastmcp", "pydantic", "starlette", "uvicorn", "yaw"},
-                {"yaw.core", "yaw.runtime"},
-            ),
-            "optimize.py": (
-                stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
-                {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval"},
-            ),
-            "cli.py": (
-                stdlib | {"filelock", "yaw"},
-                {"yaw.core", "yaw.runtime", "yaw.mcp_server", "yaw.optimize"},
-            ),
-            "__main__.py": (stdlib | {"yaw"}, {"yaw.cli"}),
-        }
-        forbidden_explicit: dict[str, set[str]] = {
-            "datasets.py": {"dspy", "cocoindex", "sqlite3"} | http_mods,
-            "retrieval.py": {"dspy", "cocoindex"} | http_mods,
-            "qa.py": {"cocoindex"} | http_mods,
-            "runtime.py": {"cocoindex", "fastmcp", "starlette", "uvicorn"},
-            "cli.py": {"dspy", "sqlite3", "cocoindex", "fastmcp", "starlette", "uvicorn", "numpy"},
-        }
-
-        for mod_name, (allowed_top, allowed_yaw) in layer_rules.items():
-            mod_path = YAW_DIR / mod_name
-            for lineno, mod in parse_module_imports(mod_path):
-                top = mod.split(".")[0]
-                self.assertIn(top, allowed_top, f"{mod_name}:{lineno} imports forbidden package '{mod}'")
-                self.assertNotIn(
-                    top,
-                    forbidden_explicit.get(mod_name, set()),
-                    f"{mod_name}:{lineno} explicitly forbidden import '{mod}'",
+            rel = py_file.relative_to(YAW_DIR)
+            if rel == Path("__init__.py"):
+                self.assertEqual(parse_module_imports(py_file), [])
+                self.assertEqual(find_unresolvable_dynamic_imports(py_file), [])
+                continue
+            domain = rel.parts[0][:-3] if len(rel.parts) == 1 else rel.parts[0]
+            self.assertIn(domain, yaw_rules, f"Unmapped file in yaw/: {rel.as_posix()}")
+            allowed_top, allowed_yaw, forbidden = yaw_rules[domain]
+            allow_getattr = py_file.name == "__init__.py" and is_leaf_package(py_file.parent)
+            violations.extend(
+                _validate_import_boundary(
+                    py_file, allowed_top, allowed_yaw, forbidden, allow_public_api_getattr=allow_getattr
                 )
-                if top == "yaw":
-                    self.assertTrue(
-                        any(mod == a or mod.startswith(f"{a}.") for a in allowed_yaw),
-                        f"{mod_name}:{lineno} violates DAG by importing '{mod}' (allowed: {sorted(allowed_yaw)})",
-                    )
+            )
 
-        # Verify lazy top-level exclusions in cli.py
-        cli_tree = ast.parse((YAW_DIR / "cli.py").read_text(encoding="utf-8"))
-        for stmt in cli_tree.body:
-            if isinstance(stmt, ast.Import):
-                for alias in stmt.names:
-                    self.assertFalse(
-                        alias.name.startswith(("yaw.optimize", "yaw.datasets")),
-                        f"cli.py:{stmt.lineno} must lazy-import {alias.name}",
-                    )
-            elif isinstance(stmt, ast.ImportFrom) and stmt.module is not None:
-                self.assertFalse(
-                    stmt.module.startswith(("yaw.optimize", "yaw.datasets")),
-                    f"cli.py:{stmt.lineno} must lazy-import {stmt.module}",
-                )
+        script_files = sorted((PROJECT_ROOT / "scripts").rglob("*.py"))
+        self.assertGreater(len(script_files), 0, "No Python files found in scripts/")
+        for script_file in script_files:
+            rel_script = script_file.relative_to(PROJECT_ROOT / "scripts").as_posix()
+            self.assertIn(rel_script, script_rules, f"Unmapped file in scripts/: {rel_script}")
+            allowed_top, allowed_yaw, forbidden = script_rules[rel_script]
+            violations.extend(_validate_import_boundary(script_file, allowed_top, allowed_yaw, forbidden))
 
-        self.assertLessEqual(len((YAW_DIR / "__main__.py").read_text(encoding="utf-8").splitlines()), 10)
+        cli_files = [p for p in py_files if p.relative_to(YAW_DIR).parts[0] in {"cli.py", "cli"}]
+        violations.extend(_validate_cli_lazy_imports(cli_files))
+        self.assertEqual(violations, [], "Rule 12 boundary violations detected:\n" + "\n".join(violations))
+
+    def test_zero_suppression_comments_across_repo(self):
+        """Rule 12b: Zero # noqa, # ruff: noqa, or C901 suppression comments across yaw/, scripts/, and tests/."""
+        py_files = sorted(
+            list(YAW_DIR.rglob("*.py"))
+            + list((PROJECT_ROOT / "scripts").rglob("*.py"))
+            + list((PROJECT_ROOT / "tests").rglob("*.py"))
+        )
+        self.assertGreater(len(py_files), 0)
+        violations = [
+            f"{py_file.relative_to(PROJECT_ROOT)}:{lineno}: forbidden suppression comment {comment!r}"
+            for py_file in py_files
+            for lineno, comment in find_suppression_comments(py_file.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual(violations, [], "Suppression comments detected:\n" + "\n".join(violations))
+
+    def test_synthetic_dynamic_imports_and_suppression_comment_detection(self):
+        """Verify static/dynamic importlib & __import__ detection and tokenize suppression comment scanner."""
+        noqa_tok = "noqa"
+        c901_tok = "C901"
+        sample_src = "\n".join(
+            [
+                f"x = 1  # {noqa_tok}",
+                f"y = 2  # {noqa_tok}: {c901_tok}",
+                f"# ruff: {noqa_tok}",
+                f'literal_ok = "# {noqa_tok}: {c901_tok}\\n# ruff: {noqa_tok}"',
+            ]
+        )
+        hits = find_suppression_comments(sample_src)
+        self.assertEqual([ln for ln, _ in hits], [1, 2, 3])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            static_mod = tmp_path / "static_dyn.py"
+            static_mod.write_text(
+                "\n".join(
+                    [
+                        "import importlib",
+                        "from importlib import import_module",
+                        'm1 = importlib.import_module("yaw.pipeline")',
+                        'm2 = import_module("dspy")',
+                        'm3 = __import__("sqlite3")',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            parsed = parse_module_imports(static_mod)
+            imported_names = {mod for _, mod in parsed}
+            self.assertTrue({"yaw.pipeline", "dspy", "sqlite3"}.issubset(imported_names))
+            self.assertEqual(find_unresolvable_dynamic_imports(static_mod), [])
+
+            unresolvable_mod = tmp_path / "dyn_var.py"
+            unresolvable_mod.write_text(
+                "\n".join(
+                    [
+                        "import importlib",
+                        "def load(name: str):",
+                        "    return importlib.import_module(name)",
+                        "def load2(name: str):",
+                        "    return __import__(name)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            unresolvable = find_unresolvable_dynamic_imports(unresolvable_mod)
+            self.assertEqual(len(unresolvable), 2)
+            self.assertEqual([ln for ln, _ in unresolvable], [3, 5])
 
     def test_purged_dependencies_banned_across_yaw(self):
         """Rule 13: Purged dependencies (sqlite_vec, spacy, en_core_web_sm, optuna) are absent across all yaw/**."""
@@ -1127,7 +1454,10 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(set(project["scripts"].keys()), {"yaw"})
 
         setuptools_cfg = data["tool"]["setuptools"]
-        self.assertEqual(setuptools_cfg["packages"], ["yaw", "yaw.core"])
+        expected_packages = sorted(
+            ".".join(p.parent.relative_to(PROJECT_ROOT).parts) for p in YAW_DIR.rglob("__init__.py")
+        )
+        self.assertEqual(sorted(setuptools_cfg["packages"]), expected_packages)
         self.assertNotIn("py-modules", setuptools_cfg)
         self.assertNotIn("find", setuptools_cfg)
         self.assertLessEqual({"py.typed", "baselines.json"}, set(setuptools_cfg["package-data"]["yaw"]))

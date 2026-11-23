@@ -421,7 +421,7 @@ Measured performance results record into [evaluation-graph-storage.md](../evalua
 
 ### 4.1 Epistemic Grounding — Hidden States & Tensor-Network Belief Math
 
-- **Rejected Claims:** Static corpora do not evolve over wall-clock time, and simplex-normalized cosine/IDF² potentials are uncalibrated belief states rather than frequentist factual truth probabilities (`[hmm-retrieval.md](hmm-retrieval.md)`).
+- **Rejected Claims:** Static corpora do not evolve over wall-clock time, and simplex-normalized cosine/IDF² potentials are uncalibrated belief states rather than frequentist factual truth probabilities ([hmm-retrieval.md](hmm-retrieval.md)).
 - **Physical Model:** Per Miller, Leek & Schwartz (SIGIR 1999) and Lafferty & Zhai (2001), latent variable $Z_h$ represents the **unobserved compositional query referent state at hop $h$** while corpus sub-spans are polysemous surface emissions sharing strings across disjoint referents. Continuous heterogeneous stalks $U_c \in \mathbb{R}^{d \times r_c}$ and PSD density 4-tensors $\mathcal{P}_h[b, s] \succeq 0$ evolve multi-sense superposition coherently along DAG paths (`O(|E| \cdot H)` sum-product forward-backward smoothing), attenuating dead-end hubs that fail downstream measurement constraints without destructive signed-vector path cancellation.
 
 ### 4.2 Expected Performance Regimes & Primary Structural Ceiling
