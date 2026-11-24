@@ -6,7 +6,7 @@
 
 Status: active, 2026-11-08. Pinned code: `c98aebe`.
 
-- Controls: [types.py](../../yaw/core/types.py), [__init__.py](../../yaw/core/__init__.py), [config.py](../../yaw/core/config.py), [pipeline.py](../../yaw/pipeline.py), [retrieval.py](../../yaw/retrieval.py), [runtime.py](../../yaw/runtime.py), [test_architecture.py](../../tests/core/test_architecture.py) *(historical `yaw/daemon/...` OpenIE/W3C/SHACL modules retired in [bare-bones-replacement-sprint.md](../reviews/bare-bones-replacement-sprint.md))*
+- Controls: [types.py](../../yaw/core/types.py), [__init__.py](../../yaw/core/__init__.py), [config.py](../../yaw/core/config.py), `yaw/pipeline.py`, `yaw/retrieval.py`, [runtime.py](../../yaw/runtime.py), [test_architecture.py](../../tests/core/test_architecture.py) *(historical `yaw/daemon/...` OpenIE/W3C/SHACL modules retired in [bare-bones-replacement-sprint.md](../reviews/bare-bones-replacement-sprint.md))*
 - Depends on: [FOUNDATIONAL.md](../../FOUNDATIONAL.md), [AGENTS.md](../../AGENTS.md), [retrieval.md](../../.agents/rules/retrieval.md), [qa.md](../../.agents/rules/qa.md), [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md)
 - Updated with: [w3c-improvements.md](w3c-improvements.md), [native-cocoindex-graph.md](../native-cocoindex-graph.md), [epistemic-confidence-spec.md](epistemic-confidence-spec.md), [shacl-healer-publication.md](../reviews/shacl-healer-publication.md), [incremental-publication-work.md](../reviews/incremental-publication-work.md)
 

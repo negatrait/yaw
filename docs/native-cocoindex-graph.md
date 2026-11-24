@@ -1,24 +1,24 @@
-# Native CocoIndex graph & `M_FINAL_1B` retrieval engine (`yaw/retrieval.py`)
+# Native CocoIndex graph & `M_FINAL_1B` retrieval engine (`yaw/retrieval/`)
 
 Status: active (frozen `M_FINAL_1B` shipped via `EVAL-5` at `5c4b115`).
 
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
-| Rules | [retrieval.md](../.agents/rules/retrieval.md): `yaw/retrieval.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
-| Owns code | `yaw/retrieval.py` |
-| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`ChunkPointer`, `HydratedPassage`, `resolve_corpus_path`, `YawRuntimeError`, `format_query_for_embedding`); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/pipeline.py` & `yaw/datasets.py` (writes `chunks`, `chunk_fts`, `chunk_vocab` and invokes `compute_db_fingerprints`, `compute_index_artifacts`, `normalize_fts_unicode61` to materialize `rabitq_index` and `citation_graph`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` consuming `RetrievalIndex`, `search_index`, `lexical_search`, `expand_citation_neighbors`, `hydrate_ranked_passages`, and `hydrate_passage`; [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/runtime.py`, `yaw/mcp_server.py` & `yaw/cli.py` (`get_retrieval_index` WAL hot-swaps, `recall`, `qa`); [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `scripts/{benchmark,download_datasets,verify_paper_parity_gate,evaluation}.py` evaluating `build_retrieval_index` and `search_index` parity; [epic-3-performance.md](epic-3-performance.md): owns `scripts/watchdog.py` (`open_readonly_db`) & deferred `EVAL-6` (`SearchResult.completeness`, Graph Scout); [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_retrieval.py`) |
+| Rules | [retrieval.md](../.agents/rules/retrieval.md): `yaw/retrieval/**/*.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
+| Owns code | `yaw/retrieval/**/*.py` |
+| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`ChunkPointer`, `HydratedPassage`, `resolve_corpus_path`, `YawRuntimeError`, `format_query_for_embedding`); [native-cocoindex-indexing.md](native-cocoindex-indexing.md): owns `yaw/pipeline/**/*.py` & `yaw/datasets.py` (writes `chunks`, `chunk_fts`, `chunk_vocab` and invokes `compute_db_fingerprints`, `compute_index_artifacts`, `normalize_fts_unicode61` to materialize `rabitq_index` and `citation_graph`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` consuming `RetrievalIndex`, `search_index`, `lexical_search`, `expand_citation_neighbors`, `hydrate_ranked_passages`, and `hydrate_passage`; [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/runtime.py`, `yaw/mcp_server.py` & `yaw/cli.py` (`get_retrieval_index` WAL hot-swaps, `recall`, `qa`); [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `scripts/{benchmark,download_datasets,verify_paper_parity_gate,evaluation}.py` evaluating `build_retrieval_index` and `search_index` parity; [epic-3-performance.md](epic-3-performance.md): owns `scripts/watchdog.py` (`open_readonly_db`) & deferred `EVAL-6` (`SearchResult.completeness`, Graph Scout); [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_retrieval.py`) |
 | References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local serving constraints |
 | Supersedes / superseded by | Supersedes legacy OpenIE/W3C/SHACL/PPR/HMM graph storage ([archive/w3c-improvements.md](archive/w3c-improvements.md), [archive/epistemic-confidence-spec.md](archive/epistemic-confidence-spec.md)), `sqlite-vec` `vec0` virtual tables, `CandidateStageCache`, and `3cd3952` `VectorSearch` with `M_FINAL_1B` ([mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), `5c4b115`) |
 | Records | [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), [mdl-dag-experiment-report.md](reviews/mdl-dag-experiment-report.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md), [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [evaluation-graph-storage.md](evaluation-graph-storage.md), [evaluation.md](evaluation.md) |
 
 ## 1. Scope & Pure Dependency Boundary
 
-In scope: Read-only hybrid retrieval, 1-bit Extended SoA RaBitQ quantization, single-pass corpus hydration & `# Heading` title extraction, compressed `CitationGraph` & `DiffusionOperators`, tangent-steered cyclic citation + 1-bit PMI diffusion, conditional Noisy-OR evidence aggregation, Rank-1 Cholesky 1-bit DPP reranking, `pool_k = max(top_k * 4, 50)` MaxP span deferral, multilingual lexical search (`unicode61`, umlaut folding, Koehn–Knight compound splitting, CJK bigrams/PMI), `?mode=ro` WAL SHA-256 disk hydration, and strict `INDEX_NOT_READY` vs `CONSISTENCY_ERROR` failure contracts in `yaw/retrieval.py`.
+In scope: Read-only hybrid retrieval, 1-bit Extended SoA RaBitQ quantization, single-pass corpus hydration & `# Heading` title extraction, compressed `CitationGraph` & `DiffusionOperators`, tangent-steered cyclic citation + 1-bit PMI diffusion, conditional Noisy-OR evidence aggregation, Rank-1 Cholesky 1-bit DPP reranking, `pool_k = max(top_k * 4, 50)` MaxP span deferral, multilingual lexical search (`unicode61`, umlaut folding, Koehn–Knight compound splitting, CJK bigrams/PMI), `?mode=ro` WAL SHA-256 disk hydration, and strict `INDEX_NOT_READY` vs `CONSISTENCY_ERROR` failure contracts in `yaw/retrieval/`.
 
-Non-goals: Persistent writes to `yaw.db` or `.yaw/coco_lmdb` (owned by `yaw/pipeline.py` in [native-cocoindex-indexing.md](native-cocoindex-indexing.md)); runtime locking/polling orchestration (`yaw/runtime.py` in [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); Sprint `3.2`–`3.3` lifespan unification, `SearchResult.coverage` / `next_candidates` sparse slip, and dual-root Librarian wiki ([epic-3-performance.md](epic-3-performance.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md)).
+Non-goals: Persistent writes to `yaw.db` or `.yaw/coco_lmdb` (owned by `yaw/pipeline/` in [native-cocoindex-indexing.md](native-cocoindex-indexing.md)); runtime locking/polling orchestration (`yaw/runtime.py` in [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); Sprint `3.2`–`3.3` lifespan unification, `SearchResult.coverage` / `next_candidates` sparse slip, and dual-root Librarian wiki ([epic-3-performance.md](epic-3-performance.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md)).
 
-- **Pure Kernel Containment (`Rule 12`):** `yaw/retrieval.py` imports **only** Python `stdlib`, `numpy`, `scipy`, `sqlite3`, and `yaw.core.*` — zero `dspy`, `cocoindex`, HTTP clients, or retired stack dependencies (`sqlite-vec`, `spacy`, `optuna`, OpenIE/SHACL).
+- **Pure Kernel Containment (`Rule 12`):** `yaw/retrieval/` imports **only** Python `stdlib`, `numpy`, `scipy`, `sqlite3`, and `yaw.core.*` — zero `dspy`, `cocoindex`, HTTP clients, or retired stack dependencies (`sqlite-vec`, `spacy`, `optuna`, OpenIE/SHACL).
 
 <a id="11-pipeline-order-extract-local-evidence-before-global-adjudication"></a>
 <a id="evidence-backed-provenance-restoration"></a>
@@ -30,8 +30,8 @@ Non-goals: Persistent writes to `yaw.db` or `.yaw/coco_lmdb` (owned by `yaw/pipe
 
 - **`?mode=ro` WAL Snapshots (`open_readonly_db`, `_snapshot_tx`):** Opens SQLite in URI read-only mode (`?mode=ro`, `check_same_thread=False`, `isolation_level=None`) with `PRAGMA busy_timeout=30000`, `cache_size=-65536`, `temp_store=MEMORY`, `query_only=ON`, and zero extensions. `_snapshot_tx` acquires a per-connection `RLock` and wraps reads in a single `BEGIN` ... `ROLLBACK` snapshot transaction, validating `chunk_fts` and `chunk_vocab` presence (`CONSISTENCY_ERROR` when `require_fts=True` and absent).
 - **Deterministic SHA-256 Fingerprints (`compute_db_fingerprints`):** Queries `chunks ORDER BY chunk_id ASC` (`chunk_id, embedding_f16, rel_path, source_hash, start_line, end_line, char_start, char_end, ast_island_start, ast_island_end, title`), verifying even/uniform IEEE `<f2>` `float16` LE byte lengths (`CONSISTENCY_ERROR` on null or mismatched rows) and hashing ordered `(chunk_id, embedding_f16)` into `vec_sha256` and chunk coordinates/titles into `source_sha256`.
-- **Single-Pass Disk Hydration & `# Heading` Extraction (`compute_index_artifacts`, `_hydrate_corpus_chunks`, `_build_citation_graph`):**
-  - Materializes `IndexArtifacts` for `yaw/pipeline.py:reconcile_index_tables` in a single disk pass per distinct `rel_posix_path` (`ThreadPoolExecutor(max_workers=16)`), normalizing CRLF/CR to `\n`, decoding UTF-8 strictly, verifying line bounds and SHA-256 `source_hash` (`strict=True` raises `CONSISTENCY_ERROR`), and extracting the first non-empty Markdown `# Heading` (`_extract_markdown_h1`) whenever `ptr.title` is empty.
+- **Single-Pass Disk Hydration & `# Heading` Extraction (`compute_index_artifacts`, `hydrate_corpus_chunks`, `build_citation_graph`):**
+  - Materializes `IndexArtifacts` for `yaw/pipeline/`: `reconcile_index_tables` in a single disk pass per distinct `rel_posix_path` (`ThreadPoolExecutor(max_workers=16)`), normalizing CRLF/CR to `\n`, decoding UTF-8 strictly, verifying line bounds and SHA-256 `source_hash` (`strict=True` raises `CONSISTENCY_ERROR`), and extracting the first non-empty Markdown `# Heading` (`extract_markdown_h1`) whenever `ptr.title` is empty.
   - Persists two single-row (`id = 1`) plain SQLite tables:
     1. `rabitq_index`: `n_chunks`, `dim`, `embedding_model`, `task_mode`, `vec_sha256`, `source_sha256`, `n_words`, `codes_blob`, `ip_norm_blob`, `mean_blob`, `d_eff_shannon`.
     2. `citation_graph`: `n_chunks`, `vec_sha256`, `source_sha256`, `doc_titles_blob` (zlib-compressed JSON map), `graph_blob` (`YCG1` binary header + little-endian `<i4` CSR arrays + UTF-8 `[pmi_terms, prop_nouns, doc_titles]` metadata under zlib compression).
@@ -87,7 +87,7 @@ class RetrievalIndex:
     d_eff: float
     codes: NDArray[np.uint8]
     ip_norm: NDArray[np.float32]
-    rotator: _Rotator | None
+    rotator: Rotator | None
     doc_titles: dict[str, str]
     title_by_first_word: dict[str, tuple[int, dict[tuple[str, ...], tuple[int, ...]]]]
     citation_graph: CitationGraph | None
@@ -96,7 +96,7 @@ class RetrievalIndex:
     resolved_path_cache: dict[tuple[Path, str], Path] = field(default_factory=dict)
 ```
 
-Primary public functions in `yaw/retrieval.py`: `empty_retrieval_index()`, `open_readonly_db(db_path)`, `normalize_fts_unicode61(text)`, `compute_db_fingerprints(conn)`, `compute_index_artifacts(rows, corpus_root=None)`, `build_retrieval_index(conn, *, expected_embedding_model=None, expected_task_mode=None)`, `lexical_search(...)`, `search_index(...) -> SearchResult`, `expand_citation_neighbors(...)`, `hydrate_passage(...) -> HydratedPassage`, `hydrate_ranked_passages(...) -> tuple[HydratedPassage, ...]`, `format_evidence_route(passages)`.
+Primary public functions in `yaw/retrieval/`: `empty_retrieval_index()`, `open_readonly_db(db_path)`, `normalize_fts_unicode61(text)`, `compute_db_fingerprints(conn)`, `compute_index_artifacts(rows, corpus_root=None)`, `build_retrieval_index(conn, *, expected_embedding_model=None, expected_task_mode=None)`, `lexical_search(...)`, `search_index(...) -> SearchResult`, `expand_citation_neighbors(...)`, `hydrate_passage(...) -> HydratedPassage`, `hydrate_ranked_passages(...) -> tuple[HydratedPassage, ...]`, `format_evidence_route(passages)`.
 
 ## 6. Capability Gates (`M_FINAL_1B` Confirmatory Proof)
 

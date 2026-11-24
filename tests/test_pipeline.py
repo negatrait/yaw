@@ -463,6 +463,7 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
         "CORPUS_ROOT",
         "SQLITE_DB",
         "EMBEDDER",
+        "DspyBatchEmbedder",
         "PipelineSession",
         "open_managed_db",
         "make_dspy_embed_fn",
@@ -475,11 +476,14 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
         "list_user_tables",
     ):
         assert hasattr(yaw_pipeline, exported), f"Missing export {exported}"
-    src = Path(yaw_pipeline.__file__).read_text(encoding="utf-8")
-    assert "INDEXING_ERROR_SINK" not in src
-    assert "_loop_runner" not in src
-    assert "cocoindex._internal" not in src
-    assert "exception_handler=" in src
+    assert yaw_pipeline.__file__ is not None
+    sources = [
+        py_file.read_text(encoding="utf-8") for py_file in sorted(Path(yaw_pipeline.__file__).parent.rglob("*.py"))
+    ]
+    assert all("INDEXING_ERROR_SINK" not in s for s in sources)
+    assert all("_loop_runner" not in s for s in sources)
+    assert all("cocoindex._internal" not in s for s in sources)
+    assert any("exception_handler=" in s for s in sources)
 
 
 def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(

@@ -46,7 +46,7 @@ package = true
 preview-features = ["content-addressed-cache"]
 
 [tool.setuptools]
-packages = ["yaw", "yaw.core"]
+packages = ["yaw", "yaw.core", "yaw.pipeline", "yaw.retrieval"]
 
 [tool.setuptools.package-data]
 yaw = ["py.typed", "baselines.json"]

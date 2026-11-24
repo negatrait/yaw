@@ -91,14 +91,16 @@ def _index_corpus(
 
 
 def test_retrieval_module_isolation_and_unicode61_normalization() -> None:
-    tree = ast.parse(Path(retrieval_mod.__file__).read_text(encoding="utf-8"))
+    assert retrieval_mod.__file__ is not None
     imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imported.add(alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imported.add(node.module.split(".")[0])
+    for py_file in sorted(Path(retrieval_mod.__file__).parent.rglob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.add(node.module.split(".")[0])
     assert {"sqlite_vec", "spacy", "optuna", "dspy", "fastmcp", "cocoindex", "sentence_transformers"}.isdisjoint(
         imported
     )
