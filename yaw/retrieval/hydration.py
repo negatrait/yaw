@@ -7,7 +7,6 @@ import json
 import re
 import zlib
 from collections.abc import Collection, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -351,10 +350,9 @@ def hydrate_corpus_chunks(
                 title = extract_markdown_h1(first_line)
         return chunk_texts, rel, title
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        for grp_res, rel, title in pool.map(_read_group, by_rel.items()):
-            for pos, txt in grp_res:
-                texts[pos] = txt
-            if title:
-                titles[rel] = title
+    for grp_res, rel, title in map(_read_group, by_rel.items()):
+        for pos, txt in grp_res:
+            texts[pos] = txt
+        if title:
+            titles[rel] = title
     return texts, titles

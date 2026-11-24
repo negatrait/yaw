@@ -16,13 +16,17 @@ from yaw.core import YawConfig, YawRuntimeError
 
 
 class DspyBatchEmbedder:
-    """Native DSPy batching with one shared HTTP admission gate for indexing and queries."""
+    """Native DSPy batching with sync HTTP gate and pure async acall."""
 
     def __init__(self, cfg: YawConfig) -> None:
-        kwargs: dict[str, Any] = {"api_base": cfg.base_url, "api_key": cfg.api_key or "yaw"}
+        kwargs: dict[str, Any] = {
+            "api_base": cfg.base_url,
+            "api_key": cfg.api_key or "yaw",
+            "max_retries": 0,
+        }
         self._embedder = dspy.Embedder(
             f"{cfg.provider}/{cfg.embedding_model}",
-            batch_size=cfg.embed_batch_size,
+            batch_size=max(1, int(cfg.embed_batch_size)),
             caching=False,
             **kwargs,
         )
@@ -45,6 +49,13 @@ class DspyBatchEmbedder:
             return np.zeros((0, 0), dtype=np.float32)
         with self._sem:
             raw = self._embedder(texts)
+        return self._normalize_batch(raw)
+
+    async def acall(self, texts: list[str]) -> NDArray[np.float32]:
+        """Embed texts asynchronously via dspy.Embedder.acall (caller owns concurrency semaphore)."""
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        raw = await self._embedder.acall(texts)
         return self._normalize_batch(raw)
 
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NamedTuple, override
 
@@ -78,6 +79,31 @@ class SourceChunk:
     body: str
 
 
+@dataclass(slots=True)
+class SinkMutationTracker:
+    """Thread-safe monotonic counter incremented strictly on actual SQLite target writes."""
+
+    seq: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def bump(self) -> int:
+        """Increment and return the target mutation sequence counter."""
+        with self._lock:
+            self.seq += 1
+            return self.seq
+
+
+SINK_TRACKER = coco.ContextKey[SinkMutationTracker]("yaw/pipeline/sink_tracker")
+
+
+def _bump_sink_tracker(context_provider: coco.ContextProvider) -> None:
+    try:
+        tracker = context_provider.get(SINK_TRACKER)
+    except KeyError:
+        return
+    tracker.bump()
+
+
 class FtsTableKey(NamedTuple):
     """CocoIndex stable key identifying `(db_key, table_name)` for contentless FTS5 targets."""
 
@@ -110,7 +136,7 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
         self._table_name = validate_identifier(table_name)
         self._sink = coco.TargetActionSink[_FtsRowAction].from_fn(self._apply)
 
-    def _apply(self, _context_provider: coco.ContextProvider, actions: Sequence[_FtsRowAction], /) -> None:
+    def _apply(self, context_provider: coco.ContextProvider, actions: Sequence[_FtsRowAction], /) -> None:
         if not actions:
             return
         deletes = [(act.chunk_id,) for act in actions]
@@ -124,6 +150,7 @@ class _FtsRowHandler(coco.TargetHandler[tuple[str, str], bytes]):
                     f'INSERT INTO "{self._table_name}"(rowid, title, body) VALUES (?, ?, ?)',
                     inserts,
                 )
+        _bump_sink_tracker(context_provider)
 
     @override
     def reconcile(
@@ -166,12 +193,14 @@ def _apply_fts_tables(context_provider: coco.ContextProvider, actions: Sequence[
         by_db.setdefault(act.key.db_key, []).append(act)
     for db_key, db_actions in by_db.items():
         conn_mgr = context_provider.get(db_key, sqlite.ManagedConnection)
+        did_mutate = False
         with conn_mgr.transaction() as conn:
             for act in db_actions:
                 table = validate_identifier(act.table_name)
                 if act.action in ("delete", "replace"):
                     conn.execute('DROP TABLE IF EXISTS "chunk_vocab"')
                     conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                    did_mutate = True
                 if coco.is_non_existence(act.desired_mode):
                     continue
                 if act.action in ("insert", "upsert", "replace"):
@@ -181,6 +210,9 @@ def _apply_fts_tables(context_provider: coco.ContextProvider, actions: Sequence[
                         "tokenize='unicode61 remove_diacritics 1')"
                     )
                     conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS \"chunk_vocab\" USING fts5vocab({table}, 'row')")
+                    did_mutate = True
+        if did_mutate:
+            _bump_sink_tracker(context_provider)
 
 
 _FTS_TABLE_SINK = coco.TargetActionSink[_FtsTableAction].from_fn(

@@ -1,4 +1,4 @@
-"""Pipeline session lifecycle, worker loop orchestration, and fail-fast error mapping."""
+"""Pipeline session lifecycle, shared-loop CocoIndex lifespan, and fail-fast error mapping."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ import hashlib
 import os
 import sqlite3
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import cocoindex as coco
 import numpy as np
@@ -23,7 +23,7 @@ from yaw.core import YawConfig, YawRuntimeError, resolve_coco_state_root
 
 from .embedder import EMBEDDER, DspyBatchEmbedder, PipelineEmbedder, make_dspy_embed_fn
 from .flow import CORPUS_ROOT, SQLITE_DB, indexing_main
-from .targets import open_managed_db, reconcile_index_tables
+from .targets import SINK_TRACKER, SinkMutationTracker, open_managed_db, reconcile_index_tables
 
 WORKER_ERROR_TYPES: tuple[type[Exception], ...] = (
     YawRuntimeError,
@@ -55,63 +55,23 @@ def _normalize_worker_error(exc: BaseException) -> Exception:
 
 @dataclass(slots=True)
 class PipelineSession:
-    """Handle bundle owning a CocoIndex Environment, worker thread/loop, and SQLite connection."""
+    """Handle bundle owning CocoIndex environment/app handles, embedder, and SQLite connection."""
 
     db_path: Path
     state_dir: Path
     corpus_root: Path
     embedding_model: str
     task_mode: str
-    env: coco.Environment
-    app: coco.App[Any, Any]
+    cfg: YawConfig
+    resolved_app: str
+    embedder: PipelineEmbedder
     conn_mgr: sqlite.ManagedConnection
     live: bool
-    ready_event: threading.Event
-    thread: threading.Thread
-    loop: asyncio.AbstractEventLoop
-    stop_async: asyncio.Event
+    env: coco.Environment | None = None
+    app: coco.App[Any, Any] | None = None
+    sink_tracker: SinkMutationTracker | None = None
+    ready_event: asyncio.Event | None = None
     error: Exception | None = None
-
-
-async def _watch_pipeline(
-    session: PipelineSession,
-    handle: coco.UpdateHandle[Any],
-    stop_async: asyncio.Event,
-) -> None:
-    snaps: AsyncIterator[Any] | None = None
-    had_errors = 0
-    try:
-        snaps = handle.watch()
-        async for snap in snaps:
-            if session.error is not None:
-                break
-            if snap.stats.total.num_errors:
-                had_errors = snap.stats.total.num_errors
-                if snap.status.name == "READY":
-                    break
-                continue
-            if snap.status.name == "READY":
-                await asyncio.to_thread(
-                    reconcile_index_tables,
-                    session.conn_mgr,
-                    embedding_model=session.embedding_model,
-                    task_mode=session.task_mode,
-                    corpus_root=session.corpus_root,
-                )
-                session.ready_event.set()
-        if had_errors and session.error is None:
-            session.error = YawRuntimeError(
-                "CONSISTENCY_ERROR",
-                f"CocoIndex live update reported {had_errors} component error(s).",
-            )
-    finally:
-        try:
-            if session.error is not None:
-                session.ready_event.set()
-                stop_async.set()
-        finally:
-            if isinstance(snaps, AsyncGenerator):
-                await snaps.aclose()
 
 
 def _build_embedder_memo_key(
@@ -128,43 +88,70 @@ def _build_embedder_memo_key(
     return (*base_memo, "custom", custom_id)
 
 
+def _deliver_component_error(
+    norm: Exception,
+    loop: asyncio.AbstractEventLoop,
+    ready_event: asyncio.Event | None,
+    on_error: Callable[[Exception], None] | None,
+) -> None:
+    def _notify() -> None:
+        if on_error is not None:
+            on_error(norm)
+        if ready_event is not None:
+            ready_event.set()
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        _notify()
+    elif not loop.is_closed() and loop.is_running():
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_notify)
+
+
 def _make_component_error_handler(
     holder: dict[str, Any],
     err_lock: threading.Lock,
-    ready_event: threading.Event,
+    loop: asyncio.AbstractEventLoop,
+    ready_event: asyncio.Event | None = None,
+    on_error: Callable[[Exception], None] | None = None,
 ) -> Callable[[BaseException, coco.ExceptionContext], None]:
     def _on_component_error(exc: BaseException, _ctx: coco.ExceptionContext) -> None:
         if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
             raise exc
+        norm = _normalize_worker_error(exc)
         with err_lock:
             session = holder.get("session")
             if session is not None and session.error is None:
-                session.error = _normalize_worker_error(exc)
-        ready_event.set()
+                session.error = norm
+            elif holder.get("error") is None:
+                holder["error"] = norm
+        _deliver_component_error(norm, loop, ready_event, on_error)
         raise exc
 
     return _on_component_error
 
 
-async def _init_pipeline_session(
+def _build_coco_env_and_app(
     *,
-    db_path: Path,
     state_dir: Path,
     corpus_root: Path,
-    cfg: YawConfig,
     conn_mgr: sqlite.ManagedConnection,
     embedder: PipelineEmbedder,
+    cfg: YawConfig,
     resolved_app: str,
     live: bool,
-    ready_event: threading.Event,
-    stop_async: asyncio.Event,
     loop: asyncio.AbstractEventLoop,
     on_component_error: Callable[[BaseException, coco.ExceptionContext], None],
-) -> PipelineSession:
+) -> tuple[coco.Environment, coco.App[Any, Any], SinkMutationTracker]:
+    tracker = SinkMutationTracker()
     ctx = coco.ContextProvider()
     ctx.provide(CORPUS_ROOT, corpus_root)
     ctx.provide(SQLITE_DB, conn_mgr)
     ctx.provide(EMBEDDER, embedder)
+    ctx.provide(SINK_TRACKER, tracker)
     env = coco.Environment(
         settings=coco.Settings(db_path=state_dir),
         context_provider=ctx,
@@ -184,58 +171,221 @@ async def _init_pipeline_session(
             cfg.embedding_task_mode,
             live,
         )
-        session = PipelineSession(
-            db_path=db_path,
-            state_dir=state_dir,
-            corpus_root=corpus_root,
-            embedding_model=cfg.embedding_model,
-            task_mode=cfg.embedding_task_mode,
-            env=env,
-            app=app,
-            conn_mgr=conn_mgr,
-            live=live,
-            ready_event=ready_event,
-            thread=threading.current_thread(),
-            loop=loop,
-            stop_async=stop_async,
-        )
         success = True
-        return session
+        return env, app, tracker
     finally:
         if not success:
             env.close()
 
 
-def _record_async_results(session: PipelineSession, results: Sequence[object]) -> None:
+async def _to_thread_joined[T](fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+async def _reconcile_until_settled(
+    session: PipelineSession,
+    tracker: SinkMutationTracker,
+    last_reconciled_seq: int,
+    *,
+    initial: bool,
+    stop_requested: list[bool],
+) -> tuple[bool, int]:
+    changed_any = False
+    pending_initial = initial
+    while (pending_initial or tracker.seq != last_reconciled_seq) and not stop_requested[0]:
+        seq_snapshot = tracker.seq
+        changed = await _to_thread_joined(
+            reconcile_index_tables,
+            session.conn_mgr,
+            embedding_model=session.embedding_model,
+            task_mode=session.task_mode,
+            corpus_root=session.corpus_root,
+        )
+        changed_any = changed_any or changed
+        last_reconciled_seq = seq_snapshot
+        pending_initial = False
+    return changed_any, last_reconciled_seq
+
+
+async def _reconcile_snapshot_step(
+    session: PipelineSession,
+    tracker: SinkMutationTracker,
+    last_reconciled_seq: int,
+    *,
+    is_initial: bool,
+    stop_requested: list[bool],
+    on_reconciled: Callable[[bool, bool], Awaitable[None]] | None,
+) -> int:
+    changed, next_seq = await _reconcile_until_settled(
+        session,
+        tracker,
+        last_reconciled_seq,
+        initial=is_initial,
+        stop_requested=stop_requested,
+    )
+    if not stop_requested[0] and on_reconciled is not None:
+        await on_reconciled(changed, is_initial)
+    if not stop_requested[0] and session.ready_event is not None:
+        session.ready_event.set()
+    return next_seq
+
+
+async def _consume_watch_snapshots(
+    session: PipelineSession,
+    snaps: AsyncIterator[Any],
+    tracker: SinkMutationTracker,
+    inflight_reconcile: list[asyncio.Task[int] | None],
+    stop_requested: list[bool],
+    on_reconciled: Callable[[bool, bool], Awaitable[None]] | None,
+) -> int:
+    initial_ready_done = False
+    last_reconciled_seq = 0
+    had_errors = 0
+    async for snap in snaps:
+        if stop_requested[0] or session.error is not None:
+            break
+        if snap.stats.total.num_errors:
+            had_errors = int(snap.stats.total.num_errors)
+            if snap.status.name == "READY":
+                break
+            continue
+        if snap.status.name == "READY" and snap.stats.total.num_in_progress == 0:
+            is_initial = not initial_ready_done
+            if is_initial or tracker.seq != last_reconciled_seq:
+                task = asyncio.create_task(
+                    _reconcile_snapshot_step(
+                        session,
+                        tracker,
+                        last_reconciled_seq,
+                        is_initial=is_initial,
+                        stop_requested=stop_requested,
+                        on_reconciled=on_reconciled,
+                    )
+                )
+                inflight_reconcile[0] = task
+                try:
+                    last_reconciled_seq = await asyncio.shield(task)
+                    inflight_reconcile[0] = None
+                except BaseException as exc:
+                    if not isinstance(exc, asyncio.CancelledError) and task.done():
+                        inflight_reconcile[0] = None
+                    raise
+                initial_ready_done = True
+    return had_errors
+
+
+def _finalize_watch_result(
+    session: PipelineSession,
+    watch_res: int | BaseException,
+    cur: asyncio.Task[Any] | None,
+) -> None:
+    if isinstance(watch_res, (KeyboardInterrupt, SystemExit)) or (
+        isinstance(watch_res, asyncio.CancelledError) and cur is not None and cur.cancelling() > 0
+    ):
+        raise watch_res
+    if isinstance(watch_res, BaseException):
+        if session.error is None:
+            session.error = _normalize_worker_error(watch_res)
+    elif watch_res and session.error is None:
+        session.error = YawRuntimeError(
+            "CONSISTENCY_ERROR",
+            f"CocoIndex live update reported {int(watch_res)} component error(s).",
+        )
+
+
+async def _watch_pipeline(
+    session: PipelineSession,
+    handle: coco.UpdateHandle[Any],
+    tracker: SinkMutationTracker,
+    *,
+    inflight_reconcile: list[asyncio.Task[int] | None],
+    stop_requested: list[bool],
+    on_reconciled: Callable[[bool, bool], Awaitable[None]] | None,
+    on_error: Callable[[Exception], None] | None,
+) -> None:
+    snaps_box: list[AsyncIterator[Any]] = []
+    cur = asyncio.current_task()
+
+    async def _run_watch() -> int:
+        snaps = handle.watch()
+        snaps_box.append(snaps)
+        return await _consume_watch_snapshots(
+            session,
+            snaps,
+            tracker,
+            inflight_reconcile,
+            stop_requested,
+            on_reconciled,
+        )
+
+    try:
+        (watch_res,) = await asyncio.gather(_run_watch(), return_exceptions=True)
+        _finalize_watch_result(session, watch_res, cur)
+    finally:
+        try:
+            if session.error is not None:
+                if on_error is not None:
+                    on_error(session.error)
+                if session.ready_event is not None:
+                    session.ready_event.set()
+        finally:
+            if snaps_box and isinstance(snaps_box[0], AsyncGenerator):
+                await snaps_box[0].aclose()
+
+
+def _record_async_results(
+    session: PipelineSession,
+    results: Sequence[object],
+    on_error: Callable[[Exception], None] | None,
+) -> None:
     for res in results:
         if isinstance(res, (KeyboardInterrupt, SystemExit)):
             raise res
         if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
             if session.error is None:
                 session.error = _normalize_worker_error(res)
-            session.ready_event.set()
+            err = session.error
+            if on_error is not None:
+                on_error(err)
+            if session.ready_event is not None:
+                session.ready_event.set()
 
 
-async def _run_live_session(
+async def _stop_live_handle(
     session: PipelineSession,
-    stop_async: asyncio.Event,
+    handle: coco.UpdateHandle[Any],
+    watch_task: asyncio.Task[None],
     loop: asyncio.AbstractEventLoop,
-    cur: asyncio.Task[Any] | None,
+    on_error: Callable[[Exception], None] | None,
+    *,
+    inflight_reconcile: list[asyncio.Task[int] | None],
+    stop_requested: list[bool],
 ) -> None:
-    handle = session.app.update(live=True)
-    watch_task = asyncio.create_task(_watch_pipeline(session, handle, stop_async))
-    stop_task = asyncio.create_task(stop_async.wait())
-    _, pending = await asyncio.wait({watch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
+    stop_requested[0] = True
+    watch_task.cancel()
+    results = await asyncio.gather(watch_task, return_exceptions=True)
+    _record_async_results(session, results, on_error)
+    pending_reconcile = inflight_reconcile[0]
+    if pending_reconcile is not None:
+        inflight_reconcile[0] = None
+        reconcile_results = await asyncio.gather(pending_reconcile, return_exceptions=True)
+        _record_async_results(session, reconcile_results, on_error)
+    cur = asyncio.current_task()
+    live_tasks = [
+        t
+        for t in asyncio.all_tasks(loop)
+        if t is not cur and not t.done() and getattr(t.get_coro(), "__qualname__", None) == "_process_live_wrapper"
+    ]
+    for task in live_tasks:
         task.cancel()
-    results = await asyncio.gather(watch_task, stop_task, return_exceptions=True)
-    _record_async_results(session, results)
-    other = [t for t in asyncio.all_tasks(loop) if t is not cur and not t.done()]
-    for t in other:
-        t.cancel()
-    if other:
-        await asyncio.gather(*other, return_exceptions=True)
-    (shutdown_res,) = await asyncio.gather(asyncio.wait_for(handle.result(), timeout=5.0), return_exceptions=True)
+    if live_tasks:
+        await asyncio.gather(*live_tasks, return_exceptions=True)
+    (shutdown_res,) = await asyncio.gather(asyncio.wait_for(handle.result(), timeout=2.0), return_exceptions=True)
     if isinstance(shutdown_res, (KeyboardInterrupt, SystemExit)) or (
         isinstance(shutdown_res, asyncio.CancelledError) and cur is not None and cur.cancelling() > 0
     ):
@@ -243,89 +393,27 @@ async def _run_live_session(
     if isinstance(shutdown_res, BaseException) and not isinstance(shutdown_res, (TimeoutError, asyncio.CancelledError)):
         if session.error is None:
             session.error = _normalize_worker_error(shutdown_res)
-        session.ready_event.set()
-    del handle
+        err = session.error
+        if on_error is not None:
+            on_error(err)
+        if session.ready_event is not None:
+            session.ready_event.set()
 
 
-async def _session_worker(
-    *,
-    db_path: Path,
-    state_dir: Path,
-    corpus_root: Path,
+def _prepare_session_paths(
     cfg: YawConfig,
-    conn_mgr: sqlite.ManagedConnection,
-    embedder: PipelineEmbedder,
-    resolved_app: str,
-    live: bool,
-    ready_event: threading.Event,
-    init_event: threading.Event,
-    holder: dict[str, Any],
-    on_component_error: Callable[[BaseException, coco.ExceptionContext], None],
-) -> None:
-    loop = asyncio.get_running_loop()
-    stop_async = asyncio.Event()
-    (init_res,) = await asyncio.gather(
-        _init_pipeline_session(
-            db_path=db_path,
-            state_dir=state_dir,
-            corpus_root=corpus_root,
-            cfg=cfg,
-            conn_mgr=conn_mgr,
-            embedder=embedder,
-            resolved_app=resolved_app,
-            live=live,
-            ready_event=ready_event,
-            stop_async=stop_async,
-            loop=loop,
-            on_component_error=on_component_error,
-        ),
-        return_exceptions=True,
-    )
-    cur = asyncio.current_task()
-    if isinstance(init_res, BaseException):
-        is_fatal = isinstance(init_res, (KeyboardInterrupt, SystemExit)) or (
-            isinstance(init_res, asyncio.CancelledError) and cur is not None and cur.cancelling() > 0
-        )
-        holder["init_error"] = init_res if is_fatal else _normalize_worker_error(init_res)
-        init_event.set()
-        if is_fatal:
-            raise init_res
-        return
-    session = init_res
-    holder["session"] = session
-    init_event.set()
-
-    if not live:
-        await stop_async.wait()
-        return
-    await _run_live_session(session, stop_async, loop, cur)
-
-
-def start_pipeline(
-    cfg: YawConfig,
-    *,
-    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
-    live: bool = True,
-    app_name: str | None = None,
-) -> PipelineSession:
-    """Start the declarative CocoIndex indexing session (live watcher or catch-up app)."""
+    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None,
+    app_name: str | None,
+) -> tuple[Path, Path, Path, sqlite.ManagedConnection, PipelineEmbedder, str]:
     assert cfg.db_path is not None and cfg.state_dir is not None and cfg.corpus_root is not None
     db_path = Path(cfg.db_path).resolve()
     corpus_root = Path(cfg.corpus_root).resolve()
     corpus_root.mkdir(parents=True, exist_ok=True)
     state_dir = resolve_coco_state_root(cfg.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
-
+    os.environ.setdefault("COCOINDEX_BANNER", "false")
     active_embed = embed_fn or make_dspy_embed_fn(cfg)
     conn_mgr = open_managed_db(db_path)
-
-    os.environ.setdefault("COCOINDEX_BANNER", "false")
-    ready_event = threading.Event()
-    init_event = threading.Event()
-    err_lock = threading.Lock()
-    holder: dict[str, Any] = {}
-    on_component_error = _make_component_error_handler(holder, err_lock, ready_event)
-
     embedder = PipelineEmbedder(
         active_embed,
         memo_key=_build_embedder_memo_key(cfg, active_embed),
@@ -333,45 +421,175 @@ def start_pipeline(
         max_in_flight=cfg.embed_max_in_flight,
     )
     resolved_app = app_name or f"yaw_{hashlib.sha256(db_path.as_posix().encode('utf-8')).hexdigest()[:12]}"
+    return db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app
 
-    thread = threading.Thread(
-        target=lambda: asyncio.run(
-            _session_worker(
-                db_path=db_path,
-                state_dir=state_dir,
-                corpus_root=corpus_root,
-                cfg=cfg,
-                conn_mgr=conn_mgr,
-                embedder=embedder,
-                resolved_app=resolved_app,
-                live=live,
-                ready_event=ready_event,
-                init_event=init_event,
-                holder=holder,
-                on_component_error=on_component_error,
+
+@contextlib.asynccontextmanager
+async def open_pipeline_lifespan(
+    cfg: YawConfig,
+    *,
+    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
+    live: bool = True,
+    app_name: str | None = None,
+    on_reconciled: Callable[[bool, bool], Awaitable[None]] | None = None,
+    on_error: Callable[[Exception], None] | None = None,
+) -> AsyncGenerator[PipelineSession]:
+    """Run declarative CocoIndex lifecycle directly on the caller's asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(cfg, embed_fn, app_name)
+    ready_event = asyncio.Event()
+    err_lock = threading.Lock()
+    holder: dict[str, Any] = {"session": None, "error": None}
+    error_notified = False
+
+    def _notify_once(exc: Exception) -> None:
+        nonlocal error_notified
+        if error_notified:
+            return
+        error_notified = True
+        if on_error is not None:
+            on_error(exc)
+
+    on_err = _make_component_error_handler(holder, err_lock, loop, ready_event, _notify_once)
+    env: coco.Environment | None = None
+    try:
+        env, app, tracker = _build_coco_env_and_app(
+            state_dir=state_dir,
+            corpus_root=corpus_root,
+            conn_mgr=conn_mgr,
+            embedder=embedder,
+            cfg=cfg,
+            resolved_app=resolved_app,
+            live=live,
+            loop=loop,
+            on_component_error=on_err,
+        )
+        session = PipelineSession(
+            db_path=db_path,
+            state_dir=state_dir,
+            corpus_root=corpus_root,
+            embedding_model=cfg.embedding_model,
+            task_mode=cfg.embedding_task_mode,
+            cfg=cfg,
+            resolved_app=resolved_app,
+            embedder=embedder,
+            conn_mgr=conn_mgr,
+            live=live,
+            env=env,
+            app=app,
+            sink_tracker=tracker,
+            ready_event=ready_event,
+        )
+        with err_lock:
+            holder["session"] = session
+            if holder["error"] is not None and session.error is None:
+                session.error = holder["error"]
+        if live:
+            handle = app.update(live=True)
+            inflight_reconcile: list[asyncio.Task[int] | None] = [None]
+            stop_requested = [False]
+            watch_task = asyncio.create_task(
+                _watch_pipeline(
+                    session,
+                    handle,
+                    tracker,
+                    inflight_reconcile=inflight_reconcile,
+                    stop_requested=stop_requested,
+                    on_reconciled=on_reconciled,
+                    on_error=_notify_once,
+                )
             )
-        ),
-        daemon=True,
-        name="yaw-cocoindex-session",
+            try:
+                yield session
+            finally:
+                await _stop_live_handle(
+                    session,
+                    handle,
+                    watch_task,
+                    loop,
+                    _notify_once,
+                    inflight_reconcile=inflight_reconcile,
+                    stop_requested=stop_requested,
+                )
+        else:
+            await app.update(live=False).result()
+            changed = await _to_thread_joined(
+                reconcile_index_tables,
+                conn_mgr,
+                embedding_model=cfg.embedding_model,
+                task_mode=cfg.embedding_task_mode,
+                corpus_root=corpus_root,
+            )
+            if on_reconciled is not None:
+                await on_reconciled(changed, True)
+            ready_event.set()
+            yield session
+    finally:
+        try:
+            if env is not None:
+                env.close()
+        finally:
+            conn_mgr.close()
+
+
+def start_pipeline(
+    cfg: YawConfig,
+    *,
+    embed_fn: Callable[[list[str]], NDArray[np.float32]] | None = None,
+    live: bool = False,
+    app_name: str | None = None,
+) -> PipelineSession:
+    """Create a thread-free catch-up CocoIndex PipelineSession (live=False only)."""
+    if live:
+        raise YawRuntimeError(
+            "INVALID_INPUT",
+            "start_pipeline() supports live=False only; use open_pipeline_lifespan() for live pipelines.",
+        )
+    db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(cfg, embed_fn, app_name)
+    return PipelineSession(
+        db_path=db_path,
+        state_dir=state_dir,
+        corpus_root=corpus_root,
+        embedding_model=cfg.embedding_model,
+        task_mode=cfg.embedding_task_mode,
+        cfg=cfg,
+        resolved_app=resolved_app,
+        embedder=embedder,
+        conn_mgr=conn_mgr,
+        live=False,
+    )
+
+
+async def _run_catchup_action(session: PipelineSession, *, drop: bool) -> None:
+    loop = asyncio.get_running_loop()
+    err_lock = threading.Lock()
+    holder: dict[str, Any] = {"session": session, "error": None}
+    on_err = _make_component_error_handler(holder, err_lock, loop)
+    env, app, _ = _build_coco_env_and_app(
+        state_dir=session.state_dir,
+        corpus_root=session.corpus_root,
+        conn_mgr=session.conn_mgr,
+        embedder=session.embedder,
+        cfg=session.cfg,
+        resolved_app=session.resolved_app,
+        live=False,
+        loop=loop,
+        on_component_error=on_err,
     )
     try:
-        thread.start()
-    except Exception:
-        conn_mgr.close()
-        raise
-    init_event.wait()
-    if (init_err := holder.get("init_error")) is not None:
-        thread.join(timeout=5.0)
-        conn_mgr.close()
-        raise init_err
-    return cast(PipelineSession, holder["session"])
+        if drop:
+            await app.drop()
+        else:
+            await app.update(live=False).result()
+    finally:
+        env.close()
 
 
 def update_pipeline_once(session: PipelineSession) -> None:
     """Execute one catch-up CocoIndex update synchronously and reconcile persisted index tables."""
     if session.error is not None:
         raise session.error
-    session.app.update_blocking(live=False)
+    asyncio.run(_run_catchup_action(session, drop=False))
     if session.error is not None:
         raise session.error
     reconcile_index_tables(
@@ -380,29 +598,18 @@ def update_pipeline_once(session: PipelineSession) -> None:
         task_mode=session.task_mode,
         corpus_root=session.corpus_root,
     )
-    session.ready_event.set()
 
 
-def wait_pipeline_ready(session: PipelineSession, timeout: float = 30.0) -> bool:
-    """Block until initial CocoIndex catch-up and reconciliation finish; re-raises live watcher failures."""
-    ready = session.ready_event.wait(timeout=timeout)
-    if session.error is not None:
-        raise session.error
-    return ready
+def drop_pipeline(session: PipelineSession) -> None:
+    """Drop all CocoIndex target states and tracking memos for a catch-up session."""
+    asyncio.run(_run_catchup_action(session, drop=True))
 
 
 def close_pipeline(session: PipelineSession) -> None:
-    """Stop the CocoIndex worker thread/loop cleanly and close Environment and SQLite handles."""
+    """Close any open CocoIndex Environment and SQLite ManagedConnection."""
     try:
-        if not session.loop.is_closed() and session.loop.is_running():
-            with contextlib.suppress(RuntimeError):
-                session.loop.call_soon_threadsafe(session.stop_async.set)
-        if session.thread.is_alive() and session.thread is not threading.current_thread():
-            session.thread.join(timeout=10.0)
-            if session.thread.is_alive():
-                raise YawRuntimeError("SHUTTING_DOWN", "Timed out waiting for CocoIndex session thread to stop.")
-    finally:
-        try:
+        if session.env is not None:
             session.env.close()
-        finally:
-            session.conn_mgr.close()
+            session.env = None
+    finally:
+        session.conn_mgr.close()

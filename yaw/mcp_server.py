@@ -1,19 +1,21 @@
-"""Thin FastMCP Streamable HTTP adapter with loopback Host/Origin 403 guard and 3 read-only tools."""
+"""Thin FastMCP Streamable HTTP adapter with loopback Host/Origin 403 guard and unified L3 lifespan."""
 
 from __future__ import annotations
 
 import asyncio
-import functools
+import contextlib
+import hmac
 import ipaddress
+import math
 import os
-import threading
+import socket
+import sys
 from collections.abc import AsyncGenerator, Callable
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated, Any
 
 import uvicorn
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 from starlette.middleware import Middleware as StarletteMiddleware
@@ -23,17 +25,17 @@ from starlette.responses import JSONResponse
 from yaw.core import DaemonStatus, YawConfig, YawRuntimeError
 from yaw.runtime import (
     YawRuntime,
-    close_runtime,
-    get_status,
+    acquire_daemon_control,
     redact_secrets,
+    runtime_lifespan,
     serialize_passage,
-    start_runtime,
+    snapshot_status,
 )
 from yaw.runtime import (
-    ask as runtime_ask,
+    aask as runtime_aask,
 )
 from yaw.runtime import (
-    recall as runtime_recall,
+    arecall as runtime_arecall,
 )
 
 
@@ -124,92 +126,128 @@ def _to_tool_error(exc: YawRuntimeError, api_key: str) -> ToolError:
     return ToolError(redact_secrets(str(exc), api_key))
 
 
-def create_mcp_app(
-    rt: YawRuntime | None = None,
-    *,
-    runtime_factory: Callable[[], YawRuntime] | None = None,
-    http_path: str | None = None,
-) -> tuple[FastMCP, Any]:
-    """Create the FastMCP server and pre-dispatch-guarded Starlette Streamable HTTP ASGI app."""
-    if (rt is None) == (runtime_factory is None):
-        raise YawRuntimeError("INVALID_INPUT", "Provide exactly one of rt or runtime_factory.")
-    mount_path = http_path if http_path is not None else (rt.config.http_path if rt is not None else "/mcp")
-    if not isinstance(mount_path, str) or not mount_path.startswith("/"):
-        raise YawRuntimeError("INVALID_INPUT", f"http_path must start with '/', got {mount_path!r}.")
+def _parse_wait_param(request: Request) -> float | None:
+    if "wait" not in request.query_params:
+        return 0.0
+    try:
+        val = float(request.query_params["wait"])
+    except ValueError:
+        return None
+    if not math.isfinite(val) or val < 0.0:
+        return None
+    return val
+
+
+def _build_mcp_lifespan(
+    rt: YawRuntime | None,
+    cfg: YawConfig | None,
+    runtime_lifespan_factory: Callable[[asyncio.Event], AbstractAsyncContextManager[YawRuntime]] | None,
+    holder: dict[str, YawRuntime | None],
+    evt: asyncio.Event,
+) -> Callable[[FastMCP], AbstractAsyncContextManager[dict[str, YawRuntime | None]]]:
     if rt is not None:
-        _validate_loopback_bind(rt.config.http_host)
 
-    holder: dict[str, YawRuntime | None] = {"rt": rt}
-    exec_box: list[ThreadPoolExecutor | None] = [None]
-    active_sessions = [0]
+        @asynccontextmanager
+        async def _static_lifespan(_server: FastMCP) -> AsyncGenerator[dict[str, YawRuntime | None]]:
+            holder["rt"] = rt
+            if rt.lifecycle != "starting":
+                evt.set()
+            yield {"rt": rt}
 
-    def _ensure_executor(active_rt: YawRuntime | None) -> ThreadPoolExecutor | None:
-        if exec_box[0] is None:
-            cap = active_rt.config.queue_maxsize if active_rt is not None else 32
-            exec_box[0] = ThreadPoolExecutor(max_workers=max(cap + 8, 40), thread_name_prefix="yaw-mcp-worker")
-        return exec_box[0]
+        return _static_lifespan
 
     @asynccontextmanager
-    async def _lifespan(_server: FastMCP) -> AsyncGenerator[None]:
-        owns_rt = runtime_factory is not None
-        active_sessions[0] += 1
-        if owns_rt and holder["rt"] is None:
-            built = await asyncio.to_thread(runtime_factory)
-            try:
-                _validate_loopback_bind(built.config.http_host)
-            except BaseException:
-                await asyncio.to_thread(close_runtime, built)
-                active_sessions[0] -= 1
-                raise
-            holder["rt"] = built
-        _ensure_executor(holder["rt"])
+    async def _managed_lifespan(_server: FastMCP) -> AsyncGenerator[dict[str, YawRuntime | None]]:
+        if runtime_lifespan_factory is not None:
+            cm = runtime_lifespan_factory(evt)
+        else:
+            assert cfg is not None
+            cm = runtime_lifespan(cfg, live=True, wait_for_ready=False, ready_evt=evt)
         try:
-            yield
-        finally:
-            active_sessions[0] -= 1
-            if active_sessions[0] == 0:
-                active = holder["rt"]
-                if owns_rt:
+            async with cm as active_rt:
+                _validate_loopback_bind(active_rt.config.http_host)
+                holder["rt"] = active_rt
+                try:
+                    yield {"rt": active_rt}
+                finally:
                     holder["rt"] = None
-                pool = exec_box[0]
-                exec_box[0] = None
-                if owns_rt and active is not None:
-                    await asyncio.to_thread(close_runtime, active)
-                if pool is not None:
-                    await asyncio.to_thread(pool.shutdown, True)
+        except BaseException:
+            evt.set()
+            raise
 
-    async def _run_offloaded(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_ensure_executor(holder["rt"]), functools.partial(fn, *args, **kwargs))
+    return _managed_lifespan
 
-    mcp = FastMCP("yaw", strict_input_validation=True, lifespan=_lifespan)
 
+def _register_http_routes(
+    mcp: FastMCP,
+    holder: dict[str, YawRuntime | None],
+    ready_evt: asyncio.Event,
+    control_token: str | None,
+    stop_cb: Callable[[], None] | None,
+) -> None:
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"}, status_code=200)
 
     @mcp.custom_route("/readyz", methods=["GET"])
-    async def readyz(_request: Request) -> JSONResponse:
+    async def readyz(request: Request) -> JSONResponse:
+        wait_val = _parse_wait_param(request)
+        if wait_val is None:
+            return JSONResponse({"error": "Invalid wait query parameter."}, status_code=400)
         active = holder["rt"]
+        unsettled = active is None or snapshot_status(active).lifecycle == "starting"
+        if unsettled and wait_val > 0.0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(ready_evt.wait(), timeout=wait_val)
+            active = holder["rt"]
         if active is None:
             return JSONResponse({"status": "starting"}, status_code=503)
-        st = await _run_offloaded(get_status, active)
+        st = snapshot_status(active)
         if st.lifecycle == "ready" and not st.provider_ready:
             return JSONResponse({"status": "stopping"}, status_code=503)
         return JSONResponse({"status": st.lifecycle}, status_code=200 if st.lifecycle == "ready" else 503)
 
+    @mcp.custom_route("/status", methods=["GET"])
+    async def status_route(_request: Request) -> JSONResponse:
+        active = holder["rt"]
+        if active is None:
+            return JSONResponse(
+                DaemonStatus(
+                    lifecycle="starting",
+                    provider_ready=False,
+                    sync_state="syncing",
+                    pid=os.getpid(),
+                ).to_dict(),
+                status_code=200,
+            )
+        return JSONResponse(snapshot_status(active).to_dict(), status_code=200)
+
+    @mcp.custom_route("/_internal/stop", methods=["POST"])
+    async def internal_stop(request: Request) -> JSONResponse:
+        hdrs = request.headers.getlist("x-yaw-control-token")
+        if control_token is None or len(hdrs) != 1 or not hmac.compare_digest(hdrs[0], control_token):
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        if stop_cb is not None:
+            stop_cb()
+        ready_evt.set()
+        return JSONResponse({"status": "stopping"}, status_code=200, headers={"Connection": "close"})
+
+
+def _register_mcp_tools(mcp: FastMCP, holder: dict[str, YawRuntime | None]) -> None:
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     )
     async def recall(
         query: Annotated[str, Field(min_length=1)],
         top_k: Annotated[int, Field(ge=1, le=20)] = 5,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Retrieve ranked disk-hydrated corpus passages using zero-LLM RetrievalIndex."""
-        if (active := holder["rt"]) is None:
+        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
+        if active is None:
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:
-            passages = await _run_offloaded(runtime_recall, active, query, top_k=top_k)
+            passages = await runtime_arecall(active, query, top_k=top_k)
         except YawRuntimeError as exc:
             raise _to_tool_error(exc, active.config.api_key) from exc
         return {
@@ -221,12 +259,13 @@ def create_mcp_app(
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
     )
-    async def qa(question: Annotated[str, Field(min_length=1)]) -> dict[str, Any]:
+    async def qa(question: Annotated[str, Field(min_length=1)], ctx: Context | None = None) -> dict[str, Any]:
         """Answer a multi-hop question using bare ReAct grounded in retrieved corpus passages."""
-        if (active := holder["rt"]) is None:
+        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
+        if active is None:
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:
-            res = await _run_offloaded(runtime_ask, active, question)
+            res = await runtime_aask(active, question)
         except YawRuntimeError as exc:
             raise _to_tool_error(exc, active.config.api_key) from exc
         return {
@@ -239,50 +278,134 @@ def create_mcp_app(
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     )
-    async def daemon_status() -> dict[str, Any]:
+    async def daemon_status(ctx: Context | None = None) -> dict[str, Any]:
         """Return a non-blocking redacted snapshot of daemon lifecycle and chunk counts."""
-        if (active := holder["rt"]) is None:
+        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
+        if active is None:
             return DaemonStatus(
                 lifecycle="starting",
                 provider_ready=False,
                 sync_state="syncing",
                 pid=os.getpid(),
             ).to_dict()
-        return (await _run_offloaded(get_status, active)).to_dict()
+        return snapshot_status(active).to_dict()
 
+
+def _resolve_mount_path(rt: YawRuntime | None, cfg: YawConfig | None, http_path: str | None) -> str:
+    if http_path is not None:
+        mount_path = http_path
+    elif rt is not None:
+        mount_path = rt.config.http_path
+    elif cfg is not None:
+        mount_path = cfg.http_path
+    else:
+        mount_path = "/mcp"
+    if not isinstance(mount_path, str) or not mount_path.startswith("/"):
+        raise YawRuntimeError("INVALID_INPUT", f"http_path must start with '/', got {mount_path!r}.")
+    return mount_path
+
+
+def create_mcp_app(
+    rt: YawRuntime | None = None,
+    *,
+    cfg: YawConfig | None = None,
+    runtime_lifespan_factory: Callable[[asyncio.Event], AbstractAsyncContextManager[YawRuntime]] | None = None,
+    http_path: str | None = None,
+    ready_evt: asyncio.Event | None = None,
+    control_token: str | None = None,
+    stop_cb: Callable[[], None] | None = None,
+) -> tuple[FastMCP, Any]:
+    """Create the FastMCP server and pre-dispatch-guarded Starlette Streamable HTTP ASGI app."""
+    if sum(arg is not None for arg in (rt, cfg, runtime_lifespan_factory)) != 1:
+        raise YawRuntimeError("INVALID_INPUT", "Provide exactly one of rt, cfg, or runtime_lifespan_factory.")
+    mount_path = _resolve_mount_path(rt, cfg, http_path)
+    if rt is not None:
+        _validate_loopback_bind(rt.config.http_host)
+    if cfg is not None:
+        _validate_loopback_bind(cfg.http_host)
+
+    holder: dict[str, YawRuntime | None] = {"rt": rt}
+    evt = (
+        ready_evt
+        if ready_evt is not None
+        else (rt.ready_evt if rt is not None and rt.ready_evt is not None else asyncio.Event())
+    )
+    lifespan = _build_mcp_lifespan(rt, cfg, runtime_lifespan_factory, holder, evt)
+    mcp = FastMCP("yaw", strict_input_validation=True, lifespan=lifespan)
+    _register_http_routes(mcp, holder, evt, control_token, stop_cb)
+    _register_mcp_tools(mcp, holder)
     app = mcp.http_app(path=mount_path, middleware=[StarletteMiddleware(_LoopbackGuardMiddleware)])
     return mcp, app
 
 
-def serve_http(cfg: YawConfig) -> None:
-    """Bind loopback Streamable HTTP transport and run the live YawRuntime until stopped."""
+def _bind_loopback_socket(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(128)
+        sock.setblocking(False)
+        return sock
+    except OSError as exc:
+        sock.close()
+        raise YawRuntimeError("BUSY", f"Port {host}:{port} is already in use or unavailable: {exc}") from exc
+
+
+def _emit_listening_sentinel_and_silence_stdout() -> None:
+    sys.stdout.write("YAW_LISTENING\n")
+    sys.stdout.flush()
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 1)
+    finally:
+        os.close(devnull_fd)
+
+
+def serve_http(cfg: YawConfig, *, notify_stdout: bool = False) -> None:
+    """Bind loopback Streamable HTTP transport and run unified YawRuntime until stopped."""
     _validate_loopback_bind(cfg.http_host)
     if isinstance(cfg.http_port, bool) or not isinstance(cfg.http_port, int) or not (1 <= cfg.http_port <= 65535):
         raise YawRuntimeError("INVALID_INPUT", f"http_port must be in 1..65535, got {cfg.http_port!r}.")
     if not isinstance(cfg.http_path, str) or not cfg.http_path.startswith("/"):
         raise YawRuntimeError("INVALID_INPUT", f"http_path must start with '/', got {cfg.http_path!r}.")
 
-    server_box: list[uvicorn.Server] = []
-    rt_box: list[YawRuntime] = []
-
-    def _build_runtime() -> YawRuntime:
-        rt = start_runtime(cfg, live=True, wait_for_ready=False)
-        rt_box.append(rt)
-
-        def _watch_stop() -> None:
-            rt.stop_event.wait()
-            if server_box:
-                server_box[0].should_exit = True
-
-        threading.Thread(target=_watch_stop, name="yaw-http-stop-watcher", daemon=True).start()
-        return rt
-
-    _, app = create_mcp_app(runtime_factory=_build_runtime, http_path=cfg.http_path)
     host = cfg.http_host[1:-1] if cfg.http_host.startswith("[") and cfg.http_host.endswith("]") else cfg.http_host
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=cfg.http_port, log_level="warning", lifespan="on"))
-    server_box.append(server)
-    try:
-        server.run()
-    finally:
-        if rt_box:
-            rt_box[0].stop_event.set()
+    with acquire_daemon_control(cfg) as (file_lock, control_token):
+        evt = asyncio.Event()
+        sock = _bind_loopback_socket(host, cfg.http_port)
+        try:
+            server_box: list[uvicorn.Server] = []
+
+            def _stop_cb() -> None:
+                if server_box:
+                    server_box[0].should_exit = True
+
+            _, app = create_mcp_app(
+                runtime_lifespan_factory=lambda ready_e: runtime_lifespan(
+                    cfg, live=True, wait_for_ready=False, file_lock=file_lock, ready_evt=ready_e
+                ),
+                http_path=cfg.http_path,
+                ready_evt=evt,
+                control_token=control_token,
+                stop_cb=_stop_cb,
+            )
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=host,
+                    port=cfg.http_port,
+                    timeout_graceful_shutdown=2,
+                    log_level="warning",
+                    lifespan="on",
+                )
+            )
+            server_box.append(server)
+            if notify_stdout:
+                _emit_listening_sentinel_and_silence_stdout()
+            server.run(sockets=[sock])
+        finally:
+            sock.close()

@@ -1,7 +1,10 @@
 """Declarative live CocoIndex v1 pipeline indexing IEEE float16 chunks, unicode61 FTS5, and SoA artifacts."""
 
 import importlib
+import os
 from typing import TYPE_CHECKING, Any
+
+os.environ.setdefault("COCOINDEX_DISABLE_USAGE_TRACKING", "1")
 
 if TYPE_CHECKING:
     from .embedder import EMBEDDER, DspyBatchEmbedder, make_dspy_embed_fn
@@ -10,11 +13,20 @@ if TYPE_CHECKING:
         WORKER_ERROR_TYPES,
         PipelineSession,
         close_pipeline,
+        drop_pipeline,
+        open_pipeline_lifespan,
         start_pipeline,
         update_pipeline_once,
-        wait_pipeline_ready,
     )
-    from .targets import ChunkRow, SourceChunk, list_user_tables, open_managed_db, reconcile_index_tables
+    from .targets import (
+        SINK_TRACKER,
+        ChunkRow,
+        SinkMutationTracker,
+        SourceChunk,
+        list_user_tables,
+        open_managed_db,
+        reconcile_index_tables,
+    )
 
 _PUBLIC_API: dict[str, str] = {
     "CORPUS_ROOT": ".flow",
@@ -22,18 +34,21 @@ _PUBLIC_API: dict[str, str] = {
     "DspyBatchEmbedder": ".embedder",
     "EMBEDDER": ".embedder",
     "PipelineSession": ".session",
+    "SINK_TRACKER": ".targets",
     "SQLITE_DB": ".flow",
+    "SinkMutationTracker": ".targets",
     "SourceChunk": ".targets",
     "WORKER_ERROR_TYPES": ".session",
     "chunk_file_content": ".flow",
     "close_pipeline": ".session",
+    "drop_pipeline": ".session",
     "list_user_tables": ".targets",
     "make_dspy_embed_fn": ".embedder",
     "open_managed_db": ".targets",
+    "open_pipeline_lifespan": ".session",
     "reconcile_index_tables": ".targets",
     "start_pipeline": ".session",
     "update_pipeline_once": ".session",
-    "wait_pipeline_ready": ".session",
 }
 
 __all__ = [
@@ -42,18 +57,21 @@ __all__ = [
     "DspyBatchEmbedder",
     "EMBEDDER",
     "PipelineSession",
+    "SINK_TRACKER",
     "SQLITE_DB",
+    "SinkMutationTracker",
     "SourceChunk",
     "WORKER_ERROR_TYPES",
     "chunk_file_content",
     "close_pipeline",
+    "drop_pipeline",
     "list_user_tables",
     "make_dspy_embed_fn",
     "open_managed_db",
+    "open_pipeline_lifespan",
     "reconcile_index_tables",
     "start_pipeline",
     "update_pipeline_once",
-    "wait_pipeline_ready",
 ]
 
 

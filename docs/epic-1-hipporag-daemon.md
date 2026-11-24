@@ -29,7 +29,7 @@ L1  yaw/datasets.py      v2 .md bundles, slicing, pure EM/F1/Recall    (stdlib, 
 L1  yaw/retrieval/       M_FINAL_1B RetrievalIndex & disk hydration    (stdlib, numpy, scipy, sqlite3, yaw.core)
 L2  yaw/pipeline/        CocoIndex >= 1.2.0 5-table live/catch-up sync (cocoindex, dspy, numpy, sqlite3, core, retrieval)
 L2  yaw/qa.py            Bare dspy.ReAct + lm15 + 4 read-only tools    (dspy, numpy, sqlite3, core, retrieval)
-L3  yaw/runtime.py       YawRuntime, FileLock, data_version swaps      (dspy, filelock, numpy, sqlite3, core, pipeline, qa, retrieval)
+L3  yaw/runtime.py       YawRuntime, unified lifespan, control token    (dspy, filelock, numpy, sqlite3, core, pipeline, qa, retrieval)
 L4  yaw/mcp_server.py    FastMCP HTTP + Host/Origin 403 + 3 tools      (fastmcp, pydantic, starlette, uvicorn, core, runtime)
 L4  yaw/optimize.py      dspy.GEPA QA prompt compilation               (dspy, filelock, numpy, sqlite3, core, datasets, pipeline, qa, retrieval)
 L5  yaw/cli.py           yaw {daemon,recall,qa,optimize,config} CLI    (stdlib, filelock, core, runtime, mcp_server, lazy optimize)
@@ -69,7 +69,7 @@ All `6` owned files (`yaw/__init__.py`, `yaw/__main__.py`, and the stdlib-only `
    - [native-cocoindex-indexing.md](native-cocoindex-indexing.md) (`yaw/pipeline/**/*.py`, `yaw/datasets.py`): declarative 5-table CocoIndex `1.2.0` sync (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`) and v2 `.md` dataset bundles.
    - [native-cocoindex-graph.md](native-cocoindex-graph.md) (`yaw/retrieval/**/*.py`): read-only `M_FINAL_1B` `RetrievalIndex` (`search_index`, `lexical_search`, `expand_citation_neighbors`, `hydrate_ranked_passages`).
    - [dspy-improvements.md](dspy-improvements.md) (`yaw/qa.py`, `yaw/optimize.py`): bare `dspy.ReAct` QA (`create_lm` via `dspy.lm15`, `temperature=1.0`) and `dspy.GEPA` optimization saving `.yaw/qa_program.json`.
-   - [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md) (`yaw/mcp_server.py`, `yaw/runtime.py`, `yaw/cli.py`): `YawRuntime` (`BoundedSemaphore(32)`, `Semaphore(1)`, `PRAGMA data_version` swaps), FastMCP Streamable HTTP, and `yaw` CLI.
+   - [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md) (`yaw/mcp_server.py`, `yaw/runtime.py`, `yaw/cli.py`): `YawRuntime` (`L3` `runtime_lifespan`, `query_sem` + headroom-clamped `embed_sem`, reactive sink swaps, `acquire_daemon_control` `.yaw/control.token`), FastMCP Streamable HTTP (`0` custom pools), and `yaw` CLI (`YAW_LISTENING`, HTTP stop).
 
 ---
 

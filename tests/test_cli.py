@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
 import runpy
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -30,7 +32,7 @@ from yaw.datasets import prepare_dataset_bundle
 from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
 from yaw.qa import build_qa_agent
 from yaw.retrieval import build_retrieval_index, open_readonly_db
-from yaw.runtime import signal_stop_event
+from yaw.runtime import control_token_path
 
 _CID_IN_TEXT_RE = re.compile(r"\[chunk_id=(\d+)\]")
 _FORBIDDEN_WORDS = ("mani" + "fold", "h" + "mm", "hippo" + "rag")
@@ -319,6 +321,8 @@ def test_cli_zero_wrappers_and_clean_vocabulary() -> None:
             assert marker not in low, f"Forbidden marker {marker!r} in {path}"
 
     cli_src = cli_path.read_text(encoding="utf-8")
+    for retired in ("daemon.pid", "signal_stop_event", "time.sleep"):
+        assert retired not in cli_src
     tree = ast.parse(cli_src, filename=str(cli_path))
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
@@ -545,11 +549,9 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
         finally:
             held.release()
 
-        # Stale PID + stale status.json must normalize to stopped without deleting files, and redact secrets
-        dead_proc = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead_proc.wait(timeout=10)
-        pid_path = cfg.state_dir / "daemon.pid"
-        write_text_atomic(pid_path, f"{dead_proc.pid}\n")
+        # Stale status.json + stale control.token when lock is free must normalize to stopped without mutating files
+        tok_path = control_token_path(cfg)
+        write_text_atomic(tok_path, "stale-token-leftover")
         stale_status = json.dumps(
             {
                 "lifecycle": "ready",
@@ -559,7 +561,7 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
                 "active_op": "qa",
                 "last_error": f"Failed with key={cfg.api_key} Bearer tok_xyz",
                 "last_sync_at": 1234.5,
-                "pid": dead_proc.pid,
+                "pid": 999999,
                 "num_chunks": 1,
             }
         )
@@ -574,7 +576,17 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
         assert norm_st["pid"] is None
         assert norm_st["num_chunks"] >= 2
         assert cfg.api_key not in str(norm_st["last_error"]) and "tok_xyz" not in str(norm_st["last_error"])
-        assert pid_path.is_file() and cfg.status_path.read_text(encoding="utf-8") == stale_status
+        assert tok_path.is_file() and cfg.status_path.read_text(encoding="utf-8") == stale_status
+
+        # Fresh uninitialized workspace creates zero files on daemon status
+        fresh_root = tmp_path / "fresh_ws_uninit"
+        fresh_root.mkdir()
+        fresh_toml = _write_toml(fresh_root, port=srv.server_port, http_port=_free_port())
+        fresh_cfg = load_config(fresh_toml)
+        assert main(["daemon", "status", "--config", str(fresh_toml), "--json"]) == 0
+        fresh_st = json.loads(capsys.readouterr().out)
+        assert fresh_st["lifecycle"] == "stopped" and fresh_st["num_chunks"] == 0
+        assert fresh_cfg.state_dir is not None and not fresh_cfg.state_dir.exists()
 
         # Corrupt status.json must fail fast (exit 1), never silently suppressed
         cfg.status_path.write_text("{corrupt json", encoding="utf-8")
@@ -899,7 +911,26 @@ def test_cli_optimizer_interrupt_during_provider_request(tmp_path: Path, force: 
         srv.server_close()
 
 
-def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Path) -> None:
+def _http_post_stop(port: int, token: str) -> int:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+    try:
+        conn.request("POST", "/_internal/stop", headers={"Host": f"127.0.0.1:{port}", "X-Yaw-Control-Token": token})
+        return int(conn.getresponse().status)
+    finally:
+        conn.close()
+
+
+def _http_get_json(port: int, path: str) -> tuple[int, dict[str, Any]]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+    try:
+        conn.request("GET", path, headers={"Host": f"127.0.0.1:{port}", "Connection": "close"})
+        resp = conn.getresponse()
+        return int(resp.status), json.loads(resp.read().decode("utf-8"))
+    finally:
+        conn.close()
+
+
+def test_cli_daemon_detached_start_status_stop_and_foreground_run_control(tmp_path: Path) -> None:
     srv, _ = _start_openai_stub()
     mcp_port = _free_port()
     toml_path = _write_toml(tmp_path, port=srv.server_port, http_port=mcp_port)
@@ -907,7 +938,7 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
     assert cfg.corpus_root and cfg.lock_path and cfg.state_dir
     cfg.corpus_root.mkdir(parents=True, exist_ok=True)
     (cfg.corpus_root / "note.md").write_text("# Apollo\nNeil Armstrong commanded Apollo 11.\n", encoding="utf-8")
-    pid_path = cfg.state_dir / "daemon.pid"
+    tok_path = control_token_path(cfg)
 
     def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -919,21 +950,28 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
             timeout=45,
         )
 
-    started_pid: int | None = None
     run_proc: subprocess.Popen[str] | None = None
     try:
+        # Stopping when not running must fail NOT_READY without creating/touching control.token
         stop_missing = _run_cli("daemon", "stop", "--config", str(toml_path), "--json")
         assert stop_missing.returncode == 1
         assert "NOT_READY" in json.loads(stop_missing.stderr)["error"]
+        assert not tok_path.exists()
 
         started = _run_cli("daemon", "start", "--config", str(toml_path), "--json")
         assert started.returncode == 0, started.stderr
         start_data = json.loads(started.stdout)
         started_pid = int(start_data["pid"])
+        assert started_pid > 0
         assert start_data["lifecycle"] == "ready"
         assert start_data["provider_ready"] is True
         assert start_data["num_chunks"] >= 1
-        assert pid_path.is_file() and pid_path.read_text(encoding="utf-8").strip() == str(started_pid)
+        assert not (cfg.state_dir / "daemon.pid").exists()
+        assert tok_path.is_file()
+        if os.name != "nt":
+            assert stat.S_IMODE(tok_path.stat().st_mode) == 0o600
+        tok_value = tok_path.read_text(encoding="ascii").strip()
+        assert len(tok_value) == 64
         assert _readyz_get(mcp_port) == 200
 
         status_live = _run_cli("daemon", "status", "--config", str(toml_path), "--json")
@@ -943,17 +981,21 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
         assert live_data["pid"] == started_pid
         assert live_data["num_chunks"] >= 1
 
+        # Second start must fail BUSY and preserve active control.token
         start_dup = _run_cli("daemon", "start", "--config", str(toml_path), "--json")
         assert start_dup.returncode == 1
         assert "BUSY" in json.loads(start_dup.stderr)["error"]
+        assert tok_path.read_text(encoding="ascii").strip() == tok_value
 
         stopped = _run_cli("daemon", "stop", "--config", str(toml_path), "--json")
         assert stopped.returncode == 0, stopped.stderr
         assert json.loads(stopped.stdout) == {"lifecycle": "stopped"}
-        started_pid = None
-        assert not pid_path.exists()
+        assert not tok_path.exists()
+        assert not (cfg.state_dir / "daemon.pid").exists()
 
-        # Verify yaw.db.lock was cleanly released by the daemon process
+        # Verify TCP port & yaw.db.lock were both released cleanly
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+            probe_sock.bind(("127.0.0.1", mcp_port))
         lock = filelock.FileLock(str(cfg.lock_path), timeout=0)
         lock.acquire(timeout=0)
         lock.release()
@@ -964,12 +1006,12 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
         assert after_data["lifecycle"] == "stopped"
         assert after_data["pid"] is None
 
-        # Verify direct `daemon run` writes pid_path and unlinks it in its own finally block
+        # Foreground `daemon run` must keep stdout clean (no YAW_LISTENING) and stop via HTTP control.token
         run_proc = subprocess.Popen(
             [sys.executable, "-m", "yaw", "daemon", "run", "--config", str(toml_path)],
             cwd=str(tmp_path),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
@@ -978,32 +1020,171 @@ def test_cli_daemon_detached_start_status_stop_and_run_pid_cleanup(tmp_path: Pat
             if run_proc.poll() is not None:
                 pytest.fail(f"daemon run exited early: {run_proc.stderr.read() if run_proc.stderr else ''}")
             try:
-                if pid_path.is_file() and _readyz_get(mcp_port) == 200:
+                if _readyz_get(mcp_port) == 200:
                     break
             except OSError:
                 pass
             time.sleep(0.1)
-        run_pid = int(pid_path.read_text(encoding="utf-8").strip())
-        assert run_pid > 0
-        assert cfg.status_path is not None
-        assert json.loads(cfg.status_path.read_text(encoding="utf-8"))["pid"] == run_pid
-
-        if os.name == "nt":
-            assert signal_stop_event(cfg.lock_path) is True
-        else:
-            run_proc.terminate()
+        st_code, st_body = _http_get_json(mcp_port, "/status")
+        assert st_code == 200 and st_body["pid"] > 0
+        assert not (cfg.state_dir / "daemon.pid").exists()
+        run_tok = tok_path.read_text(encoding="ascii").strip()
+        assert _http_post_stop(mcp_port, run_tok) == 200
         assert run_proc.wait(timeout=15) == 0
+        stdout_text = run_proc.stdout.read() if run_proc.stdout is not None else ""
+        assert "YAW_LISTENING" not in stdout_text
+        if run_proc.stdout is not None:
+            run_proc.stdout.close()
         if run_proc.stderr is not None:
             run_proc.stderr.close()
         run_proc = None
-        assert not pid_path.exists()
+        assert not tok_path.exists()
     finally:
-        if started_pid is not None:
-            if os.name == "nt":
-                signal_stop_event(cfg.lock_path)
-            else:
-                subprocess.run(["kill", str(started_pid)], check=False)
+        if tok_path.is_file():
+            with contextlib.suppress(OSError):
+                _http_post_stop(mcp_port, tok_path.read_text(encoding="ascii").strip())
         if run_proc is not None and run_proc.poll() is None:
             run_proc.kill()
             run_proc.wait(timeout=5)
         srv.shutdown()
+
+
+def test_cli_daemon_start_503_rollback_stops_child_and_releases_bind(tmp_path: Path) -> None:
+    class _Fail500Handler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            body = json.dumps({"error": {"message": "embed backend 500"}}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    err_srv = ThreadingHTTPServer(("127.0.0.1", 0), _Fail500Handler)
+    err_thread = threading.Thread(target=err_srv.serve_forever, daemon=True)
+    err_thread.start()
+    try:
+        mcp_port = _free_port()
+        toml_path = _write_toml(tmp_path, port=int(err_srv.server_address[1]), http_port=mcp_port)
+        cfg = load_config(toml_path)
+        assert cfg.corpus_root is not None and cfg.lock_path is not None
+        cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+        (cfg.corpus_root / "boom.md").write_text("# Boom\nTrigger startup 503 failure.\n", encoding="utf-8")
+
+        res = subprocess.run(
+            [sys.executable, "-m", "yaw", "daemon", "start", "--config", str(toml_path), "--json"],
+            check=False,
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        assert res.returncode == 1
+        err_obj = json.loads(res.stderr)
+        assert "NOT_READY" in err_obj["error"]
+        assert not control_token_path(cfg).exists()
+
+        # Rollback must have cleanly shut down the child, freeing both yaw.db.lock and TCP bind
+        lock = filelock.FileLock(str(cfg.lock_path), timeout=0)
+        lock.acquire(timeout=0)
+        lock.release()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+            probe_sock.bind(("127.0.0.1", mcp_port))
+    finally:
+        err_srv.shutdown()
+        err_srv.server_close()
+        err_thread.join(timeout=5.0)
+
+
+def test_cli_daemon_start_lifespan_http_reset_wraps_not_ready_and_redacts_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret_key = "super-secret-startup-reset-key"
+    mcp_port = _free_port()
+    toml_path = _write_toml(tmp_path, port=_free_port(), http_port=mcp_port, api_key=secret_key)
+    cfg = load_config(toml_path)
+    assert cfg.db_path is not None and cfg.lock_path is not None
+    # Make db_path a directory so serve_http binds+listens and emits YAW_LISTENING,
+    # then uvicorn aborts lifespan.startup() in open_managed_db before serving /readyz.
+    cfg.db_path.mkdir(parents=True)
+
+    res = subprocess.run(
+        [sys.executable, "-m", "yaw", "daemon", "start", "--config", str(toml_path), "--json"],
+        check=False,
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert res.returncode == 1
+    assert res.stderr.lstrip().startswith("{")
+    err_obj = json.loads(res.stderr)
+    assert err_obj["error"].startswith("[NOT_READY]")
+    assert "unable to open database file" in err_obj["error"]
+    assert secret_key not in err_obj["error"]
+    assert not control_token_path(cfg).exists()
+
+    lock = filelock.FileLock(str(cfg.lock_path), timeout=0)
+    lock.acquire(timeout=0)
+    lock.release()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+        probe_sock.bind(("127.0.0.1", mcp_port))
+
+    # Also verify /status RemoteDisconnected after /readyz 200 wraps into [NOT_READY] + rollback,
+    # and main() handles http.client.HTTPException cleanly without an unhandled traceback.
+    import yaw.cli as cli_mod
+
+    ws2 = tmp_path / "status_reset"
+    ws2.mkdir()
+    toml2 = _write_toml(ws2, port=_free_port(), http_port=_free_port(), api_key=secret_key)
+    cfg2 = load_config(toml2)
+    assert cfg2.state_dir is not None
+    state_dir2 = cfg2.state_dir
+    state_dir2.mkdir(parents=True, exist_ok=True)
+    rolled_back: list[bool] = []
+
+    class _DummyProc:
+        def poll(self) -> int:
+            return 0
+
+    monkeypatch.setattr(cli_mod, "_spawn_daemon_process", lambda _c, _p: (_DummyProc(), state_dir2 / "d.log"))
+    monkeypatch.setattr(cli_mod, "_await_listening_sentinel", lambda _proc, _log: None)
+    monkeypatch.setattr(cli_mod, "_rollback_started_daemon", lambda _c, _proc: rolled_back.append(True))
+
+    def _status_reset(_cfg: YawConfig, _method: str, path: str, **_kwargs: Any) -> tuple[int, dict[str, Any]]:
+        if path.startswith("/readyz"):
+            return 200, {"status": "ready"}
+        raise http.client.RemoteDisconnected(f"closed mid-status key={secret_key}")
+
+    monkeypatch.setattr(cli_mod, "_http_json", _status_reset)
+    assert cli_mod.main(["daemon", "start", "--config", str(toml2), "--json"]) == 1
+    status_err = json.loads(capsys.readouterr().err)["error"]
+    assert status_err.startswith("[NOT_READY]")
+    assert "RemoteDisconnected" in status_err
+    assert secret_key not in status_err
+    assert rolled_back == [True]
+
+    def _raise_http_exc(_cfg: YawConfig) -> dict[str, Any]:
+        raise http.client.RemoteDisconnected(f"unexpected disconnect key={secret_key}")
+
+    monkeypatch.setattr(cli_mod, "_daemon_status", _raise_http_exc)
+    assert cli_mod.main(["daemon", "status", "--config", str(toml2), "--json"]) == 1
+    direct_err = json.loads(capsys.readouterr().err)["error"]
+    assert "unexpected disconnect" in direct_err
+    assert secret_key not in direct_err
+
+
+def test_cli_wait_process_handle_pid_fallback_returns_false_while_live() -> None:
+    from yaw.cli import _wait_process_handle
+
+    assert _wait_process_handle(("pid", os.getpid()), timeout=0.05) is False
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as dead_proc:
+        dead_pid = int(dead_proc.pid)
+        dead_proc.wait(timeout=10)
+    assert _wait_process_handle(("pid", dead_pid), timeout=0.05) is True

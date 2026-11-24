@@ -1,15 +1,17 @@
-"""Plain zero-wrapper YawRuntime lifecycle, live WAL data_version swaps, and query entrypoints."""
+"""Plain zero-wrapper YawRuntime lifecycle, async lifespan orchestration, and query entrypoints."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,7 @@ from typing import Any
 import dspy
 import filelock
 import numpy as np
+from numpy.typing import NDArray
 
 from yaw.core import (
     DaemonStatus,
@@ -33,13 +36,13 @@ from yaw.core import (
     write_text_atomic,
 )
 from yaw.pipeline import (
-    WORKER_ERROR_TYPES,
+    DspyBatchEmbedder,
     PipelineSession,
     close_pipeline,
     make_dspy_embed_fn,
+    open_pipeline_lifespan,
     start_pipeline,
     update_pipeline_once,
-    wait_pipeline_ready,
 )
 from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
 from yaw.retrieval import (
@@ -51,28 +54,10 @@ from yaw.retrieval import (
     search_index,
 )
 
-_kernel32: Any = None
-if os.name == "nt":
-    import ctypes
-
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
-    _kernel32.CreateEventW.restype = ctypes.c_void_p
-    _kernel32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
-    _kernel32.OpenEventW.restype = ctypes.c_void_p
-    _kernel32.SetEvent.argtypes = [ctypes.c_void_p]
-    _kernel32.SetEvent.restype = ctypes.c_int
-    _kernel32.ResetEvent.argtypes = [ctypes.c_void_p]
-    _kernel32.ResetEvent.restype = ctypes.c_int
-    _kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    _kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    _kernel32.CloseHandle.restype = ctypes.c_int
-
 
 @dataclass(slots=True)
 class YawRuntime:
-    """Mutable runtime state owning lock, live CocoIndex pipeline, semaphores, and RetrievalIndex."""
+    """Mutable runtime state owning lock, CocoIndex pipeline, semaphores, and RetrievalIndex."""
 
     config: YawConfig
     pipeline: PipelineSession
@@ -82,80 +67,22 @@ class YawRuntime:
     query_sem: threading.BoundedSemaphore
     index_lock: threading.RLock
     retrieval_index: RetrievalIndex
-    index_data_version: int
     lifecycle: str
     last_error: str | None
     last_sync_at: float | None
     file_lock: filelock.FileLock
     stop_event: threading.Event
-    win32_stop_handle: int | None = field(default=None, repr=False)
-    win32_waiter_thread: threading.Thread | None = field(default=None, repr=False)
-    ready_thread: threading.Thread | None = field(default=None, repr=False)
-    probe_conn: sqlite3.Connection | None = None
-    probe_lock: threading.Lock = field(default_factory=threading.Lock)
+    owns_file_lock: bool = True
+    index_generation: int = 0
+    ready_evt: asyncio.Event | None = None
+    async_loop: asyncio.AbstractEventLoop | None = None
+    async_query_sem: asyncio.Semaphore | None = None
+    async_embed_sem: asyncio.Semaphore | None = None
+    async_lm_sem: asyncio.Semaphore | None = None
+    embed_uses_async: bool = False
     state_lock: threading.Lock = field(default_factory=threading.Lock)
     active_queries: int = 0
     active_op: str | None = None
-
-
-def win32_stop_event_name(lock_path: Path | str) -> str:
-    """Return the deterministic Local kernel stop-event name for lock_path."""
-    resolved = str(Path(lock_path).resolve()).replace("\\", "/").lower()
-    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
-    return f"Local\\yaw-stop-{digest}"
-
-
-def signal_stop_event(lock_path: Path | str) -> bool:
-    """Signal an active Win32 Local stop event for lock_path if open."""
-    if os.name != "nt" or _kernel32 is None:
-        return False
-    handle = _kernel32.OpenEventW(0x0002, 0, win32_stop_event_name(lock_path))
-    if not handle:
-        return False
-    try:
-        return bool(_kernel32.SetEvent(handle))
-    finally:
-        _kernel32.CloseHandle(handle)
-
-
-def _start_win32_stop_event(rt: YawRuntime) -> None:
-    if os.name != "nt" or _kernel32 is None or rt.config.lock_path is None:
-        return
-    handle = _kernel32.CreateEventW(None, 1, 0, win32_stop_event_name(rt.config.lock_path))
-    if not handle:
-        return
-    _kernel32.ResetEvent(handle)
-    rt.win32_stop_handle = int(handle)
-
-    def _wait_kernel_event(ev_handle: int) -> None:
-        if _kernel32.WaitForSingleObject(ev_handle, 0xFFFFFFFF) == 0:
-            rt.stop_event.set()
-
-    thread = threading.Thread(
-        target=_wait_kernel_event,
-        args=(int(handle),),
-        name="yaw-win32-stop-waiter",
-        daemon=True,
-    )
-    rt.win32_waiter_thread = thread
-    thread.start()
-
-
-def _close_win32_stop_event(rt: YawRuntime) -> None:
-    if os.name != "nt" or _kernel32 is None:
-        return
-    handle = rt.win32_stop_handle
-    rt.win32_stop_handle = None
-    if handle is not None and handle != 0:
-        with contextlib.suppress(OSError):
-            _kernel32.SetEvent(handle)
-    waiter = rt.win32_waiter_thread
-    if waiter is not None and waiter.is_alive() and waiter is not threading.current_thread():
-        waiter.join(timeout=1.0)
-    rt.win32_waiter_thread = None
-    if handle is not None and handle != 0:
-        with contextlib.suppress(OSError):
-            _kernel32.CloseHandle(handle)
 
 
 def require_path(path: Path | None, label: str) -> Path:
@@ -165,26 +92,63 @@ def require_path(path: Path | None, label: str) -> Path:
     return Path(path).resolve()
 
 
-def _read_data_version(rt: YawRuntime) -> int:
-    with rt.probe_lock:
-        if rt.probe_conn is None:
-            raise YawRuntimeError("SHUTTING_DOWN", "Runtime database probe is closed.")
-        row = rt.probe_conn.execute("PRAGMA data_version").fetchone()
-        return int(row[0]) if row else 0
+def control_token_path(cfg: YawConfig) -> Path:
+    """Return the path of the daemon HTTP control token beside yaw.db.lock."""
+    return require_path(cfg.lock_path, "lock_path").parent / "control.token"
 
 
-def get_retrieval_index(rt: YawRuntime, conn: sqlite3.Connection | None = None) -> RetrievalIndex:
-    """Return current RetrievalIndex, rebuilding outside index_lock when PRAGMA data_version changes."""
-    cur_ver = _read_data_version(rt)
+def _acquire_file_lock(cfg: YawConfig) -> filelock.FileLock:
+    lock_path = require_path(cfg.lock_path, "lock_path")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = filelock.FileLock(str(lock_path), timeout=0)
+    try:
+        lock.acquire(timeout=0)
+    except filelock.Timeout as exc:
+        raise YawRuntimeError("BUSY", f"Lock {lock_path} is already held by another YAW instance.") from exc
+    return lock
+
+
+@contextlib.contextmanager
+def acquire_daemon_control(cfg: YawConfig) -> Generator[tuple[filelock.FileLock, str]]:
+    """Acquire exclusive yaw.db.lock first, then write/cleanup 0o600 .yaw/control.token under lock."""
+    file_lock = _acquire_file_lock(cfg)
+    tok_path = control_token_path(cfg)
+    token = secrets.token_hex(32)
+    tmp_path = tok_path.with_name(f".{tok_path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        tmp_path.replace(tok_path)
+        yield file_lock, token
+    finally:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            tok_path.unlink(missing_ok=True)
+        if file_lock.is_locked:
+            file_lock.release()
+
+
+def sync_embed_concurrency_limit(embed_max_in_flight: int) -> int:
+    """Clamp sync embed_fn thread offload concurrency to leave >= 4 default-executor workers free."""
+    cpu_count = os.process_cpu_count() or 1
+    default_pool_cap = min(32, cpu_count + 4)
+    return max(1, min(int(embed_max_in_flight), default_pool_cap - 4))
+
+
+def get_retrieval_index(rt: YawRuntime) -> RetrievalIndex:
+    """Return the active immutable RetrievalIndex snapshot under short RLock."""
     with rt.index_lock:
-        if rt.index_data_version >= 0 and cur_ver == rt.index_data_version:
-            return rt.retrieval_index
+        return rt.retrieval_index
 
+
+def reload_retrieval_index(rt: YawRuntime, conn: sqlite3.Connection | None = None) -> RetrievalIndex:
+    """Rebuild RetrievalIndex from ?mode=ro WAL outside index_lock and atomically swap it in."""
     db_path = require_path(rt.config.db_path, "db_path")
     with contextlib.nullcontext(conn) if conn is not None else contextlib.closing(open_readonly_db(db_path)) as ro_conn:
-        if ro_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
-            with rt.index_lock:
-                return rt.retrieval_index
         try:
             new_idx = build_retrieval_index(
                 ro_conn,
@@ -194,143 +158,249 @@ def get_retrieval_index(rt: YawRuntime, conn: sqlite3.Connection | None = None) 
         except YawRuntimeError as exc:
             if exc.code == "INDEX_NOT_READY":
                 with rt.index_lock:
-                    if rt.pipeline.live and rt.index_data_version >= 0:
+                    if rt.pipeline.live and rt.index_generation > 0:
                         return rt.retrieval_index
             raise
 
-    updated = False
     with rt.index_lock:
-        if cur_ver >= rt.index_data_version:
-            rt.retrieval_index = new_idx
-            rt.index_data_version = cur_ver
-            updated = True
+        rt.retrieval_index = new_idx
+        rt.index_generation += 1
         current_idx = rt.retrieval_index
-    if updated:
-        now = time.time()
-        with rt.state_lock:
-            rt.last_sync_at = now
+    now = time.time()
+    with rt.state_lock:
+        rt.last_sync_at = now
     return current_idx
+
+
+def _build_runtime_instance(
+    cfg: YawConfig,
+    pipeline: PipelineSession,
+    lm: dspy.LM,
+    embed_fn: EmbedFn,
+    file_lock: filelock.FileLock,
+    *,
+    owns_file_lock: bool,
+    ready_evt: asyncio.Event | None = None,
+    async_loop: asyncio.AbstractEventLoop | None = None,
+) -> YawRuntime:
+    uses_async = isinstance(embed_fn, DspyBatchEmbedder)
+    embed_cap = cfg.embed_max_in_flight if uses_async else sync_embed_concurrency_limit(cfg.embed_max_in_flight)
+    return YawRuntime(
+        config=cfg,
+        pipeline=pipeline,
+        lm=lm,
+        embed_fn=embed_fn,
+        lm_sem=threading.Semaphore(1),
+        query_sem=threading.BoundedSemaphore(cfg.queue_maxsize),
+        index_lock=threading.RLock(),
+        retrieval_index=empty_retrieval_index(),
+        lifecycle="starting",
+        last_error=None,
+        last_sync_at=None,
+        file_lock=file_lock,
+        stop_event=threading.Event(),
+        owns_file_lock=owns_file_lock,
+        ready_evt=ready_evt,
+        async_loop=async_loop,
+        async_query_sem=asyncio.Semaphore(cfg.queue_maxsize) if async_loop is not None else None,
+        async_embed_sem=asyncio.Semaphore(embed_cap) if async_loop is not None else None,
+        async_lm_sem=asyncio.Semaphore(1) if async_loop is not None else None,
+        embed_uses_async=uses_async,
+    )
+
+
+def _record_runtime_error(rt: YawRuntime, exc: BaseException) -> None:
+    msg = redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key)
+    with rt.state_lock:
+        rt.last_error = msg
+        if rt.lifecycle not in ("stopping", "stopped"):
+            rt.lifecycle = "error"
+
+
+def _mark_ready(rt: YawRuntime) -> None:
+    now = time.time()
+    with rt.state_lock:
+        if rt.lifecycle in ("stopping", "stopped") or rt.stop_event.is_set():
+            return
+        if rt.lifecycle == "starting":
+            rt.lifecycle = "ready"
+        rt.last_sync_at = now
+        rt.last_error = None
+
+
+@contextlib.asynccontextmanager
+async def runtime_lifespan(
+    cfg: YawConfig,
+    *,
+    live: bool = True,
+    wait_for_ready: bool = False,
+    embed_fn: EmbedFn | None = None,
+    lm: dspy.LM | None = None,
+    file_lock: filelock.FileLock | None = None,
+    ready_evt: asyncio.Event | None = None,
+) -> AsyncGenerator[YawRuntime]:
+    """Run unified CocoIndex + YawRuntime lifecycle directly on the caller's asyncio event loop."""
+    owns_file_lock = file_lock is None
+    active_lock = file_lock if file_lock is not None else _acquire_file_lock(cfg)
+    evt = ready_evt if ready_evt is not None else asyncio.Event()
+    loop = asyncio.get_running_loop()
+    rt_box: dict[str, YawRuntime] = {}
+    active_embed: EmbedFn | None = None
+
+    def _on_error(exc: Exception) -> None:
+        if (active_rt := rt_box.get("rt")) is None or active_rt.stop_event.is_set():
+            evt.set()
+            return
+        _record_runtime_error(active_rt, exc)
+        get_status(active_rt)
+        evt.set()
+
+    async def _on_reconciled(changed: bool, is_initial: bool) -> None:
+        if (active_rt := rt_box.get("rt")) is None or active_rt.stop_event.is_set():
+            return
+        if changed or is_initial:
+            await asyncio.to_thread(reload_retrieval_index, active_rt)
+        if is_initial:
+            _mark_ready(active_rt)
+        await asyncio.to_thread(get_status, active_rt)
+        evt.set()
+
+    try:
+        if cfg.log_path is not None:
+            configure_logging(cfg.log_path)
+        active_embed = embed_fn or make_dspy_embed_fn(cfg)
+        active_lm = lm or create_lm(cfg)
+        async with open_pipeline_lifespan(
+            cfg,
+            embed_fn=active_embed,
+            live=live,
+            on_reconciled=_on_reconciled,
+            on_error=_on_error,
+        ) as pipeline:
+            rt = _build_runtime_instance(
+                cfg,
+                pipeline,
+                active_lm,
+                active_embed,
+                active_lock,
+                owns_file_lock=owns_file_lock,
+                ready_evt=evt,
+                async_loop=loop,
+            )
+            rt_box["rt"] = rt
+            if not live and rt.lifecycle == "starting":
+                await asyncio.to_thread(reload_retrieval_index, rt)
+                _mark_ready(rt)
+                await asyncio.to_thread(get_status, rt)
+                evt.set()
+            else:
+                await asyncio.to_thread(get_status, rt)
+                if wait_for_ready and not await wait_ready_async(rt, timeout=30.0):
+                    raise YawRuntimeError("NOT_READY", "Timed out waiting for initial indexing readiness.")
+            try:
+                yield rt
+            finally:
+                rt.stop_event.set()
+                with rt.state_lock:
+                    if rt.lifecycle != "stopped":
+                        rt.lifecycle = "stopping"
+                evt.set()
+    finally:
+        if (active_rt := rt_box.get("rt")) is not None:
+            with active_rt.state_lock:
+                active_rt.lifecycle = "stopped"
+                active_rt.active_op = None
+            await asyncio.to_thread(get_status, active_rt)
+        evt.set()
+        if owns_file_lock and active_lock.is_locked:
+            active_lock.release()
 
 
 def start_runtime(
     cfg: YawConfig,
     *,
-    live: bool = True,
+    live: bool = False,
     wait_for_ready: bool = True,
     embed_fn: EmbedFn | None = None,
     lm: dspy.LM | None = None,
+    file_lock: filelock.FileLock | None = None,
 ) -> YawRuntime:
-    """Acquire exclusive yaw.db.lock, start CocoIndex pipeline, and optionally block until ready."""
-    lock_path = require_path(cfg.lock_path, "lock_path")
-    db_path = require_path(cfg.db_path, "db_path")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    file_lock = filelock.FileLock(str(lock_path), timeout=0)
-    try:
-        file_lock.acquire(timeout=0)
-    except filelock.Timeout as exc:
-        raise YawRuntimeError("BUSY", f"Lock {lock_path} is already held by another YAW instance.") from exc
-
+    """Acquire yaw.db.lock (when not pre-acquired) and start catch-up YawRuntime (live=False only)."""
+    if live:
+        raise YawRuntimeError(
+            "INVALID_INPUT",
+            "start_runtime() supports live=False only; use runtime_lifespan() for live mode.",
+        )
+    owns_file_lock = file_lock is None
+    active_lock = file_lock if file_lock is not None else _acquire_file_lock(cfg)
     pipeline: PipelineSession | None = None
-    probe_conn: sqlite3.Connection | None = None
     rt: YawRuntime | None = None
     try:
         if cfg.log_path is not None:
             configure_logging(cfg.log_path)
         active_embed = embed_fn or make_dspy_embed_fn(cfg)
         active_lm = lm or create_lm(cfg)
-        pipeline = start_pipeline(cfg, embed_fn=active_embed, live=live)
-        probe_conn = open_readonly_db(db_path)
-        probe_conn.isolation_level = None
-        probe_conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-
-        rt = YawRuntime(
-            config=cfg,
-            pipeline=pipeline,
-            lm=active_lm,
-            embed_fn=active_embed,
-            lm_sem=threading.Semaphore(1),
-            query_sem=threading.BoundedSemaphore(cfg.queue_maxsize),
-            index_lock=threading.RLock(),
-            retrieval_index=empty_retrieval_index(),
-            index_data_version=-1,
-            lifecycle="starting",
-            last_error=None,
-            last_sync_at=None,
-            file_lock=file_lock,
-            stop_event=threading.Event(),
-            probe_conn=probe_conn,
+        pipeline = start_pipeline(cfg, embed_fn=active_embed, live=False)
+        rt = _build_runtime_instance(
+            cfg,
+            pipeline,
+            active_lm,
+            active_embed,
+            active_lock,
+            owns_file_lock=owns_file_lock,
         )
-        _start_win32_stop_event(rt)
         get_status(rt)
-
-        if wait_for_ready:
-            if not wait_ready(rt, timeout=30.0):
-                raise YawRuntimeError("NOT_READY", "Timed out waiting for initial indexing readiness.")
-        elif live:
-
-            def _await_initial_ready() -> None:
-                if rt is None:
-                    return
-                rt.pipeline.ready_event.wait()
-                if not rt.stop_event.is_set() and rt.lifecycle == "starting":
-                    try:
-                        wait_ready(rt, timeout=0.0)
-                    # Transition async startup waiter to error state and persist redacted error to status.json.
-                    except WORKER_ERROR_TYPES as exc:
-                        msg = redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key)
-                        with rt.state_lock:
-                            rt.last_error = msg
-                            rt.lifecycle = "error"
-                        rt.pipeline.ready_event.set()
-                        get_status(rt)
-
-            rt.ready_thread = threading.Thread(target=_await_initial_ready, name="yaw-ready-waiter", daemon=True)
-            rt.ready_thread.start()
+        if wait_for_ready and not wait_ready(rt, timeout=30.0):
+            raise YawRuntimeError("NOT_READY", "Timed out waiting for initial indexing readiness.")
         return rt
     except BaseException:
         if rt is not None:
             close_runtime(rt)
         else:
-            if probe_conn is not None:
-                with contextlib.suppress(sqlite3.Error):
-                    probe_conn.close()
             if pipeline is not None:
                 close_pipeline(pipeline)
-            if file_lock.is_locked:
-                file_lock.release()
+            if owns_file_lock and active_lock.is_locked:
+                active_lock.release()
         raise
 
 
 def wait_ready(rt: YawRuntime, timeout: float = 30.0) -> bool:
-    """Wait for initial indexing catch-up, build RetrievalIndex, and mark runtime ready."""
+    """Execute initial catch-up indexing synchronously, load RetrievalIndex, and mark runtime ready."""
+    _ = timeout
+    if rt.pipeline.live:
+        raise YawRuntimeError("INVALID_INPUT", "wait_ready() supports catch-up mode only; use wait_ready_async().")
     try:
-        if not rt.pipeline.live and not rt.pipeline.ready_event.is_set():
+        if rt.lifecycle == "starting":
             update_pipeline_once(rt.pipeline)
-            ready = True
-        else:
-            ready = wait_pipeline_ready(rt.pipeline, timeout=timeout)
     except BaseException as exc:
         if not rt.stop_event.is_set():
-            msg = redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key)
-            with rt.state_lock:
-                rt.last_error = msg
+            _record_runtime_error(rt, exc)
             get_status(rt)
         raise
-
-    if not ready or rt.stop_event.is_set():
+    if rt.stop_event.is_set():
         return False
-
-    get_retrieval_index(rt)
-    now = time.time()
-    with rt.state_lock:
-        if rt.lifecycle in ("stopping", "stopped") or rt.stop_event.is_set():
-            return False
-        if rt.lifecycle == "starting":
-            rt.lifecycle = "ready"
-        rt.last_sync_at = now
-        rt.last_error = None
+    reload_retrieval_index(rt)
+    _mark_ready(rt)
     get_status(rt)
-    return True
+    return rt.lifecycle == "ready"
+
+
+async def wait_ready_async(rt: YawRuntime, timeout: float = 30.0) -> bool:
+    """Await initial indexing readiness on the running asyncio loop."""
+    if not rt.pipeline.live:
+        if rt.lifecycle == "starting":
+            await asyncio.to_thread(wait_ready, rt, timeout)
+        return rt.lifecycle == "ready"
+    evt = rt.ready_evt or rt.pipeline.ready_event
+    if evt is not None:
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+    lc, _ = _sync_pipeline_error(rt)
+    if rt.pipeline.error is not None:
+        raise rt.pipeline.error
+    return lc == "ready" and not rt.stop_event.is_set()
 
 
 def _validate_text_input(raw: str, label: str) -> str:
@@ -344,15 +414,12 @@ def _validate_text_input(raw: str, label: str) -> str:
 
 def _sync_pipeline_error(rt: YawRuntime) -> tuple[str, str | None]:
     pipe_err = rt.pipeline.error
-    pipe_num_errors = getattr(rt.pipeline, "num_errors", 0)
-    err_msg: str | None = None
-    if pipe_err is not None:
-        err_msg = f"{type(pipe_err).__name__}: {pipe_err}"
-    elif pipe_num_errors and pipe_num_errors > 0:
-        err_msg = f"Pipeline reported {pipe_num_errors} component error(s)."
+    err_msg = (
+        redact_secrets(f"{type(pipe_err).__name__}: {pipe_err}", rt.config.api_key) if pipe_err is not None else None
+    )
     with rt.state_lock:
         if err_msg is not None:
-            if rt.last_error is None or not rt.last_error or pipe_err is not None:
+            if rt.last_error is None or not bool(rt.last_error) or rt.lifecycle not in ("error", "stopping", "stopped"):
                 rt.last_error = err_msg
             if rt.lifecycle not in ("stopping", "stopped"):
                 rt.lifecycle = "error"
@@ -369,11 +436,55 @@ def _ensure_ready(rt: YawRuntime) -> None:
         raise YawRuntimeError("NOT_READY", f"Daemon runtime is not ready (lifecycle={lc}).")
 
 
+def _ensure_async_primitives(rt: YawRuntime) -> tuple[asyncio.Semaphore, asyncio.Semaphore, asyncio.Semaphore]:
+    loop = asyncio.get_running_loop()
+    if rt.async_loop is not loop or rt.async_query_sem is None or rt.async_embed_sem is None or rt.async_lm_sem is None:
+        embed_cap = (
+            rt.config.embed_max_in_flight
+            if rt.embed_uses_async
+            else sync_embed_concurrency_limit(rt.config.embed_max_in_flight)
+        )
+        rt.async_loop = loop
+        rt.async_query_sem = asyncio.Semaphore(rt.config.queue_maxsize)
+        rt.async_embed_sem = asyncio.Semaphore(embed_cap)
+        rt.async_lm_sem = asyncio.Semaphore(1)
+    return rt.async_query_sem, rt.async_embed_sem, rt.async_lm_sem
+
+
+@contextlib.asynccontextmanager
+async def _admit_query_async(rt: YawRuntime, op_name: str) -> AsyncGenerator[None]:
+    q_sem, _, _ = _ensure_async_primitives(rt)
+    with rt.state_lock:
+        if rt.active_queries >= rt.config.queue_maxsize or q_sem.locked():
+            raise YawRuntimeError("BUSY", f"Runtime query capacity ({rt.config.queue_maxsize}) saturated.")
+        rt.active_queries += 1
+        rt.active_op = op_name
+    try:
+        await q_sem.acquire()
+    except BaseException:
+        with rt.state_lock:
+            rt.active_queries = max(0, rt.active_queries - 1)
+            if rt.active_queries == 0:
+                rt.active_op = None
+        raise
+    try:
+        yield
+    finally:
+        q_sem.release()
+        with rt.state_lock:
+            rt.active_queries = max(0, rt.active_queries - 1)
+            if rt.active_queries == 0:
+                rt.active_op = None
+
+
 @contextlib.contextmanager
 def _admit_query(rt: YawRuntime, op_name: str) -> Generator[None]:
     if not rt.query_sem.acquire(blocking=False):
         raise YawRuntimeError("BUSY", f"Runtime query capacity ({rt.config.queue_maxsize}) saturated.")
     with rt.state_lock:
+        if rt.active_queries >= rt.config.queue_maxsize:
+            rt.query_sem.release()
+            raise YawRuntimeError("BUSY", f"Runtime query capacity ({rt.config.queue_maxsize}) saturated.")
         rt.active_queries += 1
         rt.active_op = op_name
     try:
@@ -421,6 +532,19 @@ def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, 
         yield conn, index, corpus_root
 
 
+def _search_and_hydrate(
+    db_path: Path,
+    index: RetrievalIndex,
+    corpus_root: Path,
+    q_vec: NDArray[np.float32],
+    query: str,
+    top_k: int,
+) -> tuple[HydratedPassage, ...]:
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
+        res = search_index(index, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50))
+    return hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
+
+
 def _run_recall(
     cfg: YawConfig,
     conn: sqlite3.Connection,
@@ -440,15 +564,35 @@ def _run_recall(
     return hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
 
 
-def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
-    """Execute zero-LLM hybrid RetrievalIndex search with MaxP disk hydration."""
+async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
+    """Execute zero-LLM hybrid RetrievalIndex search asynchronously using DspyBatchEmbedder.acall or clamped offload."""
     q = _validate_recall_args(query, top_k)
     _ensure_ready(rt)
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    async with _admit_query_async(rt, "recall"):
+        index = get_retrieval_index(rt)
+        if index.size == 0:
+            return ()
+        _, embed_sem, _ = _ensure_async_primitives(rt)
+        formatted = format_query_for_embedding(q, rt.config.embedding_task_mode)
+        async with embed_sem:
+            if isinstance(rt.embed_fn, DspyBatchEmbedder):
+                raw_emb = await rt.embed_fn.acall([formatted])
+            else:
+                raw_emb = np.asarray(await asyncio.to_thread(rt.embed_fn, [formatted]), dtype=np.float32)
+        q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
+        return await asyncio.to_thread(_search_and_hydrate, db_path, index, corpus_root, q_vec, q, top_k)
 
+
+def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
+    """Execute zero-LLM hybrid RetrievalIndex search synchronously with MaxP disk hydration."""
+    q = _validate_recall_args(query, top_k)
+    _ensure_ready(rt)
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "recall"), contextlib.closing(open_readonly_db(db_path)) as conn:
-        index = get_retrieval_index(rt, conn)
+        index = get_retrieval_index(rt)
         return _run_recall(rt.config, conn, index, corpus_root, rt.embed_fn, q, top_k)
 
 
@@ -507,15 +651,8 @@ def _run_qa(
         return ask_question(question, corpus_root=corpus_root, index=index, agent=agent)
 
 
-def ask(rt: YawRuntime, question: str) -> QAResult:
-    """Execute bounded bare dspy.ReAct QA over indexed corpus passages with citation verification."""
-    q = _validate_text_input(question, "Question")
-    _ensure_ready(rt)
-
-    db_path = require_path(rt.config.db_path, "db_path")
-    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
-    with _admit_query(rt, "qa"), contextlib.closing(open_readonly_db(db_path)) as conn:
-        index = get_retrieval_index(rt, conn)
+def _ask_with_index(rt: YawRuntime, db_path: Path, corpus_root: Path, index: RetrievalIndex, q: str) -> QAResult:
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
         try:
             result = _run_qa(rt.config, conn, index, corpus_root, rt.embed_fn, rt.lm, q, lm_lock=rt.lm_sem)
         except YawRuntimeError as exc:
@@ -523,9 +660,33 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
                 with rt.state_lock:
                     rt.last_error = redact_secrets(str(exc), rt.config.api_key)
             raise
-        with rt.state_lock:
-            rt.last_error = None
-        return result
+    with rt.state_lock:
+        rt.last_error = None
+    return result
+
+
+async def aask(rt: YawRuntime, question: str) -> QAResult:
+    """Execute bounded bare dspy.ReAct QA asynchronously serialized under async_lm_sem."""
+    q = _validate_text_input(question, "Question")
+    _ensure_ready(rt)
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    async with _admit_query_async(rt, "qa"):
+        index = get_retrieval_index(rt)
+        _, _, lm_sem = _ensure_async_primitives(rt)
+        async with lm_sem:
+            return await asyncio.to_thread(_ask_with_index, rt, db_path, corpus_root, index, q)
+
+
+def ask(rt: YawRuntime, question: str) -> QAResult:
+    """Execute bounded bare dspy.ReAct QA synchronously over indexed corpus passages."""
+    q = _validate_text_input(question, "Question")
+    _ensure_ready(rt)
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    with _admit_query(rt, "qa"):
+        index = get_retrieval_index(rt)
+        return _ask_with_index(rt, db_path, corpus_root, index, q)
 
 
 def ask_once(cfg: YawConfig, question: str) -> QAResult:
@@ -535,8 +696,8 @@ def ask_once(cfg: YawConfig, question: str) -> QAResult:
         return _run_qa(cfg, conn, index, corpus_root, make_dspy_embed_fn(cfg), create_lm(cfg), q)
 
 
-def get_status(rt: YawRuntime) -> DaemonStatus:
-    """Return lock-free redacted DaemonStatus snapshot and persist status.json atomically."""
+def snapshot_status(rt: YawRuntime) -> DaemonStatus:
+    """Return lock-free redacted DaemonStatus snapshot without disk I/O."""
     num_chunks = rt.retrieval_index.size
     lc, raw_err = _sync_pipeline_error(rt)
     with rt.state_lock:
@@ -547,7 +708,7 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
     sync_state = (
         "error" if redacted_err is not None and bool(redacted_err) else ("syncing" if lc == "starting" else "idle")
     )
-    status = DaemonStatus(
+    return DaemonStatus(
         lifecycle=lc,
         provider_ready=lc in ("starting", "ready") and not rt.stop_event.is_set(),
         sync_state=sync_state,
@@ -558,6 +719,11 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
         pid=os.getpid() if lc != "stopped" else None,
         num_chunks=num_chunks,
     )
+
+
+def get_status(rt: YawRuntime) -> DaemonStatus:
+    """Return lock-free redacted DaemonStatus snapshot and persist status.json atomically."""
+    status = snapshot_status(rt)
     if rt.config.status_path is not None:
         try:
             write_text_atomic(rt.config.status_path, json.dumps(status.to_dict(), indent=2))
@@ -567,31 +733,20 @@ def get_status(rt: YawRuntime) -> DaemonStatus:
 
 
 def close_runtime(rt: YawRuntime) -> None:
-    """Stop runtime cleanly, close CocoIndex/SQLite probe handles, and release yaw.db.lock."""
+    """Stop catch-up runtime cleanly, close CocoIndex/SQLite handles, and release owned lock."""
     rt.stop_event.set()
     with rt.state_lock:
         if rt.lifecycle == "stopped":
-            _close_win32_stop_event(rt)
-            if rt.file_lock.is_locked:
+            if rt.owns_file_lock and rt.file_lock.is_locked:
                 rt.file_lock.release()
             return
         rt.lifecycle = "stopping"
-    rt.pipeline.ready_event.set()
-    if rt.ready_thread is not None and rt.ready_thread.is_alive() and rt.ready_thread is not threading.current_thread():
-        rt.ready_thread.join(timeout=2.0)
-    rt.ready_thread = None
-    _close_win32_stop_event(rt)
     try:
-        with rt.probe_lock:
-            if rt.probe_conn is not None:
-                with contextlib.suppress(sqlite3.Error):
-                    rt.probe_conn.close()
-                rt.probe_conn = None
         close_pipeline(rt.pipeline)
     finally:
         with rt.state_lock:
             rt.lifecycle = "stopped"
             rt.active_op = None
         get_status(rt)
-        if rt.file_lock.is_locked:
+        if rt.owns_file_lock and rt.file_lock.is_locked:
             rt.file_lock.release()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +20,7 @@ from typing import Any, override
 
 import dspy
 import fastmcp
+import filelock
 import numpy as np
 import pytest
 from fastmcp import FastMCP
@@ -26,26 +29,33 @@ from mcp.types import ToolAnnotations
 from numpy.typing import NDArray
 
 from yaw.core import YawConfig, YawRuntimeError
+from yaw.pipeline import DspyBatchEmbedder
 from yaw.qa import build_qa_agent
 from yaw.retrieval import build_retrieval_index, open_readonly_db
 from yaw.runtime import (
     YawRuntime,
+    aask,
+    acquire_daemon_control,
+    arecall,
     ask,
     ask_once,
     close_runtime,
+    control_token_path,
     create_lm,
     get_retrieval_index,
     get_status,
     recall,
     recall_once,
     redact_secrets,
+    reload_retrieval_index,
     require_path,
     resolve_program_path,
+    runtime_lifespan,
     serialize_passage,
-    signal_stop_event,
+    snapshot_status,
     start_runtime,
-    wait_ready,
-    win32_stop_event_name,
+    sync_embed_concurrency_limit,
+    wait_ready_async,
 )
 
 
@@ -140,13 +150,25 @@ def test_fastmcp_gate_and_runtime_module_isolation(tmp_path: Path) -> None:
     tree = ast.parse(src, filename=str(rt_path))
     class_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
     assert class_names == {"YawRuntime"}
+    forbidden_prefixes = ("yaw.daemon", "cocoindex", "fastmcp", "openai", "optuna", "starlette", "uvicorn")
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                assert not alias.name.startswith(("yaw.daemon", "fastmcp", "optuna", "starlette", "uvicorn"))
+                assert not alias.name.startswith(forbidden_prefixes)
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
-            assert not mod.startswith(("yaw.daemon", "fastmcp", "optuna", "starlette", "uvicorn"))
+            assert not mod.startswith(forbidden_prefixes)
+    for retired in (
+        "win32_stop_event_name",
+        "signal_stop_event",
+        "PRAGMA data_version",
+        "index_data_version",
+        "probe_conn",
+        "yaw-win32-stop-waiter",
+        "yaw-ready-waiter",
+        "ThreadPoolExecutor",
+    ):
+        assert retired not in src
 
     cfg = _make_cfg(tmp_path)
     lm = create_lm(cfg)
@@ -168,6 +190,10 @@ def test_empty_corpus_precedence_filelock_and_lifecycle(tmp_path: Path) -> None:
     def tracked_embed(texts: list[str]) -> NDArray[np.float32]:
         embed_calls.append(list(texts))
         return _topic_embed(texts, dim=64)
+
+    with pytest.raises(YawRuntimeError) as exc_live:
+        start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=tracked_embed, lm=create_lm(cfg))
+    assert exc_live.value.code == "INVALID_INPUT"
 
     rt = start_runtime(
         cfg,
@@ -238,19 +264,20 @@ def test_empty_corpus_precedence_filelock_and_lifecycle(tmp_path: Path) -> None:
         close_runtime(rt2)
 
 
-def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Path) -> None:
+def test_live_reactive_swap_maxp_idle_noop_and_unlocked_inference(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
     assert cfg.corpus_root is not None
-    cfg.corpus_root.mkdir(parents=True)
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
 
     multi_text = "\n\n".join(
         f"Stage {k}: " + " ".join(f"Orbital booster valve item {k}_{j}." for j in range(1, 6)) for k in range(1, 8)
     )
-    (cfg.corpus_root / "multi.json").write_text(
+    (corpus_root / "multi.json").write_text(
         json.dumps({"title": "Booster Manual", "text": multi_text}),
         encoding="utf-8",
     )
-    (cfg.corpus_root / "booster_backup.md").write_text(
+    (corpus_root / "booster_backup.md").write_text(
         "# Booster Backup\nOrbital booster backup valve specification for emergency shutoff.\n",
         encoding="utf-8",
     )
@@ -265,62 +292,95 @@ def test_live_pragma_data_version_swap_maxp_and_unlocked_inference(tmp_path: Pat
             assert release_embed.wait(timeout=5.0)
         return _topic_embed(texts, dim=64)
 
-    rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=gated_embed, lm=create_lm(cfg))
+    threads_before = {t.ident for t in threading.enumerate()}
+
+    async def _run() -> None:
+        async with runtime_lifespan(
+            cfg, live=True, wait_for_ready=False, embed_fn=gated_embed, lm=create_lm(cfg)
+        ) as rt:
+            assert isinstance(rt, YawRuntime)
+            assert await wait_ready_async(rt, timeout=20.0) is True
+            idx0 = get_retrieval_index(rt)
+            gen0 = rt.index_generation
+            assert idx0.size >= 7 and gen0 >= 1
+
+            hits = await arecall(rt, "orbital booster", top_k=2)
+            paths = [h.pointer.rel_posix_path for h in hits]
+            assert len(hits) == 2
+            assert {"multi.json", "booster_backup.md"} == set(paths)
+            assert len({hit.pointer.span_label for hit in hits}) == 2
+            assert rt.index_generation == gen0
+
+            long_query = "orbital booster " * 80
+            assert len(long_query.encode("utf-8")) > 1024
+            assert len(await arecall(rt, long_query, top_k=2)) == 2
+            assert rt.index_generation == gen0
+
+            # Idle / empty / ignored files must NOT rebuild RetrievalIndex
+            (corpus_root / "empty.md").write_text("  \n", encoding="utf-8")
+            (corpus_root / "ignored.bin").write_bytes(b"\x01\x02")
+            await asyncio.sleep(0.4)
+            assert rt.index_generation == gen0
+
+            # Sequential post-READY create -> edit -> delete advance index_generation +1 each
+            live_file = corpus_root / "live_new.md"
+            live_file.write_text(
+                "# XylophoneZither Bio\nNeil Armstrong played XylophoneZither in Ohio.\n", encoding="utf-8"
+            )
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                if rt.index_generation > gen0:
+                    break
+                await asyncio.sleep(0.05)
+            assert rt.index_generation == gen0 + 1
+            res = await arecall(rt, "XylophoneZither", top_k=3)
+            assert any(h.pointer.rel_posix_path == "live_new.md" for h in res)
+            assert get_status(rt).num_chunks > idx0.size
+            assert get_retrieval_index(rt).size == get_status(rt).num_chunks
+
+            gen1 = rt.index_generation
+            live_file.write_text("# XylophoneZither Bio\nNeil Armstrong mastered XylophoneZither.\n", encoding="utf-8")
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline and rt.index_generation == gen1:
+                await asyncio.sleep(0.05)
+            assert rt.index_generation == gen1 + 1
+
+            gen2 = rt.index_generation
+            live_file.unlink()
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline and rt.index_generation == gen2:
+                await asyncio.sleep(0.05)
+            assert rt.index_generation == gen2 + 1
+
+            # Pause inside embed_fn -> verify index_lock is NOT held and snapshot_status returns immediately
+            gate_enabled.set()
+            task = asyncio.create_task(arecall(rt, "gateprobe", top_k=2))
+            try:
+                assert await asyncio.to_thread(entered_embed.wait, 5.0)
+                acquired = rt.index_lock.acquire(blocking=False)
+                assert acquired is True
+                rt.index_lock.release()
+                st = snapshot_status(rt)
+                assert st.queue_depth == 1
+                assert st.active_op == "recall"
+            finally:
+                release_embed.set()
+                _ = await task
+
     try:
-        assert isinstance(rt, YawRuntime)
-        assert wait_ready(rt, timeout=20.0) is True
-        idx0 = get_retrieval_index(rt)
-        ver0 = rt.index_data_version
-        assert idx0.size >= 7 and ver0 >= 1
-
-        hits = recall(rt, "orbital booster", top_k=2)
-        paths = [h.pointer.rel_posix_path for h in hits]
-        assert len(hits) == 2
-        assert {"multi.json", "booster_backup.md"} == set(paths)
-        assert len({hit.pointer.span_label for hit in hits}) == 2
-
-        # Queries > 1024 bytes succeed cleanly without artificial byte truncation
-        long_query = "orbital booster " * 80
-        assert len(long_query.encode("utf-8")) > 1024
-        assert len(recall(rt, long_query, top_k=2)) == 2
-
-        # Write a new file while live CocoIndex watcher runs and verify PRAGMA data_version auto-swap
-        (cfg.corpus_root / "live_new.md").write_text(
-            "# XylophoneZither Bio\nNeil Armstrong played XylophoneZither in Ohio.\n",
-            encoding="utf-8",
-        )
-        deadline = time.monotonic() + 20.0
-        found_live = False
-        while time.monotonic() < deadline:
-            res = recall(rt, "XylophoneZither", top_k=3)
-            if any(h.pointer.rel_posix_path == "live_new.md" for h in res):
-                found_live = True
-                break
-            time.sleep(0.1)
-        assert found_live is True
-        assert rt.index_data_version > ver0
-        assert get_status(rt).num_chunks > idx0.size
-        assert get_retrieval_index(rt).size == get_status(rt).num_chunks
-
-        # Pause inside embed_fn -> verify index_lock is NOT held and get_status returns immediately
-        gate_enabled.set()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(recall, rt, "gateprobe", top_k=2)
-            assert entered_embed.wait(timeout=5.0)
-            acquired = rt.index_lock.acquire(blocking=False)
-            assert acquired is True
-            rt.index_lock.release()
-            st = get_status(rt)
-            assert st.queue_depth == 1
-            assert st.active_op == "recall"
-            release_embed.set()
-            _ = fut.result(timeout=5.0)
+        asyncio.run(_run())
     finally:
         release_embed.set()
-        close_runtime(rt)
+
+    leaked = [
+        t.name
+        for t in threading.enumerate()
+        if t.ident not in threads_before and (not t.daemon or t.name.startswith("yaw-"))
+    ]
+    assert leaked == []
 
 
-def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: Path) -> None:
+def test_bounded_semaphore_busy_program_load_redaction_and_control_token(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path, queue_maxsize=2, api_key="super-secret-xyz987")
     assert cfg.corpus_root is not None and cfg.db_path is not None and cfg.lock_path is not None
     assert cfg.status_path is not None
@@ -453,20 +513,47 @@ def test_bounded_semaphore_busy_program_load_redaction_and_win32_stop(tmp_path: 
             assert redacted_st.last_error is not None and leaked not in redacted_st.last_error
             assert leaked not in disk_text
 
-        # Win32 named stop event signal propagation
-        if os.name == "nt":
-            assert win32_stop_event_name(cfg.lock_path).startswith("Local\\yaw-stop-")
-            assert signal_stop_event(cfg.lock_path) is True
-            deadline = time.monotonic() + 2.0
-            while not rt.stop_event.is_set() and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert rt.stop_event.is_set() is True
+        # Verify headroom clamp calculation and acquire_daemon_control / owns_file_lock handoff
+        expected_cap = max(1, min(32, min(32, (os.process_cpu_count() or 1) + 4) - 4))
+        assert sync_embed_concurrency_limit(32) == expected_cap
+
+    ctrl_cfg = _make_cfg(tmp_path / "ctrl_lock")
+    assert ctrl_cfg.corpus_root is not None and ctrl_cfg.lock_path is not None
+    ctrl_cfg.corpus_root.mkdir(parents=True)
+    tok_path = control_token_path(ctrl_cfg)
+    with acquire_daemon_control(ctrl_cfg) as (held_lock, token):
+        assert len(token) == 64
+        assert tok_path.is_file() and tok_path.read_text(encoding="ascii") == token
+        if os.name != "nt":
+            assert stat.S_IMODE(tok_path.stat().st_mode) == 0o600
+        with pytest.raises(YawRuntimeError) as exc_dup, acquire_daemon_control(ctrl_cfg):
+            pass
+        assert exc_dup.value.code == "BUSY"
+        assert tok_path.read_text(encoding="ascii") == token
+
+        rt_owned = start_runtime(
+            ctrl_cfg,
+            live=False,
+            wait_for_ready=True,
+            embed_fn=slow_embed,
+            lm=create_lm(ctrl_cfg),
+            file_lock=held_lock,
+        )
+        assert rt_owned.owns_file_lock is False
+        close_runtime(rt_owned)
+        assert held_lock.is_locked is True
+        assert tok_path.is_file()
+    assert not tok_path.exists()
+    probe = filelock.FileLock(str(ctrl_cfg.lock_path), timeout=0)
+    probe.acquire(timeout=0)
+    probe.release()
 
 
 def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_path: Path) -> None:
     secret_tok = "tok-initial-live-secret999"
     cfg = _make_cfg(tmp_path, api_key=secret_tok)
     assert cfg.corpus_root is not None and cfg.status_path is not None
+    status_path = cfg.status_path
     cfg.corpus_root.mkdir(parents=True)
     (cfg.corpus_root / "boom.md").write_text("# Boom\nTrigger initial live embed failure.\n", encoding="utf-8")
 
@@ -475,29 +562,38 @@ def test_live_initial_failure_records_error_lifecycle_and_redacted_status(tmp_pa
             raise RuntimeError(f"embed backend failed with key={secret_tok}")
         return _topic_embed(texts, dim=64)
 
-    rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=failing_embed, lm=create_lm(cfg))
-    try:
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if rt.lifecycle == "error":
-                break
-            time.sleep(0.05)
-        assert rt.lifecycle == "error"
-        st = get_status(rt)
-        assert st.lifecycle == "error"
-        assert st.sync_state == "error"
-        assert st.provider_ready is False
-        assert st.last_error is not None
-        assert "RuntimeError" in st.last_error
-        assert secret_tok not in st.last_error
-        disk_text = cfg.status_path.read_text(encoding="utf-8")
-        assert '"lifecycle": "error"' in disk_text
-        assert secret_tok not in disk_text
-        with pytest.raises(YawRuntimeError) as exc_nr:
-            recall(rt, "anything")
-        assert exc_nr.value.code == "NOT_READY"
-    finally:
-        close_runtime(rt)
+    async def _run() -> None:
+        async with runtime_lifespan(
+            cfg, live=True, wait_for_ready=False, embed_fn=failing_embed, lm=create_lm(cfg)
+        ) as rt:
+            assert rt.ready_evt is not None
+            await asyncio.wait_for(rt.ready_evt.wait(), timeout=10.0)
+            assert rt.lifecycle == "error"
+            st = get_status(rt)
+            assert st.lifecycle == "error"
+            assert st.sync_state == "error"
+            assert st.provider_ready is False
+            assert st.last_error is not None
+            assert "RuntimeError" in st.last_error
+            assert secret_tok not in st.last_error
+            assert rt.last_error is not None and secret_tok not in rt.last_error
+            assert "[REDACTED]" in rt.last_error
+            rt.last_error = "custom recorded redacted message"
+            _ = snapshot_status(rt)
+            assert rt.last_error == "custom recorded redacted message"
+            rt.last_error = None
+            synced_st = snapshot_status(rt)
+            assert synced_st.last_error is not None and secret_tok not in synced_st.last_error
+            assert rt.last_error is not None and secret_tok not in rt.last_error
+            assert "[REDACTED]" in rt.last_error
+            disk_text = status_path.read_text(encoding="utf-8")
+            assert '"lifecycle": "error"' in disk_text
+            assert secret_tok not in disk_text
+            with pytest.raises(YawRuntimeError) as exc_nr:
+                await arecall(rt, "anything")
+            assert exc_nr.value.code == "NOT_READY"
+
+    asyncio.run(_run())
 
 
 def test_live_initial_base_exception_transitions_to_error_and_redacts_status(tmp_path: Path) -> None:
@@ -507,6 +603,7 @@ def test_live_initial_base_exception_transitions_to_error_and_redacts_status(tmp
     secret_tok = "tok-initial-panic-secret888"
     cfg = _make_cfg(tmp_path, api_key=secret_tok)
     assert cfg.corpus_root is not None and cfg.status_path is not None
+    status_path = cfg.status_path
     cfg.corpus_root.mkdir(parents=True)
     (cfg.corpus_root / "panic.md").write_text("# Panic\nTrigger initial live non-Exception panic.\n", encoding="utf-8")
 
@@ -515,32 +612,32 @@ def test_live_initial_base_exception_transitions_to_error_and_redacts_status(tmp
             raise _SimulatedRustPanic(f"rust panic with key={secret_tok}")
         return _topic_embed(texts, dim=64)
 
-    rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=panicking_embed, lm=create_lm(cfg))
-    try:
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if rt.lifecycle == "error":
-                break
-            time.sleep(0.05)
-        assert rt.lifecycle == "error"
-        assert isinstance(rt.pipeline.error, RuntimeError)
-        assert isinstance(rt.pipeline.error.__cause__, BaseException)
-        st = get_status(rt)
-        assert st.lifecycle == "error"
-        assert st.sync_state == "error"
-        assert st.provider_ready is False
-        assert st.last_error is not None
-        assert "RuntimeError" in st.last_error
-        assert "_SimulatedRustPanic" in st.last_error
-        assert secret_tok not in st.last_error
-        disk_text = cfg.status_path.read_text(encoding="utf-8")
-        assert '"lifecycle": "error"' in disk_text
-        assert secret_tok not in disk_text
-        with pytest.raises(YawRuntimeError) as exc_nr:
-            recall(rt, "anything")
-        assert exc_nr.value.code == "NOT_READY"
-    finally:
-        close_runtime(rt)
+    async def _run() -> None:
+        async with runtime_lifespan(
+            cfg, live=True, wait_for_ready=False, embed_fn=panicking_embed, lm=create_lm(cfg)
+        ) as rt:
+            assert rt.ready_evt is not None
+            await asyncio.wait_for(rt.ready_evt.wait(), timeout=10.0)
+            assert rt.lifecycle == "error"
+            assert isinstance(rt.pipeline.error, RuntimeError)
+            assert isinstance(rt.pipeline.error.__cause__, BaseException)
+            st = get_status(rt)
+            assert st.lifecycle == "error"
+            assert st.sync_state == "error"
+            assert st.provider_ready is False
+            assert st.last_error is not None
+            assert "RuntimeError" in st.last_error
+            assert "_SimulatedRustPanic" in st.last_error
+            assert secret_tok not in st.last_error
+            assert rt.last_error is not None and secret_tok not in rt.last_error
+            disk_text = status_path.read_text(encoding="utf-8")
+            assert '"lifecycle": "error"' in disk_text
+            assert secret_tok not in disk_text
+            with pytest.raises(YawRuntimeError) as exc_nr:
+                await arecall(rt, "anything")
+            assert exc_nr.value.code == "NOT_READY"
+
+    asyncio.run(_run())
 
 
 def test_live_initial_http_500_transitions_to_error_and_redacts_status(tmp_path: Path) -> None:
@@ -568,38 +665,38 @@ def test_live_initial_http_500_transitions_to_error_and_redacts_status(tmp_path:
     try:
         cfg = replace(_make_cfg(tmp_path, api_key=secret_tok), base_url=f"http://127.0.0.1:{srv.server_port}/v1")
         assert cfg.corpus_root is not None and cfg.status_path is not None
+        status_path = cfg.status_path
         cfg.corpus_root.mkdir(parents=True)
         (cfg.corpus_root / "http500.md").write_text(
             "# HTTP 500\nTrigger real DSPy HTTP 500 embedding failure.\n",
             encoding="utf-8",
         )
-        rt = start_runtime(cfg, live=True, wait_for_ready=False, embed_fn=None, lm=create_lm(cfg))
-        try:
-            deadline = time.monotonic() + 15.0
-            while time.monotonic() < deadline:
-                if rt.lifecycle == "error":
-                    break
-                time.sleep(0.05)
-            assert rt.lifecycle == "error"
-            assert isinstance(rt.pipeline.error, RuntimeError)
-            assert rt.pipeline.error.__cause__ is not None
-            assert type(rt.pipeline.error.__cause__).__name__ == "InternalServerError"
-            st = get_status(rt)
-            assert st.lifecycle == "error"
-            assert st.sync_state == "error"
-            assert st.provider_ready is False
-            assert st.last_error is not None
-            assert "RuntimeError" in st.last_error
-            assert "InternalServerError" in st.last_error
-            assert secret_tok not in st.last_error
-            disk_text = cfg.status_path.read_text(encoding="utf-8")
-            assert '"lifecycle": "error"' in disk_text
-            assert secret_tok not in disk_text
-            with pytest.raises(YawRuntimeError) as exc_nr:
-                recall(rt, "anything")
-            assert exc_nr.value.code == "NOT_READY"
-        finally:
-            close_runtime(rt)
+
+        async def _run() -> None:
+            async with runtime_lifespan(cfg, live=True, wait_for_ready=False, embed_fn=None, lm=create_lm(cfg)) as rt:
+                assert rt.ready_evt is not None
+                await asyncio.wait_for(rt.ready_evt.wait(), timeout=15.0)
+                assert rt.lifecycle == "error"
+                assert isinstance(rt.pipeline.error, RuntimeError)
+                assert rt.pipeline.error.__cause__ is not None
+                assert type(rt.pipeline.error.__cause__).__name__ == "InternalServerError"
+                st = get_status(rt)
+                assert st.lifecycle == "error"
+                assert st.sync_state == "error"
+                assert st.provider_ready is False
+                assert st.last_error is not None
+                assert "RuntimeError" in st.last_error
+                assert "InternalServerError" in st.last_error
+                assert secret_tok not in st.last_error
+                assert rt.last_error is not None and secret_tok not in rt.last_error
+                disk_text = status_path.read_text(encoding="utf-8")
+                assert '"lifecycle": "error"' in disk_text
+                assert secret_tok not in disk_text
+                with pytest.raises(YawRuntimeError) as exc_nr:
+                    await arecall(rt, "anything")
+                assert exc_nr.value.code == "NOT_READY"
+
+        asyncio.run(_run())
     finally:
         srv.shutdown()
         srv.server_close()
@@ -699,6 +796,7 @@ def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path
             min_chunk_size=20,
         )
         assert cfg.corpus_root is not None and cfg.db_path is not None
+        db_path = cfg.db_path
         cfg.corpus_root.mkdir(parents=True)
         (cfg.corpus_root / "doc_lex.md").write_text(
             "# Lexical Target\nQuasarPulse99 appears in lexical target doc_lex.\n",
@@ -709,54 +807,53 @@ def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path
             encoding="utf-8",
         )
 
-        # Unindexed workspace fails fast on standalone recall_once with EMPTY_INDEX
         with pytest.raises(YawRuntimeError) as exc_empty:
             recall_once(cfg, "QuasarPulse99", top_k=1)
         assert exc_empty.value.code == "EMPTY_INDEX"
 
-        rt = start_runtime(cfg, live=True, wait_for_ready=True, embed_fn=rank_embed, lm=create_lm(cfg))
-        try:
-            idx0 = get_retrieval_index(rt)
-            ver0 = rt.index_data_version
-            assert idx0.size >= 2 and ver0 >= 1
+        async def _run() -> None:
+            async with runtime_lifespan(
+                cfg, live=True, wait_for_ready=True, embed_fn=rank_embed, lm=create_lm(cfg)
+            ) as rt:
+                idx0 = get_retrieval_index(rt)
+                gen0 = rt.index_generation
+                assert idx0.size >= 2 and gen0 >= 1
 
-            # Standalone lock-free recall_once and ask_once work cleanly alongside live runtime
-            assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
-            qa_res = ask_once(cfg, "Which doc matches QuasarPulse99?")
-            assert qa_res.passages[0].pointer.rel_posix_path == "doc_lex.md"
+                assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+                qa_res = ask_once(cfg, "Which doc matches QuasarPulse99?")
+                assert qa_res.passages[0].pointer.rel_posix_path == "doc_lex.md"
 
-            # Mismatched model / task_mode raises INDEX_NOT_READY in build_retrieval_index / recall_once
-            with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
-                _ = build_retrieval_index(
-                    ro_conn,
-                    expected_embedding_model=cfg.embedding_model,
-                    expected_task_mode=cfg.embedding_task_mode,
-                )
-            with pytest.raises(YawRuntimeError) as exc_mm:
-                recall_once(replace(cfg, embedding_model="mismatched-model"), "QuasarPulse99", top_k=1)
-            assert exc_mm.value.code == "INDEX_NOT_READY"
+                with contextlib.closing(open_readonly_db(db_path)) as ro_conn:
+                    _ = build_retrieval_index(
+                        ro_conn,
+                        expected_embedding_model=cfg.embedding_model,
+                        expected_task_mode=cfg.embedding_task_mode,
+                    )
+                with pytest.raises(YawRuntimeError) as exc_mm:
+                    recall_once(replace(cfg, embedding_model="mismatched-model"), "QuasarPulse99", top_k=1)
+                assert exc_mm.value.code == "INDEX_NOT_READY"
 
-            # 1. Transient post-ready INDEX_NOT_READY falls back to prior idx0 without advancing index_data_version
-            with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
-                orig_vsha = str(rw_conn.execute("SELECT vec_sha256 FROM rabitq_index WHERE id = 1").fetchone()[0])
-                rw_conn.execute("UPDATE rabitq_index SET vec_sha256 = 'transient_stale_sha' WHERE id = 1")
-                rw_conn.commit()
-            fallback_idx = get_retrieval_index(rt)
-            assert fallback_idx is idx0
-            assert rt.index_data_version == ver0
+                # 1. Transient post-ready INDEX_NOT_READY falls back to prior idx0 without advancing index_generation
+                with contextlib.closing(sqlite3.connect(db_path)) as rw_conn:
+                    orig_vsha = str(rw_conn.execute("SELECT vec_sha256 FROM rabitq_index WHERE id = 1").fetchone()[0])
+                    rw_conn.execute("UPDATE rabitq_index SET vec_sha256 = 'transient_stale_sha' WHERE id = 1")
+                    rw_conn.commit()
+                fallback_idx = reload_retrieval_index(rt)
+                assert fallback_idx is idx0
+                assert rt.index_generation == gen0
 
-            # 2. Restore fingerprint and introduce CONSISTENCY_ERROR -> NEVER swallowed by get_retrieval_index
-            with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
-                rw_conn.execute(
-                    "UPDATE rabitq_index SET vec_sha256 = ?, codes_blob = X'0001' WHERE id = 1",
-                    (orig_vsha,),
-                )
-                rw_conn.commit()
-            with pytest.raises(YawRuntimeError) as exc_cons:
-                get_retrieval_index(rt)
-            assert exc_cons.value.code == "CONSISTENCY_ERROR"
-        finally:
-            close_runtime(rt)
+                # 2. Restore fingerprint and introduce CONSISTENCY_ERROR -> NEVER swallowed by reload_retrieval_index
+                with contextlib.closing(sqlite3.connect(db_path)) as rw_conn:
+                    rw_conn.execute(
+                        "UPDATE rabitq_index SET vec_sha256 = ?, codes_blob = X'0001' WHERE id = 1",
+                        (orig_vsha,),
+                    )
+                    rw_conn.commit()
+                with pytest.raises(YawRuntimeError) as exc_cons:
+                    reload_retrieval_index(rt)
+                assert exc_cons.value.code == "CONSISTENCY_ERROR"
+
+        asyncio.run(_run())
     finally:
         srv.shutdown()
 
@@ -776,63 +873,122 @@ def test_live_post_ready_pipeline_failure_transitions_to_error_and_blocks_querie
             raise RuntimeError(f"post-ready embed boom key={secret_tok}")
         return _topic_embed(texts, dim=64)
 
-    def chat_responder(_turn_idx: int, payload: dict[str, Any]) -> str:
-        _ = payload
-        return "Insufficient references in corpus"
-
-    srv, _ = _start_chat_server(chat_responder)
-    cfg = YawConfig(
-        workspace_root=tmp_path,
-        corpus_root=cfg.corpus_root,
-        db_path=cfg.db_path,
-        lock_path=cfg.lock_path,
-        state_dir=cfg.state_dir,
-        log_path=cfg.log_path,
-        status_path=cfg.status_path,
-        compiled_program_path=cfg.compiled_program_path,
-        base_url=f"http://127.0.0.1:{srv.server_port}/v1",
-        api_key=secret_tok,
-        chunk_size=140,
-        chunk_overlap=20,
-        min_chunk_size=20,
-    )
+    srv, _ = _start_chat_server(lambda _t, _p: "Insufficient references in corpus")
+    cfg = replace(cfg, base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key=secret_tok)
     assert cfg.corpus_root is not None and cfg.status_path is not None
-    rt = start_runtime(cfg, live=True, wait_for_ready=True, embed_fn=post_ready_failing_embed, lm=create_lm(cfg))
+    corpus_root, status_path = cfg.corpus_root, cfg.status_path
+
+    async def _run() -> None:
+        async with runtime_lifespan(
+            cfg, live=True, wait_for_ready=True, embed_fn=post_ready_failing_embed, lm=create_lm(cfg)
+        ) as rt:
+            assert get_status(rt).lifecycle == "ready"
+            assert get_status(rt).provider_ready is True
+            assert await arecall(rt, "Apollo", top_k=1)
+
+            (corpus_root / "boom_after.md").write_text(
+                "# Trigger\nPOST_READY_EMBED_BOOM breaks live ingestion.\n",
+                encoding="utf-8",
+            )
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline and rt.pipeline.error is None:
+                await asyncio.sleep(0.05)
+            assert rt.pipeline.error is not None
+
+            with pytest.raises(YawRuntimeError) as exc_rec:
+                await arecall(rt, "Apollo")
+            assert exc_rec.value.code == "NOT_READY"
+            with pytest.raises(YawRuntimeError) as exc_ask:
+                await aask(rt, "Who commanded Apollo 11?")
+            assert exc_ask.value.code == "NOT_READY"
+
+            st = get_status(rt)
+            assert st.lifecycle == "error"
+            assert st.provider_ready is False
+            assert st.sync_state == "error"
+            assert st.last_error is not None
+            assert "RuntimeError" in st.last_error
+            assert secret_tok not in st.last_error
+            assert rt.last_error is not None and secret_tok not in rt.last_error
+            assert "[REDACTED]" in rt.last_error
+            rt.last_error = "custom recorded redacted message"
+            _ = snapshot_status(rt)
+            assert rt.last_error == "custom recorded redacted message"
+            rt.last_error = None
+            synced_st = snapshot_status(rt)
+            assert synced_st.last_error is not None and secret_tok not in synced_st.last_error
+            assert rt.last_error is not None and secret_tok not in rt.last_error
+            assert "[REDACTED]" in rt.last_error
+            disk_text = status_path.read_text(encoding="utf-8")
+            assert '"lifecycle": "error"' in disk_text
+            assert secret_tok not in disk_text
+
     try:
-        assert get_status(rt).lifecycle == "ready"
-        assert get_status(rt).provider_ready is True
-        assert recall(rt, "Apollo", top_k=1)
-
-        (cfg.corpus_root / "boom_after.md").write_text(
-            "# Trigger\nPOST_READY_EMBED_BOOM breaks live ingestion.\n",
-            encoding="utf-8",
-        )
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            if rt.pipeline.error is not None:
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("Live watcher did not capture post-ready pipeline error")
-
-        # _ensure_ready must sync pipeline error -> persist error status & raise NOT_READY even before get_status()
-        with pytest.raises(YawRuntimeError) as exc_rec:
-            recall(rt, "Apollo")
-        assert exc_rec.value.code == "NOT_READY"
-        with pytest.raises(YawRuntimeError) as exc_ask:
-            ask(rt, "Who commanded Apollo 11?")
-        assert exc_ask.value.code == "NOT_READY"
-
-        st = get_status(rt)
-        assert st.lifecycle == "error"
-        assert st.provider_ready is False
-        assert st.sync_state == "error"
-        assert st.last_error is not None
-        assert "RuntimeError" in st.last_error
-        assert secret_tok not in st.last_error
-        disk_text = cfg.status_path.read_text(encoding="utf-8")
-        assert '"lifecycle": "error"' in disk_text
-        assert secret_tok not in disk_text
+        asyncio.run(_run())
     finally:
-        close_runtime(rt)
         srv.shutdown()
+
+
+def test_arecall_awaits_dspy_batch_embedder_acall_under_l3_semaphores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _AcEmbedHandler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw_in = payload["input"]
+            texts = [raw_in] if isinstance(raw_in, str) else [str(x) for x in raw_in]
+            vecs = _topic_embed(texts, dim=16)
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": i, "embedding": vecs[i].tolist()} for i in range(len(texts))
+                    ],
+                    "model": str(payload.get("model", "")),
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _AcEmbedHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = replace(_make_cfg(tmp_path), base_url=f"http://127.0.0.1:{srv.server_port}/v1")
+        assert cfg.corpus_root is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "doc.md").write_text("# Doc\nOrbital booster valve note.\n", encoding="utf-8")
+
+        async def _run() -> None:
+            async with runtime_lifespan(cfg, live=False, wait_for_ready=True, lm=create_lm(cfg)) as rt:
+                assert isinstance(rt.embed_fn, DspyBatchEmbedder)
+                assert rt.embed_uses_async is True
+                acall_calls: list[list[str]] = []
+                orig_acall = rt.embed_fn.acall
+
+                async def _spy_acall(texts: list[str]) -> NDArray[np.float32]:
+                    acall_calls.append(list(texts))
+                    return await orig_acall(texts)
+
+                monkeypatch.setattr(rt.embed_fn, "acall", _spy_acall)
+                monkeypatch.setattr(
+                    rt.embed_fn,
+                    "__call__",
+                    lambda _texts: pytest.fail("arecall must not call sync __call__ on DspyBatchEmbedder"),
+                )
+                hits = await arecall(rt, "orbital booster", top_k=1)
+                assert len(hits) == 1
+                assert len(acall_calls) == 1
+
+        asyncio.run(_run())
+    finally:
+        srv.shutdown()
+        srv.server_close()

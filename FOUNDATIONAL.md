@@ -27,7 +27,7 @@ yaw/
 ```
 
 - Modules never import another module's `_private` symbols or access foreign `_` attributes.
-- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic; `mcp_server.py` serves Streamable HTTP on loopback `127.0.0.1:13306/mcp` with `/healthz`, `/readyz`, pre-dispatch `Host`/`Origin` `403`, and exact `3` read-only tools (`recall`, `qa`, `daemon_status`).
+- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic; `mcp_server.py` serves Streamable HTTP on loopback `127.0.0.1:13306/mcp` with `/healthz`, `/readyz`, `/status`, `.yaw/control.token`-authenticated `/_internal/stop`, pre-dispatch `Host`/`Origin` `403`, and exact `3` read-only tools (`recall`, `qa`, `daemon_status`).
 - `cli.py` lazy-imports `optimize.py` inside optimization subcommands so Tier-0 commands run standalone outside a git checkout.
 
 ## 4. System Invariants
@@ -39,9 +39,9 @@ yaw/
    - `yaw.db` stores 1-indexed `(rel_posix_path, start_line, end_line)`, character offsets `(char_start, char_end)`, and SHA-256 `source_hash`—never authoritative copies of corpus text.
    - Passages hydrate pure line/character spans uniformly from disk at query time (`max_chars=None` uncropped by default, `pool_k = max(top_k * 4, 50)` before span deduplication, zero serde JSON reparsing): missing or hash-mismatched files return `stale_on_disk = True` with `text = ""`.
 3. **Zero-LLM Hybrid Ranking (`yaw/retrieval/`, `yaw/runtime.py`):**
-   - Combines 1-bit SoA RaBitQ (`rabitq_index`), `FTS5` (`chunk_fts` / `chunk_vocab`), and tangent-steered cyclic citation + 1-bit PMI diffusion (`CitationGraph`, `DiffusionOperators`) inside `RetrievalIndex` (`build_retrieval_index`, `empty_retrieval_index`, `search_index`, `expand_citation_neighbors`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), hot-swapping outside `index_lock` via `PRAGMA data_version` (`get_retrieval_index`).
+   - Combines 1-bit SoA RaBitQ (`rabitq_index`), `FTS5` (`chunk_fts` / `chunk_vocab`), and tangent-steered cyclic citation + 1-bit PMI diffusion (`CitationGraph`, `DiffusionOperators`) inside `RetrievalIndex` (`build_retrieval_index`, `empty_retrieval_index`, `search_index`, `expand_citation_neighbors`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), swapping outside `index_lock` via reactive CocoIndex sink transitions (`get_retrieval_index`, `reload_retrieval_index`, `0` `PRAGMA data_version` polls).
 4. **Runtime Concurrency & Native Tool Calling (`yaw/runtime.py`, `yaw/qa.py`, `yaw/optimize.py`):**
-   - `recall` runs under `BoundedSemaphore(32)` over `?mode=ro` SQLite connections with zero LM endpoint dependency.
+   - `arecall` / `recall` run under `L3` `query_sem` (`32`) + `embed_sem` (`0` custom `ThreadPoolExecutor` pools) over `?mode=ro` SQLite connections with zero LM endpoint dependency.
    - Bare `dspy.ReAct` QA and `dspy.GEPA` instruction proposal declare `ProviderDefinition.chat` (`ModelSupport(function_calling=True)`) via `dspy.lm15.register_provider`, enforce `tool_choice="required"`, serialize under `Semaphore(1)`, run student and GEPA reflection at `temperature=1.0` unconditionally, and validate inline `[chunk_id=<int>]` citations strictly against non-`submit` tool observations (`0` SQLite writes during QA).
 
 ## 5. Failure Policy & Acceptance Criteria

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import gc
 import hashlib
@@ -29,14 +30,16 @@ from numpy.typing import NDArray
 import yaw.pipeline as yaw_pipeline
 from yaw.core import ChunkPointer, YawConfig, YawRuntimeError, format_query_for_embedding, load_config
 from yaw.pipeline import (
+    SinkMutationTracker,
     chunk_file_content,
     close_pipeline,
+    drop_pipeline,
     list_user_tables,
     make_dspy_embed_fn,
+    open_pipeline_lifespan,
     reconcile_index_tables,
     start_pipeline,
     update_pipeline_once,
-    wait_pipeline_ready,
 )
 from yaw.retrieval import hydrate_passage, open_readonly_db
 
@@ -279,35 +282,36 @@ def test_microbatch_64_plus_64_equals_128_invariance(tmp_path: Path) -> None:
 def test_live_mode_reconciles_disk_changes_and_allows_concurrent_wal_reads(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path)
     assert cfg.corpus_root is not None and cfg.db_path is not None
-    cfg.corpus_root.mkdir(parents=True)
-    (cfg.corpus_root / "seed.md").write_text("# Seed\nInitial quartz oscillator specification.\n", encoding="utf-8")
+    corpus_root, db_path = cfg.corpus_root, cfg.db_path
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "seed.md").write_text("# Seed\nInitial quartz oscillator specification.\n", encoding="utf-8")
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
-    try:
-        assert wait_pipeline_ready(session, timeout=20.0)
-        with _open_ro(cfg.db_path) as reader:
-            assert reader.execute("SELECT count(*) FROM chunks").fetchone()[0] == 1
-            v0 = reader.execute("PRAGMA data_version").fetchone()[0]
+    async def _run() -> None:
+        async with open_pipeline_lifespan(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True) as session:
+            assert session.ready_event is not None
+            await asyncio.wait_for(session.ready_event.wait(), timeout=20.0)
+            with _open_ro(db_path) as reader:
+                assert reader.execute("SELECT count(*) FROM chunks").fetchone()[0] == 1
+                v0 = reader.execute("PRAGMA data_version").fetchone()[0]
 
-            # Add live file while WAL reader remains open and polls concurrently
-            (cfg.corpus_root / "live_added.md").write_text(
-                "# Live\nSuperconducting niobium cavity resonance test.\n",
-                encoding="utf-8",
-            )
-            deadline = time.monotonic() + 15.0
-            seen_two = False
-            while time.monotonic() < deadline:
-                cnt = reader.execute("SELECT count(*) FROM chunks").fetchone()[0]
-                fts_hit = reader.execute("SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'niobium'").fetchall()
-                if cnt == 2 and len(fts_hit) == 1:
-                    seen_two = True
-                    break
-                time.sleep(0.1)
-            assert seen_two
-            v1 = reader.execute("PRAGMA data_version").fetchone()[0]
-            assert v1 >= v0
-    finally:
-        close_pipeline(session)
+                (corpus_root / "live_added.md").write_text(
+                    "# Live\nSuperconducting niobium cavity resonance test.\n",
+                    encoding="utf-8",
+                )
+                deadline = time.monotonic() + 15.0
+                seen_two = False
+                while time.monotonic() < deadline:
+                    cnt = reader.execute("SELECT count(*) FROM chunks").fetchone()[0]
+                    fts_hit = reader.execute("SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'niobium'").fetchall()
+                    if cnt == 2 and len(fts_hit) == 1:
+                        seen_two = True
+                        break
+                    await asyncio.sleep(0.05)
+                assert seen_two
+                v1 = reader.execute("PRAGMA data_version").fetchone()[0]
+                assert v1 >= v0
+
+    asyncio.run(_run())
 
 
 def test_loopback_dspy_embedder_pipeline(tmp_path: Path) -> None:
@@ -409,14 +413,25 @@ def test_live_pipeline_propagates_component_failures(tmp_path: Path, capfd: pyte
         _ = texts
         raise RuntimeError("Model server is down 503")
 
+    async def _run() -> None:
+        err_evt = asyncio.Event()
+        errors: list[Exception] = []
+
+        def _on_err(exc: Exception) -> None:
+            errors.append(exc)
+            err_evt.set()
+
+        async with open_pipeline_lifespan(cfg, embed_fn=failing_embed, live=True, on_error=_on_err) as session:
+            assert session.ready_event is not None
+            await asyncio.wait_for(session.ready_event.wait(), timeout=10.0)
+            await asyncio.wait_for(err_evt.wait(), timeout=2.0)
+            assert session.error is not None
+            assert "Model server is down 503" in str(session.error)
+            assert errors and "Model server is down 503" in str(errors[0])
+
     capfd.readouterr()
-    session = start_pipeline(cfg, embed_fn=failing_embed, live=True)
-    try:
-        with pytest.raises(RuntimeError, match="Model server is down 503"):
-            wait_pipeline_ready(session, timeout=10.0)
-    finally:
-        close_pipeline(session)
-    time.sleep(0.1)
+    asyncio.run(_run())
+    time.sleep(0.05)
     captured = capfd.readouterr()
     assert "Failed to clean up pending stage token" not in captured.err
     assert "environment is closed" not in captured.err
@@ -427,8 +442,9 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(
 ) -> None:
     cfg = _make_cfg(tmp_path)
     assert cfg.corpus_root is not None
-    cfg.corpus_root.mkdir(parents=True)
-    (cfg.corpus_root / "alpha.md").write_text("# Alpha\nInitial healthy file.\n", encoding="utf-8")
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "alpha.md").write_text("# Alpha\nInitial healthy file.\n", encoding="utf-8")
     calls = 0
 
     def flaky_embed(texts: list[str]) -> NDArray[np.float32]:
@@ -438,19 +454,22 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(
             raise RuntimeError("Mid-stream failure after ready")
         return _hash_embed(texts, dim=4)
 
+    async def _run() -> None:
+        err_evt = asyncio.Event()
+
+        async with open_pipeline_lifespan(
+            cfg, embed_fn=flaky_embed, live=True, on_error=lambda _exc: err_evt.set()
+        ) as session:
+            assert session.ready_event is not None
+            await asyncio.wait_for(session.ready_event.wait(), timeout=15.0)
+            (corpus_root / "beta.md").write_text("# Beta\nTriggers second embed call.\n", encoding="utf-8")
+            await asyncio.wait_for(err_evt.wait(), timeout=10.0)
+            assert session.error is not None
+            assert "Mid-stream failure after ready" in str(session.error)
+
     capfd.readouterr()
-    session = start_pipeline(cfg, embed_fn=flaky_embed, live=True)
-    try:
-        assert wait_pipeline_ready(session, timeout=15.0)
-        (cfg.corpus_root / "beta.md").write_text("# Beta\nTriggers second embed call.\n", encoding="utf-8")
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and session.error is None:
-            time.sleep(0.05)
-        with pytest.raises(RuntimeError, match="Mid-stream failure after ready"):
-            wait_pipeline_ready(session, timeout=1.0)
-    finally:
-        close_pipeline(session)
-    time.sleep(0.1)
+    asyncio.run(_run())
+    time.sleep(0.05)
     captured = capfd.readouterr()
     assert "Failed to clean up pending stage token" not in captured.err
     assert "environment is closed" not in captured.err
@@ -459,19 +478,23 @@ def test_live_pipeline_propagates_incremental_failures_after_ready(
 def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
     assert "INDEXING_ERROR_SINK" not in vars(yaw_pipeline)
     assert not hasattr(yaw_pipeline, "INDEXING_ERROR_SINK")
+    assert not hasattr(yaw_pipeline, "wait_pipeline_ready")
     for exported in (
         "CORPUS_ROOT",
         "SQLITE_DB",
         "EMBEDDER",
+        "SINK_TRACKER",
+        "SinkMutationTracker",
         "DspyBatchEmbedder",
         "PipelineSession",
         "open_managed_db",
+        "open_pipeline_lifespan",
         "make_dspy_embed_fn",
         "chunk_file_content",
         "reconcile_index_tables",
         "start_pipeline",
         "update_pipeline_once",
-        "wait_pipeline_ready",
+        "drop_pipeline",
         "close_pipeline",
         "list_user_tables",
     ):
@@ -480,9 +503,9 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
     sources = [
         py_file.read_text(encoding="utf-8") for py_file in sorted(Path(yaw_pipeline.__file__).parent.rglob("*.py"))
     ]
-    assert all("INDEXING_ERROR_SINK" not in s for s in sources)
-    assert all("_loop_runner" not in s for s in sources)
-    assert all("cocoindex._internal" not in s for s in sources)
+    for forbidden in ("INDEXING_ERROR_SINK", "_loop_runner", "cocoindex._internal", "yaw-cocoindex-session"):
+        assert all(forbidden not in s for s in sources)
+    assert all("update_blocking" not in s and "drop_blocking" not in s for s in sources)
     assert any("exception_handler=" in s for s in sources)
 
 
@@ -491,18 +514,20 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
 ) -> None:
     cfg = _make_cfg(tmp_path / "inproc")
     assert cfg.corpus_root is not None
-    cfg.corpus_root.mkdir(parents=True)
-    (cfg.corpus_root / "seed.md").write_text("# Seed\nInitial content.\n", encoding="utf-8")
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "seed.md").write_text("# Seed\nInitial content.\n", encoding="utf-8")
     capfd.readouterr()
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
-    try:
-        assert wait_pipeline_ready(session, timeout=20.0)
-        churn = cfg.corpus_root / "churn.md"
-        churn.write_text("# Churn\nCreated right before shutdown.\n", encoding="utf-8")
-        churn.write_text("# Churn\nUpdated right before shutdown.\n", encoding="utf-8")
-    finally:
-        close_pipeline(session)
+    async def _inproc() -> None:
+        async with open_pipeline_lifespan(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True) as session:
+            assert session.ready_event is not None
+            await asyncio.wait_for(session.ready_event.wait(), timeout=20.0)
+            churn = corpus_root / "churn.md"
+            churn.write_text("# Churn\nCreated right before shutdown.\n", encoding="utf-8")
+            churn.write_text("# Churn\nUpdated right before shutdown.\n", encoding="utf-8")
+
+    asyncio.run(_inproc())
     gc.collect()
     captured = capfd.readouterr()
     for bad in ("Failed to clean up pending stage token", "Task was destroyed", "different Context"):
@@ -510,11 +535,11 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
 
     sub_root = (tmp_path / "subproc").as_posix()
     script = (
-        "import gc\n"
+        "import asyncio, gc\n"
         "from pathlib import Path\n"
         "import numpy as np\n"
         "from yaw.core import YawConfig\n"
-        "from yaw.pipeline import close_pipeline, start_pipeline, wait_pipeline_ready\n"
+        "from yaw.pipeline import open_pipeline_lifespan\n"
         f"root = Path({sub_root!r})\n"
         "cfg = YawConfig(\n"
         "    workspace_root=root,\n"
@@ -530,14 +555,13 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
         "(cfg.corpus_root / 'seed.md').write_text('# Seed\\nInitial.\\n', encoding='utf-8')\n"
         "def emb(ts):\n"
         "    return np.ones((len(ts), 8), dtype=np.float32) / np.sqrt(8.0)\n"
-        "sess = start_pipeline(cfg, embed_fn=emb, live=True)\n"
-        "try:\n"
-        "    assert wait_pipeline_ready(sess, timeout=20.0)\n"
-        "    churn = cfg.corpus_root / 'churn.md'\n"
-        "    churn.write_text('# Churn\\nCreated before close.\\n', encoding='utf-8')\n"
-        "    churn.write_text('# Churn\\nUpdated before close.\\n', encoding='utf-8')\n"
-        "finally:\n"
-        "    close_pipeline(sess)\n"
+        "async def run():\n"
+        "    async with open_pipeline_lifespan(cfg, embed_fn=emb, live=True) as sess:\n"
+        "        await asyncio.wait_for(sess.ready_event.wait(), timeout=20.0)\n"
+        "        churn = cfg.corpus_root / 'churn.md'\n"
+        "        churn.write_text('# Churn\\nCreated before close.\\n', encoding='utf-8')\n"
+        "        churn.write_text('# Churn\\nUpdated before close.\\n', encoding='utf-8')\n"
+        "asyncio.run(run())\n"
         "gc.collect()\n"
     )
     proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
@@ -548,26 +572,41 @@ def test_live_pipeline_clean_shutdown_no_task_or_context_leaks(
 def test_concurrent_live_sessions_isolated_on_close(tmp_path: Path) -> None:
     cfg_a = _make_cfg(tmp_path / "sess_a")
     cfg_b = _make_cfg(tmp_path / "sess_b")
-    assert cfg_a.corpus_root is not None and cfg_b.corpus_root is not None
-    assert cfg_b.db_path is not None
+    assert cfg_a.corpus_root is not None and cfg_b.corpus_root is not None and cfg_b.db_path is not None
     cfg_a.corpus_root.mkdir(parents=True)
     cfg_b.corpus_root.mkdir(parents=True)
     (cfg_a.corpus_root / "a1.md").write_text("# Session A\nAlpha session seed.\n", encoding="utf-8")
     (cfg_b.corpus_root / "b1.md").write_text("# Session B\nBeta session seed.\n", encoding="utf-8")
 
-    sa = start_pipeline(cfg_a, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
-    sb = start_pipeline(cfg_b, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
+    ready_a = threading.Event()
+    ready_b = threading.Event()
+    stop_a = threading.Event()
+    stop_b = threading.Event()
+    loops: dict[str, asyncio.AbstractEventLoop] = {}
+
+    def _run_sess(name: str, cfg: YawConfig, ready_ev: threading.Event, stop_ev: threading.Event) -> None:
+        async def _inner() -> None:
+            async with open_pipeline_lifespan(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True) as sess:
+                assert sess.env is not None and sess.ready_event is not None
+                loops[name] = sess.env.event_loop
+                await asyncio.wait_for(sess.ready_event.wait(), timeout=20.0)
+                ready_ev.set()
+                while not stop_ev.is_set():
+                    await asyncio.sleep(0.05)
+
+        asyncio.run(_inner())
+
+    ta = threading.Thread(target=_run_sess, args=("a", cfg_a, ready_a, stop_a), daemon=True)
+    tb = threading.Thread(target=_run_sess, args=("b", cfg_b, ready_b, stop_b), daemon=True)
+    ta.start()
+    tb.start()
     try:
-        assert wait_pipeline_ready(sa, timeout=20.0)
-        assert wait_pipeline_ready(sb, timeout=20.0)
-        assert sa.loop is not sb.loop
-        assert sa.env.event_loop is not sb.env.event_loop
-
-        close_pipeline(sa)
-        close_pipeline(sa)  # Idempotent close check
-
-        assert sb.thread.is_alive()
-        assert sb.env.event_loop.is_running()
+        assert ready_a.wait(timeout=20.0) and ready_b.wait(timeout=20.0)
+        assert loops["a"] is not loops["b"]
+        stop_a.set()
+        ta.join(timeout=10.0)
+        assert not ta.is_alive() and tb.is_alive()
+        assert loops["b"].is_running()
 
         (cfg_b.corpus_root / "b2.md").write_text("# Session B2\nContinued live indexing zircon.\n", encoding="utf-8")
         with _open_ro(cfg_b.db_path) as reader:
@@ -582,31 +621,248 @@ def test_concurrent_live_sessions_isolated_on_close(tmp_path: Path) -> None:
                 time.sleep(0.05)
             assert indexed
     finally:
-        close_pipeline(sa)
-        close_pipeline(sb)
+        stop_a.set()
+        stop_b.set()
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
 
 
-def test_live_pipeline_inside_asyncio_run_uses_dedicated_loop(tmp_path: Path) -> None:
-    cfg = _make_cfg(tmp_path / "async_caller")
+def test_live_pipeline_runs_on_caller_loop_preserves_bystander_and_tracks_real_mutations(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path / "shared_loop")
     assert cfg.corpus_root is not None
-    cfg.corpus_root.mkdir(parents=True)
-    (cfg.corpus_root / "seed.md").write_text("# Async Caller\nDedicated event loop test.\n", encoding="utf-8")
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "seed.md").write_text("# Seed\nInitial content.\n", encoding="utf-8")
+
+    with pytest.raises(YawRuntimeError) as exc_live:
+        start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
+    assert exc_live.value.code == "INVALID_INPUT"
+
+    reconciled_events: list[tuple[bool, bool]] = []
+
+    async def _on_reconciled(changed: bool, is_initial: bool) -> None:
+        reconciled_events.append((changed, is_initial))
 
     async def _exercise() -> float:
         caller_loop = asyncio.get_running_loop()
-        sess = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
+        bystander_stop = asyncio.Event()
+
+        async def _bystander() -> str:
+            await bystander_stop.wait()
+            return "intact"
+
+        bystander_task = asyncio.create_task(_bystander())
         try:
-            assert sess.env.event_loop is not caller_loop
-            assert wait_pipeline_ready(sess, timeout=20.0)
-        finally:
-            t0 = time.monotonic()
-            close_pipeline(sess)
+            async with open_pipeline_lifespan(
+                cfg,
+                embed_fn=lambda ts: _hash_embed(ts, dim=8),
+                live=True,
+                on_reconciled=_on_reconciled,
+            ) as sess:
+                assert sess.env is not None and sess.env.event_loop is caller_loop
+                assert sess.ready_event is not None and sess.sink_tracker is not None
+                assert isinstance(sess.sink_tracker, SinkMutationTracker)
+                await asyncio.wait_for(sess.ready_event.wait(), timeout=20.0)
+                seq_after_init = sess.sink_tracker.seq
+                events_after_init = len(reconciled_events)
+
+                # Empty and excluded files must not advance sink tracker or trigger reconciliation
+                (corpus_root / "empty.md").write_text("   \n", encoding="utf-8")
+                (corpus_root / "ignored.bin").write_bytes(b"\x00\x01\x02")
+                await asyncio.sleep(0.4)
+                assert sess.sink_tracker.seq == seq_after_init
+                assert len(reconciled_events) == events_after_init
+
+                # Real create/edit/delete advance sink_tracker strictly
+                target = corpus_root / "mutated.md"
+                target.write_text("# Alpha\nFirst mutation line.\n", encoding="utf-8")
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline and len(reconciled_events) <= events_after_init:
+                    await asyncio.sleep(0.05)
+                assert len(reconciled_events) > events_after_init
+                assert sess.sink_tracker.seq > seq_after_init
+                t0 = time.monotonic()
             elapsed = time.monotonic() - t0
-            close_pipeline(sess)  # Idempotent close check
-        return elapsed
+            assert not bystander_task.done()
+            bystander_stop.set()
+            assert await bystander_task == "intact"
+            return elapsed
+        finally:
+            bystander_stop.set()
+            if not bystander_task.done():
+                bystander_task.cancel()
+                await asyncio.gather(bystander_task, return_exceptions=True)
 
     elapsed = asyncio.run(_exercise())
     assert elapsed < 3.0
+
+
+def test_live_pipeline_watch_non_worker_error_notifies_and_unblocks_ready_event(tmp_path: Path) -> None:
+    class _CustomWatchError(Exception):
+        pass
+
+    class _SimulatedRustPanic(BaseException):
+        pass
+
+    for label, exc_cls in (("custom_exc", _CustomWatchError), ("rust_panic", _SimulatedRustPanic)):
+        cfg = _make_cfg(tmp_path / label)
+        assert cfg.corpus_root is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "seed.md").write_text("# Seed\nWatch pipeline error check.\n", encoding="utf-8")
+
+        async def _run(cur_cfg: YawConfig = cfg, err_type: type[BaseException] = exc_cls) -> None:
+            errors: list[Exception] = []
+
+            async def _boom_reconciled(_changed: bool, _is_initial: bool) -> None:
+                raise err_type("watch consumer exploded")
+
+            async with open_pipeline_lifespan(
+                cur_cfg,
+                embed_fn=lambda ts: _hash_embed(ts, dim=8),
+                live=True,
+                on_reconciled=_boom_reconciled,
+                on_error=errors.append,
+            ) as sess:
+                assert sess.ready_event is not None
+                await asyncio.wait_for(sess.ready_event.wait(), timeout=15.0)
+                assert isinstance(sess.error, RuntimeError)
+                assert isinstance(sess.error.__cause__, err_type)
+                assert len(errors) == 1
+                assert errors[0] is sess.error
+
+        asyncio.run(_run())
+
+
+def test_dspy_batch_embedder_acall_batches_errors_and_drop_pipeline(tmp_path: Path) -> None:
+    seen_calls: list[list[str]] = []
+
+    class _EmbedHandler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw_in = payload["input"]
+            texts = [raw_in] if isinstance(raw_in, str) else [str(x) for x in raw_in]
+            seen_calls.append(list(texts))
+            vecs = (_hash_embed(texts, dim=8) * 2.0).astype(np.float32)
+            # Emit reversed index order + base64 payload for "b64" inputs to verify dspy.Embedder handling
+            items = [
+                {
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": (
+                        base64.b64encode(vecs[i].astype("<f4").tobytes()).decode("ascii")
+                        if "b64" in texts[i]
+                        else vecs[i].tolist()
+                    ),
+                }
+                for i in reversed(range(len(texts)))
+            ]
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": items,
+                    "model": str(payload.get("model", "")),
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with _loopback_embed_server_handler(_EmbedHandler) as port:
+        cfg = replace(
+            _make_http_cfg(tmp_path / "acall_ok", port=port, embedding_model="acall-model"),
+            embed_batch_size=2,
+        )
+        embedder = make_dspy_embed_fn(cfg)
+
+        async def _check_acall() -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+            empty = await embedder.acall([])
+            assert empty.shape == (0, 0)
+            v1 = await embedder.acall(["one", "two", "b64-three"])
+            v2 = await embedder.acall(["four"])
+            return v1, v2
+
+        v1, v2 = asyncio.run(_check_acall())
+        assert v1.shape == (3, 8)
+        assert v2.shape == (1, 8)
+        assert np.allclose(np.linalg.norm(v1, axis=1), 1.0, atol=1e-5)
+        assert np.allclose(v1, _hash_embed(["one", "two", "b64-three"], dim=8), atol=1e-5)
+        assert np.allclose(v2, embedder(["four"]), atol=1e-5)
+        assert seen_calls == [["one", "two"], ["b64-three"], ["four"], ["four"]]
+
+        assert cfg.corpus_root is not None and cfg.db_path is not None
+        cfg.corpus_root.mkdir(parents=True)
+        (cfg.corpus_root / "note.md").write_text("# Note\nDrop pipeline check.\n", encoding="utf-8")
+        sess = start_pipeline(cfg, embed_fn=embedder, live=False)
+        try:
+            update_pipeline_once(sess)
+            with _open_ro(cfg.db_path) as conn:
+                assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 1
+            drop_pipeline(sess)
+            with _open_ro(cfg.db_path) as conn:
+                remaining = set(list_user_tables(conn))
+                assert "chunks" not in remaining and "chunk_fts" not in remaining
+        finally:
+            close_pipeline(sess)
+
+    # HTTP 500 fails fast (max_retries=0 -> 1 attempt) and symmetrically across __call__ and acall
+    err_attempts = 0
+
+    class _ErrHandler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            nonlocal err_attempts
+            err_attempts += 1
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                self.rfile.read(length)
+            body = json.dumps({"error": {"message": "upstream fail"}}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    with _loopback_embed_server_handler(_ErrHandler) as err_port:
+        err_cfg = _make_http_cfg(tmp_path / "acall_err", port=err_port, embedding_model="err-model")
+        err_emb = make_dspy_embed_fn(err_cfg)
+
+        with pytest.raises(Exception) as sync_exc:
+            err_emb(["boom"])
+        assert type(sync_exc.value).__name__ == "InternalServerError"
+        assert err_attempts == 1
+
+        async def _check_err() -> None:
+            with pytest.raises(Exception) as async_exc:
+                await err_emb.acall(["boom"])
+            assert type(async_exc.value).__name__ == "InternalServerError"
+
+        asyncio.run(_check_err())
+        assert err_attempts == 2
+
+
+@contextlib.contextmanager
+def _loopback_embed_server_handler(handler_cls: type[BaseHTTPRequestHandler]) -> Generator[int]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
 
 
 def test_memo_hit_and_cross_file_batching(tmp_path: Path) -> None:
@@ -1073,3 +1329,73 @@ def test_restart_memo_hit_with_make_dspy_embed_fn(tmp_path: Path) -> None:
             ).fetchall()
             assert rows_second == rows_first
             assert fts_second == fts_first
+
+
+def test_live_pipeline_shutdown_joins_inflight_reconcile_before_closing_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg(tmp_path / "join_reconcile")
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    corpus_root = cfg.corpus_root
+    corpus_root.mkdir(parents=True)
+    (corpus_root / "seed.md").write_text("# Seed\nInitial quartz oscillator specification.\n", encoding="utf-8")
+
+    import yaw.pipeline.session as pipeline_session
+
+    real_reconcile = pipeline_session.reconcile_index_tables
+    reconcile_entered = threading.Event()
+    release_reconcile = threading.Event()
+    reconcile_finished = threading.Event()
+    reconcile_errors: list[BaseException] = []
+    call_count = 0
+
+    def _blocking_reconcile(
+        conn_mgr: Any,
+        *,
+        embedding_model: str,
+        task_mode: str,
+        corpus_root: Path | None = None,
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        current = call_count
+        if current == 1:
+            reconcile_entered.set()
+            assert release_reconcile.wait(timeout=10.0)
+        try:
+            return real_reconcile(
+                conn_mgr,
+                embedding_model=embedding_model,
+                task_mode=task_mode,
+                corpus_root=corpus_root,
+            )
+        except BaseException as exc:
+            reconcile_errors.append(exc)
+            raise
+        finally:
+            if current == 1:
+                reconcile_finished.set()
+
+    monkeypatch.setattr(pipeline_session, "reconcile_index_tables", _blocking_reconcile)
+
+    async def _run() -> None:
+        cm = open_pipeline_lifespan(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=8), live=True)
+        _sess = await cm.__aenter__()
+        assert await asyncio.to_thread(reconcile_entered.wait, 15.0)
+
+        exit_task = asyncio.create_task(cm.__aexit__(None, None, None))
+        await asyncio.sleep(0.2)
+        assert not exit_task.done(), "open_pipeline_lifespan closed env/conn_mgr before worker reconcile finished"
+        assert not reconcile_finished.is_set()
+
+        release_reconcile.set()
+        await asyncio.wait_for(exit_task, timeout=10.0)
+        assert reconcile_finished.is_set()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        release_reconcile.set()
+    assert reconcile_errors == []
+    with _open_ro(cfg.db_path) as conn:
+        assert conn.execute("SELECT n_chunks FROM rabitq_index WHERE id = 1").fetchone()[0] == 1

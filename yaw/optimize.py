@@ -37,7 +37,7 @@ from yaw.datasets import (
     resolve_slice_corpus_scope,
     score_retrieval_recalls,
 )
-from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
+from yaw.pipeline import close_pipeline, drop_pipeline, make_dspy_embed_fn, start_pipeline, update_pipeline_once
 from yaw.qa import (
     ABSTAIN_REPLY,
     build_qa_agent,
@@ -305,7 +305,7 @@ def _index_bundle_slices(
         if cfg.state_dir is not None and resolve_coco_state_root(cfg.state_dir).exists():
             drop_session = start_pipeline(idx_cfg, live=False, embed_fn=embed_fn)
             try:
-                drop_session.app.drop_blocking()
+                drop_pipeline(drop_session)
             finally:
                 close_pipeline(drop_session)
         _unlink_sqlite_artifacts(db_file)

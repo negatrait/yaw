@@ -1,13 +1,13 @@
 # Native CocoIndex indexing and live ingestion
 
-Status: active (clean-slate modular `M_FINAL_1B`, `5c4b115`; Sprint `3.1` `L0`–`L6` DAG).
+Status: active (clean-slate modular `M_FINAL_1B`, `5c4b115`; Sprint `3.2` shared-loop `open_pipeline_lifespan` & async `DspyBatchEmbedder`).
 
 | Relation | Links |
 | --- | --- |
 | Governed by | [FOUNDATIONAL.md](../FOUNDATIONAL.md), [AGENTS.md](../AGENTS.md), [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md) |
 | Rules | [pipeline.md](../.agents/rules/pipeline.md): `yaw/pipeline/**/*.py`, `yaw/datasets.py`; [tests.md](../.agents/rules/tests.md): `tests/**/*.py`; [docs.md](../.agents/rules/docs.md): `docs/**/*.md` |
 | Owns code | `yaw/pipeline/**/*.py`, `yaw/datasets.py` |
-| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`YawConfig`, `compute_chunk_int_id`, `format_doc_for_embedding`, `resolve_coco_state_root`, `YawRuntimeError`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval/**/*.py` (`RetrievalIndex`, `compute_db_fingerprints`, `compute_index_artifacts`, `normalize_fts_unicode61`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` consuming `start_pipeline`, `update_pipeline_once`, `close_pipeline`, `make_dspy_embed_fn`, and `resolve_slice_corpus_scope`; [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/runtime.py`, `yaw/mcp_server.py` & `yaw/cli.py` orchestrating live `PipelineSession`; [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `scripts/{benchmark,download_datasets,verify_paper_parity_gate,evaluation}.py` consuming `yaw/datasets.py` (with bundled `yaw/baselines.json`) bundles/metrics and constraining the `135/27` split; [epic-3-performance.md](epic-3-performance.md): owns `scripts/watchdog.py` & deferred `E3-P5` / `EVAL-6` proposals; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_pipeline.py`, `tests/test_datasets.py`) |
+| Peers | [epic-1-hipporag-daemon.md](epic-1-hipporag-daemon.md): owns `yaw/core/` (`YawConfig`, `compute_chunk_int_id`, `format_doc_for_embedding`, `resolve_coco_state_root`, `YawRuntimeError`); [native-cocoindex-graph.md](native-cocoindex-graph.md): owns `yaw/retrieval/**/*.py` (`RetrievalIndex`, `compute_db_fingerprints`, `compute_index_artifacts`, `normalize_fts_unicode61`); [dspy-improvements.md](dspy-improvements.md): owns `yaw/qa.py` & `yaw/optimize.py` consuming `start_pipeline`, `update_pipeline_once`, `drop_pipeline`, `close_pipeline`, `make_dspy_embed_fn`, and `resolve_slice_corpus_scope`; [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md): owns `yaw/runtime.py`, `yaw/mcp_server.py` & `yaw/cli.py` entering `open_pipeline_lifespan` & `DspyBatchEmbedder.acall`; [enterprise-rag-bench-training-plan.md](enterprise-rag-bench-training-plan.md): owns `scripts/{benchmark,download_datasets,verify_paper_parity_gate,evaluation}.py` consuming `yaw/datasets.py` (with bundled `yaw/baselines.json`) bundles/metrics and constraining the `135/27` split; [epic-3-performance.md](epic-3-performance.md): owns `scripts/watchdog.py` & deferred `E3-P5` / `EVAL-6` proposals; [coverage-plan.md](coverage-plan.md): owns `tests/**/*.py` (`tests/test_pipeline.py`, `tests/test_datasets.py`) |
 | References | [arxiv-2502.14802v1-hipporag2.md](arxiv-2502.14802v1-hipporag2.md): anchors HippoRAG 2 indexing and retrieval parity; [model-evaluation.md](model-evaluation.md): anchors local `llama.cpp` serving constraints |
 | Supersedes / superseded by | Supersedes legacy `yaw/daemon/` multi-pipeline ingestion (`frozen_indexing_app_main`, `CorpusIndexingLiveComponent`, `source_chunks`, `chunk_inference`, `DatabaseSink`, `vec0`, `CandidateStageCache`) retired under [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md) and `EVAL-5` ([mdl-dag-sprint.md](reviews/mdl-dag-sprint.md)) |
 | Records | [mdl-dag-sprint.md](reviews/mdl-dag-sprint.md), [epic-3-librarian-wiki-sprint.md](reviews/epic-3-librarian-wiki-sprint.md), [bare-bones-replacement-sprint.md](reviews/bare-bones-replacement-sprint.md), [incremental-publication-work.md](reviews/incremental-publication-work.md), [shacl-healer-publication.md](reviews/shacl-healer-publication.md), [evaluation-ingestion.md](evaluation-ingestion.md), [evaluation.md](evaluation.md) |
@@ -16,7 +16,7 @@ Status: active (clean-slate modular `M_FINAL_1B`, `5c4b115`; Sprint `3.1` `L0`�
 
 In scope: Declarative `cocoindex >= 1.2.0` live/catch-up ingestion (`yaw/pipeline/**/*.py`) into the plain 5-table SQLite schema (`chunks`, `chunk_fts`, `chunk_vocab`, `rabitq_index`, `citation_graph`), content-addressed LMDB memoization (`.yaw/coco_lmdb`), native AST/recursive byte-capped chunking, IEEE `<f2>` `float16` embedding persistence, shared `DspyBatchEmbedder` HTTP concurrency gating, `reconcile_index_tables` artifact materialization, fail-fast `exception_handler` propagation, and zero-`dspy` content-addressed v2 `.md` dataset bundles and pure evaluation metrics (`yaw/datasets.py`).
 
-Non-goals: Query-time `RetrievalIndex` scoring, 1-bit SoA RaBitQ LUT matching, cyclic citation diffusion, DPP reranking, and disk passage hydration (owned by [native-cocoindex-graph.md](native-cocoindex-graph.md)); `YawRuntime` lifecycle, `PRAGMA data_version` swaps, and FastMCP HTTP transport (owned by [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); legacy OpenIE/W3C/SHACL extraction, `yaw/daemon/` modules, `vec0`, `DatabaseSink`, or `CandidateStageCache` (permanently retired per [FOUNDATIONAL.md §2](../FOUNDATIONAL.md#2-non-goals--retired-stack)).
+Non-goals: Query-time `RetrievalIndex` scoring, 1-bit SoA RaBitQ LUT matching, cyclic citation diffusion, DPP reranking, and disk passage hydration (owned by [native-cocoindex-graph.md](native-cocoindex-graph.md)); `YawRuntime` semaphore admission, reactive index swaps, and FastMCP HTTP transport (owned by [epic-2-fastmcp-http.md](epic-2-fastmcp-http.md)); legacy OpenIE/W3C/SHACL extraction, `yaw/daemon/` modules, `vec0`, `DatabaseSink`, or `CandidateStageCache` (permanently retired per [FOUNDATIONAL.md §2](../FOUNDATIONAL.md#2-non-goals--retired-stack)).
 
 <a id="2-problem-with-evidence"></a>
 <a id="3-goals"></a>
@@ -36,8 +36,8 @@ Non-goals: Query-time `RetrievalIndex` scoring, 1-bit SoA RaBitQ LUT matching, c
   - `_compute_chunk_embedding(title_body, task_mode, embedder)` (`@coco.fn(memo=True, version=4)`) takes `(title, body)` plus `task_mode` and `PipelineEmbedder.__coco_memo_key__()` (provider, `embedding_model`, `base_url`, `embedding_task_mode`, and backend tag) — never `rel_path`, `chunk_id`, or `db_path` — so file moves, renames, or multi-DB index builds hit `.yaw/coco_lmdb` memos without re-embedding.
   - `_process_file` (`@coco.fn(memo=True, version=6)`) takes `FileLike`, targets, `embedder`, and chunking parameters, emitting `ChunkRow` and `(normalize_fts_unicode61(title), normalize_fts_unicode61(body))` target states.
   - Per-database target isolation is enforced by keying `app_name = app_name or f"yaw_{sha256(db_path)[:12]}"` and `FtsTableKey(SQLITE_DB.key, "chunk_fts")`.
-- **Single HTTP Admission Gate (`DspyBatchEmbedder` & `PipelineEmbedder`):** `DspyBatchEmbedder` wraps `dspy.Embedder(..., batch_size=cfg.embed_batch_size, caching=False)` under `threading.BoundedSemaphore(cfg.embed_max_in_flight)` and is shared between indexing and runtime queries. `PipelineEmbedder` bridges async CocoIndex batching (`coco.fn.as_async(batching=True, max_batch_size=..., max_in_flight=...)`), raising `coco.RetryWithSmallerBatch()` if a multi-item batch mismatches length and `YawRuntimeError("MODEL_ERROR", ...)` on non-finite, zero-norm, or dimension-drifting vectors.
-- **Fail-Fast Error Propagation:** `coco.Environment` wires `exception_handler=_on_component_error`, recording the first error on `PipelineSession.error`, setting `ready_event`, and re-raising. `_watch_pipeline` surfaces `snap.stats.total.num_errors` as `YawRuntimeError("CONSISTENCY_ERROR", ...)` when `READY`. Each `start_pipeline` worker thread runs its own `asyncio.run(_session_worker(...))` event loop.
+- **Single HTTP Admission & Async Embedder (`DspyBatchEmbedder` & `PipelineEmbedder`):** `DspyBatchEmbedder` wraps `dspy.Embedder(..., batch_size=cfg.embed_batch_size, caching=False, max_retries=0)`, exposing sync `__call__` (`threading.BoundedSemaphore(cfg.embed_max_in_flight)`) for `PipelineEmbedder` / `recall_once` plus pure async `acall` (`await self._embedder.acall(...)`, `0` internal `asyncio.Semaphore`, gated by `L3` `YawRuntime`). `PipelineEmbedder` bridges async CocoIndex batching (`coco.fn.as_async(batching=True, max_batch_size=..., max_in_flight=...)` via `invoke` `asyncio.to_thread`), raising `coco.RetryWithSmallerBatch()` if a multi-item batch mismatches length and `YawRuntimeError("MODEL_ERROR", ...)` on non-finite, zero-norm, or dimension-drifting vectors.
+- **Fail-Fast Shared-Loop Lifecycle (`open_pipeline_lifespan` & `SinkMutationTracker`):** `coco.Environment` wires `event_loop=running_loop` and `exception_handler=_on_component_error`, marshalling errors cleanly onto the loop, setting `ready_event`, and notifying `on_error`. `_watch_pipeline` gates `reconcile_index_tables` strictly on `snap.status.name == "READY" and snap.stats.total.num_in_progress == 0` plus `SinkMutationTracker` (`SINK_TRACKER`) delta (`0` idle/empty/ignored rebuilds), surfacing `snap.stats.total.num_errors` as `YawRuntimeError("CONSISTENCY_ERROR", ...)`.
 
 ## 4. Schema & Module Ownership
 
@@ -73,30 +73,30 @@ class ChunkRow:
 
 @dataclass(slots=True)
 class PipelineSession:
-    """Handle bundle owning a CocoIndex Environment, worker thread/loop, and SQLite connection."""
+    """Handle bundle owning CocoIndex environment/app handles, embedder, and SQLite connection."""
 
     db_path: Path
     state_dir: Path
     corpus_root: Path
     embedding_model: str
     task_mode: str
-    env: coco.Environment
-    app: coco.App[Any, Any]
+    cfg: YawConfig
+    resolved_app: str
+    embedder: PipelineEmbedder
     conn_mgr: sqlite.ManagedConnection
     live: bool
-    ready_event: threading.Event
-    thread: threading.Thread
-    loop: asyncio.AbstractEventLoop
-    stop_async: asyncio.Event
-    error: BaseException | None = None
+    env: coco.Environment | None = None
+    app: coco.App[Any, Any] | None = None
+    sink_tracker: SinkMutationTracker | None = None
+    ready_event: asyncio.Event | None = None
+    error: Exception | None = None
 ```
 
 - **Pipeline Lifecycle (`yaw/pipeline/`):**
   1. `open_managed_db(db_path)` opens CocoIndex `sqlite.connect(target, timeout=30.0, load_vec=False)` with `PRAGMA busy_timeout=30000`, `PRAGMA journal_mode=WAL`, and `PRAGMA synchronous=NORMAL`.
-  2. `start_pipeline(cfg, *, embed_fn=None, live=True, app_name=None)` starts the dedicated `yaw-cocoindex-session` thread (`asyncio.run(_session_worker(...))`), creates `coco.Environment(..., exception_handler=_on_component_error)`, mounts `indexing_main`, and when `live=True` runs `_watch_pipeline` to call `reconcile_index_tables` whenever `snap.status.name == "READY"`.
-  3. `update_pipeline_once(session)` executes `session.app.update_blocking(live=False)` and runs `reconcile_index_tables` synchronously for offline catch-up / optimization indexing.
+  2. `open_pipeline_lifespan(cfg, *, embed_fn=None, live=True, app_name=None, on_reconciled=None, on_error=None)` creates `coco.Environment(..., event_loop=running_loop, exception_handler=...)` directly on the caller's asyncio loop (`0` `yaw-cocoindex-session` threads), gates `_watch_pipeline` via `SinkMutationTracker` (`SINK_TRACKER`), cancels only `_process_live_wrapper` tasks on exit, awaits `handle.result()`, and closes `env` and `conn_mgr`.
+  3. Thread-free sync catch-up helpers (`start_pipeline(cfg, live=False)`, `update_pipeline_once(session)`, `drop_pipeline(session)`, `close_pipeline(session)`) execute `await app.update(live=False).result()` / `await app.drop()` inside short-lived `asyncio.run(...)` (`env.close()` in `finally:`, `0` `update_blocking`/`drop_blocking`) and reconcile persisted index tables.
   4. `reconcile_index_tables` compares `compute_db_fingerprints(conn)` `(n, dim, vec_sha256, source_sha256)` plus `(embedding_model, task_mode)` and non-empty blob lengths against `rabitq_index` and `citation_graph` (`id = 1`); when stale or missing, it executes `INSERT INTO chunk_fts(chunk_fts) VALUES('optimize')` and replaces both single-row artifact tables atomically from `compute_index_artifacts(rows, corpus_root)` (or deletes `id = 1` when `n == 0`).
-  5. `close_pipeline(session)` signals `stop_async`, joins the worker thread (raising `SHUTTING_DOWN` on timeout), and closes `session.env` and `session.conn_mgr`.
 
 ## 6. Capability Gates & Dataset Scope Contracts
 
