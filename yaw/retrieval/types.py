@@ -6,6 +6,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import scipy.sparse as sp
@@ -14,6 +15,7 @@ from numpy.typing import NDArray
 from yaw.core import ChunkPointer
 
 CACHE_LOCK = threading.Lock()
+CACHE_MAX_ENTRIES = 4_096
 
 CJK_RANGE = r"\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af"
 CJK_RUN_RE = re.compile(f"[{CJK_RANGE}]+")
@@ -121,7 +123,7 @@ class RetrievalIndex:
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
-    """Ranked chunk hits, log Bayes factor, and corpus spectral summary."""
+    """Ranked chunk hits, certainty metrics, next candidates, and evidence links."""
 
     ranked: tuple[tuple[int, float], ...]
     log_bf: float
@@ -129,6 +131,9 @@ class SearchResult:
     top1_cosine: float
     d_eff: float
     n_candidates: int
+    coverage: float = 0.0
+    next_candidates: tuple[tuple[int, float], ...] = ()
+    links: tuple[tuple[Literal["cite", "pmi"], int, int, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

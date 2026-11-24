@@ -22,18 +22,27 @@ from dspy.utils.callback import BaseCallback
 from dspy.utils.exceptions import LMServerError
 from numpy.typing import NDArray
 
-from yaw.core import EmbedFn, YawConfig, YawRuntimeError
+from yaw.core import EmbedFn, YawConfig, YawRuntimeError, format_query_for_embedding
 from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
 from yaw.qa import (
     QASignature,
+    _extract_seen_chunks,
     build_qa_agent,
+    collect_tool_history,
     create_lm,
     extract_inline_chunk_ids,
     make_qa_tools,
     strip_inline_citations,
 )
 from yaw.qa import ask_question as run_qa
-from yaw.retrieval import build_retrieval_index, open_readonly_db
+from yaw.retrieval import (
+    build_recall_payload,
+    build_retrieval_index,
+    format_recall_text,
+    hydrate_ranked_passages,
+    open_readonly_db,
+    search_index,
+)
 
 _CID_IN_PROMPT_RE = re.compile(r"\[chunk_id=(\d+)\]")
 
@@ -387,6 +396,12 @@ def test_qa_tools_contracts_caps_and_maxp_pooling(tmp_path: Path) -> None:
         # MaxP pooling must pass pool_k >= 50 so multi.json (7 chunks) does not starve booster_backup.md
         booster_out = search_passages("orbital booster", top_k=2)
         assert len(embed_calls) == 1
+        assert booster_out.startswith("[chunk_id=")
+        assert "certainty:" not in booster_out and "\nnext: " not in booster_out and "\nlinks: " not in booster_out
+        q_vec = _topic_embed([format_query_for_embedding("orbital booster", "distinct-titled")], dim=64)[0]
+        exp_res = search_index(idx, q_vec, query_text="orbital booster", conn=conn, top_k=2, pool_k=50)
+        exp_passages = hydrate_ranked_passages(idx, exp_res.ranked, cfg.corpus_root, top_k=2)
+        assert booster_out == format_recall_text(build_recall_payload(exp_passages))
         assert "multi.json" in booster_out
         assert len(set(_CID_IN_PROMPT_RE.findall(booster_out))) == 2
 
@@ -915,3 +930,140 @@ def test_inline_citation_extract_and_strip_handles_multi_id_and_preserves_bracke
     assert extract_inline_chunk_ids("Plain [chunk_id=7]") == [7]
     assert strip_inline_citations("Phoolwari [chunk_id=1, chunk_id=2].") == "Phoolwari."
     assert strip_inline_citations("Bar [note] [chunk_id=1, 2; chunk_id=3] , ok !") == "Bar [note], ok!"
+
+
+def test_qa_certainty_next_links_bare_ids_and_stale_marker_contracts(tmp_path: Path) -> None:
+    cfg = _index_qa_corpus(tmp_path / "u4_qa")
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    corpus_root = cfg.corpus_root
+
+    with open_readonly_db(cfg.db_path) as conn:
+        idx = build_retrieval_index(conn)
+        tools = make_qa_tools(idx, corpus_root, lambda ts: _topic_embed(ts, dim=64), conn)
+        agent = build_qa_agent(tools, max_iters=2)
+
+        # 1. search_passages emits plain passage blocks via shared format_recall_text(build_recall_payload(passages))
+        q_vec = _topic_embed([format_query_for_embedding("orbital booster", "distinct-titled")], dim=64)[0]
+        slip_res = search_index(idx, q_vec, query_text="orbital booster", conn=conn, top_k=1, pool_k=50)
+        slip_passages = hydrate_ranked_passages(idx, slip_res.ranked, corpus_root, top_k=1)
+        plain_out = tools[0].func("orbital booster", top_k=1)
+        assert plain_out == format_recall_text(build_recall_payload(slip_passages))
+        assert plain_out.startswith("[chunk_id=")
+        assert "certainty:" not in plain_out and "\nnext: " not in plain_out and "\nlinks: " not in plain_out
+
+        # 2. format_recall_text(build_recall_payload(..., index, search_result)) emits certainty/next/links;
+        #    _extract_seen_chunks and ask_question reject bare IDs from next/links with MODEL_ERROR
+        slip_obs = format_recall_text(build_recall_payload(slip_passages, index=idx, search_result=slip_res))
+        assert slip_obs.startswith("certainty: log_bf=") and "\nnext: " in slip_obs and "\nlinks: " in slip_obs
+        seen_headers = {int(c) for c in _CID_IN_PROMPT_RE.findall(slip_obs)}
+        next_cids = [int(n) for n in re.findall(r"(?:next:|,)\s*(\d+)\s+\"[^\"]+\"\s+\(", slip_obs)]
+        link_cids = [
+            int(m) for pair in re.findall(r'(?:links:|,)\s*(\d+)(?:->|~pmi\("[^"]*"\)~)(\d+)', slip_obs) for m in pair
+        ]
+        bare_only = [cid for cid in (*next_cids, *link_cids) if cid not in seen_headers]
+        assert bare_only, f"Expected bare ID in next/links outside headers: {slip_obs}"
+        history_msgs = [
+            {
+                "tool_calls": {
+                    "tool_calls": [{"id": "c1", "name": "recall"}],
+                    "tool_call_results": [{"tool_call_id": "c1", "value": slip_obs}],
+                }
+            }
+        ]
+        assert set(_extract_seen_chunks(history_msgs)) == seen_headers
+        _, _, seen_map = collect_tool_history(dspy.Prediction(history=dspy.History(messages=history_msgs)))
+        assert set(seen_map) == seen_headers
+
+        extra_cid = next(int(c) for c in idx.chunk_ids if int(c) not in seen_headers and int(c) != bare_only[0])
+        pmi_obs = format_recall_text(
+            build_recall_payload(
+                slip_passages,
+                index=idx,
+                next_candidates=slip_res.next_candidates,
+                links=(
+                    ("cite", next(iter(seen_headers)), bare_only[0], ""),
+                    ("pmi", bare_only[0], extra_cid, "booster"),
+                ),
+            )
+        )
+        assert f'~pmi("booster")~{extra_cid}' in pmi_obs
+        pmi_msgs = [
+            {
+                "tool_calls": {
+                    "tool_calls": [{"id": "c2", "name": "recall"}],
+                    "tool_call_results": [{"tool_call_id": "c2", "value": pmi_obs}],
+                }
+            }
+        ]
+        assert set(_extract_seen_chunks(pmi_msgs)) == seen_headers
+
+        def slip_search(query: str, top_k: int = 1) -> str:
+            """Return sparse slip output for bare-ID grounding boundary test."""
+            _ = (query, top_k)
+            return slip_obs
+
+        slip_agent = build_qa_agent([slip_search], max_iters=2)
+
+        def bare_id_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            msgs = payload.get("messages", [])
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Search top 1", [{"name": "slip_search", "args": {"query": "orbital booster", "top_k": 1}}]
+                )
+            tool_obs = "\n".join(str(m.get("content", "")) for m in msgs if m.get("role") == "tool")
+            assert tool_obs == slip_obs
+            return 200, _xml_tool_reply(
+                "Cite bare tail/link id", [{"name": "submit", "args": {"answer": f"Fact [chunk_id={bare_only[0]}]"}}]
+            )
+
+        srv_bare, _, _ = _start_loopback_chat_server(bare_id_responder)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_bare:
+                ask_question(
+                    slip_agent,
+                    "Which backup valve spec?",
+                    corpus_root=corpus_root,
+                    index=idx,
+                    lm=_make_loopback_lm(srv_bare),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_bare.value.code == "MODEL_ERROR"
+        finally:
+            srv_bare.shutdown()
+
+        # 3. Mutated disk file returned by search_passages emits [STALE ON DISK] after score=...: -> CONSISTENCY_ERROR
+        alpha_cid = next(int(p.chunk_id) for p in idx.pointers if p.rel_posix_path == "alpha.md")
+        (corpus_root / "alpha.md").write_text("# Mutated\nChanged before search_passages!\n", encoding="utf-8")
+        stale_obs: list[str] = []
+
+        def stale_search_responder(turn_idx: int, payload: dict[str, Any]) -> tuple[int, str]:
+            msgs = payload.get("messages", [])
+            if turn_idx == 0:
+                return 200, _xml_tool_reply(
+                    "Search Apollo", [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}]
+                )
+            tool_obs = "\n".join(str(m.get("content", "")) for m in msgs if m.get("role") == "tool")
+            stale_obs.append(tool_obs)
+            return 200, _xml_tool_reply(
+                "Cite stale header", [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={alpha_cid}]"}}]
+            )
+
+        srv_stale, _, _ = _start_loopback_chat_server(stale_search_responder)
+        try:
+            with pytest.raises(YawRuntimeError) as exc_stale:
+                ask_question(
+                    agent,
+                    "Who commanded Apollo 11?",
+                    corpus_root=corpus_root,
+                    index=idx,
+                    lm=_make_loopback_lm(srv_stale),
+                    lm_sem=threading.Semaphore(1),
+                )
+            assert exc_stale.value.code == "CONSISTENCY_ERROR"
+        finally:
+            srv_stale.shutdown()
+        assert stale_obs
+        assert "certainty:" not in stale_obs[0] and "\nnext: " not in stale_obs[0] and "\nlinks: " not in stale_obs[0]
+        assert re.search(
+            rf"\[chunk_id={alpha_cid}\] \([^)]+\) score=[^:\n]+:\n\[STALE ON DISK\] alpha\.md", stale_obs[0]
+        )

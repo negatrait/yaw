@@ -23,13 +23,15 @@ import uvicorn
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from yaw.core import YawConfig, YawRuntimeError
+from yaw.core import ChunkPointer, HydratedPassage, YawConfig, YawRuntimeError
 from yaw.mcp_server import create_mcp_app, serve_http
 from yaw.pipeline import open_managed_db, reconcile_index_tables
 from yaw.qa import create_lm
 from yaw.runtime import (
+    build_recall_payload,
     close_runtime,
     control_token_path,
+    format_recall_text,
     runtime_lifespan,
     start_runtime,
     sync_embed_concurrency_limit,
@@ -508,6 +510,18 @@ def test_predispatch_host_origin_guard_and_health_readiness_lifecycle(tmp_path: 
         close_runtime(rt_empty)
 
 
+def _assert_mcp_recall_tool_result(rec_res: Any, *, expected_text: str | None = None) -> dict[str, Any]:
+    rec = rec_res.structured_content
+    assert rec is not None and rec_res.data == rec
+    assert len(rec_res.content) == 1
+    rec_text = getattr(rec_res.content[0], "text", "")
+    assert rec_text == format_recall_text(rec)
+    if expected_text is not None:
+        assert rec_text == expected_text
+    assert "query" not in rec and "top_k" not in rec
+    return rec
+
+
 def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: Path) -> None:
     secret_key = "super-secret-mcp-token"
     cfg = _make_cfg(tmp_path / "tools", api_key=secret_key, queue_maxsize=1)
@@ -567,8 +581,9 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
 
         async def _run() -> None:
             async with Client(mcp) as client:
-                rec = (await client.call_tool("recall", {"query": "orbital booster", "top_k": 2})).data
-                assert rec["query"] == "orbital booster" and rec["top_k"] == 2
+                rec_res = await client.call_tool("recall", {"query": "orbital booster", "top_k": 2})
+                rec = _assert_mcp_recall_tool_result(rec_res)
+                assert isinstance(rec["log_bf"], float) and isinstance(rec["coverage"], float)
                 results = rec["results"]
                 assert len(results) == 2
                 assert any(r["source"]["rel_posix_path"] == "multi.json" for r in results)
@@ -577,9 +592,9 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
                     assert item["rank"] == rank_i
                     assert type(item["chunk_id"]) is int
                     assert isinstance(item["score"], float)
-                    assert item["stale_on_disk"] is False
+                    assert "stale" not in item and "stale_on_disk" not in item
                     assert item["content_hash"] == f"sha256:{hashlib.sha256(item['text'].encode('utf-8')).hexdigest()}"
-                    assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line", "title"}
+                    assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line"}
 
                 qa_res = (await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})).data
                 assert qa_res["question"] == "Who commanded Apollo 11?"
@@ -645,10 +660,13 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
                 chat_mode["mode"] = "normal"
 
                 alpha_file.write_text("# Altered\nDisk text changed after indexing.\n", encoding="utf-8")
-                stale_rec = (await client.call_tool("recall", {"query": "Apollo 11 commander", "top_k": 3})).data
+                stale_call = await client.call_tool("recall", {"query": "Apollo 11 commander", "top_k": 3})
+                stale_rec = _assert_mcp_recall_tool_result(stale_call)
                 alpha_hits = [r for r in stale_rec["results"] if r["source"]["rel_posix_path"] == "alpha.md"]
-                assert alpha_hits and alpha_hits[0]["stale_on_disk"] is True and alpha_hits[0]["text"] == ""
+                assert alpha_hits and alpha_hits[0].get("stale") is True and alpha_hits[0]["text"] == ""
+                assert "stale_on_disk" not in alpha_hits[0]
                 assert alpha_hits[0]["content_hash"] == f"sha256:{hashlib.sha256(b'').hexdigest()}"
+                assert "[STALE ON DISK] alpha.md" in getattr(stale_call.content[0], "text", "")
 
                 with pytest.raises(ToolError) as exc_cons:
                     await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})
@@ -675,6 +693,9 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
 
         async def _empty_qa() -> None:
             async with Client(mcp_e) as client:
+                empty_call = await client.call_tool("recall", {"query": "Anything?"})
+                empty_rec = _assert_mcp_recall_tool_result(empty_call, expected_text="No matching passages found.")
+                assert empty_rec == {"results": []}
                 with pytest.raises(ToolError) as exc_e:
                     await client.call_tool("qa", {"question": "Anything?"})
                 assert str(exc_e.value).startswith("[EMPTY_INDEX]")
@@ -1082,3 +1103,99 @@ def test_live_post_ready_pipeline_failure_flips_readyz_503_and_not_ready_mcp(tmp
             _stop_via_control_token(cfg)
             t_srv.join(timeout=5.0)
         stub_srv.shutdown()
+
+
+def test_mcp_recall_tool_result_next_links_sparse_and_byte_budget(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path / "slip_mcp")
+    cfg = YawConfig(
+        workspace_root=cfg.workspace_root,
+        corpus_root=cfg.corpus_root,
+        db_path=cfg.db_path,
+        lock_path=cfg.lock_path,
+        state_dir=cfg.state_dir,
+        log_path=cfg.log_path,
+        status_path=cfg.status_path,
+        compiled_program_path=cfg.compiled_program_path,
+        chunk_size=600,
+        chunk_overlap=20,
+        min_chunk_size=10,
+    )
+    assert cfg.corpus_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    pad = 'Detailed engineering telemetry log with "quoted" fields and newline records.\n'
+    (cfg.corpus_root / "source.md").write_text(
+        f"# Source Hub\nSource Hub cites Target Node using quantumflux alpha and orbital booster.\n{pad * 2}",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "target.md").write_text(
+        f"# Target Node\nTarget Node evaluates quantumflux alpha alongside orbital booster calibration.\n{pad * 2}",
+        encoding="utf-8",
+    )
+    for k in range(4):
+        (cfg.corpus_root / f"extra_{k}.md").write_text(
+            f"# Extra {k}\nExtra {k} logs orbital booster valve baseline {k}.\n{pad}",
+            encoding="utf-8",
+        )
+
+    titled_payload = build_recall_payload(
+        (
+            HydratedPassage(
+                pointer=ChunkPointer(
+                    chunk_id=11,
+                    rel_path="titled.md",
+                    source_hash="abc",
+                    start_line=1,
+                    end_line=2,
+                    char_start=0,
+                    char_end=10,
+                    title="Titled Section",
+                ),
+                score=0.9,
+                text="body",
+                stale_on_disk=False,
+            ),
+        )
+    )
+    assert titled_payload["results"][0]["source"]["title"] == "Titled Section"
+    assert "stale" not in titled_payload["results"][0]
+
+    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(cfg))
+    try:
+        mcp, _ = create_mcp_app(rt=rt)
+
+        async def _verify() -> None:
+            async with Client(mcp) as client:
+                q = "orbital booster quantumflux alpha"
+                call_res = await client.call_tool("recall", {"query": q, "top_k": 2})
+                rec = _assert_mcp_recall_tool_result(call_res)
+                rec_text = getattr(call_res.content[0], "text", "")
+                assert len(rec["next"]) == 3 and "next: " in rec_text
+                kinds = {lnk["kind"] for lnk in rec["links"]}
+                assert {"cite", "pmi"} <= kinds and "links: " in rec_text
+                for item in rec["results"]:
+                    assert "stale" not in item and "stale_on_disk" not in item
+                    assert "title" not in item["source"]
+
+                old_json_payload = {
+                    "query": q,
+                    "top_k": 2,
+                    "results": [
+                        {
+                            "rank": item["rank"],
+                            "chunk_id": item["chunk_id"],
+                            "score": item["score"],
+                            "text": item["text"],
+                            "content_hash": item["content_hash"],
+                            "stale_on_disk": False,
+                            "source": {**item["source"], "title": ""},
+                        }
+                        for item in rec["results"]
+                    ],
+                }
+                old_bytes = len(json.dumps(old_json_payload).encode("utf-8"))
+                new_bytes = len(rec_text.encode("utf-8"))
+                assert new_bytes <= 0.85 * old_bytes
+
+        asyncio.run(_verify())
+    finally:
+        close_runtime(rt)

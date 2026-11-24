@@ -555,7 +555,7 @@ def _build_rule12_specs(
             {"dspy", "cocoindex", "scripts"} | http_mods,
         ),
         "pipeline": (
-            stdlib | {"cocoindex", "dspy", "numpy", "sqlite3", "yaw"},
+            stdlib | {"cocoindex", "dspy", "numpy", "openai", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval", "yaw.pipeline"},
             {"scripts"},
         ),

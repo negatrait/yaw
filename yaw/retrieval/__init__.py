@@ -6,10 +6,22 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .db import compute_db_fingerprints, normalize_fts_unicode61, open_readonly_db
     from .graph import compute_index_artifacts
-    from .hydration import format_evidence_route, hydrate_passage, hydrate_ranked_passages
+    from .hydration import (
+        dedup_ranked_positions,
+        format_evidence_route,
+        hydrate_passage,
+        hydrate_ranked_passages,
+    )
     from .index import build_retrieval_index
     from .lexical import lexical_search
     from .search import expand_citation_neighbors, search_index
+    from .slip import (
+        NO_MATCHES_TEXT,
+        build_recall_payload,
+        dump_recall_json,
+        format_recall_text,
+        sanitize_slip_label,
+    )
     from .types import (
         CitationGraph,
         DiffusionOperators,
@@ -20,42 +32,54 @@ if TYPE_CHECKING:
     )
 
 _PUBLIC_API: dict[str, str] = {
+    "NO_MATCHES_TEXT": ".slip",
     "CitationGraph": ".types",
     "DiffusionOperators": ".types",
     "IndexArtifacts": ".types",
     "RetrievalIndex": ".types",
     "SearchResult": ".types",
+    "build_recall_payload": ".slip",
     "build_retrieval_index": ".index",
     "compute_db_fingerprints": ".db",
     "compute_index_artifacts": ".graph",
+    "dedup_ranked_positions": ".hydration",
+    "dump_recall_json": ".slip",
     "empty_retrieval_index": ".types",
     "expand_citation_neighbors": ".search",
     "format_evidence_route": ".hydration",
+    "format_recall_text": ".slip",
     "hydrate_passage": ".hydration",
     "hydrate_ranked_passages": ".hydration",
     "lexical_search": ".lexical",
     "normalize_fts_unicode61": ".db",
     "open_readonly_db": ".db",
+    "sanitize_slip_label": ".slip",
     "search_index": ".search",
 }
 
 __all__ = [
+    "NO_MATCHES_TEXT",
     "CitationGraph",
     "DiffusionOperators",
     "IndexArtifacts",
     "RetrievalIndex",
     "SearchResult",
+    "build_recall_payload",
     "build_retrieval_index",
     "compute_db_fingerprints",
     "compute_index_artifacts",
+    "dedup_ranked_positions",
+    "dump_recall_json",
     "empty_retrieval_index",
     "expand_citation_neighbors",
     "format_evidence_route",
+    "format_recall_text",
     "hydrate_passage",
     "hydrate_ranked_passages",
     "lexical_search",
     "normalize_fts_unicode61",
     "open_readonly_db",
+    "sanitize_slip_label",
     "search_index",
 ]
 

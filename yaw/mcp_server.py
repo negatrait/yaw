@@ -17,6 +17,7 @@ from typing import Annotated, Any
 import uvicorn
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 from starlette.middleware import Middleware as StarletteMiddleware
 from starlette.requests import Request
@@ -26,16 +27,18 @@ from yaw.core import DaemonStatus, YawConfig, YawRuntimeError
 from yaw.runtime import (
     YawRuntime,
     acquire_daemon_control,
+    build_recall_payload,
+    dump_recall_json,
+    format_recall_text,
     redact_secrets,
     runtime_lifespan,
-    serialize_passage,
     snapshot_status,
 )
 from yaw.runtime import (
     aask as runtime_aask,
 )
 from yaw.runtime import (
-    arecall as runtime_arecall,
+    arecall_payload as runtime_arecall_payload,
 )
 
 
@@ -241,20 +244,17 @@ def _register_mcp_tools(mcp: FastMCP, holder: dict[str, YawRuntime | None]) -> N
         query: Annotated[str, Field(min_length=1)],
         top_k: Annotated[int, Field(ge=1, le=20)] = 5,
         ctx: Context | None = None,
-    ) -> dict[str, Any]:
+    ) -> ToolResult:
         """Retrieve ranked disk-hydrated corpus passages using zero-LLM RetrievalIndex."""
         active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
         if active is None:
             raise ToolError("[NOT_READY] Daemon runtime is still starting.")
         try:
-            passages = await runtime_arecall(active, query, top_k=top_k)
+            payload = await runtime_arecall_payload(active, query, top_k=top_k)
         except YawRuntimeError as exc:
             raise _to_tool_error(exc, active.config.api_key) from exc
-        return {
-            "query": query.strip(),
-            "top_k": top_k,
-            "results": [serialize_passage(idx, hp) for idx, hp in enumerate(passages, start=1)],
-        }
+        dump_recall_json(payload)
+        return ToolResult(content=format_recall_text(payload), structured_content=payload)
 
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
@@ -272,7 +272,7 @@ def _register_mcp_tools(mcp: FastMCP, holder: dict[str, YawRuntime | None]) -> N
             "question": question.strip(),
             "answer": res.answer,
             "turns": int(res.turns),
-            "citations": [serialize_passage(idx, hp) for idx, hp in enumerate(res.passages, start=1)],
+            "citations": build_recall_payload(res.passages)["results"],
         }
 
     @mcp.tool(

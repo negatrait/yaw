@@ -717,13 +717,11 @@ class PaperParityGateTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(idx.size, 3)
                 q_vec = semantic_embed(["task: question answering | query: Which county is Erik Hort born in?"])[0]
-                ranked = search_index(
-                    idx,
-                    q_vec,
-                    query_text="Which county is Erik Hort's birthplace part of?",
-                    conn=conn,
-                    top_k=max(5 * 4, 50),
-                ).ranked
+                q_text = "Which county is Erik Hort's birthplace part of?"
+                res_pool = search_index(idx, q_vec, query_text=q_text, conn=conn, top_k=5, pool_k=50)
+                ranked_legacy = search_index(idx, q_vec, query_text=q_text, conn=conn, top_k=50).ranked
+                self.assertEqual(res_pool.ranked, ranked_legacy)
+                ranked = res_pool.ranked
                 hits = hydrate_ranked_passages(idx, ranked, corpus_dir, top_k=5)
                 self.assertGreaterEqual(len(hits), 2)
                 overall, _ = RetrievalRecall().calculate_metric_scores(

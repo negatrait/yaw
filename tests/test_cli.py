@@ -497,12 +497,14 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
         assert fresh_st["lifecycle"] == "stopped" and fresh_st["num_chunks"] == 0
         assert not (fresh_ws / ".yaw").exists()
 
-        # Empty DB chunks table -> recall returns empty [] with 0 extra HTTP calls; qa exits 1 EMPTY_INDEX
+        # Empty DB chunks table -> recall returns {"results": []} with 0 extra HTTP calls; qa exits 1 EMPTY_INDEX
         _index_corpus(cfg)
         probes_before = counts["embeddings"]
         assert counts["chat"] == 0
         assert main(["recall", "anything", "--config", str(toml_path), "--json"]) == 0
-        assert json.loads(capsys.readouterr().out) == {"query": "anything", "top_k": 5, "results": []}
+        assert json.loads(capsys.readouterr().out) == {"results": []}
+        assert main(["recall", "anything", "--config", str(toml_path)]) == 0
+        assert capsys.readouterr().out.strip() == "No matching passages found."
         assert counts["embeddings"] == probes_before and counts["chat"] == 0
 
         assert main(["qa", "Anything?", "--config", str(toml_path), "--json"]) == 1
@@ -527,17 +529,17 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
         try:
             assert main(["recall", "orbital booster", "--top-k", "2", "--config", str(toml_path), "--json"]) == 0
             rec_payload = json.loads(capsys.readouterr().out)
-            assert rec_payload["query"] == "orbital booster"
-            assert rec_payload["top_k"] == 2
+            assert "query" not in rec_payload and "top_k" not in rec_payload
+            assert isinstance(rec_payload["log_bf"], float) and isinstance(rec_payload["coverage"], float)
             assert len(rec_payload["results"]) == 2
             assert counts["chat"] == 0
             for idx, item in enumerate(rec_payload["results"], start=1):
                 assert item["rank"] == idx
                 assert isinstance(item["chunk_id"], int)
                 assert "[... cropped ...]" not in item["text"]
-                assert item["stale_on_disk"] is False
+                assert "stale" not in item and "stale_on_disk" not in item
                 assert item["content_hash"].startswith("sha256:")
-                assert {"rel_posix_path", "start_line", "end_line", "title"} <= set(item["source"])
+                assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line"}
 
             assert main(["daemon", "status", "--config", str(toml_path), "--json"]) == 0
             st_payload = json.loads(capsys.readouterr().out)
@@ -660,7 +662,8 @@ def test_cli_qa_and_program_loading_over_loopback_http(tmp_path: Path, capsys: p
             assert any("CLI_COMPILED_PROG_MARKER" in m for m in seen_messages)
 
             assert main(["recall", "Apollo 11", "--top-k", "1", "--config", str(toml_path)]) == 0
-            assert "[1] chunk_id=" in capsys.readouterr().out
+            recall_txt = capsys.readouterr().out
+            assert "certainty: log_bf=" in recall_txt and "coverage=" in recall_txt and "[chunk_id=" in recall_txt
 
             assert main(["qa", "Who commanded Apollo 11?", "--config", str(toml_path)]) == 0
             assert "Neil Armstrong" in capsys.readouterr().out
@@ -1188,3 +1191,54 @@ def test_cli_wait_process_handle_pid_fallback_returns_false_while_live() -> None
         dead_pid = int(dead_proc.pid)
         dead_proc.wait(timeout=10)
     assert _wait_process_handle(("pid", dead_pid), timeout=0.05) is True
+
+
+def test_cli_recall_sparse_next_links_and_stale_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from yaw.cli import main
+
+    srv, _ = _start_openai_stub()
+    try:
+        toml_path = _write_toml(tmp_path, port=srv.server_port, chunk_size=400, chunk_overlap=0, min_chunk_size=10)
+        cfg = load_config(toml_path)
+        assert cfg.corpus_root is not None
+        cfg.corpus_root.mkdir(parents=True, exist_ok=True)
+        src_file = cfg.corpus_root / "source.md"
+        src_file.write_text(
+            "# Source Hub\nSource Hub cites Target Node using quantumflux alpha orbital booster.\n",
+            encoding="utf-8",
+        )
+        (cfg.corpus_root / "target.md").write_text(
+            "# Target Node\nTarget Node tests quantumflux alpha orbital booster specification.\n",
+            encoding="utf-8",
+        )
+        for k in range(4):
+            (cfg.corpus_root / f"extra_{k}.md").write_text(
+                f"# Extra {k}\nExtra {k} orbital booster calibration stage {k}.\n",
+                encoding="utf-8",
+            )
+        _index_corpus(cfg)
+
+        q = "orbital booster quantumflux alpha"
+        assert main(["recall", q, "--top-k", "2", "--config", str(toml_path), "--json"]) == 0
+        rec_json = json.loads(capsys.readouterr().out)
+        assert len(rec_json["next"]) == 3
+        assert {"cite", "pmi"} <= {lnk["kind"] for lnk in rec_json["links"]}
+        for item in rec_json["results"]:
+            assert "stale" not in item and "stale_on_disk" not in item and "title" not in item["source"]
+
+        assert main(["recall", q, "--top-k", "2", "--config", str(toml_path)]) == 0
+        rec_txt = capsys.readouterr().out
+        assert "certainty: log_bf=" in rec_txt and "\nnext: " in rec_txt and "\nlinks: " in rec_txt
+        assert "->" in rec_txt and '~pmi("' in rec_txt
+
+        src_file.write_text("# Source Hub\nChanged on disk without reindexing.\n", encoding="utf-8")
+        assert main(["recall", q, "--top-k", "2", "--config", str(toml_path), "--json"]) == 0
+        stale_json = json.loads(capsys.readouterr().out)
+        src_hits = [r for r in stale_json["results"] if r["source"]["rel_posix_path"] == "source.md"]
+        assert src_hits and src_hits[0].get("stale") is True and src_hits[0]["text"] == ""
+        assert "stale_on_disk" not in src_hits[0]
+
+        assert main(["recall", q, "--top-k", "2", "--config", str(toml_path)]) == 0
+        assert "[STALE ON DISK] source.md" in capsys.readouterr().out
+    finally:
+        srv.shutdown()

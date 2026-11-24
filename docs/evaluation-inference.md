@@ -1038,3 +1038,40 @@ Verification: All 17 Oblivion Demolition Table `Test-Path` and repository-wide `
 - Full offline pytest suite (`uv run --locked pytest -m "not live_llm" -q`): **652 passed, 0 failed** (648 passed in initial batch + all 4 edge/contract regressions resolved and verified in `task-687` and `task-700`).
 - Focused Step 10 & Step 11 suite (`test_step10_*` and `test_step11_*` across `test_prompts.py`, `test_db.py`, `test_ppr.py`, `test_engine.py`): **6 passed in 19.71s**.
 - Static analysis & formatting (`uv run --locked ruff check`, `uv run --locked ty check`, `git diff --check`): **All checks passed (0 diagnostics)**.
+
+---
+
+## 49. Tier F-U4: Sparse Slip QA Ablation & MCP `ToolResult` Token Gate (2026-11-24)
+
+Measured outcome for Sprint `3.3` `U4` across untouched slice `[400, 450) × 4` (`2wikimultihopqa`, `musique`, `hotpotqa`, `popqa`; `50` queries/dataset, `n = 200`; `outputs/tier_f_u4/tier_f_u4_report.json`, `status = "COMPLETED"`, paired `qa_episodes.jsonl`, `mcp_tokens.jsonl`, `retrieval_b5s_summary.json`):
+
+### Retrieval (`B5-S`) & MCP `recall` `ToolResult.content` Token Reduction (`n = 200`)
+
+| Dataset (`n = 50` each) | `M_FINAL_1B` `R@5` | `B5-S` `R@5` | `M_FINAL_1B` `AH@5` | `B5-S` `AH@5` |
+| :--- | ---: | ---: | ---: | ---: |
+| `2wikimultihopqa` | `0.9450` | `0.4158` | `0.8600` | `0.0010` |
+| `musique` | `0.6633` | `0.3505` | `0.4000` | `0.0010` |
+| `hotpotqa` | `0.9200` | `0.4400` | `0.8400` | `0.0000` |
+| `popqa` | `0.5500` | `0.2600` | `0.1200` | `0.0000` |
+| **Macro (`n = 200`)** | **`0.7696`** | `0.3666` | **`0.7000`** | `0.0007` |
+
+- **MCP `recall` Payload Compaction (`mcp_token_gate_passed = True`):** Replacing legacy `serialize_passage` JSON (`826,161` UTF-8 bytes; `327,835` `prompt_tokens`) with `ToolResult(content=format_recall_text(payload), structured_content=payload)` (`672,424` UTF-8 bytes; `266,552` `prompt_tokens`) reduced MCP UTF-8 bytes to `0.813914x` (`mcp_char_ratio`) and endpoint `prompt_tokens` to **`0.813068x`** (`mcp_prompt_token_ratio <= 0.85`).
+
+### Paired `dspy.ReAct` QA Ablation (`n = 200` episodes/arm, `qa_retained=False`)
+
+| Metric / Arm (`[400, 450) × 4`) | Baseline (plain blocks) | Candidate (`certainty` + `next` + `links`) | Paired Diff / Ratio & 95% Bootstrap CI | Gate Threshold | Outcome |
+| :--- | ---: | ---: | :--- | :--- | :---: |
+| `EM` | `0.4150` | `0.4500` | `+0.0350` `[-0.0150, +0.0850]` | `LB >= -0.02` & parity | PASS |
+| `F1` | `0.561497` | `0.599426` | `+0.037929` `[-0.006016, +0.082807]` | `LB >= -0.02` & parity | PASS |
+| `total_episode_tokens` | `1,398,738` | `1,842,028` | `1.316921x` | `<= 1.00x` | **FAIL** |
+| `obs_tokens_per_call` | `805.1123` | `1204.5495` | `1.496126x` | `<= 1.08x` | **FAIL** |
+| `non_submit_calls` (`model_errors`) | `383` (`0`) | `404` (`0`) | `+21` calls (`0` errors) | `0` errors | — |
+
+| Dataset (`n = 50` each) | Baseline `EM` | Candidate `EM` | Baseline `F1` | Candidate `F1` |
+| :--- | ---: | ---: | ---: | ---: |
+| `2wikimultihopqa` | `0.6200` | `0.6600` | `0.6816` | `0.7333` |
+| `musique` | `0.3800` | `0.3800` | `0.4375` | `0.4575` |
+| `hotpotqa` | `0.5400` | `0.6200` | `0.6819` | `0.7734` |
+| `popqa` | `0.1200` | `0.1400` | `0.4450` | `0.4334` |
+
+- **Verdict (`qa_gate_passed = False`, `qa_retained=False`):** Candidate sparse-slip metadata (`certainty:` + `next:` + `links:`) improved paired `EM` (`+0.0350`) and `F1` (`+0.037929`) with `0` model errors, but increased `obs_tokens_per_call` by **`1.496126x`** (`> 1.08x`) and `total_episode_tokens` by **`1.316921x`** (`> 1.00x`). Therefore `qa_retained=False`: `yaw/qa.py` routes all 4 tools through the shared `format_recall_text(build_recall_payload(passages))` helper **without** forwarding `index`/`search_result` (`certainty:`/`next:`/`links:`), while MCP `recall` retains the full `ToolResult` sparse slip (`mcp_prompt_token_ratio = 0.813068`).

@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 
 from yaw.core import ChunkPointer, HydratedPassage, YawRuntimeError, resolve_corpus_path
 
-from .types import CACHE_LOCK, RetrievalIndex
+from .types import CACHE_LOCK, CACHE_MAX_ENTRIES, RetrievalIndex
 
 _MAX_HYDRATE_SPAN = 10_000
 _TITLE_TRAILING_SEP_RE = re.compile(r"\s+[-–—:]+\s*$")
@@ -139,6 +139,8 @@ def _resolve_cached_path(
     target = resolve_corpus_path(corpus_root, rel_posix_path)
     with CACHE_LOCK:
         path_cache[p_key] = target
+        while len(path_cache) > CACHE_MAX_ENTRIES:
+            path_cache.pop(next(iter(path_cache)))
     return target
 
 
@@ -247,6 +249,32 @@ def hydrate_passage(
     return hydrate_one(corpus_root, ptr, score, max_chars, include_island, full_span, strict=False)
 
 
+def dedup_ranked_positions(
+    idx: RetrievalIndex,
+    ranked_chunks: Sequence[tuple[int, float]],
+    *,
+    limit: int | None = None,
+) -> tuple[tuple[int, int, float], ...]:
+    """Apply MaxP 5-tuple span deduplication without opening or reading files on disk."""
+    if not ranked_chunks or (limit is not None and limit <= 0):
+        return ()
+    out: list[tuple[int, int, float]] = []
+    seen_spans: set[tuple[str, int, int, int, int]] = set()
+    for cid, score in ranked_chunks:
+        cid_int = int(cid)
+        if (pos := idx.id_to_pos.get(cid_int)) is None:
+            continue
+        ptr = idx.pointers[pos]
+        span = (ptr.rel_posix_path, int(ptr.start_line), int(ptr.end_line), int(ptr.char_start), int(ptr.char_end))
+        if span in seen_spans:
+            continue
+        seen_spans.add(span)
+        out.append((pos, cid_int, float(score)))
+        if limit is not None and len(out) >= limit:
+            break
+    return tuple(out)
+
+
 def hydrate_ranked_passages(
     idx: RetrievalIndex,
     ranked_chunks: Sequence[tuple[int, float]],
@@ -259,35 +287,24 @@ def hydrate_ranked_passages(
 ) -> tuple[HydratedPassage, ...]:
     """Apply MaxP span deduplication and hydrate up to `top_k` passages from disk."""
     limit = _validate_max_chars(max_chars)
-    if top_k <= 0 or not ranked_chunks:
+    deduped = dedup_ranked_positions(idx, ranked_chunks, limit=top_k)
+    if not deduped:
         return ()
-    out: list[HydratedPassage] = []
-    seen_spans: set[tuple[str, int, int, int, int]] = set()
     file_cache: _FileCache = {}
-    for cid, score in ranked_chunks:
-        if (pos := idx.id_to_pos.get(int(cid))) is None:
-            continue
-        ptr = idx.pointers[pos]
-        span = (ptr.rel_posix_path, int(ptr.start_line), int(ptr.end_line), int(ptr.char_start), int(ptr.char_end))
-        if span in seen_spans:
-            continue
-        seen_spans.add(span)
-        out.append(
-            hydrate_one(
-                corpus_root,
-                ptr,
-                float(score),
-                limit,
-                include_island,
-                full_span,
-                strict=False,
-                file_cache=file_cache,
-                path_cache=idx.resolved_path_cache,
-            )
+    return tuple(
+        hydrate_one(
+            corpus_root,
+            idx.pointers[pos],
+            score,
+            limit,
+            include_island,
+            full_span,
+            strict=False,
+            file_cache=file_cache,
+            path_cache=idx.resolved_path_cache,
         )
-        if len(out) >= top_k:
-            break
-    return tuple(out)
+        for pos, _cid, score in deduped
+    )
 
 
 def format_evidence_route(passages: Sequence[HydratedPassage]) -> str:

@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from yaw.core import YawRuntimeError
 
 from .db import snapshot_tx
-from .types import CACHE_LOCK, CJK_RUN_RE, WORD_TOK_RE, RetrievalIndex
+from .types import CACHE_LOCK, CACHE_MAX_ENTRIES, CJK_RUN_RE, WORD_TOK_RE, RetrievalIndex
 
 _ASCII_NORM_TRANS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"})
 
@@ -172,6 +172,8 @@ def fetch_vocab_docs(conn: sqlite3.Connection, terms: Sequence[str], target: dic
     with CACHE_LOCK:
         for k, v in fetched.items():
             target.setdefault(k, v)
+            while len(target) > CACHE_MAX_ENTRIES:
+                target.pop(next(iter(target)))
 
 
 def umlaut_primary_variants(tok: str) -> list[str]:

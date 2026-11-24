@@ -32,11 +32,13 @@ from yaw.core import (
 from yaw.mcp_server import serve_http
 from yaw.runtime import (
     ask_once,
+    build_recall_payload,
     control_token_path,
+    dump_recall_json,
+    format_recall_text,
     read_db_chunk_count,
-    recall_once,
+    recall_once_payload,
     require_path,
-    serialize_passage,
 )
 
 _kernel32: Any = None
@@ -267,21 +269,6 @@ def _normalize_stopped_status(cfg: YawConfig) -> dict[str, Any]:
     ).to_dict()
 
 
-def _format_passages_text(items: Sequence[dict[str, Any]]) -> str:
-    if not items:
-        return "No matching passages."
-    blocks = []
-    for item in items:
-        src = item["source"]
-        body = "[STALE ON DISK]" if item["stale_on_disk"] else item["text"]
-        head = (
-            f"[{item['rank']}] chunk_id={item['chunk_id']} "
-            f"({src['rel_posix_path']}:{src['start_line']}-{src['end_line']}) score={item['score']:.3f}"
-        )
-        blocks.append(f"{head}\n{body}")
-    return "\n\n".join(blocks)
-
-
 def _daemon_status(cfg: YawConfig) -> dict[str, Any]:
     lock_path = require_path(cfg.lock_path, "lock_path")
     if not _is_lock_held(lock_path):
@@ -501,12 +488,7 @@ def _daemon_stop(cfg: YawConfig) -> dict[str, Any]:
 
 
 def _cmd_recall(cfg: YawConfig, query: str, top_k: int) -> dict[str, Any]:
-    passages = recall_once(cfg, query, top_k=top_k)
-    return {
-        "query": query.strip(),
-        "top_k": top_k,
-        "results": [serialize_passage(i, hp) for i, hp in enumerate(passages, 1)],
-    }
+    return recall_once_payload(cfg, query, top_k=top_k)
 
 
 def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
@@ -515,7 +497,7 @@ def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
         "question": res.question,
         "answer": res.answer,
         "turns": int(res.turns),
-        "citations": [serialize_passage(i, hp) for i, hp in enumerate(res.passages, start=1)],
+        "citations": build_recall_payload(res.passages)["results"],
     }
 
 
@@ -542,7 +524,7 @@ def _cmd_config(args: argparse.Namespace, config_path: Path | None) -> tuple[Any
 
 
 def _emit(payload: Any, *, json_out: bool, text: str) -> None:
-    print(json.dumps(payload, indent=2) if json_out else text)
+    print(dump_recall_json(payload, indent=2) if json_out else text)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -608,10 +590,10 @@ def _dispatch_command(args: argparse.Namespace, config_path: Path | None, err_ct
         return payload, json.dumps(payload, indent=2)
     if args.command == "recall":
         payload = _cmd_recall(cfg, args.query, args.top_k)
-        return payload, _format_passages_text(payload["results"])
+        return payload, format_recall_text(payload)
     if args.command == "qa":
         payload = _cmd_qa(cfg, args.question)
-        cites = _format_passages_text(payload["citations"]) if payload["citations"] else ""
+        cites = format_recall_text({"results": payload["citations"]}) if payload["citations"] else ""
         text = f"{payload['answer']}\n\n{cites}" if cites else payload["answer"]
         return payload, text
 

@@ -365,7 +365,9 @@ def run_yaw_benchmark(
         for q_idx, query in enumerate(queries):
             q_unit = q_vecs[q_idx]
             t_q0 = perf_counter()
-            ranked = search_index(index, q_unit, query_text=query, conn=conn, top_k=pool_k).ranked
+            ranked = search_index(
+                index, q_unit, query_text=query, conn=conn, top_k=RETRIEVAL_TOP_K, pool_k=pool_k
+            ).ranked
             hydrated = hydrate_ranked_passages(index, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
             retrieval_elapsed = perf_counter() - t_q0
 

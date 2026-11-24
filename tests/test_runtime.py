@@ -37,21 +37,25 @@ from yaw.runtime import (
     aask,
     acquire_daemon_control,
     arecall,
+    arecall_payload,
     ask,
     ask_once,
+    build_recall_payload,
     close_runtime,
     control_token_path,
     create_lm,
+    dump_recall_json,
+    format_recall_text,
     get_retrieval_index,
     get_status,
     recall,
     recall_once,
+    recall_once_payload,
     redact_secrets,
     reload_retrieval_index,
     require_path,
     resolve_program_path,
     runtime_lifespan,
-    serialize_passage,
     snapshot_status,
     start_runtime,
     sync_embed_concurrency_limit,
@@ -218,9 +222,12 @@ def test_empty_corpus_precedence_filelock_and_lifecycle(tmp_path: Path) -> None:
         assert disk_st["lifecycle"] == "ready"
         assert disk_st["num_chunks"] == 0
 
-        # Empty ready corpus: recall returns (), ask raises EMPTY_INDEX (zero extra embed calls beyond dim probe)
+        # Empty ready corpus: recall returns (), arecall_payload returns {"results": []}, ask raises EMPTY_INDEX
         probe_count = len(embed_calls)
         assert recall(rt, "anything", top_k=5) == ()
+        assert asyncio.run(arecall_payload(rt, "anything", top_k=5)) == {"results": []}
+        assert format_recall_text({"results": []}) == "No matching passages found."
+        assert json.loads(dump_recall_json({"results": []})) == {"results": []}
         assert len(embed_calls) == probe_count
         with pytest.raises(YawRuntimeError) as exc_empty:
             ask(rt, "What happened?")
@@ -462,11 +469,15 @@ def test_bounded_semaphore_busy_program_load_redaction_and_control_token(tmp_pat
 
         recalled_for_ser = recall(rt, "Which valve controls booster separation?", top_k=1)
         assert len(recalled_for_ser) == 1
-        ser = serialize_passage(1, recalled_for_ser[0])
+        slip_payload = build_recall_payload(recalled_for_ser)
+        ser = slip_payload["results"][0]
         assert ser["rank"] == 1
         assert ser["chunk_id"] == int(recalled_for_ser[0].pointer.chunk_id)
         assert ser["content_hash"].startswith("sha256:")
         assert ser["source"]["start_line"] == int(recalled_for_ser[0].pointer.start_line)
+        assert "stale" not in ser and "stale_on_disk" not in ser
+        assert json.loads(dump_recall_json(slip_payload)) == slip_payload
+        assert f"[chunk_id={ser['chunk_id']}]" in format_recall_text(slip_payload)
 
         def _dummy_tool(query: str) -> str:
             return query
@@ -820,6 +831,10 @@ def test_live_post_ready_index_not_ready_fallback_and_consistency_guard(tmp_path
                 assert idx0.size >= 2 and gen0 >= 1
 
                 assert recall_once(cfg, "QuasarPulse99", top_k=1)[0].pointer.rel_posix_path == "doc_lex.md"
+                once_payload = recall_once_payload(cfg, "QuasarPulse99", top_k=1)
+                assert once_payload["results"][0]["source"]["rel_posix_path"] == "doc_lex.md"
+                assert isinstance(once_payload["log_bf"], float) and isinstance(once_payload["coverage"], float)
+                assert "certainty: log_bf=" in format_recall_text(once_payload)
                 qa_res = ask_once(cfg, "Which doc matches QuasarPulse99?")
                 assert qa_res.passages[0].pointer.rel_posix_path == "doc_lex.md"
 
@@ -967,18 +982,28 @@ def test_arecall_awaits_dspy_batch_embedder_acall_under_l3_semaphores(
         cfg.corpus_root.mkdir(parents=True)
         (cfg.corpus_root / "doc.md").write_text("# Doc\nOrbital booster valve note.\n", encoding="utf-8")
 
+        aclose_calls = 0
+
         async def _run() -> None:
+            nonlocal aclose_calls
             async with runtime_lifespan(cfg, live=False, wait_for_ready=True, lm=create_lm(cfg)) as rt:
                 assert isinstance(rt.embed_fn, DspyBatchEmbedder)
                 assert rt.embed_uses_async is True
                 acall_calls: list[list[str]] = []
                 orig_acall = rt.embed_fn.acall
+                orig_aclose = rt.embed_fn.aclose
 
                 async def _spy_acall(texts: list[str]) -> NDArray[np.float32]:
                     acall_calls.append(list(texts))
                     return await orig_acall(texts)
 
+                async def _spy_aclose() -> None:
+                    nonlocal aclose_calls
+                    aclose_calls += 1
+                    await orig_aclose()
+
                 monkeypatch.setattr(rt.embed_fn, "acall", _spy_acall)
+                monkeypatch.setattr(rt.embed_fn, "aclose", _spy_aclose)
                 monkeypatch.setattr(
                     rt.embed_fn,
                     "__call__",
@@ -986,9 +1011,15 @@ def test_arecall_awaits_dspy_batch_embedder_acall_under_l3_semaphores(
                 )
                 hits = await arecall(rt, "orbital booster", top_k=1)
                 assert len(hits) == 1
-                assert len(acall_calls) == 1
+                payload = await arecall_payload(rt, "orbital booster", top_k=1)
+                assert len(payload["results"]) == 1
+                assert isinstance(payload["log_bf"], float) and isinstance(payload["coverage"], float)
+                assert "certainty: log_bf=" in format_recall_text(payload)
+                assert json.loads(dump_recall_json(payload)) == payload
+                assert len(acall_calls) == 2
 
         asyncio.run(_run())
+        assert aclose_calls == 1
     finally:
         srv.shutdown()
         srv.server_close()

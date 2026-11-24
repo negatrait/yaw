@@ -22,7 +22,9 @@ from dspy.utils.exceptions import AdapterParseError, ContextWindowExceededError
 from .core import EmbedFn, HydratedPassage, QAResult, YawConfig, YawRuntimeError, format_query_for_embedding
 from .retrieval import (
     RetrievalIndex,
+    build_recall_payload,
     expand_citation_neighbors,
+    format_recall_text,
     hydrate_passage,
     hydrate_ranked_passages,
     lexical_search,
@@ -31,7 +33,6 @@ from .retrieval import (
 )
 
 _MAX_TOP_K = 25
-_NO_MATCHES = "No matching passages found."
 _PASSAGE_HEAD_RE = re.compile(r"^\[chunk_id=(\d+)\]\s+\([^)\n]+\)\s+score=([-+]?\d+(?:\.\d+)?):$", re.MULTILINE)
 _CITATION_BLOCK_RE = re.compile(r"\[(?:chunk_id=\d+(?:\s*[,;]\s*(?:chunk_id=)?\d+)*)\]")
 _CHUNK_NUM_RE = re.compile(r"\d+")
@@ -90,16 +91,6 @@ def _valid_int(val: Any, lo: int = 1, hi: int | None = None) -> bool:
     return isinstance(val, int) and not isinstance(val, bool) and val >= lo and (hi is None or val <= hi)
 
 
-def _format_passages(passages: Sequence[HydratedPassage]) -> str:
-    if not passages:
-        return _NO_MATCHES
-    return "\n\n".join(
-        f"[chunk_id={p.pointer.chunk_id}] ({p.pointer.rel_posix_path}:{p.pointer.start_line}-{p.pointer.end_line})"
-        f" score={p.score:.3f}:\n{f'[STALE ON DISK] {p.pointer.rel_posix_path}' if p.stale_on_disk else p.text}"
-        for p in passages
-    )
-
-
 def _require_query(query: str) -> str:
     if not isinstance(query, str) or not (q := query.strip()):
         raise ValueError("query must be a non-empty string.")
@@ -151,39 +142,40 @@ def make_qa_tools(
         """Search corpus passages using hybrid 1-bit RaBitQ, lexical, and citation diffusion ranking."""
         q, k = _require_query(query), _require_top_k(top_k)
         if index.size == 0:
-            return _NO_MATCHES
+            return format_recall_text(build_recall_payload(()))
         raw_emb = np.asarray(embed_fn([format_query_for_embedding(q, task_mode)]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         with _tool_conn() as db_conn:
-            ranked = search_index(index, q_vec, query_text=q, conn=db_conn, top_k=max(k * 4, 50)).ranked
-        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
+            res = search_index(index, q_vec, query_text=q, conn=db_conn, top_k=k, pool_k=max(k * 4, 50))
+        passages = hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=k)
+        return format_recall_text(build_recall_payload(passages))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
         """Run zero-embedder FTS5 keyword grep over indexed passages."""
         q, k = _require_query(query), _require_top_k(top_k)
         if index.size == 0:
-            return _NO_MATCHES
+            return format_recall_text(build_recall_payload(()))
         # Over-fetch pool_k = max(k * 4, 50) to prevent sub-chunk starvation during MaxP span dedup.
         with _tool_conn() as db_conn:
             ranked = lexical_search(index, q, db_conn, top_k=max(k * 4, 50))
-        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
+        return format_recall_text(build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k)))
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
         """Expand isotropic, lexical, citation-diffusion, and same-AST-island neighbor passages for chunk_id."""
         _require_chunk_pos(index, chunk_id)
         k = _require_top_k(top_k)
         if index.size <= 1:
-            return _NO_MATCHES
+            return format_recall_text(build_recall_payload(()))
         with _tool_conn() as db_conn:
             ranked = expand_citation_neighbors(
                 index, chunk_id, corpus_root=corpus_root, conn=db_conn, top_k=max(k * 4, 50)
             )
-        return _format_passages(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k))
+        return format_recall_text(build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k)))
 
     def read_chunk(chunk_id: int) -> str:
         """Read the exact hydrated passage for a single chunk_id."""
         _require_chunk_pos(index, chunk_id)
-        return _format_passages(_hydrate_ids(index, [(chunk_id, 1.0)], corpus_root))
+        return format_recall_text(build_recall_payload(_hydrate_ids(index, [(chunk_id, 1.0)], corpus_root)))
 
     return [
         dspy.Tool(search_passages, arg_desc=_QUERY_DESC),

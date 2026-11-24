@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import os
 import secrets
@@ -47,11 +46,21 @@ from yaw.pipeline import (
 from yaw.qa import ask_question, build_qa_agent, create_lm, make_qa_tools
 from yaw.retrieval import (
     RetrievalIndex,
+    SearchResult,
     build_retrieval_index,
     empty_retrieval_index,
     hydrate_ranked_passages,
     open_readonly_db,
     search_index,
+)
+from yaw.retrieval import (
+    build_recall_payload as build_recall_payload,
+)
+from yaw.retrieval import (
+    dump_recall_json as dump_recall_json,
+)
+from yaw.retrieval import (
+    format_recall_text as format_recall_text,
 )
 
 
@@ -306,14 +315,20 @@ async def runtime_lifespan(
                         rt.lifecycle = "stopping"
                 evt.set()
     finally:
-        if (active_rt := rt_box.get("rt")) is not None:
-            with active_rt.state_lock:
-                active_rt.lifecycle = "stopped"
-                active_rt.active_op = None
-            await asyncio.to_thread(get_status, active_rt)
-        evt.set()
-        if owns_file_lock and active_lock.is_locked:
-            active_lock.release()
+        try:
+            if isinstance(active_embed, DspyBatchEmbedder):
+                await active_embed.aclose()
+        finally:
+            try:
+                if (active_rt := rt_box.get("rt")) is not None:
+                    with active_rt.state_lock:
+                        active_rt.lifecycle = "stopped"
+                        active_rt.active_op = None
+                    await asyncio.to_thread(get_status, active_rt)
+                evt.set()
+            finally:
+                if owns_file_lock and active_lock.is_locked:
+                    active_lock.release()
 
 
 def start_runtime(
@@ -532,20 +547,20 @@ def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, 
         yield conn, index, corpus_root
 
 
-def _search_and_hydrate(
+def _search_and_hydrate_with_result(
     db_path: Path,
     index: RetrievalIndex,
     corpus_root: Path,
     q_vec: NDArray[np.float32],
     query: str,
     top_k: int,
-) -> tuple[HydratedPassage, ...]:
+) -> tuple[SearchResult, tuple[HydratedPassage, ...]]:
     with contextlib.closing(open_readonly_db(db_path)) as conn:
-        res = search_index(index, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50))
-    return hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
+        res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
+    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
 
 
-def _run_recall(
+def _run_recall_with_result(
     cfg: YawConfig,
     conn: sqlite3.Connection,
     index: RetrievalIndex,
@@ -553,19 +568,23 @@ def _run_recall(
     embed_fn: EmbedFn | None,
     query: str,
     top_k: int,
-) -> tuple[HydratedPassage, ...]:
+) -> tuple[SearchResult | None, tuple[HydratedPassage, ...]]:
     if index.size == 0:
-        return ()
+        return None, ()
     active_embed = embed_fn or make_dspy_embed_fn(cfg)
     formatted = format_query_for_embedding(query, cfg.embedding_task_mode)
     raw_emb = np.asarray(active_embed([formatted]), dtype=np.float32)
     q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-    res = search_index(index, q_vec, query_text=query, conn=conn, top_k=max(top_k * 4, 50))
-    return hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
+    res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
+    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
 
 
-async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
-    """Execute zero-LLM hybrid RetrievalIndex search asynchronously using DspyBatchEmbedder.acall or clamped offload."""
+async def _arecall_core(
+    rt: YawRuntime,
+    query: str,
+    *,
+    top_k: int = 5,
+) -> tuple[RetrievalIndex, SearchResult | None, tuple[HydratedPassage, ...]]:
     q = _validate_recall_args(query, top_k)
     _ensure_ready(rt)
     db_path = require_path(rt.config.db_path, "db_path")
@@ -573,7 +592,7 @@ async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[Hydrat
     async with _admit_query_async(rt, "recall"):
         index = get_retrieval_index(rt)
         if index.size == 0:
-            return ()
+            return index, None, ()
         _, embed_sem, _ = _ensure_async_primitives(rt)
         formatted = format_query_for_embedding(q, rt.config.embedding_task_mode)
         async with embed_sem:
@@ -582,7 +601,22 @@ async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[Hydrat
             else:
                 raw_emb = np.asarray(await asyncio.to_thread(rt.embed_fn, [formatted]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
-        return await asyncio.to_thread(_search_and_hydrate, db_path, index, corpus_root, q_vec, q, top_k)
+        res, passages = await asyncio.to_thread(
+            _search_and_hydrate_with_result, db_path, index, corpus_root, q_vec, q, top_k
+        )
+        return index, res, passages
+
+
+async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
+    """Execute zero-LLM hybrid RetrievalIndex search asynchronously using DspyBatchEmbedder.acall or clamped offload."""
+    _, _, passages = await _arecall_core(rt, query, top_k=top_k)
+    return passages
+
+
+async def arecall_payload(rt: YawRuntime, query: str, *, top_k: int = 5) -> dict[str, Any]:
+    """Execute asynchronous zero-LLM recall and assemble the canonical sparse slip payload."""
+    index, res, passages = await _arecall_core(rt, query, top_k=top_k)
+    return build_recall_payload(passages, index=index, search_result=res)
 
 
 def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
@@ -593,14 +627,24 @@ def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassa
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "recall"), contextlib.closing(open_readonly_db(db_path)) as conn:
         index = get_retrieval_index(rt)
-        return _run_recall(rt.config, conn, index, corpus_root, rt.embed_fn, q, top_k)
+        _, passages = _run_recall_with_result(rt.config, conn, index, corpus_root, rt.embed_fn, q, top_k)
+        return passages
 
 
 def recall_once(cfg: YawConfig, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
     """Execute standalone read-only zero-LLM recall without acquiring the daemon lock."""
     q = _validate_recall_args(query, top_k)
     with _open_indexed_search(cfg) as (conn, index, corpus_root):
-        return _run_recall(cfg, conn, index, corpus_root, None, q, top_k)
+        _, passages = _run_recall_with_result(cfg, conn, index, corpus_root, None, q, top_k)
+        return passages
+
+
+def recall_once_payload(cfg: YawConfig, query: str, *, top_k: int = 5) -> dict[str, Any]:
+    """Execute standalone read-only zero-LLM recall and return the canonical sparse slip payload."""
+    q = _validate_recall_args(query, top_k)
+    with _open_indexed_search(cfg) as (conn, index, corpus_root):
+        res, passages = _run_recall_with_result(cfg, conn, index, corpus_root, None, q, top_k)
+        return build_recall_payload(passages, index=index, search_result=res)
 
 
 def resolve_program_path(cfg: YawConfig) -> Path | None:
@@ -609,26 +653,6 @@ def resolve_program_path(cfg: YawConfig) -> Path | None:
         return Path(cfg.compiled_program_path)
     fallback = require_path(cfg.for_optimization().compiled_program_path, "optimization compiled_program_path")
     return fallback if fallback.is_file() else None
-
-
-def serialize_passage(rank: int, hp: HydratedPassage) -> dict[str, Any]:
-    """Serialize a hydrated passage into the canonical JSON payload shared by MCP and CLI."""
-    ptr = hp.pointer
-    digest = hashlib.sha256(hp.text.encode("utf-8")).hexdigest()
-    return {
-        "rank": rank,
-        "chunk_id": int(ptr.chunk_id),
-        "text": hp.text,
-        "score": float(hp.score),
-        "stale_on_disk": bool(hp.stale_on_disk),
-        "content_hash": f"sha256:{digest}",
-        "source": {
-            "rel_posix_path": ptr.rel_posix_path,
-            "start_line": int(ptr.start_line),
-            "end_line": int(ptr.end_line),
-            "title": ptr.title,
-        },
-    }
 
 
 def _run_qa(

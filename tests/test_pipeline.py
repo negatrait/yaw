@@ -744,6 +744,8 @@ def test_dspy_batch_embedder_acall_batches_errors_and_drop_pipeline(tmp_path: Pa
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            assert payload.get("encoding_format") == "float"
+            assert payload.get("model") == "acall-model"
             raw_in = payload["input"]
             texts = [raw_in] if isinstance(raw_in, str) else [str(x) for x in raw_in]
             seen_calls.append(list(texts))
@@ -949,6 +951,7 @@ def _loopback_embed_server(
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            assert payload.get("encoding_format") == "float"
             raw_in = payload["input"]
             texts = [raw_in] if isinstance(raw_in, str) else [str(x) for x in raw_in]
             model = str(payload.get("model", ""))
@@ -1399,3 +1402,131 @@ def test_live_pipeline_shutdown_joins_inflight_reconcile_before_closing_db(
     assert reconcile_errors == []
     with _open_ro(cfg.db_path) as conn:
         assert conn.execute("SELECT n_chunks FROM rabitq_index WHERE id = 1").fetchone()[0] == 1
+
+
+@contextlib.contextmanager
+def _keepalive_embed_server() -> Generator[tuple[int, dict[str, Any]]]:
+    lock = threading.Lock()
+    stats: dict[str, Any] = {"tcp_conns": 0, "requests": []}
+
+    class _KeepAliveHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        @override
+        def setup(self) -> None:
+            with lock:
+                stats["tcp_conns"] += 1
+            super().setup()
+
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw_in = payload["input"]
+            texts = [raw_in] if isinstance(raw_in, str) else [str(x) for x in raw_in]
+            with lock:
+                stats["requests"].append(
+                    {"model": payload.get("model"), "encoding_format": payload.get("encoding_format"), "texts": texts}
+                )
+            vecs = (_hash_embed(texts, dim=8) * 3.0).astype(np.float32)
+            items = [
+                {
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": (
+                        base64.b64encode(vecs[i].astype("<f4").tobytes()).decode("ascii")
+                        if "b64" in texts[i]
+                        else vecs[i].tolist()
+                    ),
+                }
+                for i in reversed(range(len(texts)))
+            ]
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": items,
+                    "model": str(payload.get("model", "")),
+                    "usage": {"prompt_tokens": len(texts), "total_tokens": len(texts)},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _KeepAliveHandler)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port, stats
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dspy_batch_embedder_pooled_keepalive_waves_azure_and_aclose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _keepalive_embed_server() as (port, stats):
+        cfg = replace(
+            _make_http_cfg(tmp_path / "pooled", port=port, embedding_model="pooled-model"),
+            embed_batch_size=2,
+        )
+        embedder = make_dspy_embed_fn(cfg)
+
+        async def _run_pooled() -> None:
+            for i in range(10):
+                out = await embedder.acall([f"seq-{i}"])
+                assert out.shape == (1, 8)
+            assert stats["tcp_conns"] == 1
+            assert len(stats["requests"]) == 10
+            assert all(r["model"] == "pooled-model" for r in stats["requests"])
+            assert all(r["encoding_format"] == "float" for r in stats["requests"])
+
+            # Verify batch_size slicing + reversed index sorting + base64 decode on pooled client
+            sliced = await embedder.acall(["s0", "s1-b64", "s2"])
+            assert np.allclose(sliced, _hash_embed(["s0", "s1-b64", "s2"], dim=8), atol=1e-5)
+            assert [r["texts"] for r in stats["requests"][-2:]] == [["s0", "s1-b64"], ["s2"]]
+
+            await asyncio.gather(*(embedder.acall([f"w1-{i}"]) for i in range(32)))
+            threads_after_w1 = {t.name for t in threading.enumerate() if t.name.startswith("asyncio_")}
+            await asyncio.gather(*(embedder.acall([f"w2-{i}"]) for i in range(32)))
+            threads_after_w2 = {t.name for t in threading.enumerate() if t.name.startswith("asyncio_")}
+            assert threads_after_w2 - threads_after_w1 == set()
+
+            assert embedder._async_client is not None
+            orig_close = embedder._async_client.close
+            closed_calls = 0
+
+            async def _spy_close() -> None:
+                nonlocal closed_calls
+                closed_calls += 1
+                await orig_close()
+
+            monkeypatch.setattr(embedder._async_client, "close", _spy_close)
+            await embedder.aclose()
+            assert closed_calls == 1
+            assert embedder._async_client is None
+
+        asyncio.run(_run_pooled())
+
+    # Azure provider fallback routes through self._embedder.acall and normalizes batch
+    az_cfg = replace(_make_http_cfg(tmp_path / "azure", port=1, embedding_model="az-deploy"), provider="azure")
+    az_embedder = make_dspy_embed_fn(az_cfg)
+    az_calls: list[list[str]] = []
+
+    async def _fake_az_acall(texts: list[str]) -> NDArray[np.float32]:
+        az_calls.append(list(texts))
+        return np.array([[3.0, 4.0] for _ in texts], dtype=np.float32)
+
+    monkeypatch.setattr(az_embedder._embedder, "acall", _fake_az_acall)
+    az_out = asyncio.run(az_embedder.acall(["hello", "world"]))
+    assert az_calls == [["hello", "world"]]
+    assert np.allclose(az_out, np.array([[0.6, 0.8], [0.6, 0.8]], dtype=np.float32), atol=1e-6)
+    asyncio.run(az_embedder.aclose())

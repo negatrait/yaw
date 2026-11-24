@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 import hashlib
+import json
 import math
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,23 +19,34 @@ import pytest
 from numpy.typing import NDArray
 
 import yaw.retrieval as retrieval_mod
+import yaw.retrieval.hydration as retrieval_hydration
+import yaw.retrieval.lexical as retrieval_lexical
+import yaw.retrieval.search as retrieval_search
 from yaw.core import ChunkPointer, YawConfig, YawRuntimeError
-from yaw.pipeline import close_pipeline, start_pipeline, update_pipeline_once
+from yaw.pipeline import close_pipeline, open_managed_db, reconcile_index_tables, start_pipeline, update_pipeline_once
 from yaw.retrieval import (
+    NO_MATCHES_TEXT,
     SearchResult,
+    build_recall_payload,
     build_retrieval_index,
     compute_db_fingerprints,
     compute_index_artifacts,
+    dedup_ranked_positions,
+    dump_recall_json,
     empty_retrieval_index,
     expand_citation_neighbors,
     format_evidence_route,
+    format_recall_text,
     hydrate_passage,
     hydrate_ranked_passages,
     lexical_search,
     normalize_fts_unicode61,
     open_readonly_db,
+    sanitize_slip_label,
     search_index,
 )
+from yaw.retrieval.graph import lists_to_csr
+from yaw.retrieval.types import CACHE_MAX_ENTRIES
 
 
 def _make_cfg(root: Path, *, chunk_size: int = 300, chunk_overlap: int = 0, min_chunk_size: int = 20) -> YawConfig:
@@ -609,3 +623,366 @@ def test_single_pass_title_hydration_and_lazy_diffusion_operators(
         with pytest.raises(YawRuntimeError) as exc_dt:
             build_retrieval_index(ro_conn)
         assert exc_dt.value.code == "CONSISTENCY_ERROR"
+
+
+def _compute_exact_post(
+    idx: retrieval_mod.RetrievalIndex,
+    q_vec: NDArray[np.float32],
+    query_text: str,
+    conn: sqlite3.Connection,
+) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
+    eligible = retrieval_lexical.eligible_mask(idx)
+    n_eff = int(np.sum(eligible))
+    t_path = math.sqrt(max(1.0, idx.d_eff) / max(1.0, math.log(float(n_eff) + 1.0)))
+    assert idx.diffusion_ops is not None
+    post, _, _, _ = retrieval_search._score_query_evidence(
+        idx, q_vec, query_text, conn, eligible, [], n_eff, t_path, idx.diffusion_ops
+    )
+    return post, eligible
+
+
+def _verify_duplicate_span_coverage(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path / "dup_cov", chunk_size=140, min_chunk_size=10)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "doc_a.md").write_text(
+        "# Alpha Hub\nOrbital booster primary valve calibration protocol.\n\n"
+        + ("Geology basalt limestone secondary outcrop details. " * 3)
+        + "\n",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "doc_b.md").write_text(
+        "# Beta Node\nOrbital booster emergency stage check.\n",
+        encoding="utf-8",
+    )
+    _index_corpus(cfg)
+
+    with contextlib.closing(sqlite3.connect(cfg.db_path)) as rw_conn:
+        row_top = rw_conn.execute(
+            "SELECT chunk_id, embedding_f16, rel_path, source_hash, start_line, end_line, "
+            "char_start, char_end, ast_island_start, ast_island_end, title "
+            "FROM chunks WHERE rel_path = 'doc_a.md' ORDER BY start_line LIMIT 1"
+        ).fetchone()
+        assert row_top is not None
+        dup_cid = int(rw_conn.execute("SELECT MAX(chunk_id) FROM chunks").fetchone()[0]) + 50
+        rw_conn.execute(
+            "INSERT INTO chunks (chunk_id, embedding_f16, rel_path, source_hash, start_line, end_line, "
+            "char_start, char_end, ast_island_start, ast_island_end, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (dup_cid, *row_top[1:]),
+        )
+        rw_conn.execute(
+            "INSERT INTO chunk_fts(rowid, title, body) VALUES (?, ?, ?)",
+            (dup_cid, str(row_top[10]), "Orbital booster primary valve calibration protocol."),
+        )
+        rw_conn.commit()
+    with contextlib.closing(open_managed_db(cfg.db_path)) as conn_mgr:
+        reconcile_index_tables(
+            conn_mgr,
+            embedding_model=cfg.embedding_model,
+            task_mode=cfg.embedding_task_mode,
+            corpus_root=cfg.corpus_root,
+        )
+
+    q = "orbital booster primary valve"
+    q_vec = _topic_embed([q])[0]
+    with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+        idx = build_retrieval_index(ro_conn)
+        assert idx.size >= 4
+        res = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=3, pool_k=50)
+        raw_top3_cids = [cid for cid, _ in res.ranked[:3]]
+        dedup3 = dedup_ranked_positions(idx, res.ranked, limit=3)
+        dedup_top3_cids = [cid for _, cid, _ in dedup3]
+        assert len(dedup_top3_cids) == 3
+        assert len(raw_top3_cids) == 3 and dup_cid in raw_top3_cids
+        assert dedup_top3_cids != raw_top3_cids
+        post, elig = _compute_exact_post(idx, q_vec, q, ro_conn)
+        expected_cov = float(post[[p for p, _, _ in dedup3]].sum() / max(float(post[elig].sum()), 1e-12))
+        naive_cov = float(post[[idx.id_to_pos[c] for c in raw_top3_cids]].sum() / max(float(post[elig].sum()), 1e-12))
+        assert res.coverage == pytest.approx(expected_cov, abs=1e-12)
+        assert res.coverage != pytest.approx(naive_cov, abs=1e-6)
+        res_t1 = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=1, pool_k=50)
+        assert dup_cid not in {c for c, _ in res_t1.next_candidates}
+        assert len({idx.pointers[idx.id_to_pos[c]].span_label for c, _ in res_t1.next_candidates}) == len(
+            res_t1.next_candidates
+        )
+
+
+def test_coverage_pool_k_parity_and_duplicate_span_top_k(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path, chunk_size=300, min_chunk_size=10)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    for i in range(56):
+        kw = "orbital booster valve protocol" if i < 18 else f"geology basalt survey note {i}"
+        (cfg.corpus_root / f"doc_{i:02d}.md").write_text(
+            f"# Doc {i:02d}\nEntry {i:02d}: {kw} calibration record {i}.\n",
+            encoding="utf-8",
+        )
+    _index_corpus(cfg)
+
+    q = "orbital booster valve"
+    q_vec = _topic_embed([q])[0]
+    with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+        idx = build_retrieval_index(ro_conn)
+        assert idx.size == 56
+        res_pool50 = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=50)
+        res_u5 = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=5, pool_k=50)
+        assert res_u5.ranked == res_pool50.ranked
+        assert res_u5.n_candidates == res_pool50.n_candidates
+
+        post, eligible = _compute_exact_post(idx, q_vec, q, ro_conn)
+        denom = max(float(post[eligible].sum()), 1e-12)
+        covs: list[float] = []
+        for k in (2, 5, 10):
+            rk = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=k, pool_k=50)
+            top_pos = [p for p, _, _ in dedup_ranked_positions(idx, rk.ranked, limit=k)]
+            expected_cov = float(post[top_pos].sum() / denom)
+            assert 0.0 < rk.coverage <= 1.0
+            assert rk.coverage == pytest.approx(expected_cov, abs=1e-12)
+            assert len(rk.next_candidates) == 3
+            covs.append(rk.coverage)
+        assert covs[0] < covs[1] < covs[2]
+
+    _verify_duplicate_span_coverage(tmp_path)
+
+
+def test_dedup_next_labels_zero_tail_opens_and_cache_caps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _make_cfg(tmp_path, chunk_size=260, min_chunk_size=10)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    for i in range(12):
+        if i == 3:
+            body = 'Plain note "quoted"\twith   orbital booster notes\n'
+        else:
+            body = f'# Orbital "Title" {i:02d} {"X" * 70}\nOrbital booster calibration item {i:02d}.\n'
+        (cfg.corpus_root / f"item_{i:02d}.md").write_text(body, encoding="utf-8")
+    _index_corpus(cfg)
+
+    q = "orbital booster calibration"
+    q_vec = _topic_embed([q])[0]
+    with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+        idx = build_retrieval_index(ro_conn)
+        res = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=2, pool_k=50)
+        assert len(res.next_candidates) == 3
+
+        # Delete ALL 3 tail files on disk before hydration + payload formatting
+        tail_paths = {idx.pointers[idx.id_to_pos[cid]].rel_posix_path for cid, _ in res.next_candidates}
+        for rel_tail in tail_paths:
+            (cfg.corpus_root / rel_tail).unlink()
+
+        opened_paths: list[str] = []
+        hydrate_calls: list[int] = []
+        orig_open = builtins.open
+        orig_read_bytes = Path.read_bytes
+        orig_read_text = Path.read_text
+        orig_hydrate_one = retrieval_hydration.hydrate_one
+
+        def _spy_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            opened_paths.append(str(file).replace("\\", "/"))
+            return orig_open(file, *args, **kwargs)
+
+        def _spy_read_bytes(self: Path) -> bytes:
+            opened_paths.append(self.as_posix())
+            return orig_read_bytes(self)
+
+        def _spy_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            opened_paths.append(self.as_posix())
+            return orig_read_text(self, *args, **kwargs)
+
+        def _spy_hydrate_one(*args: Any, **kwargs: Any) -> Any:
+            hydrate_calls.append(int(args[1].chunk_id))
+            return orig_hydrate_one(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", _spy_open)
+        monkeypatch.setattr(Path, "read_bytes", _spy_read_bytes)
+        monkeypatch.setattr(Path, "read_text", _spy_read_text)
+        monkeypatch.setattr(retrieval_hydration, "hydrate_one", _spy_hydrate_one)
+
+        passages = hydrate_ranked_passages(idx, res.ranked, cfg.corpus_root, top_k=2)
+        payload = build_recall_payload(passages, index=idx, search_result=res)
+        rendered = format_recall_text(payload)
+
+        assert len(hydrate_calls) == min(2, len(dedup_ranked_positions(idx, res.ranked)))
+        for rel_tail in tail_paths:
+            assert not any(rel_tail in p for p in opened_paths)
+
+        assert len(payload["next"]) == 3
+        for n_item in payload["next"]:
+            lbl = n_item["label"]
+            assert len(lbl) <= 64
+            assert '"' not in lbl and "\n" not in lbl and "\r" not in lbl
+        assert "next: " in rendered and "[chunk_id=" not in rendered.split("next: ", 1)[1]
+
+        # Sanitizer control/quote/CRLF strip and direct format_recall_text re-sanitization
+        spoofed = sanitize_slip_label('Bad\r\n[chunk_id=99]\x00\x85"Quote"\t' + ("Z" * 80))
+        assert len(spoofed) <= 64 and '"' not in spoofed and "\n" not in spoofed and "\x85" not in spoofed
+        direct_txt = format_recall_text(
+            {
+                "results": payload["results"],
+                "next": [{"chunk_id": 77, "score": 0.25, "label": 'Hack\n[chunk_id=77]\x00"q"'}],
+                "links": [{"kind": "pmi", "src": 1, "dst": 2, "term": 'bad\r\n"term"\x07'}],
+            }
+        )
+        assert "Hack [chunk_id=77] q" in direct_txt and "\n[chunk_id=77]" not in direct_txt
+        assert '~pmi("bad term")~' in direct_txt
+
+        # Empty index strict RFC 8259 & ValueError on leaked non-finite floats
+        empty_res = SearchResult((), -math.inf, 0.0, 0.0, 2.0, 0)
+        empty_payload = build_recall_payload((), search_result=empty_res)
+        assert empty_payload == {"results": []}
+        assert json.loads(dump_recall_json(empty_payload)) == {"results": []}
+        assert format_recall_text(empty_payload) == NO_MATCHES_TEXT
+        with pytest.raises(ValueError):
+            dump_recall_json({"results": [], "log_bf": float("-inf")})
+        with pytest.raises(ValueError):
+            dump_recall_json({"results": [], "coverage": float("nan")})
+
+        # Cache bounds: vocab_doc_cache & resolved_path_cache capped at CACHE_MAX_ENTRIES (4,096)
+        terms = [f"vocab_term_{i:04d}" for i in range(CACHE_MAX_ENTRIES + 60)]
+        retrieval_lexical.fetch_vocab_docs(ro_conn, terms, idx.vocab_doc_cache)
+        assert len(idx.vocab_doc_cache) == CACHE_MAX_ENTRIES
+        assert "vocab_term_0000" not in idx.vocab_doc_cache
+        assert f"vocab_term_{CACHE_MAX_ENTRIES + 59:04d}" in idx.vocab_doc_cache
+
+        for i in range(CACHE_MAX_ENTRIES + 60):
+            retrieval_hydration._resolve_cached_path(cfg.corpus_root, f"cache_{i:04d}.md", idx.resolved_path_cache)
+        assert len(idx.resolved_path_cache) == CACHE_MAX_ENTRIES
+        assert (cfg.corpus_root, "cache_0000.md") not in idx.resolved_path_cache
+        assert (cfg.corpus_root, f"cache_{CACHE_MAX_ENTRIES + 59:04d}.md") in idx.resolved_path_cache
+
+
+def test_search_result_links_multi_chunk_cites_and_rarest_global_pmi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _make_cfg(tmp_path, chunk_size=180, min_chunk_size=10)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+
+    (cfg.corpus_root / "source.md").write_text(
+        "# Source Hub\nSource Hub cites Beta Manifold and uses orbital quantumflux_alpha with Gamma Node.\n",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "beta.md").write_text(
+        "# Beta Manifold\n"
+        "Beta Manifold primary orbital booster section with internal shared_intra_phrase note.\n\n"
+        + ("Filler secondary chunk mentioning shared_intra_phrase and orbital baseline details. " * 2)
+        + "\n",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "gamma.md").write_text(
+        "# Gamma Node\nGamma Node pairs orbital quantumflux_alpha alongside common_shared_pair calibration.\n",
+        encoding="utf-8",
+    )
+    for k in range(4):
+        (cfg.corpus_root / f"common_{k}.md").write_text(
+            f"# Common {k}\nCommon {k} uses common_shared_pair and orbital valve baseline {k}.\n",
+            encoding="utf-8",
+        )
+    _index_corpus(cfg)
+
+    with contextlib.closing(open_readonly_db(cfg.db_path)) as ro_conn:
+        idx = build_retrieval_index(ro_conn)
+        assert idx.citation_graph is not None
+        beta_chunks = [p.chunk_id for p in idx.pointers if p.rel_posix_path == "beta.md"]
+        assert len(beta_chunks) >= 2
+        src_cid = next(p.chunk_id for p in idx.pointers if p.rel_posix_path == "source.md")
+
+        io_calls: list[str] = []
+        orig_open = builtins.open
+        orig_rb = Path.read_bytes
+        orig_rt = Path.read_text
+        monkeypatch.setattr(builtins, "open", lambda f, *a, **kw: (io_calls.append(str(f)), orig_open(f, *a, **kw))[1])
+        monkeypatch.setattr(Path, "read_bytes", lambda self: (io_calls.append(self.as_posix()), orig_rb(self))[1])
+        monkeypatch.setattr(
+            Path, "read_text", lambda self, *a, **kw: (io_calls.append(self.as_posix()), orig_rt(self, *a, **kw))[1]
+        )
+
+        q = "orbital booster Beta Manifold Source Hub Gamma Node"
+        q_vec = _topic_embed([q])[0]
+        res = search_index(idx, q_vec, query_text=q, conn=ro_conn, top_k=4, pool_k=50)
+        assert io_calls == []
+
+        deduped = dedup_ranked_positions(idx, res.ranked, limit=7)
+        top_pos = [p for p, _, _ in deduped[:4]]
+        next_pos = [p for p, _, _ in deduped[4:7]]
+        cand_cids = [idx.chunk_ids[p] for p in [*top_pos, *next_pos]]
+        best_beta_cid = next(cid for cid in cand_cids if cid in beta_chunks)
+        assert ("cite", src_cid, best_beta_cid, "") in res.links
+        for other_b in beta_chunks:
+            if other_b != best_beta_cid:
+                assert ("cite", src_cid, other_b, "") not in res.links
+
+        # Verify <= 1 global rarest cross-doc PMI edge & latency budget on extracted link kernel
+        pmi_links = [lnk for lnk in res.links if lnk[0] == "pmi"]
+        assert len(pmi_links) <= 1
+        assert all(idx.path_idx[idx.id_to_pos[lnk[1]]] != idx.path_idx[idx.id_to_pos[lnk[2]]] for lnk in res.links)
+
+        # Confirm global rarest cross-doc PMI selection deterministically with two synthetic cross-doc terms
+        cg = idx.citation_graph
+        p0, p1, p2 = top_pos[0], top_pos[1], top_pos[2]
+        assert len({int(idx.path_idx[p0]), int(idx.path_idx[p1]), int(idx.path_idx[p2])}) == 3
+        cpmi_lists: list[list[int]] = [[] for _ in range(idx.size)]
+        cpmi_lists[p0] = [0, 1]
+        cpmi_lists[p1] = [0]
+        cpmi_lists[p2] = [1]
+        for extra_p in range(idx.size):
+            if extra_p not in (p0, p1, p2):
+                cpmi_lists[extra_p] = [0]
+        pmi_indptr = np.array([0, idx.size - 2, idx.size], dtype=np.int32)
+        pmi_indices = np.zeros(idx.size, dtype=np.int32)
+        cpmi_indptr, cpmi_indices = lists_to_csr(cpmi_lists, idx.size)
+        cg_pmi = retrieval_mod.CitationGraph(
+            fi=cg.fi,
+            fx=cg.fx,
+            ri=cg.ri,
+            rx=cg.rx,
+            dc_indptr=cg.dc_indptr,
+            dc_indices=cg.dc_indices,
+            pmi_indptr=pmi_indptr,
+            pmi_indices=pmi_indices,
+            cpmi_indptr=cpmi_indptr,
+            cpmi_indices=cpmi_indices,
+            pmi_terms=("common_phrase", 'rare\n"phrase"\x07'),
+            prop_nouns=cg.prop_nouns,
+            doc_titles=cg.doc_titles,
+        )
+        idx_pmi = retrieval_mod.RetrievalIndex(
+            chunk_ids=idx.chunk_ids,
+            id_to_pos=idx.id_to_pos,
+            pointers=idx.pointers,
+            path_idx=idx.path_idx,
+            distinct_paths=idx.distinct_paths,
+            dim=idx.dim,
+            mean_vec=idx.mean_vec,
+            d_eff=idx.d_eff,
+            codes=idx.codes,
+            ip_norm=idx.ip_norm,
+            rotator=idx.rotator,
+            doc_titles=idx.doc_titles,
+            title_by_first_word=idx.title_by_first_word,
+            citation_graph=cg_pmi,
+            diffusion_ops=idx.diffusion_ops,
+        )
+        links_pmi = retrieval_search._extract_candidate_links(idx_pmi, top_pos, next_pos)
+        pmi_only = [lnk for lnk in links_pmi if lnk[0] == "pmi"]
+        assert pmi_only == [("pmi", idx.chunk_ids[p0], idx.chunk_ids[p2], "rare phrase")]
+
+        t0 = time.perf_counter()
+        for _ in range(500):
+            retrieval_search._extract_candidate_links(idx_pmi, top_pos, next_pos)
+        per_call_ms = ((time.perf_counter() - t0) * 1000.0) / 500.0
+        assert per_call_ms < 0.05
+
+        direct_payload = build_recall_payload((), links=links_pmi) | {
+            "results": [
+                {
+                    "rank": 1,
+                    "chunk_id": idx.chunk_ids[p0],
+                    "score": 1.0,
+                    "text": "x",
+                    "content_hash": "sha256:0",
+                    "source": {"rel_posix_path": "a.md", "start_line": 1, "end_line": 1},
+                }
+            ]
+        }
+        rendered_links = format_recall_text(direct_payload)
+        assert f'{idx.chunk_ids[p0]}~pmi("rare phrase")~{idx.chunk_ids[p2]}' in rendered_links

@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Collection, Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 import scipy.sparse as sp
@@ -16,7 +17,7 @@ from yaw.core import YawRuntimeError
 
 from .db import norm_entity_text, snapshot_tx
 from .graph import build_diffusion_operators
-from .hydration import hydrate_one
+from .hydration import dedup_ranked_positions, hydrate_one
 from .lexical import eligible_mask, extract_multilingual_anchors, extract_title_references, lexical_search
 from .rabitq import (
     build_beta_nats_lut,
@@ -29,7 +30,15 @@ from .rabitq import (
     transform_vectors,
     unpack_1bit_signed,
 )
-from .types import TANGENT_COS_CLIP, TANGENT_RHO_CLIP, DiffusionOperators, RetrievalIndex, SearchResult
+from .slip import sanitize_slip_label
+from .types import (
+    TANGENT_COS_CLIP,
+    TANGENT_RHO_CLIP,
+    CitationGraph,
+    DiffusionOperators,
+    RetrievalIndex,
+    SearchResult,
+)
 
 
 def fetch_point_vectors(
@@ -256,17 +265,25 @@ def rerank_dpp_1bit(
     return selected
 
 
+def _require_positive_int(val: Any, label: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+        raise YawRuntimeError("INVALID_INPUT", f"{label} must be a positive integer, got {val!r}")
+    return val
+
+
 def _validate_search_inputs(
     idx: RetrievalIndex,
     query_embedding: NDArray[np.float32],
     conn: sqlite3.Connection | None,
     top_k: int,
+    pool_k: int | None,
     path_glob: str | None,
     masked_rel_paths: Collection[str] | None,
     exclude_chunk_ids: Sequence[int] | None,
 ) -> tuple[NDArray[np.bool_], list[int], int] | SearchResult:
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
-        raise YawRuntimeError("INVALID_INPUT", f"top_k must be a positive integer, got {top_k!r}")
+    _require_positive_int(top_k, "top_k")
+    if pool_k is not None:
+        _require_positive_int(pool_k, "pool_k")
     if conn is None:
         raise YawRuntimeError("CONSISTENCY_ERROR", "search_index requires an active SQLite connection.")
     if idx.size == 0:
@@ -457,6 +474,76 @@ def _select_ranked_positions(
     return tuple(ranked_list), len(selected_pos)
 
 
+def _collect_cite_links(
+    idx: RetrievalIndex,
+    cg: CitationGraph,
+    cand_pos: Sequence[int],
+) -> list[tuple[Literal["cite", "pmi"], int, int, str]]:
+    doc_best_pos: dict[int, int] = {}
+    for p in cand_pos:
+        doc_best_pos.setdefault(int(idx.path_idx[p]), p)
+    seen_cites: set[tuple[int, int]] = set()
+    cite_links: list[tuple[Literal["cite", "pmi"], int, int, str]] = []
+    for u in cand_pos:
+        src_doc = int(idx.path_idx[u])
+        src_cid = int(idx.chunk_ids[u])
+        for di in cg.fx[int(cg.fi[u]) : int(cg.fi[u + 1])]:
+            v = doc_best_pos.get(int(di))
+            if int(di) == src_doc or v is None or v == u:
+                continue
+            dst_cid = int(idx.chunk_ids[v])
+            if (src_cid, dst_cid) not in seen_cites:
+                seen_cites.add((src_cid, dst_cid))
+                cite_links.append(("cite", src_cid, dst_cid, ""))
+    return cite_links
+
+
+def _find_rarest_pmi_link(
+    idx: RetrievalIndex,
+    cg: CitationGraph,
+    cand_pos: Sequence[int],
+) -> tuple[Literal["cite", "pmi"], int, int, str] | None:
+    if not cg.pmi_terms or cg.cpmi_indices.size == 0:
+        return None
+    terms_by_rank = [
+        {int(e) for e in cg.cpmi_indices[int(cg.cpmi_indptr[u]) : int(cg.cpmi_indptr[u + 1])]} for u in cand_pos
+    ]
+    best_key: tuple[int, str, int, int] | None = None
+    best_link: tuple[Literal["cite", "pmi"], int, int, str] | None = None
+    for rank_u, u in enumerate(cand_pos):
+        terms_u = terms_by_rank[rank_u]
+        if not terms_u:
+            continue
+        doc_u = int(idx.path_idx[u])
+        for rank_v in range(rank_u + 1, len(cand_pos)):
+            v = cand_pos[rank_v]
+            if int(idx.path_idx[v]) == doc_u:
+                continue
+            for eid in terms_u & terms_by_rank[rank_v]:
+                clean_term = sanitize_slip_label(cg.pmi_terms[eid])
+                if not clean_term:
+                    continue
+                cand_key = (int(cg.pmi_indptr[eid + 1] - cg.pmi_indptr[eid]), clean_term, rank_u, rank_v)
+                if best_key is None or cand_key < best_key:
+                    best_key = cand_key
+                    best_link = ("pmi", int(idx.chunk_ids[u]), int(idx.chunk_ids[v]), clean_term)
+    return best_link
+
+
+def _extract_candidate_links(
+    idx: RetrievalIndex,
+    top_k_pos: Sequence[int],
+    next_pos: Sequence[int],
+) -> tuple[tuple[Literal["cite", "pmi"], int, int, str], ...]:
+    cand_pos = [*top_k_pos, *next_pos]
+    if len(cand_pos) < 2 or idx.citation_graph is None:
+        return ()
+    links = _collect_cite_links(idx, idx.citation_graph, cand_pos)
+    if (pmi_link := _find_rarest_pmi_link(idx, idx.citation_graph, cand_pos)) is not None:
+        links.append(pmi_link)
+    return tuple(links)
+
+
 def search_index(
     idx: RetrievalIndex,
     query_embedding: NDArray[np.float32],
@@ -464,13 +551,14 @@ def search_index(
     query_text: str = "",
     conn: sqlite3.Connection | None = None,
     top_k: int = 10,
+    pool_k: int | None = None,
     path_glob: str | None = None,
     masked_rel_paths: Collection[str] | None = None,
     exclude_chunk_ids: Sequence[int] | None = None,
 ) -> SearchResult:
     """Run frozen M_FINAL_1B retrieval: 1-bit RaBitQ, unicode61 lexical/title anchors, tangent diffusion, and DPP."""
     validated = _validate_search_inputs(
-        idx, query_embedding, conn, top_k, path_glob, masked_rel_paths, exclude_chunk_ids
+        idx, query_embedding, conn, top_k, pool_k, path_glob, masked_rel_paths, exclude_chunk_ids
     )
     if isinstance(validated, SearchResult):
         return validated
@@ -493,7 +581,18 @@ def search_index(
     post, all_q_cos, ev_max, ex_sum = _score_query_evidence(
         idx, query_embedding, query_text, conn, eligible, excl_pos, n_eff, t_path, ops
     )
-    ranked_out, n_candidates = _select_ranked_positions(idx, post, all_q_cos, eligible, top_k, n_eff)
+    dpp_k = pool_k if pool_k is not None else top_k
+    ranked_out, n_candidates = _select_ranked_positions(idx, post, all_q_cos, eligible, dpp_k, n_eff)
+    deduped = dedup_ranked_positions(idx, ranked_out, limit=top_k + 3)
+    top_entries = deduped[:top_k]
+    next_entries = deduped[top_k : top_k + 3]
+    top_k_pos = [p for p, _, _ in top_entries]
+    next_pos = [p for p, _, _ in next_entries]
+    coverage = (
+        min(1.0, max(0.0, float(post[top_k_pos].sum() / max(float(post[eligible].sum()), 1e-12)))) if top_k_pos else 0.0
+    )
+    next_candidates = tuple((cid, sc) for _, cid, sc in next_entries)
+    links = _extract_candidate_links(idx, top_k_pos, next_pos)
     top1_cos = float(all_q_cos[eligible].max())
     log_bf = float(ev_max + math.log(ex_sum) - math.log(float(n_eff)))
     return SearchResult(
@@ -503,6 +602,9 @@ def search_index(
         top1_cosine=top1_cos,
         d_eff=idx.d_eff,
         n_candidates=n_candidates,
+        coverage=coverage,
+        next_candidates=next_candidates,
+        links=links,
     )
 
 
