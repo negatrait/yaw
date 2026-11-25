@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     )
     from .logger import FIFOLineRotatingHandler, configure_logging, get_logger
     from .types import (
+        DASH_RE,
         ChunkPointer,
         DaemonStatus,
         EmbedFn,
@@ -29,13 +30,18 @@ if TYPE_CHECKING:
         format_doc_for_embedding,
         format_query_for_embedding,
         inclusive_end_line,
+        markdown_heading_level,
+        normalize_ast_heading,
         redact_secrets,
         render_document_text,
+        require_corpus_dir,
         resolve_corpus_path,
+        split_lf_lines,
     )
 
 _PUBLIC_API: dict[str, str] = {
     "ChunkPointer": ".types",
+    "DASH_RE": ".types",
     "DEFAULT_EXCLUDED_PATTERNS": ".config",
     "DEFAULT_INCLUDED_PATTERNS": ".config",
     "DaemonStatus": ".types",
@@ -54,18 +60,23 @@ _PUBLIC_API: dict[str, str] = {
     "get_logger": ".logger",
     "inclusive_end_line": ".types",
     "load_config": ".config",
+    "markdown_heading_level": ".types",
+    "normalize_ast_heading": ".types",
     "parse_dataset_list": ".config",
     "redact_secrets": ".types",
     "render_document_text": ".types",
+    "require_corpus_dir": ".types",
     "resolve_coco_state_root": ".config",
     "resolve_corpus_path": ".types",
     "set_config_value": ".config",
+    "split_lf_lines": ".types",
     "write_text_atomic": ".config",
     "write_via_temp_atomic": ".config",
 }
 
 __all__ = [
     "ChunkPointer",
+    "DASH_RE",
     "DEFAULT_EXCLUDED_PATTERNS",
     "DEFAULT_INCLUDED_PATTERNS",
     "DaemonStatus",
@@ -84,12 +95,16 @@ __all__ = [
     "get_logger",
     "inclusive_end_line",
     "load_config",
+    "markdown_heading_level",
+    "normalize_ast_heading",
     "parse_dataset_list",
     "redact_secrets",
     "render_document_text",
+    "require_corpus_dir",
     "resolve_coco_state_root",
     "resolve_corpus_path",
     "set_config_value",
+    "split_lf_lines",
     "write_text_atomic",
     "write_via_temp_atomic",
 ]

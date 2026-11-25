@@ -21,7 +21,6 @@ CJK_RANGE = r"\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af"
 CJK_RUN_RE = re.compile(f"[{CJK_RANGE}]+")
 WORD_TOK_RE = re.compile(rf"[^\W_{CJK_RANGE}]+(?:[+#._-][^\W_{CJK_RANGE}]+|[+]{{2}}|#)?")
 WS_RUN_RE = re.compile(r"\s+")
-DASH_RE = re.compile(r"[\u2010-\u2015\u2212]")
 POSS_RE = re.compile(r"(?<=[0-9a-zA-Z\u00c0-\u024f])['’]s\b")
 
 TANGENT_COS_CLIP = 0.9999

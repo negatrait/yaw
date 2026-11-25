@@ -368,7 +368,7 @@ def run_yaw_benchmark(
             ranked = search_index(
                 index, q_unit, query_text=query, conn=conn, top_k=RETRIEVAL_TOP_K, pool_k=pool_k
             ).ranked
-            hydrated = hydrate_ranked_passages(index, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
+            hydrated = hydrate_ranked_passages(index, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K, include_island=True)
             retrieval_elapsed = perf_counter() - t_q0
 
             if index.size > 0:
@@ -380,7 +380,9 @@ def run_yaw_benchmark(
                 else:
                     top_pos = np.argsort(-dpr_scores, kind="stable")
                 dpr_ranked = [(index.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
-                dpr_hydrated = hydrate_ranked_passages(index, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K)
+                dpr_hydrated = hydrate_ranked_passages(
+                    index, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K, include_island=True
+                )
             else:
                 dpr_hydrated = ()
 

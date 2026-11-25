@@ -594,7 +594,12 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
                     assert isinstance(item["score"], float)
                     assert "stale" not in item and "stale_on_disk" not in item
                     assert item["content_hash"] == f"sha256:{hashlib.sha256(item['text'].encode('utf-8')).hexdigest()}"
-                    assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line"}
+                    expected_source_keys = {"rel_posix_path", "start_line", "end_line"}
+                    if item["source"]["rel_posix_path"].endswith(".md"):
+                        expected_source_keys.add("title")
+                    assert set(item["source"]) == expected_source_keys
+                    if item["source"]["rel_posix_path"].endswith(".md"):
+                        assert item["source"]["title"] in {"Apollo 11 Mission", "Booster Backup"}
 
                 qa_res = (await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})).data
                 assert qa_res["question"] == "Who commanded Apollo 11?"
@@ -1174,7 +1179,7 @@ def test_mcp_recall_tool_result_next_links_sparse_and_byte_budget(tmp_path: Path
                 assert {"cite", "pmi"} <= kinds and "links: " in rec_text
                 for item in rec["results"]:
                     assert "stale" not in item and "stale_on_disk" not in item
-                    assert "title" not in item["source"]
+                    assert item["source"]["title"] in {"Source Hub", "Target Node", *(f"Extra {k}" for k in range(4))}
 
                 old_json_payload = {
                     "query": q,

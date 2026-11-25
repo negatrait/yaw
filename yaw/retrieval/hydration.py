@@ -1,40 +1,63 @@
-"""Zero-copy disk hydration, SHA-256 freshness verification, and MaxP span deduplication."""
+"""Zero-copy disk hydration, CocoIndex fingerprint freshness verification, and MaxP island deduplication."""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 import zlib
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from cocoindex.connectorkits.fingerprint import fingerprint_str
 from numpy.typing import NDArray
 
-from yaw.core import ChunkPointer, HydratedPassage, YawRuntimeError, resolve_corpus_path
+from yaw.core import (
+    DASH_RE,
+    ChunkPointer,
+    HydratedPassage,
+    YawRuntimeError,
+    markdown_heading_level,
+    normalize_ast_heading,
+    resolve_corpus_path,
+    split_lf_lines,
+)
 
 from .types import CACHE_LOCK, CACHE_MAX_ENTRIES, RetrievalIndex
 
 _MAX_HYDRATE_SPAN = 10_000
-_TITLE_TRAILING_SEP_RE = re.compile(r"\s+[-–—:]+\s*$")
-_TITLE_TAG_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s+(.+)$")
+_MARKDOWN_SUFFIXES = (".md", ".markdown", ".mdx")
 
 type _FileCache = dict[str, tuple[Path, str, list[str]] | None]
 
 
-def extract_markdown_h1(raw_head: str) -> str:
-    """Extract normalized title text from a leading Markdown # Heading line."""
-    first = next((ln.strip() for ln in raw_head.splitlines() if ln.strip()), "")
-    if not first.startswith("#"):
-        return ""
-    title = _TITLE_TRAILING_SEP_RE.sub("", first.lstrip("#").strip()).strip()
-    if m := _TITLE_TAG_PREFIX_RE.match(title):
-        raw_grp = m.group(1)
-        if isinstance(raw_grp, str) and (stripped := raw_grp.strip()):
-            title = stripped
-    return title
+def is_markdown_path(rel_path: str) -> bool:
+    """Return True when `rel_path` has a recognized Markdown file suffix."""
+    return rel_path.lower().endswith(_MARKDOWN_SUFFIXES)
+
+
+def resolve_hydrated_line_span(
+    ptr: ChunkPointer,
+    *,
+    include_island: bool,
+    total_lines: int | None = None,
+) -> tuple[int, int]:
+    """Resolve effective 1-indexed inclusive `[es, ee]` hydration lines without widening sentinel `(1, 1)`."""
+    sl, el = int(ptr.start_line), int(ptr.end_line)
+    is_, ie_ = int(ptr.ast_island_start), int(ptr.ast_island_end)
+    if not include_island or is_ <= 0 or ie_ < is_ or (is_, ie_) == (1, 1):
+        return sl, el
+    es, ee = min(sl, is_), max(el, ie_)
+    if total_lines is not None:
+        max_ln = max(1, int(total_lines))
+        es = max(1, min(es, max_ln))
+        ee = max(es, min(ee, max_ln))
+    max_span = max(el - sl + 1, _MAX_HYDRATE_SPAN - 1)
+    if ee - es + 1 > max_span:
+        ee = min(ee, max(el, es + max_span - 1))
+        if ee - es + 1 > max_span:
+            es = max(1, ee - max_span + 1)
+    return es, ee
 
 
 def pack_doc_titles_blob(doc_titles: Mapping[str, str]) -> bytes:
@@ -90,7 +113,7 @@ def _validate_max_chars(max_chars: int | None) -> int | None:
 def _crop_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    lines = text.splitlines()
+    lines = split_lf_lines(text)
     if len(lines) >= 3 and max_chars >= 120:
         half = max(20, (max_chars - 48) // 2)
         head: list[str] = []
@@ -162,7 +185,7 @@ def _load_corpus_file(
             raise YawRuntimeError(
                 "CONSISTENCY_ERROR", f"Invalid UTF-8 or unreadable source file {target}: {exc}"
             ) from exc
-        loaded = (target, text, text.splitlines())
+        loaded = (target, text, split_lf_lines(text))
     if file_cache is not None:
         file_cache[rel_posix_path] = loaded
     return loaded
@@ -173,25 +196,30 @@ def _render_hydrated_slice(
     text: str,
     lines: list[str],
     raw_slice: str,
-    include_island: bool,
+    es: int,
+    ee: int,
     full_span: bool,
     limit: int | None,
+    *,
+    prepend_title: bool = True,
 ) -> str:
     sl, el = int(ptr.start_line), int(ptr.end_line)
-    if include_island and 0 < ptr.ast_island_start <= ptr.ast_island_end:
-        es, ee = min(sl, int(ptr.ast_island_start)), min(len(lines), max(el, int(ptr.ast_island_end)))
+    if (es, ee) != (sl, el):
         rendered = "\n".join(lines[es - 1 : ee])
     elif not full_span and ptr.char_end > ptr.char_start:
         rendered = text[ptr.char_start : ptr.char_end]
     else:
         rendered = raw_slice
-    if (
-        ptr.title
-        and not rendered.lstrip().startswith("#")
-        and not rendered.startswith(f"{ptr.title}\n")
-        and rendered != ptr.title
-    ):
-        rendered = f"{ptr.title}\n{rendered}"
+    if prepend_title and ptr.title:
+        head_span = max(1, el - es + 1)
+        rendered_lines = split_lf_lines(rendered)
+        has_opening = (
+            rendered == ptr.title
+            or rendered.startswith(f"{ptr.title}\n")
+            or any(normalize_ast_heading(ln) == ptr.title for ln in rendered_lines[:head_span])
+        )
+        if not has_opening:
+            rendered = f"{ptr.title}\n{rendered}"
     if limit is not None and limit > 0:
         rendered = _crop_text(rendered, limit)
     return rendered
@@ -206,10 +234,11 @@ def hydrate_one(
     full_span: bool,
     *,
     strict: bool = False,
+    prepend_title: bool = True,
     file_cache: _FileCache | None = None,
     path_cache: dict[tuple[Path, str], Path] | None = None,
 ) -> HydratedPassage:
-    """Hydrate one verified slice from disk, enforcing line bounds and SHA-256 freshness."""
+    """Hydrate one verified slice from disk, enforcing line bounds and fingerprint freshness."""
     limit = _validate_max_chars(max_chars)
     sl, el = int(ptr.start_line), int(ptr.end_line)
     if sl < 1 or el < sl or (el - sl + 1) > _MAX_HYDRATE_SPAN:
@@ -227,13 +256,31 @@ def hydrate_one(
             raise YawRuntimeError("CONSISTENCY_ERROR", f"Stale line range [{sl}, {el}] in {target}")
         return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
     raw_slice = "\n".join(lines[sl - 1 : el])
-    if ptr.source_hash and hashlib.sha256(raw_slice.encode("utf-8")).hexdigest() != ptr.source_hash:
+    if ptr.source_hash and fingerprint_str(raw_slice).hex() != ptr.source_hash:
         if strict:
-            raise YawRuntimeError("CONSISTENCY_ERROR", f"SHA-256 drift detected on disk for {target}")
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Source fingerprint drift detected on disk for {target}")
         return HydratedPassage(ptr, "", float(score), stale_on_disk=True)
 
-    rendered = _render_hydrated_slice(ptr, text, lines, raw_slice, include_island, full_span, limit)
-    return HydratedPassage(ptr, rendered, float(score), stale_on_disk=False)
+    es, ee = resolve_hydrated_line_span(ptr, include_island=include_island, total_lines=len(lines))
+    rendered = _render_hydrated_slice(
+        ptr,
+        text,
+        lines,
+        raw_slice,
+        es,
+        ee,
+        full_span,
+        limit,
+        prepend_title=prepend_title,
+    )
+    return HydratedPassage(
+        ptr,
+        rendered,
+        float(score),
+        stale_on_disk=False,
+        hydrated_start_line=es,
+        hydrated_end_line=ee,
+    )
 
 
 def hydrate_passage(
@@ -245,7 +292,7 @@ def hydrate_passage(
     include_island: bool = False,
     full_span: bool = False,
 ) -> HydratedPassage:
-    """Hydrate a single ChunkPointer directly from disk, verifying SHA-256 freshness."""
+    """Hydrate a single ChunkPointer directly from disk, verifying source fingerprint freshness."""
     return hydrate_one(corpus_root, ptr, score, max_chars, include_island, full_span, strict=False)
 
 
@@ -254,18 +301,28 @@ def dedup_ranked_positions(
     ranked_chunks: Sequence[tuple[int, float]],
     *,
     limit: int | None = None,
+    include_island: bool = False,
 ) -> tuple[tuple[int, int, float], ...]:
-    """Apply MaxP 5-tuple span deduplication without opening or reading files on disk."""
+    """Apply MaxP span (or expanded AST island when `include_island=True`) deduplication with zero disk opens."""
     if not ranked_chunks or (limit is not None and limit <= 0):
         return ()
     out: list[tuple[int, int, float]] = []
-    seen_spans: set[tuple[str, int, int, int, int]] = set()
+    seen_spans: set[tuple[Any, ...]] = set()
     for cid, score in ranked_chunks:
         cid_int = int(cid)
         if (pos := idx.id_to_pos.get(cid_int)) is None:
             continue
         ptr = idx.pointers[pos]
-        span = (ptr.rel_posix_path, int(ptr.start_line), int(ptr.end_line), int(ptr.char_start), int(ptr.char_end))
+        sl, el = int(ptr.start_line), int(ptr.end_line)
+        if include_island:
+            es, ee = resolve_hydrated_line_span(ptr, include_island=True)
+            span: tuple[Any, ...] = (
+                (ptr.rel_posix_path, es, ee)
+                if es < ee
+                else (ptr.rel_posix_path, sl, el, int(ptr.char_start), int(ptr.char_end))
+            )
+        else:
+            span = (ptr.rel_posix_path, sl, el, int(ptr.char_start), int(ptr.char_end))
         if span in seen_spans:
             continue
         seen_spans.add(span)
@@ -282,12 +339,12 @@ def hydrate_ranked_passages(
     *,
     top_k: int = 5,
     max_chars: int | None = None,
-    include_island: bool = False,
+    include_island: bool = True,
     full_span: bool = False,
 ) -> tuple[HydratedPassage, ...]:
-    """Apply MaxP span deduplication and hydrate up to `top_k` passages from disk."""
+    """Apply MaxP span/island deduplication and hydrate up to `top_k` passages from disk."""
     limit = _validate_max_chars(max_chars)
-    deduped = dedup_ranked_positions(idx, ranked_chunks, limit=top_k)
+    deduped = dedup_ranked_positions(idx, ranked_chunks, limit=top_k, include_island=include_island)
     if not deduped:
         return ()
     file_cache: _FileCache = {}
@@ -311,15 +368,78 @@ def format_evidence_route(passages: Sequence[HydratedPassage]) -> str:
     """Format hydrated passages with explicit provenance headers for recall and ReAct output."""
     blocks: list[str] = []
     for idx, hp in enumerate(passages, start=1):
+        span = f"{hp.pointer.rel_posix_path}:{hp.resolved_start_line}-{hp.resolved_end_line}"
         if hp.stale_on_disk:
-            blocks.append(
-                f"[{idx}] [STALE: {hp.pointer.span_label} | chunk_id={hp.pointer.chunk_id} | score={hp.score:.4f}]"
-            )
+            blocks.append(f"[{idx}] [STALE: {span} | chunk_id={hp.pointer.chunk_id} | score={hp.score:.4f}]")
         else:
-            blocks.append(
-                f"[{idx}] [{hp.pointer.span_label} | chunk_id={hp.pointer.chunk_id} | score={hp.score:.4f}]\n{hp.text}"
-            )
+            blocks.append(f"[{idx}] [{span} | chunk_id={hp.pointer.chunk_id} | score={hp.score:.4f}]\n{hp.text}")
     return "\n\n".join(blocks)
+
+
+def _update_fence_state(raw: str, fence: tuple[str, int]) -> tuple[tuple[str, int], bool]:
+    stripped = raw.lstrip(" ")
+    if raw.startswith("\t") or len(raw) - len(stripped) > 3:
+        return fence, False
+    f_ch, f_len = fence
+    if not f_ch and stripped.startswith(("```", "~~~")):
+        ch = stripped[0]
+        return (ch, len(stripped) - len(stripped.lstrip(ch))), True
+    if f_ch and stripped.startswith(f_ch * f_len) and not stripped.strip(f_ch + " \t"):
+        return ("", 0), True
+    return fence, False
+
+
+def _leading_frontmatter_end(lines: Sequence[str], max_el: int) -> int:
+    first_idx = next((i for i in range(max_el) if lines[i].strip()), None)
+    if (
+        first_idx is None
+        or lines[first_idx].strip() != "---"
+        or first_idx + 1 >= max_el
+        or not lines[first_idx + 1].strip()
+    ):
+        return 0
+    for j in range(first_idx + 1, max_el):
+        s = lines[j].strip()
+        if s in ("---", "..."):
+            return j + 1
+        if s and not (lines[j][0].isspace() or s.startswith(("#", "-")) or ":" in s):
+            return 0
+    return 0
+
+
+def _collect_h1_by_line(lines: Sequence[str], max_el: int) -> dict[int, str]:
+    start_idx = _leading_frontmatter_end(lines, max_el)
+    fence = ("", 0)
+    h1_by_line: dict[int, str] = {}
+    for idx in range(start_idx, max_el):
+        fence, is_delim = _update_fence_state(lines[idx], fence)
+        if (
+            not is_delim
+            and not fence[0]
+            and markdown_heading_level(lines, idx + 1) == 1
+            and (h1 := normalize_ast_heading(lines[idx]))
+        ):
+            h1_by_line[idx + 1] = h1
+    return h1_by_line
+
+
+def _resolve_chunk_doc_h1(lines: Sequence[str], ptrs: Sequence[ChunkPointer]) -> str:
+    if not ptrs or not lines:
+        return ""
+    ordered = sorted(ptrs, key=lambda p: (int(p.start_line), int(p.char_start)))
+    max_el = min(len(lines), max(int(p.end_line) for p in ordered))
+    h1_by_line = _collect_h1_by_line(lines, max_el)
+    has_titled_chunk = any(p.title.strip() for p in ordered)
+    for ptr in ordered:
+        t_ptr = DASH_RE.sub("-", ptr.title.strip())
+        if has_titled_chunk and not t_ptr:
+            continue
+        sl = max(1, int(ptr.start_line))
+        el = min(max_el, int(ptr.end_line))
+        hits = [h1_by_line[ln] for ln in range(sl, el + 1) if ln in h1_by_line]
+        if hits:
+            return t_ptr if t_ptr in hits else hits[0]
+    return ""
 
 
 def hydrate_corpus_chunks(
@@ -355,6 +475,7 @@ def hydrate_corpus_chunks(
                     False,
                     False,
                     strict=True,
+                    prepend_title=False,
                     file_cache=local_cache,
                 ).text,
             )
@@ -362,9 +483,7 @@ def hydrate_corpus_chunks(
         ]
         title = ""
         if rel in title_targets and (loaded := local_cache.get(rel)) is not None:
-            first_line = next((ln for ln in loaded[2] if ln.strip()), "")
-            if first_line:
-                title = extract_markdown_h1(first_line)
+            title = _resolve_chunk_doc_h1(loaded[2], [pointers[pos] for pos in pos_list])
         return chunk_texts, rel, title
 
     for grp_res, rel, title in map(_read_group, by_rel.items()):

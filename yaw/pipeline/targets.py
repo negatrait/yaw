@@ -15,6 +15,7 @@ from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectors import sqlite
 
+from yaw.core import require_corpus_dir
 from yaw.retrieval import compute_db_fingerprints, compute_index_artifacts
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -297,9 +298,10 @@ def reconcile_index_tables(
     *,
     embedding_model: str,
     task_mode: str,
-    corpus_root: Path | None = None,
+    corpus_root: Path | str,
 ) -> bool:
     """Optimize FTS5 and materialize single-row `rabitq_index` + `citation_graph` when chunks change."""
+    resolved_root = require_corpus_dir(corpus_root)
     with conn_mgr.readonly() as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             return False
@@ -338,7 +340,7 @@ def reconcile_index_tables(
             g_del = conn.execute('DELETE FROM "citation_graph" WHERE id = 1').rowcount
         return bool((r_del or 0) + (g_del or 0))
 
-    artifacts = compute_index_artifacts(rows, corpus_root)
+    artifacts = compute_index_artifacts(rows, resolved_root)
     with conn_mgr.transaction() as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_fts'").fetchone() is not None:
             conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize')")

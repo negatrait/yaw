@@ -557,7 +557,7 @@ def _search_and_hydrate_with_result(
 ) -> tuple[SearchResult, tuple[HydratedPassage, ...]]:
     with contextlib.closing(open_readonly_db(db_path)) as conn:
         res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
-    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
+    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k, include_island=True)
 
 
 def _run_recall_with_result(
@@ -576,7 +576,7 @@ def _run_recall_with_result(
     raw_emb = np.asarray(active_embed([formatted]), dtype=np.float32)
     q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
     res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
-    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k)
+    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k, include_island=True)
 
 
 async def _arecall_core(

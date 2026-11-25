@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import os
 import sqlite3
 import threading
@@ -15,6 +14,7 @@ from typing import Any
 
 import cocoindex as coco
 import numpy as np
+from cocoindex.connectorkits.fingerprint import fingerprint_str
 from cocoindex.connectors import sqlite
 from dspy.utils.exceptions import DSPyError
 from numpy.typing import NDArray
@@ -420,7 +420,7 @@ def _prepare_session_paths(
         batch_size=cfg.embed_batch_size,
         max_in_flight=cfg.embed_max_in_flight,
     )
-    resolved_app = app_name or f"yaw_{hashlib.sha256(db_path.as_posix().encode('utf-8')).hexdigest()[:12]}"
+    resolved_app = app_name or f"yaw_{fingerprint_str(db_path.as_posix()).hex()[:12]}"
     return db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app
 
 

@@ -723,7 +723,25 @@ class PaperParityGateTests(unittest.TestCase):
                 self.assertEqual(res_pool.ranked, ranked_legacy)
                 ranked = res_pool.ranked
                 hits = hydrate_ranked_passages(idx, ranked, corpus_dir, top_k=5)
-                self.assertGreaterEqual(len(hits), 2)
+                self.assertEqual([hp.pointer.rel_posix_path for hp in hits], ["montebello.md", "albany.md"])
+                mont_lines = (corpus_dir / "montebello.md").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(hits[0].resolved_start_line, 1)
+                self.assertEqual(hits[0].resolved_end_line, len(mont_lines))
+                self.assertTrue(hits[0].text.startswith("# Montebello\n"))
+                self.assertFalse(hits[0].text.startswith("Montebello\n# Montebello"))
+                self.assertIn("Montebello is an incorporated village", hits[0].text)
+                self.assertIn("Rockland County is the southernmost county", hits[0].text)
+                self.assertIn("incorporated as a village in 1986", hits[0].text)
+
+                exact = hydrate_passage(hits[0].pointer, corpus_dir)
+                self.assertEqual(exact.resolved_start_line, hits[0].pointer.start_line)
+                self.assertEqual(exact.resolved_end_line, hits[0].pointer.end_line)
+                self.assertNotEqual(
+                    (exact.resolved_start_line, exact.resolved_end_line),
+                    (hits[0].resolved_start_line, hits[0].resolved_end_line),
+                )
+                self.assertLess(len(exact.text), len(hits[0].text))
+
                 overall, _ = RetrievalRecall().calculate_metric_scores(
                     gold_docs=[[full_gold_passage]],
                     retrieved_docs=[[hp.text for hp in hits]],

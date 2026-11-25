@@ -583,7 +583,7 @@ def search_index(
     )
     dpp_k = pool_k if pool_k is not None else top_k
     ranked_out, n_candidates = _select_ranked_positions(idx, post, all_q_cos, eligible, dpp_k, n_eff)
-    deduped = dedup_ranked_positions(idx, ranked_out, limit=top_k + 3)
+    deduped = dedup_ranked_positions(idx, ranked_out, limit=top_k + 3, include_island=True)
     top_entries = deduped[:top_k]
     next_entries = deduped[top_k : top_k + 3]
     top_k_pos = [p for p, _, _ in top_entries]

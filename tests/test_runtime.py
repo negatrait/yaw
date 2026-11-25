@@ -474,7 +474,8 @@ def test_bounded_semaphore_busy_program_load_redaction_and_control_token(tmp_pat
         assert ser["rank"] == 1
         assert ser["chunk_id"] == int(recalled_for_ser[0].pointer.chunk_id)
         assert ser["content_hash"].startswith("sha256:")
-        assert ser["source"]["start_line"] == int(recalled_for_ser[0].pointer.start_line)
+        assert ser["source"]["start_line"] == int(recalled_for_ser[0].resolved_start_line)
+        assert ser["source"]["end_line"] == int(recalled_for_ser[0].resolved_end_line)
         assert "stale" not in ser and "stale_on_disk" not in ser
         assert json.loads(dump_recall_json(slip_payload)) == slip_payload
         assert f"[chunk_id={ser['chunk_id']}]" in format_recall_text(slip_payload)

@@ -16,10 +16,10 @@ import numpy as np
 import scipy.sparse as sp
 from numpy.typing import NDArray
 
-from yaw.core import ChunkPointer, YawRuntimeError
+from yaw.core import DASH_RE, ChunkPointer, YawRuntimeError, require_corpus_dir
 
 from .db import fingerprint_rows, norm_entity_text
-from .hydration import build_chunk_pointers, hydrate_corpus_chunks, pack_doc_titles_blob
+from .hydration import build_chunk_pointers, hydrate_corpus_chunks, is_markdown_path, pack_doc_titles_blob
 from .rabitq import (
     build_beta_nats_lut,
     build_rotator,
@@ -31,7 +31,6 @@ from .rabitq import (
 )
 from .types import (
     CJK_RUN_RE,
-    DASH_RE,
     TANGENT_RHO_CLIP,
     WORD_TOK_RE,
     CitationGraph,
@@ -114,7 +113,7 @@ def build_title_index(
     raw_by_first: dict[str, dict[tuple[str, ...], list[int]]] = {}
     max_len_by_first: dict[str, int] = {}
     for pos, ptr in enumerate(pointers):
-        eff_title = ptr.title or doc_titles.get(ptr.rel_posix_path, "")
+        eff_title = doc_titles.get(ptr.rel_posix_path, "")
         for tk in extract_title_keys(eff_title, prop_nouns=prop_nouns):
             first = tk[0]
             tbl = raw_by_first.setdefault(first, {})
@@ -131,42 +130,14 @@ def build_title_index(
     }
 
 
-def _empty_citation_graph(
-    n: int,
-    nd: int,
-    dc_indptr: NDArray[np.int32],
-    dc_indices: NDArray[np.int32],
-    doc_titles: tuple[str, ...],
-) -> CitationGraph:
-    return CitationGraph(
-        fi=np.zeros(n + 1, dtype=np.int32),
-        fx=np.zeros(0, dtype=np.int32),
-        ri=np.zeros(nd + 1, dtype=np.int32),
-        rx=np.zeros(0, dtype=np.int32),
-        dc_indptr=dc_indptr,
-        dc_indices=dc_indices,
-        pmi_indptr=np.zeros(1, dtype=np.int32),
-        pmi_indices=np.zeros(0, dtype=np.int32),
-        cpmi_indptr=np.zeros(n + 1, dtype=np.int32),
-        cpmi_indices=np.zeros(0, dtype=np.int32),
-        pmi_terms=(),
-        prop_nouns=frozenset(),
-        doc_titles=doc_titles,
-    )
-
-
 def _resolve_doc_titles_and_chunks(
     pointers: Sequence[ChunkPointer],
     distinct_paths: Sequence[str],
-    raw_dt: list[str],
     corpus_root: Path,
 ) -> tuple[list[str], tuple[str, ...], dict[str, str]]:
-    missing_title_paths = {distinct_paths[di] for di, t in enumerate(raw_dt) if not t}
-    ct, disk_titles = hydrate_corpus_chunks(pointers, corpus_root, extract_titles_for=missing_title_paths)
-    for di, dp in enumerate(distinct_paths):
-        if not raw_dt[di] and (t_ext := disk_titles.get(dp, "")):
-            raw_dt[di] = DASH_RE.sub("-", t_ext)
-    doc_titles_tup = tuple(raw_dt)
+    md_paths = [dp for dp in distinct_paths if is_markdown_path(dp)]
+    ct, disk_titles = hydrate_corpus_chunks(pointers, corpus_root, extract_titles_for=md_paths)
+    doc_titles_tup = tuple(DASH_RE.sub("-", disk_titles.get(dp, "")) for dp in distinct_paths)
     doc_titles_norm = {dp: dt for dp, dt in zip(distinct_paths, doc_titles_tup, strict=True) if dt}
     return ct, doc_titles_tup, doc_titles_norm
 
@@ -325,22 +296,14 @@ def build_citation_graph(
     pointers: Sequence[ChunkPointer],
     distinct_paths: Sequence[str],
     path_idx_arr: NDArray[np.uint32],
-    corpus_root: Path | None,
+    corpus_root: Path | str,
 ) -> CitationGraph:
     """Hydrate corpus chunks once and build CSR title-reference and 1-bit PMI graphs."""
+    c_root = require_corpus_dir(corpus_root)
     n = len(pointers)
     nd = len(distinct_paths)
     dc_indptr, dc_indices = build_dc_csr(path_idx_arr, nd)
-    raw_dt = [""] * nd
-    for pos, ptr in enumerate(pointers):
-        di = int(path_idx_arr[pos])
-        if not raw_dt[di] and (t_str := ptr.title.strip()):
-            raw_dt[di] = DASH_RE.sub("-", t_str)
-
-    if corpus_root is None:
-        return _empty_citation_graph(n, nd, dc_indptr, dc_indices, tuple(raw_dt))
-
-    ct, doc_titles_tup, doc_titles_norm = _resolve_doc_titles_and_chunks(pointers, distinct_paths, raw_dt, corpus_root)
+    ct, doc_titles_tup, doc_titles_norm = _resolve_doc_titles_and_chunks(pointers, distinct_paths, c_root)
     db = max(4, math.ceil(math.sqrt(max(1, n))))
     prop_nouns, w_df, bg_post = _collect_corpus_vocab_stats(ct)
     fi, fx, ri, rx = _build_citation_csr(ct, path_idx_arr, pointers, doc_titles_norm, prop_nouns, n, nd, db)
@@ -508,8 +471,9 @@ def unpack_citation_graph_blob(blob: bytes, path_idx: NDArray[np.uint32], nd_exp
     )
 
 
-def compute_index_artifacts(rows: Sequence[Any], corpus_root: Path | str | None = None) -> IndexArtifacts:
+def compute_index_artifacts(rows: Sequence[Any], corpus_root: Path | str) -> IndexArtifacts:
     """Compute 1-bit SoA RaBitQ codes, Shannon d_eff, and compressed CitationGraph blobs from chunk rows."""
+    c_root = require_corpus_dir(corpus_root)
     if not rows:
         empty = hashlib.sha256(b"").hexdigest()
         return IndexArtifacts(0, 0, empty, empty, 0, b"", b"", b"", 0.0, b"", b"")
@@ -523,7 +487,6 @@ def compute_index_artifacts(rows: Sequence[Any], corpus_root: Path | str | None 
     rot = build_rotator(dim)
     codes, ip_norm = pack_rabitq_soa(unit, rot)
     w = (dim + 63) // 64
-    c_root = Path(corpus_root).resolve() if corpus_root is not None else None
     _cids, pointers, distinct_paths, path_idx_arr = build_chunk_pointers(rows)
     cg = build_citation_graph(pointers, distinct_paths, path_idx_arr, c_root)
     doc_titles_map = {dp: dt for dp, dt in zip(distinct_paths, cg.doc_titles, strict=True) if dt}

@@ -32,8 +32,8 @@ def _serialize_result_item(rank: int, hp: HydratedPassage) -> dict[str, Any]:
     digest = hashlib.sha256(hp.text.encode("utf-8")).hexdigest()
     source: dict[str, Any] = {
         "rel_posix_path": ptr.rel_posix_path,
-        "start_line": int(ptr.start_line),
-        "end_line": int(ptr.end_line),
+        "start_line": int(hp.resolved_start_line),
+        "end_line": int(hp.resolved_end_line),
     }
     if ptr.title:
         source["title"] = ptr.title

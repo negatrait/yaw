@@ -7,6 +7,8 @@ import sys
 import tempfile
 import tokenize
 import unittest
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -494,15 +496,26 @@ def _validate_yaw_vocabulary_and_bases(py_files: list[Path]) -> list[str]:
     return violations
 
 
+@dataclass(frozen=True, slots=True)
+class _Rule12Spec:
+    allowed_top: set[str]
+    allowed_yaw: set[str]
+    forbidden: set[str]
+    allowed_exact: frozenset[str] = frozenset()
+    forbidden_prefixes: tuple[str, ...] = ()
+
+
 def _validate_import_boundary(
     mod_path: Path,
     allowed_top: set[str],
     allowed_yaw: set[str],
     forbidden: set[str],
     *,
+    allowed_exact: frozenset[str] = frozenset(),
+    forbidden_prefixes: tuple[str, ...] = (),
     allow_public_api_getattr: bool = False,
 ) -> list[str]:
-    rel = mod_path.relative_to(PROJECT_ROOT).as_posix()
+    rel = mod_path.relative_to(PROJECT_ROOT).as_posix() if mod_path.is_relative_to(PROJECT_ROOT) else mod_path.name
     violations = [
         f"{rel}:{lineno}: unresolvable dynamic import '{call_txt}'"
         for lineno, call_txt in find_unresolvable_dynamic_imports(
@@ -511,6 +524,10 @@ def _validate_import_boundary(
     ]
     for lineno, mod in parse_module_imports(mod_path):
         top = mod.split(".")[0]
+        if mod in allowed_exact and top != "yaw":
+            continue
+        if any(mod == pfx or mod.startswith(f"{pfx}.") for pfx in forbidden_prefixes):
+            violations.append(f"{rel}:{lineno} explicitly forbidden import '{mod}'")
         if top not in allowed_top:
             violations.append(f"{rel}:{lineno} imports forbidden package '{mod}'")
         if top in forbidden:
@@ -540,68 +557,95 @@ def _validate_cli_lazy_imports(cli_files: list[Path]) -> list[str]:
 
 def _build_rule12_specs(
     stdlib: set[str],
-) -> tuple[dict[str, tuple[set[str], set[str], set[str]]], dict[str, tuple[set[str], set[str], set[str]]]]:
+) -> tuple[dict[str, _Rule12Spec], dict[str, _Rule12Spec]]:
     http_mods = {"httpx", "httpx2", "openai", "urllib", "http", "socket", "requests"}
-    yaw_rules: dict[str, tuple[set[str], set[str], set[str]]] = {
-        "core": (stdlib | {"yaw"}, {"yaw.core"}, {"scripts"}),
-        "datasets": (
+    yaw_rules: dict[str, _Rule12Spec] = {
+        "core": _Rule12Spec(stdlib | {"yaw"}, {"yaw.core"}, {"scripts"}),
+        "datasets": _Rule12Spec(
             stdlib | {"filelock", "numpy", "yaw"},
             {"yaw.core", "yaw.datasets"},
             {"dspy", "cocoindex", "sqlite3", "scripts"} | http_mods,
         ),
-        "retrieval": (
+        "retrieval": _Rule12Spec(
             stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval"},
             {"dspy", "cocoindex", "scripts"} | http_mods,
+            # Narrow L1 carve-out: pure Rust BLAKE2b string hashing with zero Tokio/Env/App state.
+            allowed_exact=frozenset({"cocoindex.connectorkits.fingerprint"}),
         ),
-        "pipeline": (
+        "pipeline": _Rule12Spec(
             stdlib | {"cocoindex", "dspy", "numpy", "openai", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval", "yaw.pipeline"},
             {"scripts"},
+            forbidden_prefixes=("cocoindex._internal",),
         ),
-        "qa": (
+        "qa": _Rule12Spec(
             stdlib | {"dspy", "numpy", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval", "yaw.qa"},
             {"cocoindex", "scripts"} | http_mods,
         ),
-        "runtime": (
+        "runtime": _Rule12Spec(
             stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
             {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.runtime"},
             {"cocoindex", "fastmcp", "starlette", "uvicorn", "scripts"},
         ),
-        "mcp_server": (
+        "mcp_server": _Rule12Spec(
             stdlib | {"fastmcp", "pydantic", "starlette", "uvicorn", "yaw"},
             {"yaw.core", "yaw.runtime", "yaw.mcp_server"},
             {"cocoindex", "dspy", "numpy", "sqlite3", "scripts"},
         ),
-        "optimize": (
+        "optimize": _Rule12Spec(
             stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
             {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.optimize"},
             {"scripts"},
         ),
-        "cli": (
+        "cli": _Rule12Spec(
             stdlib | {"filelock", "yaw"},
             {"yaw.core", "yaw.runtime", "yaw.mcp_server", "yaw.optimize", "yaw.cli"},
             {"dspy", "sqlite3", "cocoindex", "fastmcp", "starlette", "uvicorn", "numpy", "scripts"},
         ),
-        "__main__": (stdlib | {"yaw"}, {"yaw.cli"}, {"scripts"}),
+        "__main__": _Rule12Spec(stdlib | {"yaw"}, {"yaw.cli"}, {"scripts"}),
     }
-    script_rules: dict[str, tuple[set[str], set[str], set[str]]] = {
-        "watchdog.py": (
+    script_rules: dict[str, _Rule12Spec] = {
+        "watchdog.py": _Rule12Spec(
             stdlib | {"filelock", "matplotlib", "psutil", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval"},
             {"cocoindex", "fastmcp", "dspy"},
         ),
-        "evaluation.py": (stdlib | {"numpy", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
-        "download_datasets.py": (stdlib | {"yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
-        "benchmark.py": (stdlib | {"dspy", "numpy", "scripts", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
-        "verify_paper_parity_gate.py": (
+        "evaluation.py": _Rule12Spec(stdlib | {"numpy", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "download_datasets.py": _Rule12Spec(stdlib | {"yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "benchmark.py": _Rule12Spec(stdlib | {"dspy", "numpy", "scripts", "yaw"}, {"yaw"}, {"cocoindex", "fastmcp"}),
+        "verify_paper_parity_gate.py": _Rule12Spec(
             stdlib | {"dspy", "numpy", "scripts", "yaw"},
             {"yaw"},
             {"cocoindex", "fastmcp"},
         ),
     }
     return yaw_rules, script_rules
+
+
+def _is_self_cls_super(val_node: ast.AST) -> bool:
+    if isinstance(val_node, ast.Name) and val_node.id in {"self", "cls"}:
+        return True
+    return bool(isinstance(val_node, ast.Call) and isinstance(val_node.func, ast.Name) and val_node.func.id == "super")
+
+
+def _find_private_attr_violations(py_files: Sequence[Path]) -> tuple[list[str], list[str]]:
+    violations: list[str] = []
+    provider_violations: list[str] = []
+    for py_file in py_files:
+        rel = py_file.relative_to(PROJECT_ROOT) if py_file.is_relative_to(PROJECT_ROOT) else py_file.name
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if node.attr.startswith("_") and not node.attr.startswith("__") and not _is_self_cls_super(node.value):
+                if isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr == "_exit":
+                    continue
+                violations.append(f"{rel}:{node.lineno}: cross-object access of private attribute '{node.attr}'")
+            if node.attr == "_provider":
+                provider_violations.append(f"{rel}:{node.lineno}: access of ._provider attribute is forbidden")
+    return violations, provider_violations
 
 
 class ArchitectureTests(unittest.TestCase):
@@ -871,41 +915,10 @@ class ArchitectureTests(unittest.TestCase):
         Forbids accessing _-prefixed attributes on objects other than self, cls, or super()
         (allowing stdlib os._exit), and forbids any access to ._provider across yaw/.
         """
-
-        def is_self_cls_super(val_node: ast.AST) -> bool:
-            if isinstance(val_node, ast.Name) and val_node.id in {"self", "cls"}:
-                return True
-            return bool(
-                isinstance(val_node, ast.Call) and isinstance(val_node.func, ast.Name) and val_node.func.id == "super"
-            )
-
         target_files = sorted(YAW_DIR.rglob("*.py"))
         self.assertGreater(len(target_files), 0, "No Python files found in yaw/")
 
-        violations: list[str] = []
-        provider_violations: list[str] = []
-        for py_file in target_files:
-            source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(py_file))
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Attribute)
-                    and node.attr.startswith("_")
-                    and not node.attr.startswith("__")
-                    and not is_self_cls_super(node.value)
-                ):
-                    if isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr == "_exit":
-                        continue
-                    violations.append(
-                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
-                        f"cross-object access of private attribute '{node.attr}'"
-                    )
-                if isinstance(node, ast.Attribute) and node.attr == "_provider":
-                    provider_violations.append(
-                        f"{py_file.relative_to(PROJECT_ROOT)}:{node.lineno}: "
-                        f"access of ._provider attribute is forbidden"
-                    )
-
+        violations, provider_violations = _find_private_attr_violations(target_files)
         self.assertEqual(
             violations,
             [],
@@ -1324,11 +1337,17 @@ class ArchitectureTests(unittest.TestCase):
                 continue
             domain = rel.parts[0][:-3] if len(rel.parts) == 1 else rel.parts[0]
             self.assertIn(domain, yaw_rules, f"Unmapped file in yaw/: {rel.as_posix()}")
-            allowed_top, allowed_yaw, forbidden = yaw_rules[domain]
+            spec = yaw_rules[domain]
             allow_getattr = py_file.name == "__init__.py" and is_leaf_package(py_file.parent)
             violations.extend(
                 _validate_import_boundary(
-                    py_file, allowed_top, allowed_yaw, forbidden, allow_public_api_getattr=allow_getattr
+                    py_file,
+                    spec.allowed_top,
+                    spec.allowed_yaw,
+                    spec.forbidden,
+                    allowed_exact=spec.allowed_exact,
+                    forbidden_prefixes=spec.forbidden_prefixes,
+                    allow_public_api_getattr=allow_getattr,
                 )
             )
 
@@ -1337,8 +1356,17 @@ class ArchitectureTests(unittest.TestCase):
         for script_file in script_files:
             rel_script = script_file.relative_to(PROJECT_ROOT / "scripts").as_posix()
             self.assertIn(rel_script, script_rules, f"Unmapped file in scripts/: {rel_script}")
-            allowed_top, allowed_yaw, forbidden = script_rules[rel_script]
-            violations.extend(_validate_import_boundary(script_file, allowed_top, allowed_yaw, forbidden))
+            spec = script_rules[rel_script]
+            violations.extend(
+                _validate_import_boundary(
+                    script_file,
+                    spec.allowed_top,
+                    spec.allowed_yaw,
+                    spec.forbidden,
+                    allowed_exact=spec.allowed_exact,
+                    forbidden_prefixes=spec.forbidden_prefixes,
+                )
+            )
 
         cli_files = [p for p in py_files if p.relative_to(YAW_DIR).parts[0] in {"cli.py", "cli"}]
         violations.extend(_validate_cli_lazy_imports(cli_files))
@@ -1410,6 +1438,107 @@ class ArchitectureTests(unittest.TestCase):
             unresolvable = find_unresolvable_dynamic_imports(unresolvable_mod)
             self.assertEqual(len(unresolvable), 2)
             self.assertEqual([ln for ln, _ in unresolvable], [3, 5])
+
+    def test_rule12_cocoindex_fingerprint_and_pipeline_boundaries(self):
+        """Verify narrow L1 cocoindex.connectorkits.fingerprint match and public CocoIndex pipeline boundaries."""
+        yaw_rules, _ = _build_rule12_specs(set(sys.stdlib_module_names))
+        retrieval_spec = yaw_rules["retrieval"]
+        pipeline_spec = yaw_rules["pipeline"]
+        self.assertEqual(retrieval_spec.allowed_exact, frozenset({"cocoindex.connectorkits.fingerprint"}))
+        self.assertEqual(pipeline_spec.allowed_exact, frozenset())
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            ok_retrieval = tmp_path / "retrieval_ok.py"
+            ok_retrieval.write_text(
+                "from cocoindex.connectorkits.fingerprint import fingerprint_str\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _validate_import_boundary(
+                    ok_retrieval,
+                    retrieval_spec.allowed_top,
+                    retrieval_spec.allowed_yaw,
+                    retrieval_spec.forbidden,
+                    allowed_exact=retrieval_spec.allowed_exact,
+                ),
+                [],
+            )
+
+            bad_retrieval_imports = [
+                "import cocoindex\n",
+                "from cocoindex import Environment, App\n",
+                "from cocoindex.connectors import sqlite\n",
+                "from cocoindex.ops.code import CodeSource\n",
+                "from cocoindex._internal.core import render_ranges\n",
+                "from cocoindex.connectorkits import fingerprint\n",
+                "from cocoindex.connectorkits.fingerprint.extra import something\n",
+            ]
+            for idx, snippet in enumerate(bad_retrieval_imports):
+                bad_mod = tmp_path / f"retrieval_bad_{idx}.py"
+                bad_mod.write_text(snippet, encoding="utf-8")
+                bad_hits = _validate_import_boundary(
+                    bad_mod,
+                    retrieval_spec.allowed_top,
+                    retrieval_spec.allowed_yaw,
+                    retrieval_spec.forbidden,
+                    allowed_exact=retrieval_spec.allowed_exact,
+                )
+                self.assertGreater(len(bad_hits), 0, f"Expected Rule 12 rejection in retrieval for {snippet!r}")
+
+            ok_pipeline = tmp_path / "pipeline_ok.py"
+            ok_pipeline.write_text(
+                "\n".join(
+                    [
+                        "from cocoindex.ops.code import CodeMatch, CodeSource, render_match",
+                        "from cocoindex.ops.text import RecursiveSplitter, detect_code_language",
+                        "from cocoindex.resources.chunk import Chunk, TextPosition",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _validate_import_boundary(
+                    ok_pipeline,
+                    pipeline_spec.allowed_top,
+                    pipeline_spec.allowed_yaw,
+                    pipeline_spec.forbidden,
+                    allowed_exact=pipeline_spec.allowed_exact,
+                    forbidden_prefixes=pipeline_spec.forbidden_prefixes,
+                ),
+                [],
+            )
+            bad_pipeline_imports = [
+                "from cocoindex._internal.core import render_ranges\n",
+                "from cocoindex._internal.core import CodeSource\n",
+                "from cocoindex._internal.other import x\n",
+                "import cocoindex._internal\n",
+                "from cocoindex._internal import memo_fingerprint\n",
+                "from cocoindex._internal.core.sub import y\n",
+            ]
+            for idx, snippet in enumerate(bad_pipeline_imports):
+                bad_pipe = tmp_path / f"pipeline_bad_{idx}.py"
+                bad_pipe.write_text(snippet, encoding="utf-8")
+                bad_pipe_hits = _validate_import_boundary(
+                    bad_pipe,
+                    pipeline_spec.allowed_top,
+                    pipeline_spec.allowed_yaw,
+                    pipeline_spec.forbidden,
+                    allowed_exact=pipeline_spec.allowed_exact,
+                    forbidden_prefixes=pipeline_spec.forbidden_prefixes,
+                )
+                self.assertGreater(len(bad_pipe_hits), 0, f"Expected Rule 12 rejection in pipeline for {snippet!r}")
+            attr_violations, provider_violations = _find_private_attr_violations([ok_pipeline])
+            self.assertEqual(attr_violations, [])
+            self.assertEqual(provider_violations, [])
+
+            bad_attr_pipeline = tmp_path / "pipeline_bad_attr.py"
+            bad_attr_pipeline.write_text(
+                "import cocoindex\nx = cocoindex._internal.core.render_ranges\n",
+                encoding="utf-8",
+            )
+            bad_attr_hits, _ = _find_private_attr_violations([bad_attr_pipeline])
+            self.assertEqual(len(bad_attr_hits), 1)
 
     def test_purged_dependencies_banned_across_yaw(self):
         """Rule 13: Purged dependencies (sqlite_vec, spacy, en_core_web_sm, optuna) are absent across all yaw/**."""

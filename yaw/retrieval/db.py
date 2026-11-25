@@ -11,9 +11,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from yaw.core import YawRuntimeError
+from yaw.core import DASH_RE, YawRuntimeError
 
-from .types import CJK_RUN_RE, DASH_RE, POSS_RE, WS_RUN_RE
+from .types import CJK_RUN_RE, POSS_RE, WS_RUN_RE
 
 _CONN_LOCKS_GUARD = threading.Lock()
 _CONN_LOCKS: dict[int, threading.RLock] = {}

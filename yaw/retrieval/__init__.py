@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         format_evidence_route,
         hydrate_passage,
         hydrate_ranked_passages,
+        resolve_hydrated_line_span,
     )
     from .index import build_retrieval_index
     from .lexical import lexical_search
@@ -53,6 +54,7 @@ _PUBLIC_API: dict[str, str] = {
     "lexical_search": ".lexical",
     "normalize_fts_unicode61": ".db",
     "open_readonly_db": ".db",
+    "resolve_hydrated_line_span": ".hydration",
     "sanitize_slip_label": ".slip",
     "search_index": ".search",
 }
@@ -79,6 +81,7 @@ __all__ = [
     "lexical_search",
     "normalize_fts_unicode61",
     "open_readonly_db",
+    "resolve_hydrated_line_span",
     "sanitize_slip_label",
     "search_index",
 ]

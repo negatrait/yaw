@@ -21,9 +21,13 @@ from yaw.core.types import (
     format_doc_for_embedding,
     format_query_for_embedding,
     inclusive_end_line,
+    markdown_heading_level,
+    normalize_ast_heading,
     redact_secrets,
     render_document_text,
+    require_corpus_dir,
     resolve_corpus_path,
+    split_lf_lines,
 )
 
 
@@ -70,6 +74,22 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(passage.text, "Hello world")
         self.assertEqual(passage.score, 0.95)
         self.assertFalse(passage.stale_on_disk)
+        self.assertIsNone(passage.hydrated_start_line)
+        self.assertIsNone(passage.hydrated_end_line)
+        self.assertEqual(passage.resolved_start_line, 1)
+        self.assertEqual(passage.resolved_end_line, 10)
+
+        expanded = HydratedPassage(
+            pointer=ChunkPointer(2, "p.md", "hash", 3, 6, ast_island_start=1, ast_island_end=12, title="Title"),
+            text="# Title\nExpanded",
+            score=0.88,
+            hydrated_start_line=1,
+            hydrated_end_line=12,
+        )
+        self.assertEqual(expanded.hydrated_start_line, 1)
+        self.assertEqual(expanded.hydrated_end_line, 12)
+        self.assertEqual(expanded.resolved_start_line, 1)
+        self.assertEqual(expanded.resolved_end_line, 12)
 
         stale_passage = HydratedPassage(pointer=pointer, text="Stale", score=0.5, stale_on_disk=True)
         self.assertTrue(stale_passage.stale_on_disk)
@@ -144,10 +164,17 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(render_document_text("Doc", "Body"), "Doc\nBody")
         self.assertEqual(format_query_for_embedding("who?"), "task: question answering | query: who?")
         self.assertEqual(format_doc_for_embedding("Body", title="Doc"), "title: Doc | text: Body")
+        self.assertEqual(split_lf_lines(""), [])
+        self.assertEqual(split_lf_lines("a\nb\n"), ["a", "b"])
+        self.assertEqual(split_lf_lines("a\nb"), ["a", "b"])
+        self.assertEqual(normalize_ast_heading("# [RFC-12] Tagged Header — "), "Tagged Header")
+        self.assertEqual(markdown_heading_level(["Title", "==="], 1), 1)
+        self.assertEqual(markdown_heading_level(["## Sub", "body"], 1), 2)
 
     def test_retired_legacy_types_removed(self):
         expected_all = [
             "ChunkPointer",
+            "DASH_RE",
             "DaemonStatus",
             "EmbedFn",
             "ErrorCode",
@@ -159,9 +186,13 @@ class TypesTests(unittest.TestCase):
             "format_doc_for_embedding",
             "format_query_for_embedding",
             "inclusive_end_line",
+            "markdown_heading_level",
+            "normalize_ast_heading",
             "redact_secrets",
             "render_document_text",
+            "require_corpus_dir",
             "resolve_corpus_path",
+            "split_lf_lines",
         ]
         self.assertEqual(core_types.__all__, expected_all)
         for retired in (
@@ -189,3 +220,18 @@ class TypesTests(unittest.TestCase):
             "stable_hash_id",
         ):
             self.assertFalse(hasattr(core_types, retired), f"Retired symbol {retired} still present")
+
+    def test_require_corpus_dir_validates_existing_directory(self):
+        from yaw.core import require_corpus_dir as pkg_require_corpus_dir
+
+        self.assertIs(pkg_require_corpus_dir, require_corpus_dir)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.assertEqual(require_corpus_dir(root), root.resolve())
+            self.assertEqual(require_corpus_dir(str(root)), root.resolve())
+            sample = root / "file.md"
+            sample.write_text("# Doc\n", encoding="utf-8")
+            for bad in (root / "missing", sample, "", "   ", cast(Any, None)):
+                with self.assertRaises(YawRuntimeError) as ctx:
+                    require_corpus_dir(bad)
+                self.assertEqual(ctx.exception.code, "CONSISTENCY_ERROR")

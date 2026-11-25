@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -78,6 +78,61 @@ def inclusive_end_line(start_line: int, end_line: int, end_column: int) -> int:
     return max(start_line, end_line)
 
 
+def split_lf_lines(text: str) -> list[str]:
+    """Split normalized LF text strictly on `\\n` to stay 1-to-1 with byte/line numbers."""
+    if not text:
+        return []
+    return text[:-1].split("\n") if text.endswith("\n") else text.split("\n")
+
+
+DASH_RE = re.compile(r"[\u2010-\u2015\u2212]")
+_LEADING_ATX_RE = re.compile(r"^#+\s*")
+_CLOSING_ATX_RE = re.compile(r"(?:^|\s+)#+$")
+_TITLE_TRAILING_SEP_RE = re.compile(r"(?:\s+-+|\s*[:{]+)+\s*$")
+_TITLE_TAG_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s+(.+)$")
+
+
+def normalize_ast_heading(raw_line: str) -> str:
+    """Normalize a Markdown heading or code declaration header into a clean title."""
+    first = next((ln for ln in split_lf_lines(raw_line) if ln.strip()), "")
+    head = " ".join(first.split())
+    if not head:
+        return ""
+    if head.startswith("#"):
+        head = _CLOSING_ATX_RE.sub("", _LEADING_ATX_RE.sub("", head)).strip()
+    head = DASH_RE.sub("-", head)
+    if m := _TITLE_TAG_PREFIX_RE.match(head):
+        raw_grp = m.group(1)
+        if isinstance(raw_grp, str) and (stripped := raw_grp.strip()):
+            head = stripped
+    head = _TITLE_TRAILING_SEP_RE.sub("", head)
+    return " ".join(head.split())
+
+
+def markdown_heading_level(lines: Sequence[str], frame_line: int) -> int | None:
+    """Return CommonMark ATX (1..6) or Setext (1..2) heading level for 1-indexed `frame_line`, or None."""
+    if frame_line < 1 or frame_line > len(lines):
+        return None
+    raw = lines[frame_line - 1]
+    stripped = raw.lstrip(" ")
+    if raw.startswith("\t") or len(raw) - len(stripped) > 3 or stripped.startswith(("```", "~~~", ">")):
+        return None
+    hashes = len(stripped) - len(stripped.lstrip("#"))
+    if 1 <= hashes <= 6 and (len(stripped) == hashes or stripped[hashes] in (" ", "\t")):
+        return hashes
+    if stripped.startswith(("-", "*", "+", "#")) or frame_line >= len(lines):
+        return None
+    for idx in range(frame_line, min(len(lines), frame_line + 3)):
+        u = lines[idx].strip()
+        if not u:
+            break
+        if set(u) == {"="}:
+            return 1
+        if set(u) == {"-"}:
+            return 2
+    return None
+
+
 def resolve_corpus_path(corpus_root: Path | str, rel_path: str) -> Path:
     """Resolve `rel_path` strictly inside `corpus_root`, rejecting traversal or absolute paths."""
     if not isinstance(rel_path, str) or not rel_path.strip():
@@ -94,6 +149,16 @@ def resolve_corpus_path(corpus_root: Path | str, rel_path: str) -> Path:
         resolved.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"Path escapes corpus root: {rel_path!r}") from exc
+    return resolved
+
+
+def require_corpus_dir(corpus_root: Path | str) -> Path:
+    """Validate that `corpus_root` names an existing directory, resolving it or raising CONSISTENCY_ERROR."""
+    if not isinstance(corpus_root, (Path, str)) or not str(corpus_root).strip():
+        raise YawRuntimeError("CONSISTENCY_ERROR", "Valid corpus_root directory is required.")
+    resolved = Path(corpus_root).resolve()
+    if not resolved.is_dir():
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"corpus_root does not exist or is not a directory: {resolved}")
     return resolved
 
 
@@ -130,6 +195,16 @@ class HydratedPassage:
     text: str
     score: float
     stale_on_disk: bool = False
+    hydrated_start_line: int | None = None
+    hydrated_end_line: int | None = None
+
+    @property
+    def resolved_start_line(self) -> int:
+        return self.pointer.start_line if self.hydrated_start_line is None else self.hydrated_start_line
+
+    @property
+    def resolved_end_line(self) -> int:
+        return self.pointer.end_line if self.hydrated_end_line is None else self.hydrated_end_line
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +285,7 @@ def format_doc_for_embedding(text: str, title: str = "", task_mode: str = "disti
 
 __all__ = [
     "ChunkPointer",
+    "DASH_RE",
     "DaemonStatus",
     "EmbedFn",
     "ErrorCode",
@@ -221,7 +297,11 @@ __all__ = [
     "format_doc_for_embedding",
     "format_query_for_embedding",
     "inclusive_end_line",
+    "markdown_heading_level",
+    "normalize_ast_heading",
     "redact_secrets",
     "render_document_text",
+    "require_corpus_dir",
     "resolve_corpus_path",
+    "split_lf_lines",
 ]

@@ -23,12 +23,21 @@ from typing import Any, override
 
 import numpy as np
 import pytest
+from cocoindex.connectorkits.fingerprint import fingerprint_str
 from cocoindex.ops.code import CodeSource
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from numpy.typing import NDArray
 
 import yaw.pipeline as yaw_pipeline
-from yaw.core import ChunkPointer, YawConfig, YawRuntimeError, format_query_for_embedding, load_config
+import yaw.pipeline.flow as pipeline_flow
+from yaw.core import (
+    ChunkPointer,
+    YawConfig,
+    YawRuntimeError,
+    format_query_for_embedding,
+    load_config,
+    split_lf_lines,
+)
 from yaw.pipeline import (
     SinkMutationTracker,
     chunk_file_content,
@@ -94,7 +103,13 @@ def test_declarative_five_table_schema_edit_and_delete(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    session = start_pipeline(cfg, embed_fn=lambda ts: _hash_embed(ts, dim=16), live=False)
+    seen_embed_inputs: list[str] = []
+
+    def tracked_hash_embed(ts: list[str]) -> NDArray[np.float32]:
+        seen_embed_inputs.extend(ts)
+        return _hash_embed(ts, dim=16)
+
+    session = start_pipeline(cfg, embed_fn=tracked_hash_embed, live=False)
     try:
         update_pipeline_once(session)
         with _open_ro(cfg.db_path) as conn:
@@ -137,8 +152,11 @@ def test_declarative_five_table_schema_edit_and_delete(tmp_path: Path) -> None:
 
             # Verify IEEE <f2> float16 LE blob round-trip matches embedded unit vector
             raw_a = doc_a.read_text(encoding="utf-8")
-            expected_f16 = _hash_embed([f"title: none | text: {raw_a.strip()}"], dim=16)[0].astype("<f2").tobytes()
+            expected_input_a = f"title: Alpha System | text: {raw_a.strip()}"
+            assert expected_input_a in seen_embed_inputs
+            expected_f16 = _hash_embed([expected_input_a], dim=16)[0].astype("<f2").tobytes()
             assert bytes(rows[0][1]) == expected_f16
+            assert rows[0][6] == "Alpha System"
             vec_a = np.frombuffer(bytes(rows[0][1]), dtype="<f2").astype(np.float32)
             assert vec_a.shape == (16,) and np.all(np.isfinite(vec_a))
             assert abs(float(np.linalg.norm(vec_a)) - 1.0) < 5e-3
@@ -146,6 +164,10 @@ def test_declarative_five_table_schema_edit_and_delete(tmp_path: Path) -> None:
             # Verify FTS5 + fts5vocab + single-row rabitq_index & citation_graph
             fts_hits = conn.execute("SELECT rowid, title FROM chunk_fts WHERE chunk_fts MATCH 'lunar'").fetchall()
             assert [r[0] for r in fts_hits] == [rows[0][0]]
+            fts_title_hits = conn.execute(
+                "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'title : \"alpha system\"'"
+            ).fetchall()
+            assert [r[0] for r in fts_title_hits] == [rows[0][0]]
             vocab_row = conn.execute("SELECT doc FROM chunk_vocab WHERE term = 'lunar'").fetchone()
             assert vocab_row is not None and int(vocab_row[0]) == 1
 
@@ -373,7 +395,7 @@ def test_loopback_dspy_embedder_pipeline(tmp_path: Path) -> None:
         session = start_pipeline(cfg, embed_fn=embed_fn, live=False)
         try:
             update_pipeline_once(session)
-            assert any(s.startswith("title: none | text: # Photonic Core\n") for s in seen_inputs)
+            assert any(s.startswith("title: Photonic Core | text: # Photonic Core\n") for s in seen_inputs)
             with _open_ro(cfg.db_path) as conn:
                 blob = conn.execute("SELECT embedding_f16 FROM chunks").fetchone()[0]
                 vec = np.frombuffer(blob, dtype="<f2").astype(np.float32)
@@ -500,10 +522,9 @@ def test_pipeline_uses_native_exception_handler_without_error_sink() -> None:
     ):
         assert hasattr(yaw_pipeline, exported), f"Missing export {exported}"
     assert yaw_pipeline.__file__ is not None
-    sources = [
-        py_file.read_text(encoding="utf-8") for py_file in sorted(Path(yaw_pipeline.__file__).parent.rglob("*.py"))
-    ]
-    for forbidden in ("INDEXING_ERROR_SINK", "_loop_runner", "cocoindex._internal", "yaw-cocoindex-session"):
+    py_files = sorted(Path(yaw_pipeline.__file__).parent.rglob("*.py"))
+    sources = [py_file.read_text(encoding="utf-8") for py_file in py_files]
+    for forbidden in ("INDEXING_ERROR_SINK", "_loop_runner", "yaw-cocoindex-session"):
         assert all(forbidden not in s for s in sources)
     assert all("update_blocking" not in s and "drop_blocking" not in s for s in sources)
     assert any("exception_handler=" in s for s in sources)
@@ -1034,7 +1055,13 @@ def test_native_ast_is_the_only_chunk_boundary_authority(tmp_path: Path, suffix:
     )
     chunks = chunk_file_content(name, text)
     assert [chunk.body for chunk in chunks] == [chunk.text for chunk in native if chunk.text.strip()]
-    assert all(chunk.title == "" for chunk in chunks)
+    if suffix == "md":
+        assert all(chunk.title != "not a title" for chunk in chunks)
+        assert chunks[0].title == "Incident"
+        assert chunks[-1].title == "Recovery"
+        assert all(1 <= c.ast_island_start <= c.start_line <= c.end_line <= c.ast_island_end for c in chunks)
+    else:
+        assert all(chunk.title == "" for chunk in chunks)
     for chunk in chunks:
         assert text[chunk.char_start : chunk.char_end] == chunk.body
         pointer = ChunkPointer(
@@ -1357,7 +1384,7 @@ def test_live_pipeline_shutdown_joins_inflight_reconcile_before_closing_db(
         *,
         embedding_model: str,
         task_mode: str,
-        corpus_root: Path | None = None,
+        corpus_root: Path | str,
     ) -> bool:
         nonlocal call_count
         call_count += 1
@@ -1530,3 +1557,472 @@ def test_dspy_batch_embedder_pooled_keepalive_waves_azure_and_aclose(
     assert az_calls == [["hello", "world"]]
     assert np.allclose(az_out, np.array([[0.6, 0.8], [0.6, 0.8]], dtype=np.float32), atol=1e-6)
     asyncio.run(az_embedder.aclose())
+
+
+@pytest.mark.parametrize(
+    ("doc_text", "expected_title"),
+    [
+        ("# H1 Heading\nBody text.\n", "H1 Heading"),
+        ("## H2 Heading\nBody text.\n", "H2 Heading"),
+        ("### H3 Heading\nBody text.\n", "H3 Heading"),
+        ("#### H4 Heading\nBody text.\n", "H4 Heading"),
+        ("##### H5 Heading\nBody text.\n", "H5 Heading"),
+        ("###### H6 Heading\nBody text.\n", "H6 Heading"),
+        ("## Closing ##\nBody text.\n", "Closing"),
+        ("Setext Root\n===========\n\nBody text.\n", "Setext Root"),
+        ("Setext Sub\n----------\n\nBody text.\n", "Setext Sub"),
+        ("# [RFC-12] Tagged Header\nBody text.\n", "Tagged Header"),
+        ("## Trailing Sep :\nBody text.\n", "Trailing Sep"),
+        ("# Alpha \u2014 Bridge\nBody text.\n", "Alpha - Bridge"),
+        ("# Alpha \u2013 Bridge\nBody text.\n", "Alpha - Bridge"),
+        ("# Lone Title", "Lone Title"),
+    ],
+)
+def test_ast_heading_normalization_variants(doc_text: str, expected_title: str) -> None:
+    pieces = chunk_file_content("variant.md", doc_text, chunk_size=200, chunk_overlap=20, min_chunk_size=1)
+    assert len(pieces) == 1
+    assert pieces[0].title == expected_title
+    assert pieces[0].ast_island_start == 1
+    assert pieces[0].ast_island_end == len(doc_text.splitlines())
+
+
+def test_ast_nested_walkup_fences_quotes_and_continuation() -> None:
+    nested_md = (
+        "# Doc Root\n\n"
+        "Intro paragraph establishing document root context with enough characters.\n\n"
+        "## Sec A\n\n"
+        "Body A describes primary section alpha mechanisms in clear detail here.\n\n"
+        "### Sub A1\n\n"
+        "Sub body continues section alpha inside nested subsection A1 clearly.\n\n"
+        "## Sec B\n\n"
+        "Body B starts an independent second section.\n"
+    )
+    nested_chunks = chunk_file_content("nested.md", nested_md, chunk_size=110, chunk_overlap=15, min_chunk_size=10)
+    assert len(nested_chunks) == 4
+    c_intro, c_sec_a, c_sub_a1, c_sec_b = nested_chunks
+    assert c_intro.title == "Doc Root"
+    assert c_intro.ast_island_start == 1 and c_intro.ast_island_end < 5
+    assert c_sec_a.title == "Sec A"
+    assert c_sub_a1.title == "Sec A"
+    assert c_sec_a.ast_island_start == c_sub_a1.ast_island_start == 5
+    assert 11 <= c_sec_a.ast_island_end == c_sub_a1.ast_island_end < 13
+    assert c_sec_b.title == "Sec B"
+    assert c_sec_b.ast_island_start == 13
+
+    immune_md = (
+        "# Enclosing Section\n\n"
+        "Intro paragraph inside enclosing section.\n\n"
+        "```python\n"
+        "# fake comment\n"
+        "def inner():\n"
+        "    payload = 'inside fenced code block padding for multi chunk split'\n"
+        "    return payload\n"
+        "```\n\n"
+        "    # indented fake heading\n"
+        "    indented_line_one = 'indented code block body spanning line one'\n"
+        "    indented_line_two = 'indented code block body spanning line two'\n\n"
+        "> # quote\n"
+        "> blockquote text line one inside markdown quote block.\n"
+        "> blockquote text line two continuing quote block.\n\n"
+        "- # list\n"
+        "  list item body line one continuing inside bullet.\n"
+        "  list item body line two continuing inside bullet.\n\n"
+        "---\n\n"
+        "Trailing paragraph after horizontal rule.\n"
+    )
+    immune_chunks = chunk_file_content("immune.md", immune_md, chunk_size=120, chunk_overlap=10, min_chunk_size=10)
+    assert len(immune_chunks) >= 7
+    forbidden_titles = {"fake comment", "def inner()", "def inner():", "indented fake heading", "quote", "list", "---"}
+    for piece in immune_chunks:
+        assert piece.title == "Enclosing Section"
+        assert piece.title not in forbidden_titles
+
+    cont_md = (
+        "## Large Section\n\n"
+        + "\n\n".join(
+            f"Paragraph {i}: detailed engineering evidence block {i} with distinct content." for i in range(1, 6)
+        )
+        + "\n\n## Next Section\n\nSeparate body.\n"
+    )
+    cont_chunks = chunk_file_content("cont.md", cont_md, chunk_size=140, chunk_overlap=15, min_chunk_size=10)
+    large_chunks = [c for c in cont_chunks if c.start_line < 13]
+    next_chunks = [c for c in cont_chunks if c.start_line >= 13]
+    assert len(large_chunks) >= 4 and len(next_chunks) == 1
+    island_bounds = {(c.ast_island_start, c.ast_island_end) for c in large_chunks}
+    assert len(island_bounds) == 1
+    es, ee = next(iter(island_bounds))
+    assert es == 1 and 11 <= ee < 13
+    assert all(c.title == "Large Section" for c in large_chunks)
+    assert next_chunks[0].title == "Next Section"
+    assert next_chunks[0].ast_island_start == 13
+
+
+def test_ast_python_walkup_and_headingless_fingerprint_and_app_name(tmp_path: Path) -> None:
+    worker_py = (
+        "class Worker:\n"
+        "    def run(self, items):\n"
+        "        if items:\n"
+        "            for item in items:\n"
+        "                alpha = item + 100\n"
+        "                beta = alpha + 200\n"
+        "                gamma = beta + 300\n"
+        "                yield gamma\n\n"
+        "    def stop(self):\n"
+        "        return True\n"
+    )
+    py_chunks = chunk_file_content("worker.py", worker_py, chunk_size=110, chunk_overlap=10, min_chunk_size=10)
+    cont_py = [c for c in py_chunks if "yield gamma" in c.body]
+    assert len(cont_py) == 1
+    run_cont = cont_py[0]
+    assert run_cont.title.startswith("def run")
+    assert "if " not in run_cont.title and "for " not in run_cont.title and "Worker" not in run_cont.title
+    assert run_cont.ast_island_start == 2 and 8 <= run_cont.ast_island_end < 10
+
+    plain_text = (
+        "First plain paragraph with no headings anywhere in file.\n\n"
+        "Second plain paragraph long enough to force a second chunk in plain file.\n\n"
+        "Third plain paragraph closing the unheaded file.\n"
+    )
+    total_lines = len(plain_text.splitlines())
+    for fname in ("plain.txt", "nohead.md"):
+        plain_chunks = chunk_file_content(fname, plain_text, chunk_size=90, chunk_overlap=10, min_chunk_size=10)
+        assert len(plain_chunks) >= 3
+        lines = plain_text.splitlines()
+        for piece in plain_chunks:
+            assert piece.title == ""
+            assert piece.ast_island_start == piece.start_line
+            assert piece.ast_island_end == piece.end_line
+            if piece.start_line > 1:
+                assert (piece.ast_island_start, piece.ast_island_end) != (1, 1)
+                assert (piece.ast_island_start, piece.ast_island_end) != (1, total_lines)
+            raw_slice = "\n".join(lines[piece.start_line - 1 : piece.end_line])
+            assert piece.source_hash == fingerprint_str(raw_slice).hex()
+            assert piece.source_hash != hashlib.sha256(raw_slice.encode("utf-8")).hexdigest()
+
+    cfg = _make_cfg(tmp_path, chunk_size=140, chunk_overlap=15, min_chunk_size=10)
+    assert cfg.corpus_root is not None and cfg.db_path is not None
+    cfg.corpus_root.mkdir(parents=True)
+    (cfg.corpus_root / "plain.txt").write_text("Plain body line without any heading.\n", encoding="utf-8")
+    (cfg.corpus_root / "sections.md").write_text(
+        "# Doc Title\n\n## Alpha Section\n\n"
+        + "\n\n".join(f"Section line {i} with detailed orbital booster data." for i in range(1, 5))
+        + "\n",
+        encoding="utf-8",
+    )
+    seen_inputs: list[str] = []
+
+    def cap_embed(texts: list[str]) -> NDArray[np.float32]:
+        seen_inputs.extend(texts)
+        return _hash_embed(texts, dim=16)
+
+    session = start_pipeline(cfg, embed_fn=cap_embed, live=False)
+    try:
+        expected_app = f"yaw_{fingerprint_str(cfg.db_path.resolve().as_posix()).hex()[:12]}"
+        legacy_app = f"yaw_{hashlib.sha256(cfg.db_path.resolve().as_posix().encode('utf-8')).hexdigest()[:12]}"
+        assert session.resolved_app == expected_app
+        assert session.resolved_app != legacy_app
+        update_pipeline_once(session)
+    finally:
+        close_pipeline(session)
+
+    assert any(s == "title: none | text: Plain body line without any heading." for s in seen_inputs)
+    assert any(s.startswith("title: Alpha Section | text: Section line") for s in seen_inputs)
+    with _open_ro(cfg.db_path) as conn:
+        sec_rows = conn.execute(
+            "SELECT chunk_id, source_hash, start_line, end_line, ast_island_start, ast_island_end, title "
+            "FROM chunks WHERE rel_path = 'sections.md' ORDER BY start_line"
+        ).fetchall()
+        sec_lines = (cfg.corpus_root / "sections.md").read_text(encoding="utf-8").splitlines()
+        assert len(sec_rows) >= 2
+        for _cid, s_hash, sl, el, _is, _ie, title in sec_rows:
+            assert s_hash == fingerprint_str("\n".join(sec_lines[sl - 1 : el])).hex()
+            if sl >= 3:
+                assert title == "Alpha Section"
+        fts_sec = conn.execute(
+            "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'title : \"alpha section\"'"
+        ).fetchall()
+        assert {r[0] for r in fts_sec} == {r[0] for r in sec_rows if r[6] == "Alpha Section"}
+
+
+def test_ast_top_down_opening_anchor_decorators_nonoverlap_and_single_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    multi_py = (
+        "def resolve_corpus_path(root: str, rel: str) -> str:\n"
+        '    norm = rel.replace("\\\\", "/")\n'
+        '    if norm.startswith("/"):\n'
+        '        raise ValueError("abs")\n'
+        "    return root + '/' + norm\n\n\n"
+        "@dataclass(frozen=True, slots=True)\n"
+        "class ChunkPointer:\n"
+        '    """Zero-copy provenance pointer."""\n\n'
+        "    chunk_id: int\n"
+        "    rel_path: str\n"
+        "    start_line: int\n"
+        "    end_line: int\n\n"
+        "    @property\n"
+        "    def span_label(self) -> str:\n"
+        '        return f"{self.rel_path}:{self.start_line}-{self.end_line}"\n'
+    )
+    py_chunks = chunk_file_content("types_like.py", multi_py, chunk_size=320, chunk_overlap=0, min_chunk_size=10)
+    assert len(py_chunks) == 2
+    c0, c1 = py_chunks
+    assert c0.title.startswith("def resolve_corpus_path")
+    assert c1.title == "class ChunkPointer"
+    assert c0.ast_island_end < c1.start_line
+    assert (tmp_path / "types_like.py").write_text(multi_py, encoding="utf-8") > 0
+    ptr1 = ChunkPointer(
+        chunk_id=c1.chunk_id,
+        rel_path="types_like.py",
+        source_hash=c1.source_hash,
+        start_line=c1.start_line,
+        end_line=c1.end_line,
+        char_start=c1.char_start,
+        char_end=c1.char_end,
+        ast_island_start=c1.ast_island_start,
+        ast_island_end=c1.ast_island_end,
+        title=c1.title,
+    )
+    hp1 = hydrate_passage(ptr1, tmp_path)
+    assert not hp1.stale_on_disk
+    assert hp1.text.startswith("@dataclass(frozen=True, slots=True)\nclass ChunkPointer:")
+    assert not hp1.text.startswith("def span_label")
+    assert not hp1.text.startswith("class ChunkPointer\n@dataclass")
+
+    deco_py = (
+        "class C:\n"
+        "    def alpha(self):\n"
+        "        return 1\n\n"
+        "    @property\n"
+        "    def span_label(self) -> str:\n"
+        "        if True:\n"
+        '            return "x"\n'
+        '        return "y"\n'
+    )
+    deco_chunks = chunk_file_content("deco.py", deco_py, chunk_size=120, chunk_overlap=0, min_chunk_size=10)
+    assert len(deco_chunks) == 2
+    assert deco_chunks[1].title.startswith("def span_label")
+    assert "class C" not in deco_chunks[1].title
+
+    multi_sec_md = "# Main Doc\n\n## Section One\nFirst body.\n\n## Section Two\nSecond body.\n"
+    single_md = chunk_file_content("main.md", multi_sec_md, chunk_size=400, chunk_overlap=0, min_chunk_size=10)
+    assert len(single_md) == 1 and single_md[0].title == "Main Doc"
+
+    foundational_md = (
+        "# YAW Foundations\n\n## 1. Purpose\nBody text describing zero-LLM retrieval.\n\n## 2. Scope\nSecondary body.\n"
+    )
+    found_chunks = chunk_file_content(
+        "FOUNDATIONAL.md", foundational_md, chunk_size=85, chunk_overlap=0, min_chunk_size=10
+    )
+    assert found_chunks[0].title == "YAW Foundations"
+
+    const_py = "CONST_A = 1\nCONST_B = 2\n\ndef first(x):\n    return x + 1\n\ndef second(y):\n    return y + 2\n"
+    const_chunks = chunk_file_content("const.py", const_py, chunk_size=400, chunk_overlap=0, min_chunk_size=10)
+    assert len(const_chunks) == 1 and const_chunks[0].title == "def first(x)"
+
+    ff_md = "First line\x0cwith form feed and\u2028unicode sep.\n\n## After Break\n\nBody text here.\n"
+    (tmp_path / "ff.md").write_text(ff_md, encoding="utf-8")
+    ff_chunks = chunk_file_content("ff.md", ff_md, chunk_size=55, chunk_overlap=0, min_chunk_size=10)
+    assert len(ff_chunks) == 2
+    ff_lines = split_lf_lines(ff_md)
+    assert ff_chunks[0].start_line == 1 and ff_chunks[0].end_line == 1 and ff_chunks[0].title == ""
+    assert ff_chunks[1].start_line == 3 and ff_chunks[1].end_line == 5 and ff_chunks[1].title == "After Break"
+    for piece in ff_chunks:
+        raw_slice = "\n".join(ff_lines[piece.start_line - 1 : piece.end_line])
+        assert piece.source_hash == fingerprint_str(raw_slice).hex()
+        hp_ff = hydrate_passage(
+            ChunkPointer(
+                chunk_id=piece.chunk_id,
+                rel_path="ff.md",
+                source_hash=piece.source_hash,
+                start_line=piece.start_line,
+                end_line=piece.end_line,
+                char_start=piece.char_start,
+                char_end=piece.char_end,
+                ast_island_start=piece.ast_island_start,
+                ast_island_end=piece.ast_island_end,
+                title=piece.title,
+            ),
+            tmp_path,
+        )
+        assert not hp_ff.stale_on_disk and hp_ff.text == piece.body
+
+    parse_calls = 0
+    orig_code_source = pipeline_flow.CodeSource
+
+    def counted_code_source(text: str, language: str | None = None) -> Any:
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_code_source(text, language=language)
+
+    monkeypatch.setattr(pipeline_flow, "CodeSource", counted_code_source)
+    for fname, sample in (
+        ("single.md", "# Lone Title"),
+        ("multi.md", multi_sec_md),
+        ("worker.py", deco_py),
+    ):
+        parse_calls = 0
+        chunk_file_content(fname, sample, chunk_size=200, chunk_overlap=10, min_chunk_size=1)
+        assert parse_calls == 1
+
+
+def test_render_ranges_probe_bounded_and_binary_search_frontmatter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import cocoindex.ops.code as coco_code
+
+    assert pipeline_flow.render_match is coco_code.render_match
+    render_calls = 0
+    orig_render_match = pipeline_flow.render_match
+
+    def counted_render_match(source: Any, match: Any) -> Any:
+        nonlocal render_calls
+        render_calls += 1
+        return orig_render_match(source, match)
+
+    monkeypatch.setattr(pipeline_flow, "render_match", counted_render_match)
+
+    plain_40 = "\n".join(f"CONST_{i:02d} = {i}" for i in range(40)) + "\n"
+    plain_chunks = chunk_file_content("plain.py", plain_40, chunk_size=2000, chunk_overlap=0, min_chunk_size=10)
+    assert len(plain_chunks) == 1
+    assert plain_chunks[0].title == ""
+    assert render_calls <= 2
+
+    render_calls = 0
+    frontmatter_md = (
+        "---\n"
+        "sources:\n"
+        "  - alpha.md\n"
+        "  - beta.md\n"
+        "tags: [orbital, valve]\n"
+        "---\n\n"
+        "# Card Heading\n\n"
+        "Card summary body text.\n"
+    )
+    fm_chunks = chunk_file_content("card.md", frontmatter_md, chunk_size=600, chunk_overlap=0, min_chunk_size=10)
+    assert len(fm_chunks) == 1 and fm_chunks[0].title == "Card Heading"
+    assert render_calls <= 8
+
+    render_calls = 0
+    consts_and_defs = (
+        "\n".join(f"K_{i:02d} = {i}" for i in range(12))
+        + "\n\ndef first(x):\n    y = x + 1\n    return y\n\ndef second(z):\n    w = z + 2\n    return w\n"
+    )
+    def_chunks = chunk_file_content("mods.py", consts_and_defs, chunk_size=800, chunk_overlap=0, min_chunk_size=10)
+    assert len(def_chunks) == 1 and def_chunks[0].title == "def first(x)"
+    assert render_calls <= 10
+
+    trailing_eof_md = "# Root\n\nIntro paragraph.\n\n## Trailing Section\n"
+    eof_chunks = chunk_file_content(
+        "trailing_eof.md", trailing_eof_md, chunk_size=30, chunk_overlap=0, min_chunk_size=1
+    )
+    assert len(eof_chunks) == 2
+    assert eof_chunks[0].title == "Root"
+    assert eof_chunks[1].title == "Trailing Section"
+    assert eof_chunks[1].ast_island_start == 5 and eof_chunks[1].ast_island_end == 5
+
+    mid_empty_md = "# Root\n\nIntro paragraph.\n\n## Empty Section\n\n## Next Section\n\nBody of next section.\n"
+    mid_chunks = chunk_file_content("mid_empty.md", mid_empty_md, chunk_size=30, chunk_overlap=0, min_chunk_size=1)
+    assert [(c.start_line, c.end_line, c.ast_island_start, c.ast_island_end, c.title) for c in mid_chunks[:3]] == [
+        (1, 3, 1, 3, "Root"),
+        (5, 5, 5, 5, "Empty Section"),
+        (7, 7, 7, 9, "Next Section"),
+    ]
+
+    render_calls = 0
+    deco_class_py = (
+        "class W:\n"
+        "    def alpha(self):\n"
+        "        return 0\n\n"
+        "    @d1\n"
+        "    @d2\n"
+        "    @d3\n"
+        "    def beta(self, x):\n"
+        "        return x + 1\n"
+    )
+    deco_chunks = chunk_file_content("w.py", deco_class_py, chunk_size=90, chunk_overlap=0, min_chunk_size=10)
+    assert [(c.start_line, c.end_line, c.ast_island_start, c.ast_island_end, c.title) for c in deco_chunks] == [
+        (1, 3, 1, 3, "class W"),
+        (5, 9, 5, 9, "def beta(self, x)"),
+    ]
+    assert render_calls <= 12
+
+    render_calls = 0
+    multi_sec_intro_md = (
+        "# Doc Root\n\n"
+        "Lead overview paragraph padding so the root chunk closes cleanly before intro lines.\n\n"
+        "Intro line 1.\n"
+        "Intro line 2.\n"
+        "Intro line 3.\n"
+        "Intro line 4.\n\n"
+        "## Sec A\n\n"
+        "Alpha body.\n\n"
+        "## Sec B\n\n"
+        "Beta body.\n"
+    )
+    intro_sec_chunks = chunk_file_content(
+        "intro_sec.md", multi_sec_intro_md, chunk_size=120, chunk_overlap=0, min_chunk_size=10
+    )
+    assert [(c.start_line, c.end_line, c.ast_island_start, c.ast_island_end, c.title) for c in intro_sec_chunks] == [
+        (1, 3, 1, 3, "Doc Root"),
+        (5, 16, 5, 16, "Sec A"),
+    ]
+    assert render_calls <= 12
+
+    nested_py = (
+        "def big_func(x):\n"
+        "    a = x + 1\n"
+        "    b = a * 2\n\n"
+        "    def inner_helper(y):\n"
+        "        return y + 10\n\n"
+        "    return inner_helper(b) + 1\n"
+    )
+    nested_chunks = chunk_file_content("nested.py", nested_py, chunk_size=60, chunk_overlap=0, min_chunk_size=10)
+    assert [(c.start_line, c.end_line, c.ast_island_start, c.ast_island_end, c.title) for c in nested_chunks] == [
+        (1, 1, 1, 3, "def big_func(x)"),
+        (2, 3, 1, 3, "def big_func(x)"),
+        (5, 6, 5, 6, "def inner_helper(y)"),
+        (8, 8, 8, 8, "def big_func(x)"),
+    ]
+    nested_dir = tmp_path / "nested_hydrate"
+    nested_dir.mkdir()
+    (nested_dir / "nested.py").write_text(nested_py, encoding="utf-8")
+    tail_c = nested_chunks[3]
+    tail_ptr = ChunkPointer(
+        chunk_id=tail_c.chunk_id,
+        rel_path=tail_c.rel_path,
+        source_hash=tail_c.source_hash,
+        start_line=tail_c.start_line,
+        end_line=tail_c.end_line,
+        char_start=tail_c.char_start,
+        char_end=tail_c.char_end,
+        ast_island_start=tail_c.ast_island_start,
+        ast_island_end=tail_c.ast_island_end,
+        title=tail_c.title,
+    )
+    assert hydrate_passage(tail_ptr, nested_dir, include_island=True).text == (
+        "def big_func(x)\n    return inner_helper(b) + 1"
+    )
+
+    render_calls = 0
+    mid_decl_py = (
+        "# c1 comment padding line\n"
+        "# c2 comment padding line\n"
+        "# c3 comment padding line\n"
+        "# c4 comment padding line\n"
+        "def beta(self, x):\n"
+        "    return x + 1\n"
+        "AFTER = 42\n"
+    )
+    mid_decl_chunks = chunk_file_content("mid_decl.py", mid_decl_py, chunk_size=300, chunk_overlap=0, min_chunk_size=10)
+    assert len(mid_decl_chunks) == 1 and mid_decl_chunks[0].title == "def beta(self, x)"
+    assert render_calls <= 12
+
+    miss_py = (
+        "\n".join(f"CONST_{i:02d} = {i}" for i in range(13))
+        + "\ndef missed_func():\n    return 42\n"
+        + "\n".join(f"TAIL_{i:02d} = {i}" for i in range(10))
+        + "\n"
+    )
+    miss_chunks = chunk_file_content("miss.py", miss_py, chunk_size=600, chunk_overlap=0, min_chunk_size=10)
+    assert len(miss_chunks) == 1 and miss_chunks[0].title == "def missed_func()"

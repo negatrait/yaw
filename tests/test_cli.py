@@ -26,6 +26,7 @@ from typing import Any, override
 import filelock
 import numpy as np
 import pytest
+from cocoindex.connectorkits.fingerprint import fingerprint_str
 
 from yaw.core import YawConfig, load_config, write_text_atomic
 from yaw.datasets import prepare_dataset_bundle
@@ -539,7 +540,8 @@ def test_cli_recall_and_daemon_status_strict_readonly_zero_write_locks(
                 assert "[... cropped ...]" not in item["text"]
                 assert "stale" not in item and "stale_on_disk" not in item
                 assert item["content_hash"].startswith("sha256:")
-                assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line"}
+                assert set(item["source"]) == {"rel_posix_path", "start_line", "end_line", "title"}
+                assert item["source"]["title"] in {"Booster Manual", "Booster Backup"}
 
             assert main(["daemon", "status", "--config", str(toml_path), "--json"]) == 0
             st_payload = json.loads(capsys.readouterr().out)
@@ -700,8 +702,9 @@ def test_cli_optimize_dspy_and_rejects_optuna(tmp_path: Path, capsys: pytest.Cap
             assert rows
             assert {r[0] for r in rows} == set(md_files)
             assert all(
-                r[1] == hashlib.sha256("\n".join(md_files[r[0]].splitlines()).encode("utf-8")).hexdigest()
-                and r[2] == ""
+                r[1] == fingerprint_str("\n".join(md_files[r[0]].splitlines())).hex()
+                and r[2] == md_files[r[0]].splitlines()[0].lstrip("#").strip()
+                and r[2] != ""
                 for r in rows
             )
 
@@ -1224,7 +1227,8 @@ def test_cli_recall_sparse_next_links_and_stale_drift(tmp_path: Path, capsys: py
         assert len(rec_json["next"]) == 3
         assert {"cite", "pmi"} <= {lnk["kind"] for lnk in rec_json["links"]}
         for item in rec_json["results"]:
-            assert "stale" not in item and "stale_on_disk" not in item and "title" not in item["source"]
+            assert "stale" not in item and "stale_on_disk" not in item
+            assert item["source"]["title"] in {"Source Hub", "Target Node", *(f"Extra {k}" for k in range(4))}
 
         assert main(["recall", q, "--top-k", "2", "--config", str(toml_path)]) == 0
         rec_txt = capsys.readouterr().out

@@ -147,7 +147,7 @@ def make_qa_tools(
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         with _tool_conn() as db_conn:
             res = search_index(index, q_vec, query_text=q, conn=db_conn, top_k=k, pool_k=max(k * 4, 50))
-        passages = hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=k)
+        passages = hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=k, include_island=True)
         return format_recall_text(build_recall_payload(passages))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
@@ -158,7 +158,9 @@ def make_qa_tools(
         # Over-fetch pool_k = max(k * 4, 50) to prevent sub-chunk starvation during MaxP span dedup.
         with _tool_conn() as db_conn:
             ranked = lexical_search(index, q, db_conn, top_k=max(k * 4, 50))
-        return format_recall_text(build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k)))
+        return format_recall_text(
+            build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True))
+        )
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
         """Expand isotropic, lexical, citation-diffusion, and same-AST-island neighbor passages for chunk_id."""
@@ -170,7 +172,9 @@ def make_qa_tools(
             ranked = expand_citation_neighbors(
                 index, chunk_id, corpus_root=corpus_root, conn=db_conn, top_k=max(k * 4, 50)
             )
-        return format_recall_text(build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k)))
+        return format_recall_text(
+            build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True))
+        )
 
     def read_chunk(chunk_id: int) -> str:
         """Read the exact hydrated passage for a single chunk_id."""
@@ -276,7 +280,7 @@ def ask_question(
     if not isinstance(raw_ans := _field(pred, "answer"), str) or not (answer := raw_ans.strip()):
         raise YawRuntimeError("MODEL_ERROR", "QA agent produced an empty answer.")
 
-    # Verify inline [chunk_id] citations against tool-seen IDs and disk SHA-256 hashes.
+    # Verify inline [chunk_id] citations against tool-seen IDs and disk fingerprint hashes.
     history_msgs = _field(_field(pred, "history"), "messages") or ()
     seen_scores = _extract_seen_chunks(history_msgs)
     inline_ids = extract_inline_chunk_ids(answer)
@@ -290,7 +294,7 @@ def ask_question(
     )[:max_citations]
     citations = _hydrate_ids(index, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root)
     if any(hp.stale_on_disk for hp in citations):
-        raise YawRuntimeError("CONSISTENCY_ERROR", "Cited passage failed disk SHA-256 verification.")
+        raise YawRuntimeError("CONSISTENCY_ERROR", "Cited passage failed disk fingerprint verification.")
 
     return QAResult(
         question=q,
