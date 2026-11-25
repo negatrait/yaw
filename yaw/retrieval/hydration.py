@@ -17,9 +17,12 @@ from yaw.core import (
     ChunkPointer,
     HydratedPassage,
     YawRuntimeError,
+    advance_markdown_fence,
+    is_wiki_rel_path,
+    leading_frontmatter_end,
     markdown_heading_level,
     normalize_ast_heading,
-    resolve_corpus_path,
+    resolve_source_path,
     split_lf_lines,
 )
 
@@ -151,15 +154,18 @@ def _resolve_cached_path(
     corpus_root: Path,
     rel_posix_path: str,
     path_cache: dict[tuple[Path, str], Path] | None,
+    *,
+    wiki_root: Path | None = None,
 ) -> Path:
     if path_cache is None:
-        return resolve_corpus_path(corpus_root, rel_posix_path)
-    p_key = (corpus_root, rel_posix_path)
+        return resolve_source_path(rel_posix_path, corpus_root, wiki_root)
+    cache_root = wiki_root if (wiki_root is not None and is_wiki_rel_path(rel_posix_path)) else corpus_root
+    p_key = (cache_root, rel_posix_path)
     with CACHE_LOCK:
         cached = path_cache.get(p_key)
     if cached is not None:
         return cached
-    target = resolve_corpus_path(corpus_root, rel_posix_path)
+    target = resolve_source_path(rel_posix_path, corpus_root, wiki_root)
     with CACHE_LOCK:
         path_cache[p_key] = target
         while len(path_cache) > CACHE_MAX_ENTRIES:
@@ -172,10 +178,12 @@ def _load_corpus_file(
     rel_posix_path: str,
     file_cache: _FileCache | None,
     path_cache: dict[tuple[Path, str], Path] | None,
+    *,
+    wiki_root: Path | None = None,
 ) -> tuple[Path, str, list[str]] | None:
     if file_cache is not None and rel_posix_path in file_cache:
         return file_cache[rel_posix_path]
-    target = _resolve_cached_path(corpus_root, rel_posix_path, path_cache)
+    target = _resolve_cached_path(corpus_root, rel_posix_path, path_cache, wiki_root=wiki_root)
     if not target.is_file():
         loaded: tuple[Path, str, list[str]] | None = None
     else:
@@ -237,6 +245,7 @@ def hydrate_one(
     prepend_title: bool = True,
     file_cache: _FileCache | None = None,
     path_cache: dict[tuple[Path, str], Path] | None = None,
+    wiki_root: Path | None = None,
 ) -> HydratedPassage:
     """Hydrate one verified slice from disk, enforcing line bounds and fingerprint freshness."""
     limit = _validate_max_chars(max_chars)
@@ -244,7 +253,7 @@ def hydrate_one(
     if sl < 1 or el < sl or (el - sl + 1) > _MAX_HYDRATE_SPAN:
         raise ValueError(f"Invalid hydration line range [{sl}, {el}] for {ptr.rel_posix_path}")
 
-    loaded = _load_corpus_file(corpus_root, ptr.rel_posix_path, file_cache, path_cache)
+    loaded = _load_corpus_file(corpus_root, ptr.rel_posix_path, file_cache, path_cache, wiki_root=wiki_root)
     if loaded is None:
         if strict:
             raise YawRuntimeError("CONSISTENCY_ERROR", f"Missing corpus source file: {ptr.rel_posix_path}")
@@ -291,9 +300,49 @@ def hydrate_passage(
     max_chars: int | None = None,
     include_island: bool = False,
     full_span: bool = False,
+    wiki_root: Path | None = None,
 ) -> HydratedPassage:
     """Hydrate a single ChunkPointer directly from disk, verifying source fingerprint freshness."""
-    return hydrate_one(corpus_root, ptr, score, max_chars, include_island, full_span, strict=False)
+    return hydrate_one(
+        corpus_root,
+        ptr,
+        score,
+        max_chars,
+        include_island,
+        full_span,
+        strict=False,
+        wiki_root=wiki_root,
+    )
+
+
+def verify_source_fingerprint(
+    corpus_root: Path | str,
+    rel_path: str,
+    start_line: int,
+    end_line: int,
+    expected_hash: str,
+    *,
+    wiki_root: Path | str | None = None,
+) -> tuple[bool, str]:
+    """Verify the CocoIndex fingerprint_str hex digest for a 1-indexed source line range on disk."""
+    if isinstance(start_line, bool) or not isinstance(start_line, int):
+        raise ValueError(f"start_line must be an int >= 1, got {start_line!r}")
+    if isinstance(end_line, bool) or not isinstance(end_line, int):
+        raise ValueError(f"end_line must be an int >= start_line, got {end_line!r}")
+    if start_line < 1 or end_line < start_line:
+        raise ValueError(f"Invalid line range [{start_line}, {end_line}] for {rel_path!r}")
+    target = resolve_source_path(rel_path, corpus_root, wiki_root)
+    if not target.is_file():
+        return False, ""
+    try:
+        text = target.read_bytes().decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise YawRuntimeError("CONSISTENCY_ERROR", f"Invalid UTF-8 or unreadable source file {target}: {exc}") from exc
+    lines = split_lf_lines(text)
+    if end_line > len(lines):
+        return False, ""
+    actual = fingerprint_str("\n".join(lines[start_line - 1 : end_line])).hex()
+    return actual == expected_hash, actual
 
 
 def dedup_ranked_positions(
@@ -341,6 +390,7 @@ def hydrate_ranked_passages(
     max_chars: int | None = None,
     include_island: bool = True,
     full_span: bool = False,
+    wiki_root: Path | None = None,
 ) -> tuple[HydratedPassage, ...]:
     """Apply MaxP span/island deduplication and hydrate up to `top_k` passages from disk."""
     limit = _validate_max_chars(max_chars)
@@ -359,6 +409,7 @@ def hydrate_ranked_passages(
             strict=False,
             file_cache=file_cache,
             path_cache=idx.resolved_path_cache,
+            wiki_root=wiki_root,
         )
         for pos, _cid, score in deduped
     )
@@ -376,43 +427,12 @@ def format_evidence_route(passages: Sequence[HydratedPassage]) -> str:
     return "\n\n".join(blocks)
 
 
-def _update_fence_state(raw: str, fence: tuple[str, int]) -> tuple[tuple[str, int], bool]:
-    stripped = raw.lstrip(" ")
-    if raw.startswith("\t") or len(raw) - len(stripped) > 3:
-        return fence, False
-    f_ch, f_len = fence
-    if not f_ch and stripped.startswith(("```", "~~~")):
-        ch = stripped[0]
-        return (ch, len(stripped) - len(stripped.lstrip(ch))), True
-    if f_ch and stripped.startswith(f_ch * f_len) and not stripped.strip(f_ch + " \t"):
-        return ("", 0), True
-    return fence, False
-
-
-def _leading_frontmatter_end(lines: Sequence[str], max_el: int) -> int:
-    first_idx = next((i for i in range(max_el) if lines[i].strip()), None)
-    if (
-        first_idx is None
-        or lines[first_idx].strip() != "---"
-        or first_idx + 1 >= max_el
-        or not lines[first_idx + 1].strip()
-    ):
-        return 0
-    for j in range(first_idx + 1, max_el):
-        s = lines[j].strip()
-        if s in ("---", "..."):
-            return j + 1
-        if s and not (lines[j][0].isspace() or s.startswith(("#", "-")) or ":" in s):
-            return 0
-    return 0
-
-
 def _collect_h1_by_line(lines: Sequence[str], max_el: int) -> dict[int, str]:
-    start_idx = _leading_frontmatter_end(lines, max_el)
+    start_idx = leading_frontmatter_end(lines, max_el)
     fence = ("", 0)
     h1_by_line: dict[int, str] = {}
     for idx in range(start_idx, max_el):
-        fence, is_delim = _update_fence_state(lines[idx], fence)
+        fence, is_delim = advance_markdown_fence(lines[idx], fence)
         if (
             not is_delim
             and not fence[0]
@@ -447,12 +467,14 @@ def hydrate_corpus_chunks(
     corpus_root: Path,
     *,
     extract_titles_for: Collection[str] = (),
+    wiki_root: Path | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Hydrate all corpus chunks in one disk-read pass per distinct relative file path."""
     n = len(pointers)
     if n == 0:
         return [], {}
     c_root = corpus_root if corpus_root.is_absolute() else corpus_root.resolve()
+    w_root = None if wiki_root is None else (wiki_root if wiki_root.is_absolute() else wiki_root.resolve())
     title_targets = set(extract_titles_for)
     by_rel: dict[str, list[int]] = {}
     for pos, ptr in enumerate(pointers):
@@ -477,6 +499,7 @@ def hydrate_corpus_chunks(
                     strict=True,
                     prepend_title=False,
                     file_cache=local_cache,
+                    wiki_root=w_root,
                 ).text,
             )
             for pos in pos_list

@@ -193,28 +193,14 @@ def document_identity(
     return hashlib.sha256(md.encode("utf-8")).hexdigest()[:16]
 
 
-def prepare_dataset_bundle(
-    dataset: str,
+def _collect_bundle_documents(
     corpus_path: Path,
-    questions_path: Path,
-    output_root: Path,
+    corpus: list[Any],
     *,
-    id_key: str | None = "idx",
-    title_key: str = "title",
-    body_key: str = "text",
-) -> DatasetBundle:
-    """Write an atomic content-verified v2 Markdown dataset bundle under `output_root / dataset`."""
-    if not dataset or Path(dataset).name != dataset or dataset in (".", ".."):
-        raise ValueError("Dataset identity must be a single directory name")
-    corpus_bytes, question_bytes = corpus_path.read_bytes(), questions_path.read_bytes()
-    corpus, questions = json.loads(corpus_bytes), json.loads(question_bytes)
-    if (
-        not isinstance(corpus, list)
-        or not isinstance(questions, list)
-        or not all(isinstance(q, dict) for q in questions)
-    ):
-        raise ValueError("Corpus and evaluation inputs must be JSON arrays of objects")
-
+    id_key: str | None,
+    title_key: str,
+    body_key: str,
+) -> dict[str, tuple[DatasetDocument, str]]:
     prepared: dict[str, tuple[DatasetDocument, str]] = {}
     seen_lower_paths: dict[str, str] = {}
     for index, row in enumerate(corpus):
@@ -240,21 +226,16 @@ def prepare_dataset_bundle(
         if previous is not None and previous[0].content_hash != digest:
             raise ValueError(f"Conflicting duplicate document ID {doc_id!r}")
         prepared[doc_id] = (doc, rendered)
+    return prepared
 
-    root = output_root.resolve() / dataset
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "documents").mkdir(exist_ok=True)
-    bundle = DatasetBundle(dataset, root, tuple(doc for doc, _ in prepared.values()), title_key, body_key, id_key)
-    manifest = {
-        "version": 2,
-        "dataset": dataset,
-        "title_key": title_key,
-        "body_key": body_key,
-        "id_key": id_key,
-        "source_corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
-        "documents": [asdict(d) for d in bundle.documents],
-        "evaluation_sha256": hashlib.sha256(question_bytes).hexdigest(),
-    }
+
+def _sync_bundle_files(
+    bundle: DatasetBundle,
+    prepared: Mapping[str, tuple[DatasetDocument, str]],
+    question_bytes: bytes,
+    manifest: Mapping[str, Any],
+) -> None:
+    root = bundle.root
     with FileLock(str(root / "bundle.lock")):
         if bundle.documents_root.is_symlink() or bundle.evaluation_path.parent.is_symlink():
             raise ValueError("Bundle directories must not be symlinks")
@@ -280,6 +261,46 @@ def prepare_dataset_bundle(
         rendered_manifest = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         write_text_atomic(bundle.manifest_path, rendered_manifest, newline="")
         validate_dataset_bundle(bundle)
+
+
+def prepare_dataset_bundle(
+    dataset: str,
+    corpus_path: Path,
+    questions_path: Path,
+    output_root: Path,
+    *,
+    id_key: str | None = "idx",
+    title_key: str = "title",
+    body_key: str = "text",
+) -> DatasetBundle:
+    """Write an atomic content-verified v2 Markdown dataset bundle under `output_root / dataset`."""
+    if not dataset or Path(dataset).name != dataset or dataset in (".", ".."):
+        raise ValueError("Dataset identity must be a single directory name")
+    corpus_bytes, question_bytes = corpus_path.read_bytes(), questions_path.read_bytes()
+    corpus, questions = json.loads(corpus_bytes), json.loads(question_bytes)
+    if (
+        not isinstance(corpus, list)
+        or not isinstance(questions, list)
+        or not all(isinstance(q, dict) for q in questions)
+    ):
+        raise ValueError("Corpus and evaluation inputs must be JSON arrays of objects")
+
+    prepared = _collect_bundle_documents(corpus_path, corpus, id_key=id_key, title_key=title_key, body_key=body_key)
+    root = output_root.resolve() / dataset
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "documents").mkdir(exist_ok=True)
+    bundle = DatasetBundle(dataset, root, tuple(doc for doc, _ in prepared.values()), title_key, body_key, id_key)
+    manifest = {
+        "version": 2,
+        "dataset": dataset,
+        "title_key": title_key,
+        "body_key": body_key,
+        "id_key": id_key,
+        "source_corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+        "documents": [asdict(d) for d in bundle.documents],
+        "evaluation_sha256": hashlib.sha256(question_bytes).hexdigest(),
+    }
+    _sync_bundle_files(bundle, prepared, question_bytes, manifest)
     return bundle
 
 
@@ -517,6 +538,72 @@ def get_gold_docs(
     ]
 
 
+def _collect_slice_texts(
+    samples: Sequence[Mapping[str, Any]],
+    corpus: Sequence[Mapping[str, Any]],
+    spec: Mapping[str, Any],
+    id_map: Mapping[str, str],
+    *,
+    start: int,
+    max_queries: int | None,
+    full_corpus: bool,
+    index_queries: int | None,
+) -> tuple[list[str], int]:
+    if full_corpus or max_queries is None or bool(spec.get("full_corpus_slice")):
+        return [_rendered_row_text(doc) for doc in corpus], 0
+
+    eff_iq = int(max_queries * 1.4) if index_queries is None else index_queries
+    pooled_end = start + eff_iq
+    separator = str(spec.get("sentence_separator", " "))
+    docs = [
+        p
+        for s in samples[start:pooled_end]
+        for p in _extract_sample_passages(s, separator=separator, corpus_by_id=id_map)
+    ]
+    min_per_q = int(spec.get("min_docs_per_query", 0))
+    if min_per_q <= 0:
+        return docs, 0
+
+    minimum_docs = eff_iq * min_per_q
+    docs = list(dict.fromkeys(docs))
+    seen_docs = set(docs)
+    for sample in samples[pooled_end:]:
+        if len(docs) >= minimum_docs:
+            break
+        for cand in _extract_sample_passages(sample, separator=separator, corpus_by_id=id_map):
+            if cand not in seen_docs:
+                docs.append(cand)
+                seen_docs.add(cand)
+                if len(docs) >= minimum_docs:
+                    break
+    return docs, minimum_docs
+
+
+def _select_slice_doc_ids(
+    corpus: Sequence[Mapping[str, Any]],
+    selected_text: set[str],
+    minimum_docs: int,
+    spec: Mapping[str, Any],
+) -> list[str]:
+    sf = spec.get("source_fields", {})
+    id_k = sf.get("id_key", "idx")
+    t_k, b_k = str(sf.get("title_key", "title")), str(sf.get("body_key", "text"))
+    document_ids = [
+        document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
+        for row in corpus
+        if _rendered_row_text(row) in selected_text
+    ]
+    seen_ids = set(document_ids)
+    for row in corpus:
+        if len(document_ids) >= minimum_docs:
+            break
+        did = document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
+        if did not in seen_ids:
+            document_ids.append(did)
+            seen_ids.add(did)
+    return document_ids
+
+
 def build_benchmark_slice(
     dataset_name: str,
     samples: Sequence[Mapping[str, Any]],
@@ -539,52 +626,21 @@ def build_benchmark_slice(
     id_map = _corpus_lookup(corpus)
     gold_docs = get_gold_docs(selected, dataset_name, corpus=corpus, corpus_by_id=id_map)
     gold_answers = get_gold_answers(selected)
-    minimum_docs = 0
 
-    if full_corpus or max_queries is None or bool(spec.get("full_corpus_slice")):
-        docs = [_rendered_row_text(doc) for doc in corpus]
-    else:
-        eff_iq = int(max_queries * 1.4) if index_queries is None else index_queries
-        pooled_end = start + eff_iq
-        separator = str(spec.get("sentence_separator", " "))
-        docs = [
-            p
-            for s in samples[start:pooled_end]
-            for p in _extract_sample_passages(s, separator=separator, corpus_by_id=id_map)
-        ]
-        if (min_per_q := int(spec.get("min_docs_per_query", 0))) > 0:
-            minimum_docs = eff_iq * min_per_q
-            docs = list(dict.fromkeys(docs))
-            if len(docs) < minimum_docs:
-                for sample in samples[pooled_end:]:
-                    for cand in _extract_sample_passages(sample, separator=separator, corpus_by_id=id_map):
-                        if cand not in docs:
-                            docs.append(cand)
-                            if len(docs) >= minimum_docs:
-                                break
-                    if len(docs) >= minimum_docs:
-                        break
-
+    docs, minimum_docs = _collect_slice_texts(
+        samples,
+        corpus,
+        spec,
+        id_map,
+        start=start,
+        max_queries=max_queries,
+        full_corpus=full_corpus,
+        index_queries=index_queries,
+    )
     if gold_docs is not None:
         for glist in gold_docs:
             docs.extend(glist)
-    selected_text = set(docs)
-    sf = spec.get("source_fields", {})
-    id_k = sf.get("id_key", "idx")
-    t_k, b_k = str(sf.get("title_key", "title")), str(sf.get("body_key", "text"))
-    document_ids = [
-        document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
-        for row in corpus
-        if _rendered_row_text(row) in selected_text
-    ]
-    seen_ids = set(document_ids)
-    for row in corpus:
-        if len(document_ids) >= minimum_docs:
-            break
-        did = document_identity(row, id_key=id_k, title_key=t_k, body_key=b_k)
-        if did not in seen_ids:
-            document_ids.append(did)
-            seen_ids.add(did)
+    document_ids = _select_slice_doc_ids(corpus, set(docs), minimum_docs, spec)
     return document_ids, queries, gold_docs, gold_answers
 
 
@@ -641,6 +697,41 @@ def compute_qa_em_f1(pred_str: str, gold_answers: Sequence[str]) -> tuple[float,
     return float(em), float(f1)
 
 
+def _strip_doc_title_prefixes(clean_ret: str, clean_gold: str, segments: list[str]) -> tuple[str, str, list[str]]:
+    segs = list(segments)
+    for pfx in ("Wikipedia Title: ", "Title: ", "# "):
+        if clean_ret.startswith(pfx):
+            clean_ret = clean_ret[len(pfx) :].strip()
+        if clean_gold.startswith(pfx):
+            clean_gold = clean_gold[len(pfx) :].strip()
+        if segs and segs[0].startswith(pfx):
+            segs[0] = segs[0][len(pfx) :].strip()
+    return clean_ret, clean_gold, segs
+
+
+def _segments_match_gold(segments: list[str], ws_gold: str) -> bool:
+    ws_segs = [" ".join(seg.split()) for seg in segments if " ".join(seg.split())]
+    if ws_segs and sum(len(s) for s in ws_segs) >= 20 and all(s in ws_gold for s in ws_segs):
+        return True
+    if "\n" not in segments[0]:
+        return False
+    seg0_body = " ".join(segments[0].split("\n", 1)[1].split())
+    body_segs = [seg0_body, *ws_segs[1:]] if seg0_body else ws_segs[1:]
+    return bool(body_segs and sum(len(s) for s in body_segs) >= 20 and all(s in ws_gold for s in body_segs))
+
+
+def _body_matches_gold(clean_ret: str, clean_gold: str, ws_ret: str, ws_gold: str) -> bool:
+    if len(ws_ret) >= 20 and (ws_ret in ws_gold or ws_gold in ws_ret):
+        return True
+    if "\n" in clean_ret:
+        body = " ".join(clean_ret.split("\n", 1)[1].split())
+        if len(body) >= 20 and (body in ws_gold or ws_gold in body):
+            return True
+    if "\n" in clean_gold and len(gold_body := " ".join(clean_gold.split("\n", 1)[1].split())) >= 20:
+        return gold_body in ws_ret
+    return False
+
+
 def doc_matches_gold(retrieved_doc: str, gold_doc: str) -> bool:
     """Match retrieved passages to gold passages across crops, title prefixes, and omitted spans."""
     if retrieved_doc == gold_doc:
@@ -659,34 +750,13 @@ def doc_matches_gold(retrieved_doc: str, gold_doc: str) -> bool:
         or (clean_gold.startswith("chunk-") and clean_gold == "chunk-" + hashlib.md5(clean_ret.encode()).hexdigest())
     ):
         return True
-    for pfx in ("Wikipedia Title: ", "Title: ", "# "):
-        if clean_ret.startswith(pfx):
-            clean_ret = clean_ret[len(pfx) :].strip()
-        if clean_gold.startswith(pfx):
-            clean_gold = clean_gold[len(pfx) :].strip()
-        if segments and segments[0].startswith(pfx):
-            segments[0] = segments[0][len(pfx) :].strip()
+    clean_ret, clean_gold, segments = _strip_doc_title_prefixes(clean_ret, clean_gold, segments)
     ws_ret, ws_gold = " ".join(clean_ret.split()), " ".join(clean_gold.split())
     if clean_ret == clean_gold or ws_ret == ws_gold:
         return True
-    if len(segments) > 1:
-        ws_segs = [" ".join(seg.split()) for seg in segments if " ".join(seg.split())]
-        if ws_segs and sum(len(s) for s in ws_segs) >= 20 and all(s in ws_gold for s in ws_segs):
-            return True
-        if "\n" in segments[0]:
-            seg0_body = " ".join(segments[0].split("\n", 1)[1].split())
-            body_segs = [seg0_body, *ws_segs[1:]] if seg0_body else ws_segs[1:]
-            if body_segs and sum(len(s) for s in body_segs) >= 20 and all(s in ws_gold for s in body_segs):
-                return True
-    if len(ws_ret) >= 20 and (ws_ret in ws_gold or ws_gold in ws_ret):
+    if len(segments) > 1 and _segments_match_gold(segments, ws_gold):
         return True
-    if "\n" in clean_ret:
-        body = " ".join(clean_ret.split("\n", 1)[1].split())
-        if len(body) >= 20 and (body in ws_gold or ws_gold in body):
-            return True
-    if "\n" in clean_gold and len(gold_body := " ".join(clean_gold.split("\n", 1)[1].split())) >= 20:
-        return gold_body in ws_ret
-    return False
+    return _body_matches_gold(clean_ret, clean_gold, ws_ret, ws_gold)
 
 
 def score_retrieval_recalls(

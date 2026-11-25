@@ -662,6 +662,7 @@ def expand_citation_neighbors(
     chunk_id: int,
     *,
     corpus_root: Path | str,
+    wiki_root: Path | str | None = None,
     conn: sqlite3.Connection | None = None,
     top_k: int = 6,
     path_glob: str | None = None,
@@ -675,8 +676,21 @@ def expand_citation_neighbors(
     pos, eligible, elig_pos = validated
 
     c_root = corpus_root if isinstance(corpus_root, Path) and corpus_root.is_absolute() else Path(corpus_root).resolve()
+    w_root = (
+        None
+        if wiki_root is None
+        else (wiki_root if isinstance(wiki_root, Path) and wiki_root.is_absolute() else Path(wiki_root).resolve())
+    )
     src_hp = hydrate_one(
-        c_root, idx.pointers[pos], 0.0, None, False, False, strict=True, path_cache=idx.resolved_path_cache
+        c_root,
+        idx.pointers[pos],
+        0.0,
+        None,
+        False,
+        False,
+        strict=True,
+        path_cache=idx.resolved_path_cache,
+        wiki_root=w_root,
     )
     vec_cache: dict[int, NDArray[np.float32]] = {}
     n_elig_total = int(elig_pos.size) + 1

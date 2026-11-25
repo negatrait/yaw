@@ -299,9 +299,11 @@ def reconcile_index_tables(
     embedding_model: str,
     task_mode: str,
     corpus_root: Path | str,
+    wiki_root: Path | str | None = None,
 ) -> bool:
     """Optimize FTS5 and materialize single-row `rabitq_index` + `citation_graph` when chunks change."""
     resolved_root = require_corpus_dir(corpus_root)
+    resolved_wiki = require_corpus_dir(wiki_root) if wiki_root is not None else None
     with conn_mgr.readonly() as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone() is None:
             return False
@@ -340,7 +342,7 @@ def reconcile_index_tables(
             g_del = conn.execute('DELETE FROM "citation_graph" WHERE id = 1').rowcount
         return bool((r_del or 0) + (g_del or 0))
 
-    artifacts = compute_index_artifacts(rows, resolved_root)
+    artifacts = compute_index_artifacts(rows, resolved_root, wiki_root=resolved_wiki)
     with conn_mgr.transaction() as conn:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_fts'").fetchone() is not None:
             conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize')")

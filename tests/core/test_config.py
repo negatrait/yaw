@@ -7,7 +7,7 @@ import re
 import tomllib
 from dataclasses import fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -33,8 +33,9 @@ _SECTION_HEADER_RE = re.compile(r"^\[([a-z][a-z0-9_]*)\]\s*$")
 
 def test_yaw_config_defaults() -> None:
     cfg = YawConfig()
-    assert len(fields(YawConfig)) == 31
+    assert len(fields(YawConfig)) == 32
     assert cfg.corpus_root is not None and cfg.corpus_root.name == "corpus"
+    assert cfg.wiki_root is None
     assert cfg.state_dir is not None and cfg.state_dir.name == "coco_lmdb"
     assert cfg.included_patterns == DEFAULT_INCLUDED_PATTERNS
     assert cfg.excluded_patterns == DEFAULT_EXCLUDED_PATTERNS
@@ -313,11 +314,15 @@ def test_project_yaw_toml_bijection_with_yaw_config(monkeypatch: pytest.MonkeyPa
         if cur_section is not None and (opt_match := _OPTIONAL_COMMENT_KV_RE.match(stripped)):
             commented_optional.add((cur_section, opt_match.group(1)))
 
-    assert commented_optional == {("inference", "api_key"), ("inference", "max_output_tokens")}
+    assert commented_optional == {
+        ("paths", "wiki_root"),
+        ("inference", "api_key"),
+        ("inference", "max_output_tokens"),
+    }
     assert toml_pairs.isdisjoint(commented_optional)
 
     expected_pairs = {(sec, field_name) for field_name, sec in config_mod._FIELD_TO_SECTION.items()}
-    assert len(config_mod._FIELD_TO_SECTION) == 30
+    assert len(config_mod._FIELD_TO_SECTION) == 31
     assert (toml_pairs | commented_optional) == expected_pairs
 
 
@@ -381,3 +386,53 @@ def test_get_and_set_reject_retired_and_wrong_section_keys(tmp_path: Path) -> No
         assert exc_set.value.code == "INVALID_INPUT"
 
     assert toml_path.read_text(encoding="utf-8") == original
+
+
+def test_wiki_root_validation_disjointness_toml_and_optimization_isolation(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cfg = YawConfig(workspace_root=ws, wiki_root=Path("wiki"))
+    assert cfg.wiki_root == (ws / "wiki").resolve()
+    assert YawConfig(workspace_root=ws, wiki_root=cast(Any, "wiki")).wiki_root == (ws / "wiki").resolve()
+
+    opt = cfg.for_optimization()
+    assert opt.wiki_root is None
+
+    ext_wiki = (tmp_path / "ext_wiki").resolve()
+    opt_with_wiki = cfg.for_optimization(db_override=ws / "opt" / "yaw.db", wiki_root=ext_wiki)
+    assert opt_with_wiki.wiki_root == ext_wiki
+
+    with pytest.raises(YawRuntimeError) as exc_opt_overlap:
+        cfg.for_optimization(wiki_root=ws / "wiki")
+    assert exc_opt_overlap.value.code == "INVALID_INPUT"
+
+    for bad_wiki in ("", "   ", True, 123):
+        with pytest.raises(YawRuntimeError) as exc_bad:
+            YawConfig(workspace_root=ws, wiki_root=cast(Any, bad_wiki))
+        assert exc_bad.value.code == "INVALID_INPUT"
+
+    for overlap_kwargs in (
+        {"corpus_root": "corpus", "wiki_root": "corpus"},
+        {"corpus_root": "corpus", "wiki_root": "corpus/cards"},
+        {"corpus_root": "corpus/sub", "wiki_root": "corpus"},
+        {"corpus_root": "corpus", "wiki_root": "."},
+    ):
+        with pytest.raises(YawRuntimeError) as exc_overlap:
+            YawConfig(workspace_root=ws, **cast(dict[str, Any], overlap_kwargs))
+        assert exc_overlap.value.code == "INVALID_INPUT"
+
+    toml_path = ws / "yaw.toml"
+    toml_path.write_text('[paths]\ncorpus_root = "corpus"\n', encoding="utf-8")
+    assert get_config_value(toml_path, "paths.wiki_root") is None
+
+    assert set_config_value("paths.wiki_root", "wiki", toml_path) == ("paths.wiki_root", "wiki")
+    assert load_config(toml_path).wiki_root == (ws / "wiki").resolve()
+    assert get_config_value(toml_path, "paths.wiki_root") == str((ws / "wiki").resolve())
+
+    assert set_config_value("paths.wiki_root", "null", toml_path) == ("paths.wiki_root", None)
+    assert load_config(toml_path).wiki_root is None
+
+    with pytest.raises(YawRuntimeError) as exc_empty:
+        set_config_value("paths.wiki_root", '""', toml_path)
+    assert exc_empty.value.code == "INVALID_INPUT"
+    assert load_config(toml_path).wiki_root is None

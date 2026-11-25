@@ -1,4 +1,4 @@
-"""Clean-slate telemetry monitor for the 14-file YAW stack and optimization artifacts."""
+"""Clean-slate telemetry monitor for the modular YAW stack and optimization artifacts."""
 
 from __future__ import annotations
 
@@ -128,13 +128,25 @@ def _read_json_safe(path: Path) -> dict[str, Any] | None:
 
 
 def _inspect_sqlite_db(db_path: Path) -> dict[str, Any]:
-    info: dict[str, Any] = {"path": str(db_path), "exists": db_path.is_file(), "chunks": None, "tables": []}
+    info: dict[str, Any] = {
+        "path": str(db_path),
+        "exists": db_path.is_file(),
+        "chunks": None,
+        "wiki_chunks": None,
+        "tables": [],
+    }
     try:
         with contextlib.closing(open_readonly_db(db_path)) as conn:
             raw = [str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
             info["tables"] = [t for t in raw if not t.startswith(("chunk_fts_", "sqlite_"))]
             row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
             info["chunks"] = int(row[0]) if row else 0
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+            if "rel_path" in cols:
+                w_row = conn.execute("SELECT COUNT(*) FROM chunks WHERE substr(rel_path, 1, 5) = 'wiki:'").fetchone()
+                info["wiki_chunks"] = int(w_row[0]) if w_row else 0
+            else:
+                info["wiki_chunks"] = 0
     except (YawRuntimeError, sqlite3.Error) as exc:
         if db_path.is_file() and "no such table" not in str(exc).lower():
             info["error"] = f"{type(exc).__name__}: {exc}"

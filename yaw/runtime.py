@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,8 @@ from typing import Any
 import dspy
 import filelock
 import numpy as np
+from dspy.lm15 import LM15Error
+from dspy.utils.exceptions import DSPyError
 from numpy.typing import NDArray
 
 from yaw.core import (
@@ -31,12 +34,15 @@ from yaw.core import (
     configure_logging,
     format_query_for_embedding,
     get_logger,
+    make_wiki_rel_path,
+    normalize_ast_heading,
     redact_secrets,
     write_text_atomic,
 )
 from yaw.pipeline import (
     DspyBatchEmbedder,
     PipelineSession,
+    aupdate_pipeline_once,
     close_pipeline,
     make_dspy_embed_fn,
     open_pipeline_lifespan,
@@ -49,9 +55,12 @@ from yaw.retrieval import (
     SearchResult,
     build_retrieval_index,
     empty_retrieval_index,
+    expand_citation_neighbors,
+    hydrate_passage,
     hydrate_ranked_passages,
     open_readonly_db,
     search_index,
+    verify_source_fingerprint,
 )
 from yaw.retrieval import (
     build_recall_payload as build_recall_payload,
@@ -62,6 +71,17 @@ from yaw.retrieval import (
 from yaw.retrieval import (
     format_recall_text as format_recall_text,
 )
+from yaw.wiki import (
+    WikiCardSource,
+    is_fresh_passage,
+    lint_wiki,
+    list_wiki_cards,
+    read_wiki_card,
+    should_queue_scout,
+    synthesize_scout_card,
+    validate_wiki_slug,
+    write_wiki_card,
+)
 
 
 @dataclass(slots=True)
@@ -70,7 +90,7 @@ class YawRuntime:
 
     config: YawConfig
     pipeline: PipelineSession
-    lm: dspy.LM
+    lm: dspy.LM | None
     embed_fn: EmbedFn
     lm_sem: threading.Semaphore
     query_sem: threading.BoundedSemaphore
@@ -92,6 +112,8 @@ class YawRuntime:
     state_lock: threading.Lock = field(default_factory=threading.Lock)
     active_queries: int = 0
     active_op: str | None = None
+    reconcile_waiters: set[asyncio.Event] = field(default_factory=set)
+    scout_queue: asyncio.Queue[tuple[str, tuple[HydratedPassage, ...]]] | None = None
 
 
 def require_path(path: Path | None, label: str) -> Path:
@@ -181,16 +203,34 @@ def reload_retrieval_index(rt: YawRuntime, conn: sqlite3.Connection | None = Non
     return current_idx
 
 
+def _resolve_active_lm(cfg: YawConfig, lm: dspy.LM | None) -> dspy.LM | None:
+    if lm is not None:
+        return lm
+    return create_lm(cfg) if cfg.qa_model.strip() else None
+
+
+def _resolve_wiki_root(cfg: YawConfig) -> Path | None:
+    return Path(cfg.wiki_root).resolve() if cfg.wiki_root is not None else None
+
+
+def _notify_reconcile_waiters(rt: YawRuntime | None) -> None:
+    if rt is None:
+        return
+    for waiter in tuple(rt.reconcile_waiters):
+        waiter.set()
+
+
 def _build_runtime_instance(
     cfg: YawConfig,
     pipeline: PipelineSession,
-    lm: dspy.LM,
+    lm: dspy.LM | None,
     embed_fn: EmbedFn,
     file_lock: filelock.FileLock,
     *,
     owns_file_lock: bool,
     ready_evt: asyncio.Event | None = None,
     async_loop: asyncio.AbstractEventLoop | None = None,
+    scout_queue: asyncio.Queue[tuple[str, tuple[HydratedPassage, ...]]] | None = None,
 ) -> YawRuntime:
     uses_async = isinstance(embed_fn, DspyBatchEmbedder)
     embed_cap = cfg.embed_max_in_flight if uses_async else sync_embed_concurrency_limit(cfg.embed_max_in_flight)
@@ -215,6 +255,7 @@ def _build_runtime_instance(
         async_embed_sem=asyncio.Semaphore(embed_cap) if async_loop is not None else None,
         async_lm_sem=asyncio.Semaphore(1) if async_loop is not None else None,
         embed_uses_async=uses_async,
+        scout_queue=scout_queue,
     )
 
 
@@ -237,6 +278,116 @@ def _mark_ready(rt: YawRuntime) -> None:
         rt.last_error = None
 
 
+def _is_scout_active(rt: YawRuntime) -> bool:
+    with rt.state_lock:
+        return not rt.stop_event.is_set() and rt.lifecycle == "ready"
+
+
+def _run_sync_scout(
+    rt: YawRuntime,
+    query: str,
+    passages: tuple[HydratedPassage, ...],
+    active_lm: dspy.LM,
+) -> tuple[str, str, str, str] | None:
+    with rt.lm_sem:
+        return synthesize_scout_card(query, passages, active_lm)
+
+
+async def _process_scout_item(
+    rt: YawRuntime,
+    query: str,
+    passages: tuple[HydratedPassage, ...],
+    active_lm: dspy.LM,
+) -> None:
+    if not _is_scout_active(rt):
+        return
+    fresh_passages = tuple(p for p in passages if is_fresh_passage(p))
+    if not fresh_passages:
+        return
+    _, _, lm_sem = _ensure_async_primitives(rt)
+    try:
+        async with lm_sem:
+            if not _is_scout_active(rt):
+                return
+            card = await asyncio.to_thread(_run_sync_scout, rt, query, fresh_passages, active_lm)
+        if card is None or not _is_scout_active(rt):
+            return
+        slug, title, body, kind = card
+        await write_wiki_and_sync(
+            rt,
+            slug=slug,
+            title=title,
+            body=body,
+            source_chunk_ids=tuple(p.pointer.chunk_id for p in fresh_passages),
+            kind=kind,
+            wait_for_sync=False,
+        )
+    except (YawRuntimeError, OSError, TimeoutError, ValueError, DSPyError, LM15Error) as exc:
+        get_logger("yaw.runtime").warning(
+            "Non-fatal wiki scout synthesis/write error: %s",
+            redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key),
+        )
+
+
+async def _run_scout_worker(
+    rt: YawRuntime,
+    queue: asyncio.Queue[tuple[str, tuple[HydratedPassage, ...]]],
+    active_lm: dspy.LM,
+    on_error: Callable[[Exception], None] | None = None,
+) -> None:
+    try:
+        while not rt.stop_event.is_set():
+            query, passages = await queue.get()
+            try:
+                await _process_scout_item(rt, query, passages, active_lm)
+            finally:
+                queue.task_done()
+    except Exception as exc:
+        get_logger("yaw.runtime").error(
+            "Fatal wiki scout worker error: %s",
+            redact_secrets(f"{type(exc).__name__}: {exc}", rt.config.api_key),
+        )
+        if on_error is not None:
+            on_error(exc)
+        else:
+            _record_runtime_error(rt, exc)
+        raise
+
+
+async def _stop_scout_task(scout_task: asyncio.Task[None] | None) -> None:
+    if scout_task is None:
+        return
+    if not scout_task.done():
+        scout_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scout_task
+
+
+async def _cleanup_lifespan_rt(
+    rt_box: dict[str, YawRuntime],
+    active_embed: EmbedFn | None,
+    evt: asyncio.Event,
+    active_lock: filelock.FileLock,
+    *,
+    owns_file_lock: bool,
+) -> None:
+    try:
+        if isinstance(active_embed, DspyBatchEmbedder):
+            await active_embed.aclose()
+    finally:
+        try:
+            if (active_rt := rt_box.get("rt")) is not None:
+                with active_rt.state_lock:
+                    active_rt.lifecycle = "stopped"
+                    active_rt.active_op = None
+                await asyncio.to_thread(get_status, active_rt)
+                _notify_reconcile_waiters(active_rt)
+            evt.set()
+        finally:
+            if owns_file_lock and active_lock.is_locked:
+                active_lock.release()
+
+
 @contextlib.asynccontextmanager
 async def runtime_lifespan(
     cfg: YawConfig,
@@ -247,6 +398,7 @@ async def runtime_lifespan(
     lm: dspy.LM | None = None,
     file_lock: filelock.FileLock | None = None,
     ready_evt: asyncio.Event | None = None,
+    enable_scout: bool | None = None,
 ) -> AsyncGenerator[YawRuntime]:
     """Run unified CocoIndex + YawRuntime lifecycle directly on the caller's asyncio event loop."""
     owns_file_lock = file_lock is None
@@ -257,12 +409,15 @@ async def runtime_lifespan(
     active_embed: EmbedFn | None = None
 
     def _on_error(exc: Exception) -> None:
-        if (active_rt := rt_box.get("rt")) is None or active_rt.stop_event.is_set():
+        active_rt = rt_box.get("rt")
+        if active_rt is None or active_rt.stop_event.is_set():
             evt.set()
+            _notify_reconcile_waiters(active_rt)
             return
         _record_runtime_error(active_rt, exc)
         get_status(active_rt)
         evt.set()
+        _notify_reconcile_waiters(active_rt)
 
     async def _on_reconciled(changed: bool, is_initial: bool) -> None:
         if (active_rt := rt_box.get("rt")) is None or active_rt.stop_event.is_set():
@@ -273,12 +428,17 @@ async def runtime_lifespan(
             _mark_ready(active_rt)
         await asyncio.to_thread(get_status, active_rt)
         evt.set()
+        _notify_reconcile_waiters(active_rt)
 
     try:
         if cfg.log_path is not None:
             configure_logging(cfg.log_path)
         active_embed = embed_fn or make_dspy_embed_fn(cfg)
-        active_lm = lm or create_lm(cfg)
+        active_lm = _resolve_active_lm(cfg, lm)
+        scout_enabled = live and cfg.wiki_root is not None and active_lm is not None and enable_scout is not False
+        scout_queue: asyncio.Queue[tuple[str, tuple[HydratedPassage, ...]]] | None = (
+            asyncio.Queue(maxsize=16) if scout_enabled else None
+        )
         async with open_pipeline_lifespan(
             cfg,
             embed_fn=active_embed,
@@ -295,6 +455,7 @@ async def runtime_lifespan(
                 owns_file_lock=owns_file_lock,
                 ready_evt=evt,
                 async_loop=loop,
+                scout_queue=scout_queue,
             )
             rt_box["rt"] = rt
             if not live and rt.lifecycle == "starting":
@@ -302,10 +463,16 @@ async def runtime_lifespan(
                 _mark_ready(rt)
                 await asyncio.to_thread(get_status, rt)
                 evt.set()
+                _notify_reconcile_waiters(rt)
             else:
                 await asyncio.to_thread(get_status, rt)
                 if wait_for_ready and not await wait_ready_async(rt, timeout=30.0):
                     raise YawRuntimeError("NOT_READY", "Timed out waiting for initial indexing readiness.")
+            scout_task = (
+                asyncio.create_task(_run_scout_worker(rt, scout_queue, active_lm, on_error=_on_error))
+                if scout_queue is not None and active_lm is not None
+                else None
+            )
             try:
                 yield rt
             finally:
@@ -314,21 +481,10 @@ async def runtime_lifespan(
                     if rt.lifecycle != "stopped":
                         rt.lifecycle = "stopping"
                 evt.set()
+                _notify_reconcile_waiters(rt)
+                await _stop_scout_task(scout_task)
     finally:
-        try:
-            if isinstance(active_embed, DspyBatchEmbedder):
-                await active_embed.aclose()
-        finally:
-            try:
-                if (active_rt := rt_box.get("rt")) is not None:
-                    with active_rt.state_lock:
-                        active_rt.lifecycle = "stopped"
-                        active_rt.active_op = None
-                    await asyncio.to_thread(get_status, active_rt)
-                evt.set()
-            finally:
-                if owns_file_lock and active_lock.is_locked:
-                    active_lock.release()
+        await _cleanup_lifespan_rt(rt_box, active_embed, evt, active_lock, owns_file_lock=owns_file_lock)
 
 
 def start_runtime(
@@ -354,7 +510,7 @@ def start_runtime(
         if cfg.log_path is not None:
             configure_logging(cfg.log_path)
         active_embed = embed_fn or make_dspy_embed_fn(cfg)
-        active_lm = lm or create_lm(cfg)
+        active_lm = _resolve_active_lm(cfg, lm)
         pipeline = start_pipeline(cfg, embed_fn=active_embed, live=False)
         rt = _build_runtime_instance(
             cfg,
@@ -547,6 +703,18 @@ def _open_indexed_search(cfg: YawConfig) -> Generator[tuple[sqlite3.Connection, 
         yield conn, index, corpus_root
 
 
+def _validate_int_id(val: Any, label: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+        raise YawRuntimeError("INVALID_INPUT", f"{label} must be a positive integer.")
+    return val
+
+
+def _validate_top_k(top_k: int, fn_name: str) -> int:
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or not (1 <= top_k <= 20):
+        raise YawRuntimeError("INVALID_INPUT", f"{fn_name}(): top_k must be an integer between 1 and 20.")
+    return top_k
+
+
 def _search_and_hydrate_with_result(
     db_path: Path,
     index: RetrievalIndex,
@@ -554,10 +722,14 @@ def _search_and_hydrate_with_result(
     q_vec: NDArray[np.float32],
     query: str,
     top_k: int,
+    *,
+    wiki_root: Path | None = None,
 ) -> tuple[SearchResult, tuple[HydratedPassage, ...]]:
     with contextlib.closing(open_readonly_db(db_path)) as conn:
         res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
-    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k, include_island=True)
+    return res, hydrate_ranked_passages(
+        index, res.ranked, corpus_root, top_k=top_k, include_island=True, wiki_root=wiki_root
+    )
 
 
 def _run_recall_with_result(
@@ -576,7 +748,9 @@ def _run_recall_with_result(
     raw_emb = np.asarray(active_embed([formatted]), dtype=np.float32)
     q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
     res = search_index(index, q_vec, query_text=query, conn=conn, top_k=top_k, pool_k=max(top_k * 4, 50))
-    return res, hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=top_k, include_island=True)
+    return res, hydrate_ranked_passages(
+        index, res.ranked, corpus_root, top_k=top_k, include_island=True, wiki_root=_resolve_wiki_root(cfg)
+    )
 
 
 async def _arecall_core(
@@ -589,6 +763,7 @@ async def _arecall_core(
     _ensure_ready(rt)
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    wiki_root = _resolve_wiki_root(rt.config)
     async with _admit_query_async(rt, "recall"):
         index = get_retrieval_index(rt)
         if index.size == 0:
@@ -602,7 +777,7 @@ async def _arecall_core(
                 raw_emb = np.asarray(await asyncio.to_thread(rt.embed_fn, [formatted]), dtype=np.float32)
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         res, passages = await asyncio.to_thread(
-            _search_and_hydrate_with_result, db_path, index, corpus_root, q_vec, q, top_k
+            _search_and_hydrate_with_result, db_path, index, corpus_root, q_vec, q, top_k, wiki_root=wiki_root
         )
         return index, res, passages
 
@@ -616,7 +791,271 @@ async def arecall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[Hydrat
 async def arecall_payload(rt: YawRuntime, query: str, *, top_k: int = 5) -> dict[str, Any]:
     """Execute asynchronous zero-LLM recall and assemble the canonical sparse slip payload."""
     index, res, passages = await _arecall_core(rt, query, top_k=top_k)
-    return build_recall_payload(passages, index=index, search_result=res)
+    card_queued = False
+    if rt.scout_queue is not None and should_queue_scout(res, passages):
+        with contextlib.suppress(asyncio.QueueFull):
+            rt.scout_queue.put_nowait((query.strip(), passages))
+            card_queued = True
+    return build_recall_payload(passages, index=index, search_result=res, card_queued=card_queued)
+
+
+def _expand_and_hydrate(
+    db_path: Path,
+    index: RetrievalIndex,
+    corpus_root: Path,
+    wiki_root: Path | None,
+    chunk_id: int,
+    top_k: int,
+) -> tuple[HydratedPassage, ...]:
+    if index.size <= 1:
+        return ()
+    with contextlib.closing(open_readonly_db(db_path)) as conn:
+        ranked = expand_citation_neighbors(
+            index,
+            chunk_id,
+            corpus_root=corpus_root,
+            wiki_root=wiki_root,
+            conn=conn,
+            top_k=max(top_k * 4, 50),
+        )
+    return hydrate_ranked_passages(index, ranked, corpus_root, top_k=top_k, include_island=True, wiki_root=wiki_root)
+
+
+async def aexpand_neighbors_payload(rt: YawRuntime, chunk_id: int, *, top_k: int = 6) -> dict[str, Any]:
+    """Expand citation, lexical, semantic, and AST-island neighbors for `chunk_id` asynchronously."""
+    cid = _validate_int_id(chunk_id, "chunk_id")
+    k = _validate_top_k(top_k, "expand_neighbors")
+    _ensure_ready(rt)
+    db_path = require_path(rt.config.db_path, "db_path")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    wiki_root = _resolve_wiki_root(rt.config)
+    async with _admit_query_async(rt, "expand_neighbors"):
+        index = get_retrieval_index(rt)
+        if cid not in index.id_to_pos:
+            raise YawRuntimeError("INVALID_INPUT", f"Unknown chunk_id={cid}.")
+        passages = await asyncio.to_thread(_expand_and_hydrate, db_path, index, corpus_root, wiki_root, cid, k)
+        return build_recall_payload(passages)
+
+
+async def aread_chunk_payload(rt: YawRuntime, chunk_id: int) -> dict[str, Any]:
+    """Hydrate the exact verified disk span for `chunk_id` and return the canonical sparse slip payload."""
+    cid = _validate_int_id(chunk_id, "chunk_id")
+    _ensure_ready(rt)
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    wiki_root = _resolve_wiki_root(rt.config)
+    async with _admit_query_async(rt, "read_chunk"):
+        index = get_retrieval_index(rt)
+        if (pos := index.id_to_pos.get(cid)) is None:
+            raise YawRuntimeError("INVALID_INPUT", f"Unknown chunk_id={cid}.")
+        hp = await asyncio.to_thread(
+            hydrate_passage,
+            index.pointers[pos],
+            corpus_root,
+            score=1.0,
+            include_island=False,
+            wiki_root=wiki_root,
+        )
+        return build_recall_payload((hp,))
+
+
+def _resolve_wiki_sources(
+    index: RetrievalIndex,
+    source_chunk_ids: Sequence[int],
+    corpus_root: Path,
+    wiki_root: Path,
+) -> tuple[WikiCardSource, ...]:
+    sources: list[WikiCardSource] = []
+    seen: set[int] = set()
+    for cid in source_chunk_ids:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if (pos := index.id_to_pos.get(cid)) is None:
+            raise YawRuntimeError("INVALID_INPUT", f"Unknown source chunk_id={cid}.")
+        hp = hydrate_passage(index.pointers[pos], corpus_root, include_island=False, wiki_root=wiki_root)
+        if hp.stale_on_disk:
+            raise YawRuntimeError("CONSISTENCY_ERROR", f"Source chunk_id={cid} failed disk fingerprint verification.")
+        sources.append(
+            WikiCardSource(
+                rel_path=hp.pointer.rel_posix_path,
+                start_line=hp.pointer.start_line,
+                end_line=hp.pointer.end_line,
+                source_hash=hp.pointer.source_hash,
+            )
+        )
+    return tuple(sources)
+
+
+def _validate_write_wiki_args(
+    slug: str,
+    title: str,
+    body: str,
+    source_chunk_ids: Sequence[int],
+    kind: str,
+    wait_for_sync: bool,
+    sync_timeout: float,
+) -> tuple[str, str, str, str, tuple[int, ...]]:
+    try:
+        clean_slug = validate_wiki_slug(slug)
+    except ValueError as exc:
+        raise YawRuntimeError("INVALID_INPUT", str(exc)) from exc
+    clean_title = normalize_ast_heading(_validate_text_input(title, "Wiki title"))
+    if not clean_title:
+        raise YawRuntimeError("INVALID_INPUT", "write_wiki_and_sync(): Wiki title must not be empty.")
+    clean_body = _validate_text_input(body, "Wiki body")
+    clean_kind = _validate_text_input(kind, "Wiki kind")
+    if not isinstance(wait_for_sync, bool):
+        raise YawRuntimeError("INVALID_INPUT", "write_wiki_and_sync(): wait_for_sync must be a bool.")
+    if isinstance(sync_timeout, bool) or not isinstance(sync_timeout, (int, float)) or not math.isfinite(sync_timeout):
+        raise YawRuntimeError("INVALID_INPUT", "write_wiki_and_sync(): sync_timeout must be finite.")
+    if sync_timeout < 0.0:
+        raise YawRuntimeError("INVALID_INPUT", "write_wiki_and_sync(): sync_timeout must be >= 0.")
+    if isinstance(source_chunk_ids, (str, bytes)) or not isinstance(source_chunk_ids, Sequence):
+        raise YawRuntimeError(
+            "INVALID_INPUT",
+            "write_wiki_and_sync(): source_chunk_ids must be a sequence of positive integers.",
+        )
+    validated_source_ids = tuple(_validate_int_id(raw_cid, "source_chunk_ids element") for raw_cid in source_chunk_ids)
+    return clean_slug, clean_title, clean_body, clean_kind, validated_source_ids
+
+
+def _is_wiki_card_synced(index: RetrievalIndex, expected_rel: str, corpus_root: Path, wiki_root: Path) -> bool:
+    ptrs = [p for p in index.pointers if p.rel_posix_path == expected_rel]
+    if not ptrs:
+        return False
+    return all(
+        verify_source_fingerprint(
+            corpus_root,
+            p.rel_posix_path,
+            p.start_line,
+            p.end_line,
+            p.source_hash,
+            wiki_root=wiki_root,
+        )[0]
+        for p in ptrs
+    )
+
+
+async def _await_wiki_card_sync(
+    rt: YawRuntime,
+    *,
+    corpus_root: Path,
+    wiki_root: Path,
+    expected_rel: str,
+    sync_timeout: float,
+    wait_evt: asyncio.Event,
+) -> bool:
+    deadline = time.monotonic() + sync_timeout
+    while True:
+        wait_evt.clear()
+        if await asyncio.to_thread(_is_wiki_card_synced, get_retrieval_index(rt), expected_rel, corpus_root, wiki_root):
+            return True
+        if rt.stop_event.is_set() or rt.pipeline.error is not None or rt.lifecycle in ("error", "stopping", "stopped"):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        try:
+            await asyncio.wait_for(wait_evt.wait(), timeout=remaining)
+        except TimeoutError:
+            return await asyncio.to_thread(
+                _is_wiki_card_synced, get_retrieval_index(rt), expected_rel, corpus_root, wiki_root
+            )
+
+
+async def write_wiki_and_sync(
+    rt: YawRuntime,
+    *,
+    slug: str,
+    title: str,
+    body: str,
+    source_chunk_ids: Sequence[int] = (),
+    kind: str = "note",
+    wait_for_sync: bool = True,
+    sync_timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Validate sources, persist a wiki card under `wiki_root`, and reactively sync `RetrievalIndex`."""
+    clean_slug, clean_title, clean_body, clean_kind, validated_source_ids = _validate_write_wiki_args(
+        slug, title, body, source_chunk_ids, kind, wait_for_sync, sync_timeout
+    )
+
+    _ensure_ready(rt)
+    if (wiki_root := _resolve_wiki_root(rt.config)) is None:
+        raise YawRuntimeError("INVALID_INPUT", "write_wiki_and_sync(): YawConfig.wiki_root must be configured.")
+    corpus_root = require_path(rt.config.corpus_root, "corpus_root")
+    sources = await asyncio.to_thread(
+        _resolve_wiki_sources, get_retrieval_index(rt), validated_source_ids, corpus_root, wiki_root
+    )
+
+    expected_rel = make_wiki_rel_path(f"{clean_slug}.md")
+    wait_evt = asyncio.Event()
+    rt.reconcile_waiters.add(wait_evt)
+    try:
+        card_path, changed = await asyncio.to_thread(
+            write_wiki_card,
+            wiki_root,
+            clean_slug,
+            clean_title,
+            clean_body,
+            sources=sources,
+            kind=clean_kind,
+        )
+        if not rt.pipeline.live:
+            if changed:
+                await aupdate_pipeline_once(rt.pipeline)
+                await asyncio.to_thread(reload_retrieval_index, rt)
+            synced = await asyncio.to_thread(
+                _is_wiki_card_synced, get_retrieval_index(rt), expected_rel, corpus_root, wiki_root
+            )
+        elif not wait_for_sync:
+            synced = await asyncio.to_thread(
+                _is_wiki_card_synced, get_retrieval_index(rt), expected_rel, corpus_root, wiki_root
+            )
+        else:
+            synced = await _await_wiki_card_sync(
+                rt,
+                corpus_root=corpus_root,
+                wiki_root=wiki_root,
+                expected_rel=expected_rel,
+                sync_timeout=float(sync_timeout),
+                wait_evt=wait_evt,
+            )
+    finally:
+        rt.reconcile_waiters.discard(wait_evt)
+
+    return {
+        "slug": clean_slug,
+        "rel_path": expected_rel,
+        "path": str(card_path),
+        "changed": changed,
+        "synced": synced,
+        "card_queued": not synced,
+    }
+
+
+def list_wiki_entries(rt: YawRuntime) -> list[dict[str, Any]]:
+    """Return parsed metadata entries for all active wiki cards under `wiki_root`."""
+    _ensure_ready(rt)
+    if (wiki_root := _resolve_wiki_root(rt.config)) is None:
+        return []
+    return list_wiki_cards(wiki_root)
+
+
+def read_wiki_entry(rt: YawRuntime, slug: str) -> str:
+    """Read LF-normalized Markdown content for a validated wiki card slug under `wiki_root`."""
+    try:
+        clean_slug = validate_wiki_slug(slug)
+    except ValueError as exc:
+        raise YawRuntimeError("INVALID_INPUT", str(exc)) from exc
+    _ensure_ready(rt)
+    if (wiki_root := _resolve_wiki_root(rt.config)) is None:
+        raise YawRuntimeError("INVALID_INPUT", "read_wiki_entry(): YawConfig.wiki_root must be configured.")
+    return read_wiki_card(wiki_root, clean_slug)
+
+
+def lint_workspace(cfg: YawConfig) -> dict[str, Any]:
+    """Run strictly read-only wiki fingerprint linting and return a JSON-ready report dictionary."""
+    return lint_wiki(cfg).to_dict()
 
 
 def recall(rt: YawRuntime, query: str, *, top_k: int = 5) -> tuple[HydratedPassage, ...]:
@@ -661,18 +1100,21 @@ def _run_qa(
     index: RetrievalIndex,
     corpus_root: Path,
     embed_fn: EmbedFn,
-    lm: dspy.LM,
+    lm: dspy.LM | None,
     question: str,
     *,
     lm_lock: AbstractContextManager[Any] | None = None,
 ) -> QAResult:
+    if lm is None:
+        raise YawRuntimeError("MODEL_ERROR", "QA requires a configured qa_model or explicit LM instance.")
     if index.size == 0:
         raise YawRuntimeError("EMPTY_INDEX", "Cannot answer question on an empty corpus index.")
-    tools = make_qa_tools(index, corpus_root, embed_fn, conn, task_mode=cfg.embedding_task_mode)
+    wiki_root = _resolve_wiki_root(cfg)
+    tools = make_qa_tools(index, corpus_root, embed_fn, conn, task_mode=cfg.embedding_task_mode, wiki_root=wiki_root)
     agent = build_qa_agent(tools, max_iters=cfg.react_max_iters, artifact_path=resolve_program_path(cfg))
     lock_ctx = lm_lock if lm_lock is not None else contextlib.nullcontext()
     with lock_ctx, dspy.context(lm=lm):
-        return ask_question(question, corpus_root=corpus_root, index=index, agent=agent)
+        return ask_question(question, corpus_root=corpus_root, index=index, agent=agent, wiki_root=wiki_root)
 
 
 def _ask_with_index(rt: YawRuntime, db_path: Path, corpus_root: Path, index: RetrievalIndex, q: str) -> QAResult:
@@ -693,6 +1135,8 @@ async def aask(rt: YawRuntime, question: str) -> QAResult:
     """Execute bounded bare dspy.ReAct QA asynchronously serialized under async_lm_sem."""
     q = _validate_text_input(question, "Question")
     _ensure_ready(rt)
+    if rt.lm is None:
+        raise YawRuntimeError("MODEL_ERROR", "QA requires a configured qa_model or explicit LM instance.")
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     async with _admit_query_async(rt, "qa"):
@@ -706,6 +1150,8 @@ def ask(rt: YawRuntime, question: str) -> QAResult:
     """Execute bounded bare dspy.ReAct QA synchronously over indexed corpus passages."""
     q = _validate_text_input(question, "Question")
     _ensure_ready(rt)
+    if rt.lm is None:
+        raise YawRuntimeError("MODEL_ERROR", "QA requires a configured qa_model or explicit LM instance.")
     db_path = require_path(rt.config.db_path, "db_path")
     corpus_root = require_path(rt.config.corpus_root, "corpus_root")
     with _admit_query(rt, "qa"):
@@ -717,7 +1163,7 @@ def ask_once(cfg: YawConfig, question: str) -> QAResult:
     """Execute standalone read-only ReAct QA without acquiring the daemon lock."""
     q = _validate_text_input(question, "Question")
     with _open_indexed_search(cfg) as (conn, index, corpus_root):
-        return _run_qa(cfg, conn, index, corpus_root, make_dspy_embed_fn(cfg), create_lm(cfg), q)
+        return _run_qa(cfg, conn, index, corpus_root, make_dspy_embed_fn(cfg), _resolve_active_lm(cfg, None), q)
 
 
 def snapshot_status(rt: YawRuntime) -> DaemonStatus:

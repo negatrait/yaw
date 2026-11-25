@@ -1,4 +1,4 @@
-"""Thin FastMCP Streamable HTTP adapter with loopback Host/Origin 403 guard and unified L3 lifespan."""
+"""Thin FastMCP Streamable HTTP adapter with loopback Host/Origin 403 guard and 4+4 Librarian surface."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import hmac
 import ipaddress
+import json
 import math
 import os
+import re
 import socket
 import sys
 from collections.abc import AsyncGenerator, Callable
@@ -16,7 +18,7 @@ from typing import Annotated, Any
 
 import uvicorn
 from fastmcp import Context, FastMCP
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
 from fastmcp.tools import ToolResult
 from pydantic import Field
 from starlette.middleware import Middleware as StarletteMiddleware
@@ -27,18 +29,33 @@ from yaw.core import DaemonStatus, YawConfig, YawRuntimeError
 from yaw.runtime import (
     YawRuntime,
     acquire_daemon_control,
-    build_recall_payload,
     dump_recall_json,
     format_recall_text,
+    list_wiki_entries,
+    read_wiki_entry,
     redact_secrets,
     runtime_lifespan,
     snapshot_status,
+    write_wiki_and_sync,
 )
 from yaw.runtime import (
-    aask as runtime_aask,
+    aexpand_neighbors_payload as runtime_aexpand_neighbors_payload,
+)
+from yaw.runtime import (
+    aread_chunk_payload as runtime_aread_chunk_payload,
 )
 from yaw.runtime import (
     arecall_payload as runtime_arecall_payload,
+)
+
+_CHUNK_ID_RE = re.compile(r"[1-9]\d*")
+_MCP_INSTRUCTIONS = (
+    "YAW Librarian MCP server (zero-LLM hybrid retrieval + user-editable Markdown wiki). "
+    "Tools: recall(query, top_k=5), expand_neighbors(chunk_id, top_k=6), read_chunk(chunk_id), "
+    "write_wiki(slug, title, body, source_chunk_ids=None, kind='note', wait_for_sync=True). "
+    "Resources: yaw://status (JSON DaemonStatus), yaw://wiki (JSON wiki card index), "
+    "yaw://wiki/{slug*} (Markdown card), yaw://chunk/{chunk_id} (JSON exact chunk slip). "
+    "Multi-hop QA (qa) is CLI-only via `yaw qa` and is not exposed as an MCP tool."
 )
 
 
@@ -127,6 +144,34 @@ class _LoopbackGuardMiddleware:
 
 def _to_tool_error(exc: YawRuntimeError, api_key: str) -> ToolError:
     return ToolError(redact_secrets(str(exc), api_key))
+
+
+def _to_resource_error(exc: YawRuntimeError, api_key: str) -> ResourceError:
+    return ResourceError(redact_secrets(str(exc), api_key))
+
+
+def _resolve_active_rt(ctx: Context | None, holder: dict[str, YawRuntime | None]) -> YawRuntime | None:
+    ctx_rt = ctx.lifespan_context.get("rt") if ctx is not None else None
+    return ctx_rt if isinstance(ctx_rt, YawRuntime) else holder["rt"]
+
+
+def _resolve_tool_rt(ctx: Context | None, holder: dict[str, YawRuntime | None]) -> YawRuntime:
+    active = _resolve_active_rt(ctx, holder)
+    if active is None:
+        raise ToolError("[NOT_READY] Daemon runtime is still starting.")
+    return active
+
+
+def _resolve_resource_rt(ctx: Context | None, holder: dict[str, YawRuntime | None]) -> YawRuntime:
+    active = _resolve_active_rt(ctx, holder)
+    if active is None:
+        raise ResourceError("[NOT_READY] Daemon runtime is still starting.")
+    return active
+
+
+def _render_tool_result(payload: dict[str, Any]) -> ToolResult:
+    dump_recall_json(payload)
+    return ToolResult(content=format_recall_text(payload), structured_content=payload)
 
 
 def _parse_wait_param(request: Request) -> float | None:
@@ -245,50 +290,120 @@ def _register_mcp_tools(mcp: FastMCP, holder: dict[str, YawRuntime | None]) -> N
         top_k: Annotated[int, Field(ge=1, le=20)] = 5,
         ctx: Context | None = None,
     ) -> ToolResult:
-        """Retrieve ranked disk-hydrated corpus passages using zero-LLM RetrievalIndex."""
-        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
-        if active is None:
-            raise ToolError("[NOT_READY] Daemon runtime is still starting.")
+        """Retrieve ranked disk-hydrated corpus and wiki passages using zero-LLM RetrievalIndex."""
+        active = _resolve_tool_rt(ctx, holder)
         try:
             payload = await runtime_arecall_payload(active, query, top_k=top_k)
         except YawRuntimeError as exc:
             raise _to_tool_error(exc, active.config.api_key) from exc
-        dump_recall_json(payload)
-        return ToolResult(content=format_recall_text(payload), structured_content=payload)
-
-    @mcp.tool(
-        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
-    )
-    async def qa(question: Annotated[str, Field(min_length=1)], ctx: Context | None = None) -> dict[str, Any]:
-        """Answer a multi-hop question using bare ReAct grounded in retrieved corpus passages."""
-        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
-        if active is None:
-            raise ToolError("[NOT_READY] Daemon runtime is still starting.")
-        try:
-            res = await runtime_aask(active, question)
-        except YawRuntimeError as exc:
-            raise _to_tool_error(exc, active.config.api_key) from exc
-        return {
-            "question": question.strip(),
-            "answer": res.answer,
-            "turns": int(res.turns),
-            "citations": build_recall_payload(res.passages)["results"],
-        }
+        return _render_tool_result(payload)
 
     @mcp.tool(
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     )
-    async def daemon_status(ctx: Context | None = None) -> dict[str, Any]:
+    async def expand_neighbors(
+        chunk_id: Annotated[int, Field(ge=1)],
+        top_k: Annotated[int, Field(ge=1, le=20)] = 6,
+        ctx: Context | None = None,
+    ) -> ToolResult:
+        """Expand citation, lexical, semantic, and AST-island neighbors around a verified chunk_id."""
+        active = _resolve_tool_rt(ctx, holder)
+        try:
+            payload = await runtime_aexpand_neighbors_payload(active, chunk_id, top_k=top_k)
+        except YawRuntimeError as exc:
+            raise _to_tool_error(exc, active.config.api_key) from exc
+        return _render_tool_result(payload)
+
+    @mcp.tool(
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+    )
+    async def read_chunk(
+        chunk_id: Annotated[int, Field(ge=1)],
+        ctx: Context | None = None,
+    ) -> ToolResult:
+        """Read the exact verified disk span for a single chunk_id."""
+        active = _resolve_tool_rt(ctx, holder)
+        try:
+            payload = await runtime_aread_chunk_payload(active, chunk_id)
+        except YawRuntimeError as exc:
+            raise _to_tool_error(exc, active.config.api_key) from exc
+        return _render_tool_result(payload)
+
+    @mcp.tool(
+        annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+    )
+    async def write_wiki(
+        slug: Annotated[str, Field(min_length=1)],
+        title: Annotated[str, Field(min_length=1)],
+        body: Annotated[str, Field(min_length=1)],
+        source_chunk_ids: list[Annotated[int, Field(ge=1)]] | None = None,
+        kind: str = "note",
+        wait_for_sync: bool = True,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Write a grounded Markdown wiki card under wiki_root and reactively index it."""
+        active = _resolve_tool_rt(ctx, holder)
+        try:
+            return await write_wiki_and_sync(
+                active,
+                slug=slug,
+                title=title,
+                body=body,
+                source_chunk_ids=tuple(source_chunk_ids or ()),
+                kind=kind,
+                wait_for_sync=wait_for_sync,
+            )
+        except YawRuntimeError as exc:
+            raise _to_tool_error(exc, active.config.api_key) from exc
+
+
+def _register_mcp_resources(mcp: FastMCP, holder: dict[str, YawRuntime | None]) -> None:
+    @mcp.resource("yaw://status", mime_type="application/json")
+    async def status_resource(ctx: Context | None = None) -> str:
         """Return a non-blocking redacted snapshot of daemon lifecycle and chunk counts."""
-        active = (ctx.lifespan_context.get("rt") if ctx is not None else None) or holder["rt"]
+        active = _resolve_active_rt(ctx, holder)
         if active is None:
-            return DaemonStatus(
+            st = DaemonStatus(
                 lifecycle="starting",
                 provider_ready=False,
                 sync_state="syncing",
                 pid=os.getpid(),
             ).to_dict()
-        return snapshot_status(active).to_dict()
+        else:
+            st = snapshot_status(active).to_dict()
+        return json.dumps(st)
+
+    @mcp.resource("yaw://wiki", mime_type="application/json")
+    async def wiki_index_resource(ctx: Context | None = None) -> str:
+        """List metadata for all active Markdown wiki cards under wiki_root."""
+        active = _resolve_resource_rt(ctx, holder)
+        try:
+            entries = await asyncio.to_thread(list_wiki_entries, active)
+        except YawRuntimeError as exc:
+            raise _to_resource_error(exc, active.config.api_key) from exc
+        return json.dumps(entries)
+
+    @mcp.resource("yaw://wiki/{slug*}", mime_type="text/markdown")
+    async def wiki_entry_resource(slug: str, ctx: Context | None = None) -> str:
+        """Read a single validated Markdown wiki card confined strictly inside wiki_root."""
+        active = _resolve_resource_rt(ctx, holder)
+        try:
+            return await asyncio.to_thread(read_wiki_entry, active, slug)
+        except YawRuntimeError as exc:
+            raise _to_resource_error(exc, active.config.api_key) from exc
+
+    @mcp.resource("yaw://chunk/{chunk_id}", mime_type="application/json")
+    async def chunk_resource(chunk_id: str, ctx: Context | None = None) -> str:
+        """Read the exact verified disk span slip payload for chunk_id."""
+        raw_cid = chunk_id.strip()
+        if not _CHUNK_ID_RE.fullmatch(raw_cid):
+            raise ResourceError(f"[INVALID_INPUT] Invalid chunk_id={chunk_id!r}.")
+        active = _resolve_resource_rt(ctx, holder)
+        try:
+            payload = await runtime_aread_chunk_payload(active, int(raw_cid))
+        except YawRuntimeError as exc:
+            raise _to_resource_error(exc, active.config.api_key) from exc
+        return dump_recall_json(payload)
 
 
 def _resolve_mount_path(rt: YawRuntime | None, cfg: YawConfig | None, http_path: str | None) -> str:
@@ -331,9 +446,10 @@ def create_mcp_app(
         else (rt.ready_evt if rt is not None and rt.ready_evt is not None else asyncio.Event())
     )
     lifespan = _build_mcp_lifespan(rt, cfg, runtime_lifespan_factory, holder, evt)
-    mcp = FastMCP("yaw", strict_input_validation=True, lifespan=lifespan)
+    mcp = FastMCP("yaw", instructions=_MCP_INSTRUCTIONS, strict_input_validation=True, lifespan=lifespan)
     _register_http_routes(mcp, holder, evt, control_token, stop_cb)
     _register_mcp_tools(mcp, holder)
+    _register_mcp_resources(mcp, holder)
     app = mcp.http_app(path=mount_path, middleware=[StarletteMiddleware(_LoopbackGuardMiddleware)])
     return mcp, app
 

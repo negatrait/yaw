@@ -3,6 +3,8 @@
 [paths]
 # Directory watched and indexed into SQLite.
 corpus_root = "corpus"
+# Optional visible user-editable Librarian wiki directory watched alongside corpus_root.
+# wiki_root = "wiki"
 # Primary SQLite database storing plain ROWID chunks (<f2> embeddings), FTS5/fts5vocab, rabitq_index, and citation_graph.
 db_path = ".yaw/yaw.db"
 # Exclusive file lock guarding daemon and write access to yaw.db.

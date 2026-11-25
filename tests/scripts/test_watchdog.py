@@ -115,6 +115,7 @@ def test_snapshot_reads_real_sqlite_fts_locks_json_and_metrics(tmp_path: Path, p
 
     assert set(snap["databases"]) == {"yaw.db", "optimize_yaw.db"}
     assert snap["databases"]["yaw.db"]["chunks"] == 2
+    assert snap["databases"]["yaw.db"]["wiki_chunks"] == 0
     assert snap["databases"]["yaw.db"]["tables"] == [
         "chunk_fts",
         "chunk_vocab",
@@ -233,3 +234,16 @@ def test_snapshot_respects_custom_paths_from_yaw_toml(tmp_path: Path) -> None:
     assert snap["status"] == {"lifecycle": "ready", "num_chunks": 4}
     assert snap["dspy_status"] == {"state": "running"}
     assert snap["dspy_gepa_audit"] == {"best_val_score": 0.91}
+
+
+def test_snapshot_counts_wiki_chunks_when_rel_path_present(tmp_path: Path) -> None:
+    db_path = tmp_path / ".yaw" / "yaw.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE chunks (chunk_id INTEGER PRIMARY KEY, rel_path TEXT NOT NULL, embedding_f16 BLOB)")
+        conn.execute("INSERT INTO chunks VALUES (1, 'alpha.md', X'0000')")
+        conn.execute("INSERT INTO chunks VALUES (2, 'wiki:card.md', X'0000')")
+        conn.commit()
+    snap = watchdog.get_active_snapshot(tmp_path, include_llm_metrics=False)
+    assert snap["databases"]["yaw.db"]["chunks"] == 2
+    assert snap["databases"]["yaw.db"]["wiki_chunks"] == 1

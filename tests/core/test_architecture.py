@@ -42,6 +42,7 @@ _CANONICAL_DOCS_INVENTORY = frozenset(
         "epic-1-hipporag-daemon.md",
         "epic-2-fastmcp-http.md",
         "epic-3-performance.md",
+        "epic-4-retrieval-refinements.md",
         "evaluation-graph-storage.md",
         "evaluation-inference.md",
         "evaluation-ingestion.md",
@@ -66,9 +67,12 @@ _ALLOWED_DOMAIN_IMPORTS: dict[str, frozenset[str]] = {
     "yaw.retrieval": frozenset({"yaw.retrieval", "yaw.core"}),
     "yaw.pipeline": frozenset({"yaw.pipeline", "yaw.core", "yaw.retrieval"}),
     "yaw.qa": frozenset({"yaw.qa", "yaw.core", "yaw.retrieval"}),
-    "yaw.runtime": frozenset({"yaw.runtime", "yaw.core", "yaw.retrieval", "yaw.pipeline", "yaw.qa"}),
+    "yaw.wiki": frozenset({"yaw.wiki", "yaw.core", "yaw.retrieval", "yaw.qa"}),
+    "yaw.runtime": frozenset({"yaw.runtime", "yaw.core", "yaw.retrieval", "yaw.pipeline", "yaw.qa", "yaw.wiki"}),
     "yaw.mcp_server": frozenset({"yaw.mcp_server", "yaw.core", "yaw.runtime"}),
-    "yaw.optimize": frozenset({"yaw.optimize", "yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval"}),
+    "yaw.optimize": frozenset(
+        {"yaw.optimize", "yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.wiki"}
+    ),
     "yaw.cli": frozenset({"yaw.cli", "yaw.core", "yaw.mcp_server", "yaw.optimize", "yaw.runtime"}),
     "yaw.__main__": frozenset({"yaw.__main__", "yaw.cli"}),
 }
@@ -379,7 +383,7 @@ def _yaw_domain(dotted_name: str) -> str:
 
 
 def is_allowed_internal_import(importer_pkg: str, imported_mod: str) -> bool:
-    """Validate monotonic L0-L6 layer DAG containment and downward intra-package imports."""
+    """Validate monotonic L0-L7 layer DAG containment and downward intra-package imports."""
     if imported_mod != "yaw" and not imported_mod.startswith("yaw."):
         return True
     if imported_mod == "yaw":
@@ -569,14 +573,14 @@ def _build_rule12_specs(
         "retrieval": _Rule12Spec(
             stdlib | {"numpy", "scipy", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval"},
-            {"dspy", "cocoindex", "scripts"} | http_mods,
+            {"dspy", "cocoindex", "yaml", "markdown_it", "scripts"} | http_mods,
             # Narrow L1 carve-out: pure Rust BLAKE2b string hashing with zero Tokio/Env/App state.
             allowed_exact=frozenset({"cocoindex.connectorkits.fingerprint"}),
         ),
         "pipeline": _Rule12Spec(
             stdlib | {"cocoindex", "dspy", "numpy", "openai", "sqlite3", "yaw"},
             {"yaw.core", "yaw.retrieval", "yaw.pipeline"},
-            {"scripts"},
+            {"yaml", "markdown_it", "scripts"},
             forbidden_prefixes=("cocoindex._internal",),
         ),
         "qa": _Rule12Spec(
@@ -584,9 +588,14 @@ def _build_rule12_specs(
             {"yaw.core", "yaw.retrieval", "yaw.qa"},
             {"cocoindex", "scripts"} | http_mods,
         ),
+        "wiki": _Rule12Spec(
+            stdlib | {"dspy", "numpy", "sqlite3", "yaml", "yaw"},
+            {"yaw.core", "yaw.retrieval", "yaw.qa", "yaw.wiki"},
+            {"cocoindex", "fastmcp", "starlette", "uvicorn", "markdown_it", "scripts"} | http_mods,
+        ),
         "runtime": _Rule12Spec(
             stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
-            {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.runtime"},
+            {"yaw.core", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.wiki", "yaw.runtime"},
             {"cocoindex", "fastmcp", "starlette", "uvicorn", "scripts"},
         ),
         "mcp_server": _Rule12Spec(
@@ -596,7 +605,7 @@ def _build_rule12_specs(
         ),
         "optimize": _Rule12Spec(
             stdlib | {"dspy", "filelock", "numpy", "sqlite3", "yaw"},
-            {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.optimize"},
+            {"yaw.core", "yaw.datasets", "yaw.pipeline", "yaw.qa", "yaw.retrieval", "yaw.wiki", "yaw.optimize"},
             {"scripts"},
         ),
         "cli": _Rule12Spec(
@@ -674,15 +683,18 @@ class ArchitectureTests(unittest.TestCase):
             )
 
     def test_leaf_package_facades_allow_contract_import_without_knowing_file(self):
-        """Rule 1b: yaw.core exports its slim public contract and retired legacy files stay absent."""
+        """Rule 1b: yaw.core and yaw.wiki export slim public contracts and retired legacy files stay absent."""
         import yaw.core as core
+        import yaw.wiki as wiki
         from yaw.core import (
+            WIKI_REL_PREFIX,
             ChunkPointer,
             DaemonStatus,
             HydratedPassage,
             QAResult,
             YawConfig,
             YawRuntimeError,
+            advance_markdown_fence,
             compute_chunk_int_id,
             configure_logging,
             format_doc_for_embedding,
@@ -690,21 +702,57 @@ class ArchitectureTests(unittest.TestCase):
             get_config_value,
             get_logger,
             inclusive_end_line,
+            is_wiki_rel_path,
+            leading_frontmatter_end,
             load_config,
+            make_wiki_rel_path,
             parse_dataset_list,
             redact_secrets,
             render_document_text,
             resolve_coco_state_root,
             resolve_corpus_path,
+            resolve_source_path,
             set_config_value,
+            strip_wiki_rel_path,
             write_text_atomic,
             write_via_temp_atomic,
         )
+        from yaw.wiki import (
+            LintIssue,
+            LintReport,
+            ScoutCardSignature,
+            WikiCard,
+            WikiCardSource,
+            is_fresh_passage,
+            is_ignored_wiki_rel,
+            lint_wiki,
+            list_wiki_cards,
+            parse_wiki_card,
+            read_wiki_card,
+            render_wiki_card,
+            should_queue_scout,
+            synthesize_scout_card,
+            validate_wiki_slug,
+            write_wiki_card,
+        )
 
-        for cls in (ChunkPointer, DaemonStatus, HydratedPassage, QAResult, YawConfig):
+        self.assertEqual(WIKI_REL_PREFIX, "wiki:")
+        for cls in (
+            ChunkPointer,
+            DaemonStatus,
+            HydratedPassage,
+            QAResult,
+            YawConfig,
+            WikiCard,
+            WikiCardSource,
+            LintIssue,
+            LintReport,
+            ScoutCardSignature,
+        ):
             self.assertTrue(isinstance(cls, type))
         self.assertTrue(issubclass(YawRuntimeError, RuntimeError))
         for fn in (
+            advance_markdown_fence,
             compute_chunk_int_id,
             configure_logging,
             format_doc_for_embedding,
@@ -712,15 +760,31 @@ class ArchitectureTests(unittest.TestCase):
             get_config_value,
             get_logger,
             inclusive_end_line,
+            is_wiki_rel_path,
+            leading_frontmatter_end,
             load_config,
+            make_wiki_rel_path,
             parse_dataset_list,
             redact_secrets,
             render_document_text,
             resolve_coco_state_root,
             resolve_corpus_path,
+            resolve_source_path,
             set_config_value,
+            strip_wiki_rel_path,
             write_text_atomic,
             write_via_temp_atomic,
+            is_fresh_passage,
+            is_ignored_wiki_rel,
+            lint_wiki,
+            list_wiki_cards,
+            parse_wiki_card,
+            read_wiki_card,
+            render_wiki_card,
+            should_queue_scout,
+            synthesize_scout_card,
+            validate_wiki_slug,
+            write_wiki_card,
         ):
             self.assertTrue(callable(fn))
 
@@ -736,14 +800,17 @@ class ArchitectureTests(unittest.TestCase):
             self.assertFalse(hasattr(core, retired), f"Retired symbol {retired} leaked through yaw.core")
 
         self.assertTrue(all(not name.startswith("_") for name in core.__all__))
+        self.assertTrue(all(not name.startswith("_") for name in wiki.__all__))
         with self.assertRaises(AttributeError):
             _ = core._parse_config_scalar
+        with self.assertRaises(AttributeError):
+            _ = wiki._lint_single_card
 
         self.assertFalse((YAW_DIR / "daemon").exists(), "Retired yaw/daemon/ directory must remain absent")
         self.assertFalse((YAW_DIR / "core" / "constants.py").exists(), "Retired yaw/core/constants.py must be deleted")
 
     def test_domain_containment_and_zero_cross_domain_imports(self):
-        """Rule 2 & 3: Monotonic L0-L6 DAG containment with zero upward or horizontal cross-domain edges."""
+        """Rule 2 & 3: Monotonic L0-L7 DAG containment with zero upward or horizontal cross-domain edges."""
         py_files = sorted(YAW_DIR.rglob("*.py"))
         self.assertGreater(len(py_files), 0, "No .py files found in yaw/")
 
@@ -800,7 +867,7 @@ class ArchitectureTests(unittest.TestCase):
         )
 
     def test_synthetic_boundary_violation_detection(self):
-        """Verify monotonic L0-L6 DAG checks reject L0->L1, same-layer sibling, and upward edges."""
+        """Verify monotonic L0-L7 DAG checks reject L0->L1, same-layer sibling, and upward edges."""
         # L0 -> higher layers forbidden; own descendants allowed
         self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.datasets"))
         self.assertFalse(is_allowed_internal_import("yaw.core", "yaw.retrieval"))
@@ -819,6 +886,10 @@ class ArchitectureTests(unittest.TestCase):
         self.assertFalse(is_allowed_internal_import("yaw.retrieval", "yaw.pipeline"))
         self.assertFalse(is_allowed_internal_import("yaw.pipeline", "yaw.runtime"))
         self.assertFalse(is_allowed_internal_import("yaw.qa", "yaw.runtime"))
+        self.assertFalse(is_allowed_internal_import("yaw.qa", "yaw.wiki"))
+        self.assertFalse(is_allowed_internal_import("yaw.wiki", "yaw.pipeline"))
+        self.assertFalse(is_allowed_internal_import("yaw.wiki", "yaw.runtime"))
+        self.assertFalse(is_allowed_internal_import("yaw.wiki", "yaw.mcp_server"))
         self.assertFalse(is_allowed_internal_import("yaw.runtime", "yaw.mcp_server"))
         self.assertFalse(is_allowed_internal_import("yaw.mcp_server", "yaw.cli"))
         self.assertFalse(is_allowed_internal_import("yaw.cli", "yaw.__main__"))
@@ -835,8 +906,13 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(is_allowed_internal_import("yaw.retrieval.sub", "yaw.core.types"))
         self.assertTrue(is_allowed_internal_import("yaw.pipeline", "yaw.retrieval.graph"))
         self.assertTrue(is_allowed_internal_import("yaw.qa", "yaw.retrieval"))
+        self.assertTrue(is_allowed_internal_import("yaw.wiki", "yaw.core"))
+        self.assertTrue(is_allowed_internal_import("yaw.wiki", "yaw.retrieval"))
+        self.assertTrue(is_allowed_internal_import("yaw.wiki", "yaw.qa"))
         self.assertTrue(is_allowed_internal_import("yaw.runtime", "yaw.pipeline"))
+        self.assertTrue(is_allowed_internal_import("yaw.runtime", "yaw.wiki"))
         self.assertTrue(is_allowed_internal_import("yaw.optimize", "yaw.datasets"))
+        self.assertTrue(is_allowed_internal_import("yaw.optimize", "yaw.wiki"))
         self.assertTrue(is_allowed_internal_import("yaw.mcp_server", "yaw.runtime"))
         self.assertTrue(is_allowed_internal_import("yaw.cli", "yaw.mcp_server"))
         self.assertTrue(is_allowed_internal_import("yaw.__main__", "yaw.cli"))
@@ -972,6 +1048,7 @@ class ArchitectureTests(unittest.TestCase):
                 "pipeline.md",
                 "runtime.md",
                 "qa.md",
+                "wiki.md",
                 "tests.md",
                 "canonical-files.md",
                 "docs.md",
@@ -1208,7 +1285,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(broken_links, [], "Broken relative Markdown links found:\n" + "\n".join(broken_links))
 
     def test_every_doc_is_reachable_from_rules_and_canonical_inventory(self):
-        """Rule 11: docs/ matches the canonical 16-file inventory, every doc is reachable, and nav rows stay current."""
+        """Rule 11: docs/ matches the canonical 17-file inventory, every doc is reachable, and nav rows stay current."""
         actual_docs = {p.name for p in DOCS_DIR.glob("*.md")}
         self.assertEqual(
             actual_docs,
@@ -1217,7 +1294,7 @@ class ArchitectureTests(unittest.TestCase):
             f"Missing: {sorted(_CANONICAL_DOCS_INVENTORY - actual_docs)}",
         )
 
-        domain_rules = ("core.md", "retrieval.md", "pipeline.md", "runtime.md", "qa.md", "tests.md")
+        domain_rules = ("core.md", "retrieval.md", "pipeline.md", "runtime.md", "qa.md", "wiki.md", "tests.md")
         linked_docs: set[str] = set()
         for rule_name in domain_rules:
             rule_file = RULES_DIR / rule_name
@@ -1256,6 +1333,7 @@ class ArchitectureTests(unittest.TestCase):
             "epic-1-hipporag-daemon.md",
             "epic-2-fastmcp-http.md",
             "epic-3-performance.md",
+            "epic-4-retrieval-refinements.md",
             "native-cocoindex-indexing.md",
             "native-cocoindex-graph.md",
             "dspy-improvements.md",
@@ -1318,7 +1396,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(asymmetric_peers, [], "Asymmetric Tier-2 Peers rows:\n" + "\n".join(asymmetric_peers))
 
     def test_canonical_module_purity_and_behavioral_contracts(self):
-        """Rule 12: Monotonic L0-L6 DAG, zero wrappers/legacy terms, recursive yaw/ & scripts/ allowlists."""
+        """Rule 12: Monotonic L0-L7 DAG, zero wrappers/legacy terms, recursive yaw/ & scripts/ allowlists."""
         stdlib = set(sys.stdlib_module_names)
         py_files = sorted(YAW_DIR.rglob("*.py"))
         self.assertGreater(len(py_files), 0, "No Python files found in yaw/")
@@ -1540,6 +1618,72 @@ class ArchitectureTests(unittest.TestCase):
             bad_attr_hits, _ = _find_private_attr_violations([bad_attr_pipeline])
             self.assertEqual(len(bad_attr_hits), 1)
 
+    def test_rule12_wiki_and_yaml_markdown_boundaries(self):
+        """Verify L3 yaw.wiki boundaries and forbidden yaml/markdown_it imports in L1/L2."""
+        yaw_rules, _ = _build_rule12_specs(set(sys.stdlib_module_names))
+        wiki_spec = yaw_rules["wiki"]
+        retrieval_spec = yaw_rules["retrieval"]
+        pipeline_spec = yaw_rules["pipeline"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            ok_wiki = tmp_path / "wiki_ok.py"
+            ok_wiki.write_text(
+                "\n".join(
+                    [
+                        "import yaml",
+                        "import dspy",
+                        "from yaw.retrieval import verify_source_fingerprint",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _validate_import_boundary(
+                    ok_wiki,
+                    wiki_spec.allowed_top,
+                    wiki_spec.allowed_yaw,
+                    wiki_spec.forbidden,
+                    allowed_exact=wiki_spec.allowed_exact,
+                    forbidden_prefixes=wiki_spec.forbidden_prefixes,
+                ),
+                [],
+            )
+
+            for idx, snippet in enumerate(
+                [
+                    "import cocoindex\n",
+                    "import yaw.runtime\n",
+                    "from yaw.pipeline import start_pipeline\n",
+                    "import markdown_it\n",
+                ]
+            ):
+                bad_wiki = tmp_path / f"wiki_bad_{idx}.py"
+                bad_wiki.write_text(snippet, encoding="utf-8")
+                hits = _validate_import_boundary(
+                    bad_wiki,
+                    wiki_spec.allowed_top,
+                    wiki_spec.allowed_yaw,
+                    wiki_spec.forbidden,
+                    allowed_exact=wiki_spec.allowed_exact,
+                    forbidden_prefixes=wiki_spec.forbidden_prefixes,
+                )
+                self.assertGreater(len(hits), 0, f"Expected Rule 12 rejection in wiki for {snippet!r}")
+
+            for name, spec in (("retrieval", retrieval_spec), ("pipeline", pipeline_spec)):
+                for mod_idx, snippet in enumerate(("import yaml\n", "import markdown_it\n")):
+                    bad_mod = tmp_path / f"{name}_bad_{mod_idx}.py"
+                    bad_mod.write_text(snippet, encoding="utf-8")
+                    hits = _validate_import_boundary(
+                        bad_mod,
+                        spec.allowed_top,
+                        spec.allowed_yaw,
+                        spec.forbidden,
+                        allowed_exact=spec.allowed_exact,
+                        forbidden_prefixes=spec.forbidden_prefixes,
+                    )
+                    self.assertGreater(len(hits), 0, f"Expected Rule 12 rejection in {name} for {snippet!r}")
+
     def test_purged_dependencies_banned_across_yaw(self):
         """Rule 13: Purged dependencies (sqlite_vec, spacy, en_core_web_sm, optuna) are absent across all yaw/**."""
         banned_pkgs = {"sqlite_vec", "spacy", "en_core_web_sm", "optuna"}
@@ -1605,10 +1749,20 @@ class ArchitectureTests(unittest.TestCase):
         dev_deps = list(data["dependency-groups"]["dev"])
         runtime_names = _req_names(runtime_deps)
         dev_names = _req_names(dev_deps)
+        self.assertIn("pyyaml", runtime_names)
         self.assertNotIn("matplotlib", runtime_names)
         self.assertNotIn("psutil", runtime_names)
         self.assertIn("matplotlib", dev_names)
         self.assertIn("psutil", dev_names)
+
+        ruff_lint = data["tool"]["ruff"]["lint"]
+        complexity_code = "C" + "901"
+        self.assertIn(complexity_code, ruff_lint["select"])
+        self.assertNotIn(complexity_code, ruff_lint.get("ignore", []))
+        self.assertNotIn(complexity_code, ruff_lint.get("extend-ignore", []))
+        for ignored_codes in ruff_lint.get("per-file-ignores", {}).values():
+            self.assertNotIn(complexity_code, ignored_codes)
+        self.assertEqual(ruff_lint["mccabe"]["max-complexity"], 15)
         coco_deps = [d for d in runtime_deps if d.lower().startswith("cocoindex")]
         self.assertTrue(
             any(d.startswith("cocoindex>=1.2.0") for d in coco_deps),

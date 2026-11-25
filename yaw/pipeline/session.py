@@ -22,7 +22,7 @@ from numpy.typing import NDArray
 from yaw.core import YawConfig, YawRuntimeError, resolve_coco_state_root
 
 from .embedder import EMBEDDER, DspyBatchEmbedder, PipelineEmbedder, make_dspy_embed_fn
-from .flow import CORPUS_ROOT, SQLITE_DB, indexing_main
+from .flow import CORPUS_ROOT, SQLITE_DB, WIKI_ROOT, indexing_main
 from .targets import SINK_TRACKER, SinkMutationTracker, open_managed_db, reconcile_index_tables
 
 WORKER_ERROR_TYPES: tuple[type[Exception], ...] = (
@@ -67,6 +67,7 @@ class PipelineSession:
     embedder: PipelineEmbedder
     conn_mgr: sqlite.ManagedConnection
     live: bool
+    wiki_root: Path | None = None
     env: coco.Environment | None = None
     app: coco.App[Any, Any] | None = None
     sink_tracker: SinkMutationTracker | None = None
@@ -138,6 +139,7 @@ def _build_coco_env_and_app(
     *,
     state_dir: Path,
     corpus_root: Path,
+    wiki_root: Path | None,
     conn_mgr: sqlite.ManagedConnection,
     embedder: PipelineEmbedder,
     cfg: YawConfig,
@@ -149,6 +151,8 @@ def _build_coco_env_and_app(
     tracker = SinkMutationTracker()
     ctx = coco.ContextProvider()
     ctx.provide(CORPUS_ROOT, corpus_root)
+    if wiki_root is not None:
+        ctx.provide(WIKI_ROOT, wiki_root)
     ctx.provide(SQLITE_DB, conn_mgr)
     ctx.provide(EMBEDDER, embedder)
     ctx.provide(SINK_TRACKER, tracker)
@@ -170,6 +174,7 @@ def _build_coco_env_and_app(
             cfg.min_chunk_size,
             cfg.embedding_task_mode,
             live,
+            wiki_root is not None,
         )
         success = True
         return env, app, tracker
@@ -205,6 +210,7 @@ async def _reconcile_until_settled(
             embedding_model=session.embedding_model,
             task_mode=session.task_mode,
             corpus_root=session.corpus_root,
+            wiki_root=session.wiki_root,
         )
         changed_any = changed_any or changed
         last_reconciled_seq = seq_snapshot
@@ -404,11 +410,14 @@ def _prepare_session_paths(
     cfg: YawConfig,
     embed_fn: Callable[[list[str]], NDArray[np.float32]] | None,
     app_name: str | None,
-) -> tuple[Path, Path, Path, sqlite.ManagedConnection, PipelineEmbedder, str]:
+) -> tuple[Path, Path, Path, Path | None, sqlite.ManagedConnection, PipelineEmbedder, str]:
     assert cfg.db_path is not None and cfg.state_dir is not None and cfg.corpus_root is not None
     db_path = Path(cfg.db_path).resolve()
     corpus_root = Path(cfg.corpus_root).resolve()
     corpus_root.mkdir(parents=True, exist_ok=True)
+    wiki_root = Path(cfg.wiki_root).resolve() if cfg.wiki_root is not None else None
+    if wiki_root is not None:
+        wiki_root.mkdir(parents=True, exist_ok=True)
     state_dir = resolve_coco_state_root(cfg.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("COCOINDEX_BANNER", "false")
@@ -421,7 +430,7 @@ def _prepare_session_paths(
         max_in_flight=cfg.embed_max_in_flight,
     )
     resolved_app = app_name or f"yaw_{fingerprint_str(db_path.as_posix()).hex()[:12]}"
-    return db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app
+    return db_path, state_dir, corpus_root, wiki_root, conn_mgr, embedder, resolved_app
 
 
 @contextlib.asynccontextmanager
@@ -436,7 +445,9 @@ async def open_pipeline_lifespan(
 ) -> AsyncGenerator[PipelineSession]:
     """Run declarative CocoIndex lifecycle directly on the caller's asyncio event loop."""
     loop = asyncio.get_running_loop()
-    db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(cfg, embed_fn, app_name)
+    db_path, state_dir, corpus_root, wiki_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(
+        cfg, embed_fn, app_name
+    )
     ready_event = asyncio.Event()
     err_lock = threading.Lock()
     holder: dict[str, Any] = {"session": None, "error": None}
@@ -456,6 +467,7 @@ async def open_pipeline_lifespan(
         env, app, tracker = _build_coco_env_and_app(
             state_dir=state_dir,
             corpus_root=corpus_root,
+            wiki_root=wiki_root,
             conn_mgr=conn_mgr,
             embedder=embedder,
             cfg=cfg,
@@ -475,6 +487,7 @@ async def open_pipeline_lifespan(
             embedder=embedder,
             conn_mgr=conn_mgr,
             live=live,
+            wiki_root=wiki_root,
             env=env,
             app=app,
             sink_tracker=tracker,
@@ -519,6 +532,7 @@ async def open_pipeline_lifespan(
                 embedding_model=cfg.embedding_model,
                 task_mode=cfg.embedding_task_mode,
                 corpus_root=corpus_root,
+                wiki_root=wiki_root,
             )
             if on_reconciled is not None:
                 await on_reconciled(changed, True)
@@ -545,7 +559,9 @@ def start_pipeline(
             "INVALID_INPUT",
             "start_pipeline() supports live=False only; use open_pipeline_lifespan() for live pipelines.",
         )
-    db_path, state_dir, corpus_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(cfg, embed_fn, app_name)
+    db_path, state_dir, corpus_root, wiki_root, conn_mgr, embedder, resolved_app = _prepare_session_paths(
+        cfg, embed_fn, app_name
+    )
     return PipelineSession(
         db_path=db_path,
         state_dir=state_dir,
@@ -557,6 +573,7 @@ def start_pipeline(
         embedder=embedder,
         conn_mgr=conn_mgr,
         live=False,
+        wiki_root=wiki_root,
     )
 
 
@@ -568,6 +585,7 @@ async def _run_catchup_action(session: PipelineSession, *, drop: bool) -> None:
     env, app, _ = _build_coco_env_and_app(
         state_dir=session.state_dir,
         corpus_root=session.corpus_root,
+        wiki_root=session.wiki_root,
         conn_mgr=session.conn_mgr,
         embedder=session.embedder,
         cfg=session.cfg,
@@ -597,6 +615,27 @@ def update_pipeline_once(session: PipelineSession) -> None:
         embedding_model=session.embedding_model,
         task_mode=session.task_mode,
         corpus_root=session.corpus_root,
+        wiki_root=session.wiki_root,
+    )
+
+
+async def aupdate_pipeline_once(session: PipelineSession) -> None:
+    """Execute one catch-up CocoIndex update on an active session App or fallback catch-up session."""
+    if session.error is not None:
+        raise session.error
+    if session.app is None:
+        await asyncio.to_thread(update_pipeline_once, session)
+        return
+    await session.app.update(live=False).result()
+    if session.error is not None:
+        raise session.error
+    await _to_thread_joined(
+        reconcile_index_tables,
+        session.conn_mgr,
+        embedding_model=session.embedding_model,
+        task_mode=session.task_mode,
+        corpus_root=session.corpus_root,
+        wiki_root=session.wiki_root,
     )
 
 

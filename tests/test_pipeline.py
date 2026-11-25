@@ -1385,6 +1385,7 @@ def test_live_pipeline_shutdown_joins_inflight_reconcile_before_closing_db(
         embedding_model: str,
         task_mode: str,
         corpus_root: Path | str,
+        wiki_root: Path | str | None = None,
     ) -> bool:
         nonlocal call_count
         call_count += 1
@@ -1398,6 +1399,7 @@ def test_live_pipeline_shutdown_joins_inflight_reconcile_before_closing_db(
                 embedding_model=embedding_model,
                 task_mode=task_mode,
                 corpus_root=corpus_root,
+                wiki_root=wiki_root,
             )
         except BaseException as exc:
             reconcile_errors.append(exc)

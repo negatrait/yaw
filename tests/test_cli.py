@@ -34,6 +34,7 @@ from yaw.pipeline import close_pipeline, make_dspy_embed_fn, start_pipeline, upd
 from yaw.qa import build_qa_agent
 from yaw.retrieval import build_retrieval_index, open_readonly_db
 from yaw.runtime import control_token_path
+from yaw.wiki import WikiCardSource, parse_wiki_card, write_wiki_card
 
 _CID_IN_TEXT_RE = re.compile(r"\[chunk_id=(\d+)\]")
 _FORBIDDEN_WORDS = ("mani" + "fold", "h" + "mm", "hippo" + "rag")
@@ -164,6 +165,7 @@ def _write_toml(
     chunk_size: int = 160,
     chunk_overlap: int = 20,
     min_chunk_size: int = 20,
+    wiki_root: str | None = None,
 ) -> Path:
     toml_path = root / "yaw.toml"
     mcp_port = http_port if http_port is not None else _free_port()
@@ -172,6 +174,7 @@ def _write_toml(
             [
                 "[paths]",
                 'corpus_root = "corpus"',
+                *([f'wiki_root = "{wiki_root}"'] if wiki_root is not None else []),
                 'db_path = ".yaw/yaw.db"',
                 'lock_path = ".yaw/yaw.db.lock"',
                 'state_dir = ".yaw/coco_lmdb"',
@@ -1244,5 +1247,89 @@ def test_cli_recall_sparse_next_links_and_stale_drift(tmp_path: Path, capsys: py
 
         assert main(["recall", q, "--top-k", "2", "--config", str(toml_path)]) == 0
         assert "[STALE ON DISK] source.md" in capsys.readouterr().out
+    finally:
+        srv.shutdown()
+
+
+def test_cli_lint_empty_clean_and_stale_drift(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from yaw.cli import main
+
+    srv, _ = _start_openai_stub()
+    try:
+        unconfigured = tmp_path / "unconfigured"
+        unconfigured.mkdir()
+        toml_none = _write_toml(unconfigured, port=srv.server_port)
+        assert main(["lint", "--config", str(toml_none), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["ok"] is True
+
+        ws = tmp_path / "wiki_ws"
+        ws.mkdir()
+        toml_wiki = _write_toml(
+            ws, port=srv.server_port, wiki_root="wiki", chunk_size=400, chunk_overlap=0, min_chunk_size=10
+        )
+        cfg = load_config(toml_wiki)
+        assert cfg.corpus_root is not None and cfg.wiki_root is not None and cfg.db_path is not None
+        cfg.corpus_root.mkdir(parents=True)
+        cfg.wiki_root.mkdir(parents=True)
+        assert main(["lint", "--config", str(toml_wiki)]) == 0
+        assert "ok:" in capsys.readouterr().out
+
+        alpha_path = cfg.corpus_root / "alpha.md"
+        orig_text = "# Alpha Spec\nOrbital booster calibration note alpha_01.\n"
+        alpha_path.write_text(orig_text, encoding="utf-8")
+        _index_corpus(cfg)
+
+        with contextlib.closing(open_readonly_db(cfg.db_path)) as conn:
+            idx = build_retrieval_index(conn, expected_embedding_model=cfg.embedding_model)
+        ptr = idx.pointers[0]
+        write_wiki_card(
+            cfg.wiki_root,
+            slug="alpha-note",
+            title="Alpha Note",
+            body="Summary citing alpha.md.",
+            sources=(
+                WikiCardSource(
+                    rel_path=ptr.rel_path, start_line=ptr.start_line, end_line=ptr.end_line, source_hash=ptr.source_hash
+                ),
+            ),
+        )
+        _index_corpus(cfg)
+        assert main(["lint", "--config", str(toml_wiki), "--json"]) == 0
+        clean_rep = json.loads(capsys.readouterr().out)
+        assert clean_rep["ok"] is True and clean_rep["cards_checked"] == 1 and clean_rep["stale_cards"] == []
+
+        st_orig = alpha_path.stat()
+        edited_text = "# Alpha Spec\nOrbital booster calibration note BETA_999.\n"
+        assert len(edited_text.encode("utf-8")) == len(orig_text.encode("utf-8"))
+        alpha_path.write_text(edited_text, encoding="utf-8")
+        os.utime(alpha_path, ns=(st_orig.st_atime_ns, st_orig.st_mtime_ns))
+
+        assert main(["lint", "--config", str(toml_wiki), "--json"]) == 1
+        pre_rep = json.loads(capsys.readouterr().out)
+        assert pre_rep["ok"] is False and pre_rep["stale_cards"] == ["alpha-note.md"]
+        assert any(issue["code"] == "STALE_SOURCE" for issue in pre_rep["issues"])
+        card_file = cfg.wiki_root / "alpha-note.md"
+        assert parse_wiki_card(card_file, cfg.wiki_root).sources[0].source_hash == ptr.source_hash
+
+        alpha_path.write_text(
+            "# Alpha Spec\nOrbital booster calibration post-reindex drift revision.\n",
+            encoding="utf-8",
+        )
+        _index_corpus(cfg)
+        assert main(["lint", "--config", str(toml_wiki), "--json"]) == 1
+        post_rep = json.loads(capsys.readouterr().out)
+        assert post_rep["ok"] is False and post_rep["stale_cards"] == ["alpha-note.md"]
+        card_after = parse_wiki_card(card_file, cfg.wiki_root)
+        assert card_after.sources[0].source_hash == ptr.source_hash
+
+        write_wiki_card(cfg.wiki_root, slug="marked-stale", title="Marked Stale", body="Old card.", stale=True)
+        _index_corpus(cfg)
+        assert main(["lint", "--config", str(toml_wiki), "--json"]) == 1
+        marked_rep = json.loads(capsys.readouterr().out)
+        assert marked_rep["ok"] is False and "marked-stale.md" in marked_rep["stale_cards"]
+        assert any(issue["code"] == "CARD_MARKED_STALE" for issue in marked_rep["issues"])
+        assert parse_wiki_card(cfg.wiki_root / "marked-stale.md", cfg.wiki_root).stale is True
+        assert main(["lint", "--config", str(toml_wiki)]) == 1
+        assert "stale" in capsys.readouterr().out
     finally:
         srv.shutdown()

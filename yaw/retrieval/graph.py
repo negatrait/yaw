@@ -134,9 +134,11 @@ def _resolve_doc_titles_and_chunks(
     pointers: Sequence[ChunkPointer],
     distinct_paths: Sequence[str],
     corpus_root: Path,
+    *,
+    wiki_root: Path | None = None,
 ) -> tuple[list[str], tuple[str, ...], dict[str, str]]:
     md_paths = [dp for dp in distinct_paths if is_markdown_path(dp)]
-    ct, disk_titles = hydrate_corpus_chunks(pointers, corpus_root, extract_titles_for=md_paths)
+    ct, disk_titles = hydrate_corpus_chunks(pointers, corpus_root, extract_titles_for=md_paths, wiki_root=wiki_root)
     doc_titles_tup = tuple(DASH_RE.sub("-", disk_titles.get(dp, "")) for dp in distinct_paths)
     doc_titles_norm = {dp: dt for dp, dt in zip(distinct_paths, doc_titles_tup, strict=True) if dt}
     return ct, doc_titles_tup, doc_titles_norm
@@ -297,13 +299,18 @@ def build_citation_graph(
     distinct_paths: Sequence[str],
     path_idx_arr: NDArray[np.uint32],
     corpus_root: Path | str,
+    *,
+    wiki_root: Path | str | None = None,
 ) -> CitationGraph:
     """Hydrate corpus chunks once and build CSR title-reference and 1-bit PMI graphs."""
     c_root = require_corpus_dir(corpus_root)
+    w_root = require_corpus_dir(wiki_root) if wiki_root is not None else None
     n = len(pointers)
     nd = len(distinct_paths)
     dc_indptr, dc_indices = build_dc_csr(path_idx_arr, nd)
-    ct, doc_titles_tup, doc_titles_norm = _resolve_doc_titles_and_chunks(pointers, distinct_paths, c_root)
+    ct, doc_titles_tup, doc_titles_norm = _resolve_doc_titles_and_chunks(
+        pointers, distinct_paths, c_root, wiki_root=w_root
+    )
     db = max(4, math.ceil(math.sqrt(max(1, n))))
     prop_nouns, w_df, bg_post = _collect_corpus_vocab_stats(ct)
     fi, fx, ri, rx = _build_citation_csr(ct, path_idx_arr, pointers, doc_titles_norm, prop_nouns, n, nd, db)
@@ -471,9 +478,15 @@ def unpack_citation_graph_blob(blob: bytes, path_idx: NDArray[np.uint32], nd_exp
     )
 
 
-def compute_index_artifacts(rows: Sequence[Any], corpus_root: Path | str) -> IndexArtifacts:
+def compute_index_artifacts(
+    rows: Sequence[Any],
+    corpus_root: Path | str,
+    *,
+    wiki_root: Path | str | None = None,
+) -> IndexArtifacts:
     """Compute 1-bit SoA RaBitQ codes, Shannon d_eff, and compressed CitationGraph blobs from chunk rows."""
     c_root = require_corpus_dir(corpus_root)
+    w_root = require_corpus_dir(wiki_root) if wiki_root is not None else None
     if not rows:
         empty = hashlib.sha256(b"").hexdigest()
         return IndexArtifacts(0, 0, empty, empty, 0, b"", b"", b"", 0.0, b"", b"")
@@ -488,7 +501,7 @@ def compute_index_artifacts(rows: Sequence[Any], corpus_root: Path | str) -> Ind
     codes, ip_norm = pack_rabitq_soa(unit, rot)
     w = (dim + 63) // 64
     _cids, pointers, distinct_paths, path_idx_arr = build_chunk_pointers(rows)
-    cg = build_citation_graph(pointers, distinct_paths, path_idx_arr, c_root)
+    cg = build_citation_graph(pointers, distinct_paths, path_idx_arr, c_root, wiki_root=w_root)
     doc_titles_map = {dp: dt for dp, dt in zip(distinct_paths, cg.doc_titles, strict=True) if dt}
     doc_titles_blob = pack_doc_titles_blob(doc_titles_map)
     graph_blob = pack_citation_graph_blob(cg)

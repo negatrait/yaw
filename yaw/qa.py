@@ -112,11 +112,16 @@ def _require_chunk_pos(index: RetrievalIndex, chunk_id: int) -> int:
 
 
 def _hydrate_ids(
-    index: RetrievalIndex, ranked: Sequence[tuple[int, float]], corpus_root: Path
+    index: RetrievalIndex,
+    ranked: Sequence[tuple[int, float]],
+    corpus_root: Path,
+    *,
+    wiki_root: Path | None = None,
 ) -> tuple[HydratedPassage, ...]:
     """Hydrate exactly the requested chunk ids from disk, in order and without span deduplication."""
     return tuple(
-        hydrate_passage(index.pointers[index.id_to_pos[cid]], corpus_root, score=score) for cid, score in ranked
+        hydrate_passage(index.pointers[index.id_to_pos[cid]], corpus_root, score=score, wiki_root=wiki_root)
+        for cid, score in ranked
     )
 
 
@@ -127,6 +132,7 @@ def make_qa_tools(
     conn: sqlite3.Connection | Path,
     *,
     task_mode: str = "distinct-titled",
+    wiki_root: Path | None = None,
 ) -> list[dspy.Tool]:
     """Build closure-bound retrieval tools with explicit DSPy schemas for dspy.ReAct."""
 
@@ -147,7 +153,9 @@ def make_qa_tools(
         q_vec = raw_emb[0] if raw_emb.ndim == 2 else raw_emb.reshape(-1)
         with _tool_conn() as db_conn:
             res = search_index(index, q_vec, query_text=q, conn=db_conn, top_k=k, pool_k=max(k * 4, 50))
-        passages = hydrate_ranked_passages(index, res.ranked, corpus_root, top_k=k, include_island=True)
+        passages = hydrate_ranked_passages(
+            index, res.ranked, corpus_root, top_k=k, include_island=True, wiki_root=wiki_root
+        )
         return format_recall_text(build_recall_payload(passages))
 
     def lexical_grep(query: str, top_k: int = 10) -> str:
@@ -159,7 +167,9 @@ def make_qa_tools(
         with _tool_conn() as db_conn:
             ranked = lexical_search(index, q, db_conn, top_k=max(k * 4, 50))
         return format_recall_text(
-            build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True))
+            build_recall_payload(
+                hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True, wiki_root=wiki_root)
+            )
         )
 
     def expand_neighbors(chunk_id: int, top_k: int = 6) -> str:
@@ -170,16 +180,20 @@ def make_qa_tools(
             return format_recall_text(build_recall_payload(()))
         with _tool_conn() as db_conn:
             ranked = expand_citation_neighbors(
-                index, chunk_id, corpus_root=corpus_root, conn=db_conn, top_k=max(k * 4, 50)
+                index, chunk_id, corpus_root=corpus_root, wiki_root=wiki_root, conn=db_conn, top_k=max(k * 4, 50)
             )
         return format_recall_text(
-            build_recall_payload(hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True))
+            build_recall_payload(
+                hydrate_ranked_passages(index, ranked, corpus_root, top_k=k, include_island=True, wiki_root=wiki_root)
+            )
         )
 
     def read_chunk(chunk_id: int) -> str:
         """Read the exact hydrated passage for a single chunk_id."""
         _require_chunk_pos(index, chunk_id)
-        return format_recall_text(build_recall_payload(_hydrate_ids(index, [(chunk_id, 1.0)], corpus_root)))
+        return format_recall_text(
+            build_recall_payload(_hydrate_ids(index, [(chunk_id, 1.0)], corpus_root, wiki_root=wiki_root))
+        )
 
     return [
         dspy.Tool(search_passages, arg_desc=_QUERY_DESC),
@@ -258,7 +272,13 @@ def build_qa_agent(
 
 
 def ask_question(
-    question: str, *, index: RetrievalIndex, corpus_root: Path, agent: dspy.Module, max_citations: int = 5
+    question: str,
+    *,
+    index: RetrievalIndex,
+    corpus_root: Path,
+    agent: dspy.Module,
+    max_citations: int = 5,
+    wiki_root: Path | None = None,
 ) -> QAResult:
     if not isinstance(question, str) or not (q := question.strip()):
         raise YawRuntimeError("INVALID_INPUT", "question must be a non-empty string.")
@@ -292,7 +312,9 @@ def ask_question(
         inline_ids
         or [cid for cid, _ in sorted(seen_scores.items(), key=lambda x: (-x[1][0], x[1][1])) if cid in index.id_to_pos]
     )[:max_citations]
-    citations = _hydrate_ids(index, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root)
+    citations = _hydrate_ids(
+        index, [(cid, seen_scores[cid][0]) for cid in chosen_ids], corpus_root, wiki_root=wiki_root
+    )
     if any(hp.stale_on_disk for hp in citations):
         raise YawRuntimeError("CONSISTENCY_ERROR", "Cited passage failed disk fingerprint verification.")
 

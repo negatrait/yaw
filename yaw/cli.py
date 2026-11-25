@@ -36,6 +36,7 @@ from yaw.runtime import (
     control_token_path,
     dump_recall_json,
     format_recall_text,
+    lint_workspace,
     read_db_chunk_count,
     recall_once_payload,
     require_path,
@@ -501,6 +502,23 @@ def _cmd_qa(cfg: YawConfig, question: str) -> dict[str, Any]:
     }
 
 
+def _format_lint_text(report: dict[str, Any]) -> str:
+    status = "ok" if report.get("ok") else "failed"
+    cards_checked = int(report.get("cards_checked", 0))
+    stale_cards = report.get("stale_cards") or ()
+    issues = report.get("issues") or ()
+    if not issues:
+        return f"{status}: checked {cards_checked} wiki card(s), 0 issues."
+    lines = [
+        f"{status}: checked {cards_checked} wiki card(s), {len(stale_cards)} stale, {len(issues)} issue(s)",
+        *(
+            f"[{str(issue['severity']).upper()}] {issue['code']} {issue['card_rel_path']}: {issue['detail']}"
+            for issue in issues
+        ),
+    ]
+    return "\n".join(lines)
+
+
 def _redact_config_value(key: str | None, val: Any) -> Any:
     if isinstance(val, dict):
         return {k: ("[REDACTED]" if k == "api_key" and v else v) for k, v in val.items()}
@@ -546,6 +564,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_qa = sub.add_parser("qa", parents=[common], help="Run ReAct multi-hop question answering")
     p_qa.add_argument("question", help="Question to answer")
+
+    sub.add_parser("lint", parents=[common], help="Verify wiki cards against physical disk fingerprints")
 
     p_opt = sub.add_parser("optimize", parents=[common], help="Optimize QA prompts with GEPA")
     sub_opt = p_opt.add_subparsers(dest="optimize_cmd", required=True)
@@ -596,6 +616,9 @@ def _dispatch_command(args: argparse.Namespace, config_path: Path | None, err_ct
         cites = format_recall_text({"results": payload["citations"]}) if payload["citations"] else ""
         text = f"{payload['answer']}\n\n{cites}" if cites else payload["answer"]
         return payload, text
+    if args.command == "lint":
+        payload = lint_workspace(cfg)
+        return payload, _format_lint_text(payload)
 
     from yaw.optimize import optimize_dspy
 
@@ -651,7 +674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         with contextlib.redirect_stdout(sys.stderr) if json_out else contextlib.nullcontext():
             payload, text = _dispatch_command(args, config_path, err_ctx)
         _emit(payload, json_out=json_out, text=text)
-        return 0
+        return 1 if args.command == "lint" and not bool(payload.get("ok", False)) else 0
     except (YawRuntimeError, ValueError, KeyError, FileNotFoundError, OSError, http.client.HTTPException) as exc:
         api_key = _resolve_error_api_key(args, config_path, err_ctx)
         msg = redact_secrets(str(exc), api_key)

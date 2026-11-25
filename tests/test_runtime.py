@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -23,11 +24,13 @@ import fastmcp
 import filelock
 import numpy as np
 import pytest
+from dspy.utils.exceptions import DSPyError
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from numpy.typing import NDArray
 
+import yaw.runtime as yaw_runtime
 from yaw.core import YawConfig, YawRuntimeError
 from yaw.pipeline import DspyBatchEmbedder
 from yaw.qa import build_qa_agent
@@ -36,6 +39,8 @@ from yaw.runtime import (
     YawRuntime,
     aask,
     acquire_daemon_control,
+    aexpand_neighbors_payload,
+    aread_chunk_payload,
     arecall,
     arecall_payload,
     ask,
@@ -48,6 +53,9 @@ from yaw.runtime import (
     format_recall_text,
     get_retrieval_index,
     get_status,
+    lint_workspace,
+    list_wiki_entries,
+    read_wiki_entry,
     recall,
     recall_once,
     recall_once_payload,
@@ -60,6 +68,7 @@ from yaw.runtime import (
     start_runtime,
     sync_embed_concurrency_limit,
     wait_ready_async,
+    write_wiki_and_sync,
 )
 
 
@@ -1024,3 +1033,514 @@ def test_arecall_awaits_dspy_batch_embedder_acall_under_l3_semaphores(
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_tier0_zero_slm_mode_and_wiki_apis(tmp_path: Path) -> None:
+    cfg = replace(_make_cfg(tmp_path), qa_model="", wiki_root=tmp_path / "wiki")
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
+    (cfg.corpus_root / "alpha.md").write_text(
+        "# Alpha Booster\nOrbital booster valve calibration baseline.\n",
+        encoding="utf-8",
+    )
+
+    async def _run() -> None:
+        async with runtime_lifespan(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=None) as rt:
+            assert rt.lm is None and rt.scout_queue is None
+            res = await arecall_payload(rt, "orbital booster", top_k=2)
+            assert len(res["results"]) >= 1 and "card_queued" not in res
+            cid = int(res["results"][0]["chunk_id"])
+
+            written = await write_wiki_and_sync(
+                rt,
+                slug="t0-note",
+                title="Tier Zero Note",
+                body="Synthesized orbital booster baseline citing [[alpha.md]].",
+                source_chunk_ids=[cid],
+            )
+            assert written["changed"] is True and written["synced"] is True
+            assert len(list_wiki_entries(rt)) == 1
+            assert "Tier Zero Note" in read_wiki_entry(rt, "t0-note")
+            assert (await aread_chunk_payload(rt, cid))["results"][0]["chunk_id"] == cid
+            assert isinstance((await aexpand_neighbors_payload(rt, cid, top_k=4))["results"], list)
+            assert lint_workspace(cfg)["ok"] is True
+
+            with pytest.raises(YawRuntimeError) as exc_qa:
+                await aask(rt, "Who?")
+            assert exc_qa.value.code == "MODEL_ERROR"
+
+    asyncio.run(_run())
+    with pytest.raises(YawRuntimeError) as exc_once:
+        ask_once(cfg, "Who?")
+    assert exc_once.value.code == "MODEL_ERROR"
+
+
+def test_write_wiki_and_sync_reactive_event_persistence_and_stale_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(_make_cfg(tmp_path), qa_model="", wiki_root=tmp_path / "wiki")
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
+    alpha_path = cfg.corpus_root / "alpha.md"
+    alpha_path.write_text("# Apollo 11\nNeil Armstrong commanded Apollo 11.\n", encoding="utf-8")
+
+    async def _run() -> None:
+        async with runtime_lifespan(cfg, live=True, wait_for_ready=True, embed_fn=_topic_embed, lm=None) as rt:
+            apollo_hits = await arecall_payload(rt, "Apollo 11", top_k=2)
+            alpha_cid = int(apollo_hits["results"][0]["chunk_id"])
+
+            sleep_calls: list[float] = []
+
+            async def _no_poll_sleep(delay: float) -> None:
+                sleep_calls.append(delay)
+                raise AssertionError(f"write_wiki_and_sync must await Event reactively, not sleep({delay})")
+
+            with monkeypatch.context() as mp:
+                mp.setattr(asyncio, "sleep", _no_poll_sleep)
+                res = await write_wiki_and_sync(
+                    rt,
+                    slug="reactive-card",
+                    title="Reactive Card",
+                    body="Reactive wiki card indexed without polling.",
+                    source_chunk_ids=[alpha_cid],
+                    wait_for_sync=True,
+                )
+            assert sleep_calls == []
+            assert res["changed"] is True and res["synced"] is True and res["card_queued"] is False
+            assert "wiki:reactive-card.md" in get_retrieval_index(rt).doc_titles
+
+            queued = await write_wiki_and_sync(
+                rt,
+                slug="async-card",
+                title="Async Card",
+                body="Queued card body.",
+                wait_for_sync=False,
+            )
+            assert queued["changed"] is True and queued["synced"] is False and queued["card_queued"] is True
+
+            alpha_path.write_text("# Apollo 11\nModified disk text after indexing.\n", encoding="utf-8")
+            with pytest.raises(YawRuntimeError) as exc_stale:
+                await write_wiki_and_sync(
+                    rt,
+                    slug="stale-src",
+                    title="Stale Source",
+                    body="Should reject stale disk file.",
+                    source_chunk_ids=[alpha_cid],
+                )
+            assert exc_stale.value.code == "CONSISTENCY_ERROR"
+
+    asyncio.run(_run())
+
+    rt_restart = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=None)
+    try:
+        assert "wiki:reactive-card.md" in get_retrieval_index(rt_restart).doc_titles
+    finally:
+        close_runtime(rt_restart)
+
+
+def test_background_scout_queue_with_and_without_slm(tmp_path: Path) -> None:
+    chat_gate = threading.Event()
+    lm_calls = {"count": 0}
+
+    class _ScoutStubHandler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            lm_calls["count"] += 1
+            chat_gate.wait(timeout=10.0)
+            if "response_format" in req:
+                content = json.dumps(
+                    {
+                        "slug": "scout-bridge",
+                        "title": "Scout Bridge",
+                        "kind": "note",
+                        "body": "Grounded Apollo telemetry synthesis note.",
+                    }
+                )
+            else:
+                content = (
+                    "[[ ## slug ## ]]\nscout-bridge\n"
+                    "[[ ## title ## ]]\nScout Bridge\n"
+                    "[[ ## kind ## ]]\nnote\n"
+                    "[[ ## body ## ]]\nGrounded Apollo telemetry synthesis note.\n"
+                    "[[ ## completed ## ]]"
+                )
+            body = json.dumps(
+                {
+                    "id": "chatcmpl-scout",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma-4-e4b",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _ScoutStubHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg_slm = replace(
+            _make_cfg(tmp_path / "with_slm"),
+            base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+            wiki_root=tmp_path / "with_slm" / "wiki",
+        )
+        assert cfg_slm.corpus_root is not None and cfg_slm.wiki_root is not None
+        cfg_slm.corpus_root.mkdir(parents=True)
+        cfg_slm.wiki_root.mkdir(parents=True)
+        for idx in range(4):
+            (cfg_slm.corpus_root / f"doc_{idx}.md").write_text(
+                f"# Apollo Note {idx}\nApollo lunar telemetry record {idx} details booster state.\n",
+                encoding="utf-8",
+            )
+
+        async def _run_slm() -> None:
+            async with runtime_lifespan(
+                cfg_slm, live=True, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(cfg_slm)
+            ) as rt:
+                assert rt.scout_queue is not None
+                t0 = time.monotonic()
+                payload = await arecall_payload(rt, "Apollo lunar telemetry", top_k=1)
+                assert time.monotonic() - t0 < 2.0
+                assert payload["card_queued"] is True
+
+                wait_evt = asyncio.Event()
+                rt.reconcile_waiters.add(wait_evt)
+                try:
+                    chat_gate.set()
+                    deadline = time.monotonic() + 15.0
+                    while "wiki:scout-bridge.md" not in get_retrieval_index(rt).doc_titles:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, "Background scout card was not indexed in time"
+                        wait_evt.clear()
+                        await asyncio.wait_for(wait_evt.wait(), timeout=remaining)
+                finally:
+                    rt.reconcile_waiters.discard(wait_evt)
+                assert any(e["slug"] == "scout-bridge" for e in list_wiki_entries(rt))
+
+        asyncio.run(_run_slm())
+        assert lm_calls["count"] >= 1
+
+        lm_calls["count"] = 0
+        cfg_no_slm = replace(
+            _make_cfg(tmp_path / "no_slm"),
+            base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+            qa_model="",
+            wiki_root=tmp_path / "no_slm" / "wiki",
+        )
+        assert cfg_no_slm.corpus_root is not None and cfg_no_slm.wiki_root is not None
+        cfg_no_slm.corpus_root.mkdir(parents=True)
+        cfg_no_slm.wiki_root.mkdir(parents=True)
+        for idx in range(4):
+            (cfg_no_slm.corpus_root / f"doc_{idx}.md").write_text(
+                f"# Apollo Note {idx}\nApollo lunar telemetry record {idx} details booster state.\n",
+                encoding="utf-8",
+            )
+
+        async def _run_no_slm() -> None:
+            async with runtime_lifespan(
+                cfg_no_slm, live=True, wait_for_ready=True, embed_fn=_topic_embed, lm=None
+            ) as rt:
+                assert rt.lm is None and rt.scout_queue is None
+                payload = await arecall_payload(rt, "Apollo lunar telemetry", top_k=1)
+                assert "card_queued" not in payload
+
+        asyncio.run(_run_no_slm())
+        assert lm_calls["count"] == 0
+    finally:
+        chat_gate.set()
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_scout_stale_filtering_mixed_sources_and_lm_sem_serialization(tmp_path: Path) -> None:
+    lm_calls = {"count": 0}
+    hold_reingest = threading.Event()
+    hold_reingest.set()
+
+    def guarded_embed(texts: list[str]) -> NDArray[np.float32]:
+        if any("STALE_DISK_EDIT" in t for t in texts):
+            hold_reingest.wait(timeout=10.0)
+        return _topic_embed(texts)
+
+    class _MixedRuntimeScoutHandler(BaseHTTPRequestHandler):
+        @override
+        def log_message(self, format: str, *args: Any) -> None:
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            lm_calls["count"] += 1
+            fields = {
+                "slug": "mixed-scout-card",
+                "title": "Mixed Scout Card",
+                "kind": "note",
+                "body": "Synthesized strictly from fresh source.",
+            }
+            if "response_format" in req:
+                content = json.dumps(fields)
+            elif "<slug>" in "\n".join(str(m.get("content", "")) for m in req.get("messages", [])):
+                content = (
+                    f"<slug>{fields['slug']}</slug>\n"
+                    f"<title>{fields['title']}</title>\n"
+                    f"<kind>{fields['kind']}</kind>\n"
+                    f"<body>{fields['body']}</body>\n"
+                )
+            else:
+                content = (
+                    f"[[ ## slug ## ]]\n{fields['slug']}\n"
+                    f"[[ ## title ## ]]\n{fields['title']}\n"
+                    f"[[ ## kind ## ]]\n{fields['kind']}\n"
+                    f"[[ ## body ## ]]\n{fields['body']}\n"
+                    "[[ ## completed ## ]]"
+                )
+            body = json.dumps(
+                {
+                    "id": "chatcmpl-mixed-rt",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma-4-e4b",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _MixedRuntimeScoutHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = replace(
+            _make_cfg(tmp_path / "mixed_scout"),
+            base_url=f"http://127.0.0.1:{srv.server_port}/v1",
+            wiki_root=tmp_path / "mixed_scout" / "wiki",
+        )
+        assert cfg.corpus_root is not None and cfg.wiki_root is not None
+        cfg.corpus_root.mkdir(parents=True)
+        cfg.wiki_root.mkdir(parents=True)
+        stale_file = cfg.corpus_root / "doc_stale.md"
+        fresh_file = cfg.corpus_root / "doc_fresh.md"
+        stale_file.write_text(
+            "# Stale\nQuasarStaleOnly QuasarStaleOnly orbital booster valve specification.\n", encoding="utf-8"
+        )
+        fresh_file.write_text(
+            "# Fresh\nSharedRoverTelemetry SharedRoverTelemetry apollo lunar moon commander.\n", encoding="utf-8"
+        )
+        for idx in range(6):
+            (cfg.corpus_root / f"extra_{idx}.md").write_text(
+                f"# Extra {idx}\nApollo lunar orbital booster valve archive record {idx}.\n",
+                encoding="utf-8",
+            )
+
+        async def _run() -> None:
+            async with runtime_lifespan(
+                cfg, live=True, wait_for_ready=True, embed_fn=guarded_embed, lm=create_lm(cfg)
+            ) as rt:
+                # 1. Corrupt stale_file on disk while holding live re-ingest; all-stale recall must NOT queue scout.
+                hold_reingest.clear()
+                stale_file.write_text("# Stale\nSTALE_DISK_EDIT breaks fingerprint match.\n", encoding="utf-8")
+                all_stale_payload = await arecall_payload(rt, "QuasarStaleOnly", top_k=1)
+                assert all_stale_payload["results"][0]["source"]["rel_posix_path"] == "doc_stale.md"
+                assert all_stale_payload["results"][0].get("stale") is True
+                assert "card_queued" not in all_stale_payload
+                await asyncio.sleep(0.15)
+                assert lm_calls["count"] == 0
+
+                # 2. Mixed fresh+stale passages: hold rt.lm_sem to verify scout serializes on rt.lm_sem,
+                #    then verify persisted card cites ONLY fresh_file.
+                assert rt.lm_sem.acquire(timeout=2.0)
+                try:
+                    mixed_payload = await arecall_payload(
+                        rt, "QuasarStaleOnly SharedRoverTelemetry orbital apollo", top_k=2
+                    )
+                    rels = {r["source"]["rel_posix_path"]: r.get("stale", False) for r in mixed_payload["results"]}
+                    assert rels == {"doc_stale.md": True, "doc_fresh.md": False}
+                    assert mixed_payload["card_queued"] is True
+                    await asyncio.sleep(0.15)
+                    assert lm_calls["count"] == 0
+                finally:
+                    rt.lm_sem.release()
+
+                wait_evt = asyncio.Event()
+                rt.reconcile_waiters.add(wait_evt)
+                try:
+                    deadline = time.monotonic() + 15.0
+                    while "wiki:mixed-scout-card.md" not in get_retrieval_index(rt).doc_titles:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, "Mixed-source scout card was not indexed in time"
+                        wait_evt.clear()
+                        await asyncio.wait_for(wait_evt.wait(), timeout=remaining)
+                finally:
+                    rt.reconcile_waiters.discard(wait_evt)
+
+                assert lm_calls["count"] >= 1
+                entries = {e["slug"]: e for e in list_wiki_entries(rt)}
+                assert "mixed-scout-card" in entries
+                src_paths = [s["rel_path"] for s in entries["mixed-scout-card"]["sources"]]
+                assert src_paths == ["doc_fresh.md"]
+
+        asyncio.run(_run())
+    finally:
+        hold_reingest.set()
+        srv.shutdown()
+        srv.server_close()
+
+
+async def _assert_invalid_id_and_wiki_inputs(rt: YawRuntime) -> None:
+    bad_ids: tuple[Any, ...] = (0, -1, True, False, "1", 1.5)
+    for bad_id in bad_ids:
+        with pytest.raises(YawRuntimeError) as exc_exp:
+            await aexpand_neighbors_payload(rt, bad_id)
+        assert exc_exp.value.code == "INVALID_INPUT"
+
+        with pytest.raises(YawRuntimeError) as exc_read:
+            await aread_chunk_payload(rt, bad_id)
+        assert exc_read.value.code == "INVALID_INPUT"
+
+        with pytest.raises(YawRuntimeError) as exc_wiki:
+            await write_wiki_and_sync(
+                rt,
+                slug="card",
+                title="Card",
+                body="Body",
+                source_chunk_ids=[bad_id],
+            )
+        assert exc_wiki.value.code == "INVALID_INPUT"
+
+    with pytest.raises(YawRuntimeError) as exc_slug:
+        read_wiki_entry(rt, "../escape")
+    assert exc_slug.value.code == "INVALID_INPUT"
+
+
+def test_positive_chunk_id_and_wiki_validation_precedence(tmp_path: Path) -> None:
+    cfg = replace(_make_cfg(tmp_path), qa_model="", wiki_root=tmp_path / "wiki")
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
+
+    async def _run() -> None:
+        async with runtime_lifespan(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=None) as rt:
+            rt.lifecycle = "starting"
+            await _assert_invalid_id_and_wiki_inputs(rt)
+            with pytest.raises(YawRuntimeError) as exc_nr_exp:
+                await aexpand_neighbors_payload(rt, 1)
+            assert exc_nr_exp.value.code == "NOT_READY"
+            with pytest.raises(YawRuntimeError) as exc_nr_read:
+                await aread_chunk_payload(rt, 1)
+            assert exc_nr_read.value.code == "NOT_READY"
+            with pytest.raises(YawRuntimeError) as exc_nr_wiki:
+                await write_wiki_and_sync(rt, slug="card", title="Card", body="Body", source_chunk_ids=[1])
+            assert exc_nr_wiki.value.code == "NOT_READY"
+            with pytest.raises(YawRuntimeError) as exc_nr_rwiki:
+                read_wiki_entry(rt, "card")
+            assert exc_nr_rwiki.value.code == "NOT_READY"
+            rt.lifecycle = "ready"
+
+        assert rt.lifecycle == "stopped"
+        await _assert_invalid_id_and_wiki_inputs(rt)
+        with pytest.raises(YawRuntimeError) as exc_sd_exp:
+            await aexpand_neighbors_payload(rt, 1)
+        assert exc_sd_exp.value.code == "SHUTTING_DOWN"
+        with pytest.raises(YawRuntimeError) as exc_sd_read:
+            await aread_chunk_payload(rt, 1)
+        assert exc_sd_read.value.code == "SHUTTING_DOWN"
+        with pytest.raises(YawRuntimeError) as exc_sd_wiki:
+            await write_wiki_and_sync(rt, slug="card", title="Card", body="Body", source_chunk_ids=[1])
+        assert exc_sd_wiki.value.code == "SHUTTING_DOWN"
+        with pytest.raises(YawRuntimeError) as exc_sd_rwiki:
+            read_wiki_entry(rt, "card")
+        assert exc_sd_rwiki.value.code == "SHUTTING_DOWN"
+
+    asyncio.run(_run())
+
+
+def test_scout_error_handling_narrows_to_recoverable_and_propagates_bugs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = replace(
+        _make_cfg(tmp_path / "scout_errors"),
+        base_url="http://127.0.0.1:1/v1",
+        wiki_root=tmp_path / "scout_errors" / "wiki",
+    )
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
+    for idx in range(4):
+        (cfg.corpus_root / f"doc_{idx}.md").write_text(
+            f"# Apollo Note {idx}\nApollo lunar telemetry record {idx} details booster state.\n",
+            encoding="utf-8",
+        )
+
+    lm = create_lm(cfg)
+    recoverable = iter(
+        [
+            YawRuntimeError("MODEL_ERROR", "transient scout failure"),
+            DSPyError("malformed dspy output"),
+        ]
+    )
+
+    def _raise_recoverable(*_args: Any, **_kwargs: Any) -> tuple[str, str, str, str] | None:
+        raise next(recoverable)
+
+    monkeypatch.setattr(yaw_runtime, "synthesize_scout_card", _raise_recoverable)
+    runtime_logger = logging.getLogger("yaw.runtime")
+    runtime_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger="yaw.runtime")
+    try:
+
+        async def _run_recoverable() -> None:
+            async with runtime_lifespan(cfg, live=True, wait_for_ready=True, embed_fn=_topic_embed, lm=lm) as rt:
+                assert rt.scout_queue is not None
+                for _ in range(2):
+                    payload = await arecall_payload(rt, "Apollo lunar telemetry", top_k=1)
+                    assert payload["card_queued"] is True
+                await asyncio.wait_for(rt.scout_queue.join(), timeout=5.0)
+                assert rt.lifecycle == "ready"
+                assert rt.last_error is None
+
+        asyncio.run(_run_recoverable())
+        warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+        assert any("YawRuntimeError: [MODEL_ERROR] transient scout failure" in msg for msg in warnings)
+        assert any("DSPyError: malformed dspy output" in msg for msg in warnings)
+
+        caplog.clear()
+
+        def _raise_type_error(*_args: Any, **_kwargs: Any) -> tuple[str, str, str, str] | None:
+            raise TypeError("unexpected scout bug")
+
+        monkeypatch.setattr(yaw_runtime, "synthesize_scout_card", _raise_type_error)
+
+        async def _run_bug() -> None:
+            async with runtime_lifespan(cfg, live=True, wait_for_ready=True, embed_fn=_topic_embed, lm=lm) as rt:
+                assert rt.scout_queue is not None
+                payload = await arecall_payload(rt, "Apollo lunar telemetry", top_k=1)
+                assert payload["card_queued"] is True
+                await asyncio.wait_for(rt.scout_queue.join(), timeout=5.0)
+                assert rt.lifecycle == "error"
+                assert rt.last_error is not None and "TypeError: unexpected scout bug" in rt.last_error
+
+        with pytest.raises(TypeError, match="unexpected scout bug"):
+            asyncio.run(_run_bug())
+        assert not any(
+            "unexpected scout bug" in rec.getMessage() and rec.levelno == logging.WARNING for rec in caplog.records
+        )
+    finally:
+        runtime_logger.removeHandler(caplog.handler)

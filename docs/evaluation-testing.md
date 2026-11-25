@@ -413,3 +413,12 @@ none were suppressed. All 36 production source hashes match the final data.
 benchmark.py now measures **538 / 627 lines (85.81%)**. Complete production
 development coverage is **10,589 / 12,211 lines = 86.7169%, 1,622 missing and
 0 excluded**. The 100% goal and fresh complete-suite acceptance remain open.
+
+---
+
+## 44. Sprint 3.3 `U5` Tests & Blocking `C901 <= 15` (2026-11-25)
+
+- Added real-substrate librarian wiki suite [tests/test_wiki.py](../tests/test_wiki.py) covering YAML frontmatter metadata (`pyyaml`), native CocoIndex `# Heading Title` parsing, dual-root `notes.md` vs `wiki:notes.md` collision isolation, pre- and post-reindex `lint_wiki` drift without clearing `stale: true`/hashes, `should_queue_scout`, and `synthesize_scout_card`.
+- Extended [tests/core/test_types.py](../tests/core/test_types.py), [tests/test_mcp_server.py](../tests/test_mcp_server.py), [tests/test_runtime.py](../tests/test_runtime.py), [tests/test_cli.py](../tests/test_cli.py), and [tests/scripts/test_watchdog.py](../tests/scripts/test_watchdog.py) for `leading_frontmatter_end`/`markdown_heading_level`, `4+4` FastMCP tools/resources + `instructions`, Tier-0 zero-SLM mode (`qa_model = ""`), reactive `reconcile_waiters` `asyncio.Event` in `write_wiki_and_sync` (`0` polling), background `asyncio.Queue` wiki scouting (narrowed recoverable exception handling), `yaw lint`, and `wiki_chunks` counting.
+- Refactored remaining production and test functions to enforce blocking Ruff `C901 <= 15` with zero `# noqa` / `C901` suppressions across `yaw/`, `scripts/`, and `tests/`.
+- **Verification:** `uv run --offline --locked ty check` (`0`), `uv run --offline --locked ruff check` (`0`, blocking `C901 <= 15`), `uv run --offline --locked ruff format --check` (`74` files), `git diff --check` (`0`), `uv run --offline --locked pytest -o addopts=""` (`433 passed`); Critic `R4` `FINDINGS: ZERO`.

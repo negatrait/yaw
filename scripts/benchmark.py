@@ -15,8 +15,9 @@ import contextlib
 import gc
 import hashlib
 import json
+import sqlite3
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -73,6 +74,7 @@ from yaw.qa import (
     strip_inline_citations,
 )
 from yaw.retrieval import (
+    RetrievalIndex,
     build_retrieval_index,
     hydrate_ranked_passages,
     open_readonly_db,
@@ -258,6 +260,119 @@ def print_benchmark_summary(
     print(f"{'=' * 72}\n", flush=True)
 
 
+def _load_normalized_dpr_embeddings(conn: sqlite3.Connection, num_chunks: int, dim: int) -> NDArray[np.float32]:
+    if num_chunks <= 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    emb_rows = conn.execute("SELECT embedding_f16 FROM chunks ORDER BY chunk_id ASC").fetchall()
+    if len(emb_rows) != num_chunks:
+        raise RuntimeError(f"Chunk embedding row count mismatch: {len(emb_rows)} != {num_chunks}")
+    dpr_raw = np.frombuffer(b"".join(bytes(r[0]) for r in emb_rows), dtype="<f2").reshape(num_chunks, dim)
+    dpr_f32 = dpr_raw.astype(np.float32)
+    dpr_norms = np.linalg.norm(dpr_f32, axis=1, keepdims=True)
+    if np.any(dpr_norms <= 1e-12) or not np.all(np.isfinite(dpr_f32)):
+        raise RuntimeError("Indexed float16 embeddings contain zero-norm or non-finite vectors")
+    return (dpr_f32 / dpr_norms).astype(np.float32, copy=False)
+
+
+def _dpr_retrieve_passages(
+    index: RetrievalIndex,
+    dpr_embeddings: NDArray[np.float32],
+    q_unit: NDArray[np.float32],
+    corpus_dir: Path,
+    pool_k: int,
+) -> list[str]:
+    if index.size <= 0:
+        return []
+    dpr_scores = (dpr_embeddings @ q_unit).astype(np.float32, copy=False)
+    dpr_k = min(index.size, pool_k)
+    if dpr_k < index.size:
+        top_pos = np.argpartition(-dpr_scores, dpr_k - 1)[:dpr_k]
+        top_pos = top_pos[np.argsort(-dpr_scores[top_pos], kind="stable")]
+    else:
+        top_pos = np.argsort(-dpr_scores, kind="stable")
+    dpr_ranked = [(index.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
+    dpr_hydrated = hydrate_ranked_passages(index, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K, include_island=True)
+    return [hp.text for hp in dpr_hydrated if not hp.stale_on_disk]
+
+
+_RECALL_KS = (1, 2, 5, 10, 20)
+
+
+def _compute_recall_lists(
+    gold_docs: list[list[str]] | None,
+    all_retrieved_passages: list[list[str]],
+    all_dpr_passages: list[list[str]],
+) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+    if gold_docs is None:
+        empty_ret: dict[str, list[float]] = {f"@{k}": [] for k in _RECALL_KS}
+        empty_dpr: dict[str, list[float]] = {f"@{k}": [] for k in _RECALL_KS}
+        return empty_ret, empty_dpr
+    gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
+    ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
+    dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
+    _, ret_per_query = RetrievalRecall().calculate_metric_scores(
+        gold_docs=gold_docs_norm, retrieved_docs=ret_docs_norm, k_list=list(_RECALL_KS)
+    )
+    _, dpr_per_query = RetrievalRecall().calculate_metric_scores(
+        gold_docs=gold_docs_norm, retrieved_docs=dpr_docs_norm, k_list=list(_RECALL_KS)
+    )
+    ret_lists = {f"@{k}": [round(float(r[f"Recall@{k}"]), 4) for r in ret_per_query] for k in _RECALL_KS}
+    dpr_lists = {f"@{k}": [round(float(r[f"Recall@{k}"]), 4) for r in dpr_per_query] for k in _RECALL_KS}
+    return ret_lists, dpr_lists
+
+
+def _assemble_benchmark_metrics(
+    dataset: str,
+    records: Sequence[Mapping[str, Any]],
+    ret_lists: Mapping[str, list[float]],
+    dpr_lists: Mapping[str, list[float]],
+    qa_metrics: dict[str, float] | None,
+    *,
+    has_gold_docs: bool,
+    active_queries: int,
+) -> dict[str, Any]:
+    fallback_count = len(records) - active_queries
+    if has_gold_docs:
+        hipporag_ret = {f"Recall{k}": round(float(np.mean(vals)), 4) if vals else 0.0 for k, vals in ret_lists.items()}
+        dpr_ret = {f"Recall{k}": round(float(np.mean(vals)), 4) if vals else 0.0 for k, vals in dpr_lists.items()}
+        delta_vs_dpr = {k: round(hipporag_ret[k] - dpr_ret[k], 4) for k in hipporag_ret}
+    else:
+        hipporag_ret, dpr_ret, delta_vs_dpr = {}, {}, {}
+
+    metrics: dict[str, Any] = {
+        "hipporag": {"retrieval": hipporag_ret, "qa": qa_metrics},
+        "standard_dpr": {"retrieval": dpr_ret, "qa": None},
+        "delta_vs_dpr": delta_vs_dpr,
+        "recognition_memory": {
+            "queries_with_graph_seeds": active_queries,
+            "dpr_fallback_count": fallback_count,
+            "dpr_fallback_rate": round(fallback_count / len(records), 4) if records else 0.0,
+        },
+    }
+    ds_baselines = BASELINES.get(dataset, {})
+    mp = ds_baselines.get("monkeypatched_hipporag")
+    if isinstance(mp, dict):
+        metrics["monkeypatched_hipporag_baseline"] = mp
+        metrics["delta_vs_monkeypatched_hipporag"] = {
+            **{
+                k: (round(hipporag_ret[k] - float(mp[k]), 4) if k in hipporag_ret and mp.get(k) is not None else None)
+                for k in ("Recall@1", "Recall@2", "Recall@5")
+            },
+            **{
+                k: (
+                    round(float(qa_metrics[k]) - float(mp[k]), 4)
+                    if qa_metrics is not None and mp.get(k) is not None
+                    else None
+                )
+                for k in ("ExactMatch", "F1")
+            },
+        }
+    paper_baselines = {k: v for k, v in ds_baselines.items() if k != "monkeypatched_hipporag"}
+    if paper_baselines:
+        metrics["paper_baselines"] = paper_baselines
+    return metrics
+
+
 def run_yaw_benchmark(
     *,
     dataset: str,
@@ -318,45 +433,28 @@ def run_yaw_benchmark(
             "num_entity_nodes": index.num_pmi_terms,
             "num_edges": index.num_citation_edges,
         }
-
-        if num_chunks > 0:
-            emb_rows = conn.execute("SELECT embedding_f16 FROM chunks ORDER BY chunk_id ASC").fetchall()
-            if len(emb_rows) != num_chunks:
-                raise RuntimeError(f"Chunk embedding row count mismatch: {len(emb_rows)} != {num_chunks}")
-            dpr_raw = np.frombuffer(b"".join(bytes(r[0]) for r in emb_rows), dtype="<f2").reshape(num_chunks, index.dim)
-            dpr_f32 = dpr_raw.astype(np.float32)
-            dpr_norms = np.linalg.norm(dpr_f32, axis=1, keepdims=True)
-            if np.any(dpr_norms <= 1e-12) or not np.all(np.isfinite(dpr_f32)):
-                raise RuntimeError("Indexed float16 embeddings contain zero-norm or non-finite vectors")
-            dpr_embeddings = (dpr_f32 / dpr_norms).astype(np.float32, copy=False)
-        else:
-            dpr_embeddings = np.zeros((0, 0), dtype=np.float32)
+        dpr_embeddings = _load_normalized_dpr_embeddings(conn, num_chunks, index.dim)
 
         eval_start = perf_counter()
-        records: list[dict[str, Any]] = []
         all_retrieved_passages: list[list[str]] = []
         all_dpr_passages: list[list[str]] = []
         retrieved_ids_list: list[list[int]] = []
         qa_answers: list[str] = []
         timing_records: list[tuple[float, float]] = []
 
-        if queries:
-            formatted_qs = [format_query_for_embedding(q, task_mode=config.embedding_task_mode) for q in queries]
-            q_vecs = _encode_normalized(active_embed, formatted_qs)
-        else:
-            q_vecs = np.zeros((0, 0), dtype=np.float32)
+        q_vecs = (
+            _encode_normalized(
+                active_embed, [format_query_for_embedding(q, task_mode=config.embedding_task_mode) for q in queries]
+            )
+            if queries
+            else np.zeros((0, 0), dtype=np.float32)
+        )
 
         agent = None
         qa_lm = None
         if include_qa:
             qa_lm = lm or create_lm(config)
-            tools = make_qa_tools(
-                index,
-                corpus_dir,
-                active_embed,
-                conn,
-                task_mode=config.embedding_task_mode,
-            )
+            tools = make_qa_tools(index, corpus_dir, active_embed, conn, task_mode=config.embedding_task_mode)
             compiled_path = Path(compiled_program) if compiled_program is not None and bool(compiled_program) else None
             agent = build_qa_agent(tools, max_iters=config.react_max_iters, artifact_path=compiled_path)
 
@@ -371,37 +469,18 @@ def run_yaw_benchmark(
             hydrated = hydrate_ranked_passages(index, ranked, corpus_dir, top_k=RETRIEVAL_TOP_K, include_island=True)
             retrieval_elapsed = perf_counter() - t_q0
 
-            if index.size > 0:
-                dpr_scores = (dpr_embeddings @ q_unit).astype(np.float32, copy=False)
-                dpr_k = min(index.size, pool_k)
-                if dpr_k < index.size:
-                    top_pos = np.argpartition(-dpr_scores, dpr_k - 1)[:dpr_k]
-                    top_pos = top_pos[np.argsort(-dpr_scores[top_pos], kind="stable")]
-                else:
-                    top_pos = np.argsort(-dpr_scores, kind="stable")
-                dpr_ranked = [(index.chunk_ids[int(i)], float(dpr_scores[int(i)])) for i in top_pos]
-                dpr_hydrated = hydrate_ranked_passages(
-                    index, dpr_ranked, corpus_dir, top_k=RETRIEVAL_TOP_K, include_island=True
-                )
-            else:
-                dpr_hydrated = ()
-
-            retrieved_passages = [hp.text for hp in hydrated if not hp.stale_on_disk]
-            dpr_passages = [hp.text for hp in dpr_hydrated if not hp.stale_on_disk]
-            retrieved_ids = [int(hp.pointer.chunk_id) for hp in hydrated]
-            all_retrieved_passages.append(retrieved_passages)
+            dpr_passages = _dpr_retrieve_passages(index, dpr_embeddings, q_unit, corpus_dir, pool_k)
+            all_retrieved_passages.append([hp.text for hp in hydrated if not hp.stale_on_disk])
             all_dpr_passages.append(dpr_passages)
-            retrieved_ids_list.append(retrieved_ids)
+            retrieved_ids_list.append([int(hp.pointer.chunk_id) for hp in hydrated])
 
-            qa_answer = ""
             qa_elapsed = 0.0
             if include_qa and agent is not None and qa_lm is not None:
                 t_qa0 = perf_counter()
                 with dspy.context(lm=qa_lm):
                     qa_res = ask_question(query, index=index, corpus_root=corpus_dir, agent=agent)
-                qa_answer = clean_qa_answer(strip_inline_citations(qa_res.answer))
+                qa_answers.append(clean_qa_answer(strip_inline_citations(qa_res.answer)))
                 qa_elapsed = perf_counter() - t_qa0
-                qa_answers.append(qa_answer)
 
             timing_records.append((retrieval_elapsed, qa_elapsed))
             if (q_idx + 1) % 5 == 0 or (q_idx + 1) == total_queries:
@@ -411,35 +490,7 @@ def run_yaw_benchmark(
                     flush=True,
                 )
 
-    if gold_docs is not None:
-        gold_docs_norm = [[d.strip() for d in gd] for gd in gold_docs]
-        ret_docs_norm = [[p.strip() for p in rp] for rp in all_retrieved_passages]
-        dpr_docs_norm = [[p.strip() for p in dp] for dp in all_dpr_passages]
-
-        _, ret_per_query = RetrievalRecall().calculate_metric_scores(
-            gold_docs=gold_docs_norm,
-            retrieved_docs=ret_docs_norm,
-            k_list=[1, 2, 5, 10, 20],
-        )
-        _, dpr_per_query = RetrievalRecall().calculate_metric_scores(
-            gold_docs=gold_docs_norm,
-            retrieved_docs=dpr_docs_norm,
-            k_list=[1, 2, 5, 10, 20],
-        )
-        recalls_1 = [round(float(r["Recall@1"]), 4) for r in ret_per_query]
-        recalls_2 = [round(float(r["Recall@2"]), 4) for r in ret_per_query]
-        recalls_5 = [round(float(r["Recall@5"]), 4) for r in ret_per_query]
-        recalls_10 = [round(float(r["Recall@10"]), 4) for r in ret_per_query]
-        recalls_20 = [round(float(r["Recall@20"]), 4) for r in ret_per_query]
-        dpr_recalls_1 = [round(float(r["Recall@1"]), 4) for r in dpr_per_query]
-        dpr_recalls_2 = [round(float(r["Recall@2"]), 4) for r in dpr_per_query]
-        dpr_recalls_5 = [round(float(r["Recall@5"]), 4) for r in dpr_per_query]
-        dpr_recalls_10 = [round(float(r["Recall@10"]), 4) for r in dpr_per_query]
-        dpr_recalls_20 = [round(float(r["Recall@20"]), 4) for r in dpr_per_query]
-    else:
-        recalls_1 = recalls_2 = recalls_5 = recalls_10 = recalls_20 = []
-        dpr_recalls_1 = dpr_recalls_2 = dpr_recalls_5 = dpr_recalls_10 = dpr_recalls_20 = []
-
+    ret_lists, dpr_lists = _compute_recall_lists(gold_docs, all_retrieved_passages, all_dpr_passages)
     qa_metrics: dict[str, float] | None = None
     em_list: list[float] = []
     f1_list: list[float] = []
@@ -453,133 +504,40 @@ def run_yaw_benchmark(
             "F1": round(float(f1_overall["F1"]), 4),
         }
 
-    for q_idx, query in enumerate(queries):
-        retrieval_elapsed, qa_elapsed = timing_records[q_idx]
-        records.append(
-            {
-                "query_index": q_idx,
-                "question": query,
-                "answer": qa_answers[q_idx] if include_qa else "",
-                "gold_answers": gold_answers[q_idx],
-                "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
-                "qa_evidence": all_retrieved_passages[q_idx][:QA_TOP_K],
-                "dpr_evidence": all_dpr_passages[q_idx][:QA_TOP_K],
-                "recall": (
-                    {
-                        "@1": recalls_1[q_idx],
-                        "@2": recalls_2[q_idx],
-                        "@5": recalls_5[q_idx],
-                        "@10": recalls_10[q_idx],
-                        "@20": recalls_20[q_idx],
-                    }
-                    if gold_docs is not None
-                    else None
-                ),
-                "dpr_recall": (
-                    {
-                        "@1": dpr_recalls_1[q_idx],
-                        "@2": dpr_recalls_2[q_idx],
-                        "@5": dpr_recalls_5[q_idx],
-                        "@10": dpr_recalls_10[q_idx],
-                        "@20": dpr_recalls_20[q_idx],
-                    }
-                    if gold_docs is not None
-                    else None
-                ),
-                "retrieved_chunk_ids": retrieved_ids_list[q_idx],
-                "exact_match": em_list[q_idx] if include_qa else None,
-                "f1": f1_list[q_idx] if include_qa else None,
-                "retrieval_seconds": round(retrieval_elapsed, 4),
-                "qa_seconds": round(qa_elapsed, 4),
-            }
-        )
+    records = [
+        {
+            "query_index": q_idx,
+            "question": query,
+            "answer": qa_answers[q_idx] if include_qa else "",
+            "gold_answers": gold_answers[q_idx],
+            "gold_docs": gold_docs[q_idx] if gold_docs is not None else None,
+            "qa_evidence": all_retrieved_passages[q_idx][:QA_TOP_K],
+            "dpr_evidence": all_dpr_passages[q_idx][:QA_TOP_K],
+            "recall": {k: vals[q_idx] for k, vals in ret_lists.items()} if gold_docs is not None else None,
+            "dpr_recall": {k: vals[q_idx] for k, vals in dpr_lists.items()} if gold_docs is not None else None,
+            "retrieved_chunk_ids": retrieved_ids_list[q_idx],
+            "exact_match": em_list[q_idx] if include_qa else None,
+            "f1": f1_list[q_idx] if include_qa else None,
+            "retrieval_seconds": round(timing_records[q_idx][0], 4),
+            "qa_seconds": round(timing_records[q_idx][1], 4),
+        }
+        for q_idx, query in enumerate(queries)
+    ]
 
     report["evaluation_seconds"] = round(perf_counter() - eval_start, 2)
     active_queries = sum(1 for ids in retrieved_ids_list if ids)
-    fallback_count = len(records) - active_queries
-    if gold_docs is not None:
-        hipporag_ret: dict[str, Any] = {
-            "Recall@1": round(float(np.mean(recalls_1)), 4) if recalls_1 else 0.0,
-            "Recall@2": round(float(np.mean(recalls_2)), 4) if recalls_2 else 0.0,
-            "Recall@5": round(float(np.mean(recalls_5)), 4) if recalls_5 else 0.0,
-            "Recall@10": round(float(np.mean(recalls_10)), 4) if recalls_10 else 0.0,
-            "Recall@20": round(float(np.mean(recalls_20)), 4) if recalls_20 else 0.0,
-        }
-        dpr_ret: dict[str, Any] = {
-            "Recall@1": round(float(np.mean(dpr_recalls_1)), 4) if dpr_recalls_1 else 0.0,
-            "Recall@2": round(float(np.mean(dpr_recalls_2)), 4) if dpr_recalls_2 else 0.0,
-            "Recall@5": round(float(np.mean(dpr_recalls_5)), 4) if dpr_recalls_5 else 0.0,
-            "Recall@10": round(float(np.mean(dpr_recalls_10)), 4) if dpr_recalls_10 else 0.0,
-            "Recall@20": round(float(np.mean(dpr_recalls_20)), 4) if dpr_recalls_20 else 0.0,
-        }
-        delta_vs_dpr: dict[str, Any] = {
-            "Recall@1": round(hipporag_ret["Recall@1"] - dpr_ret["Recall@1"], 4),
-            "Recall@2": round(hipporag_ret["Recall@2"] - dpr_ret["Recall@2"], 4),
-            "Recall@5": round(hipporag_ret["Recall@5"] - dpr_ret["Recall@5"], 4),
-            "Recall@10": round(hipporag_ret["Recall@10"] - dpr_ret["Recall@10"], 4),
-            "Recall@20": round(hipporag_ret["Recall@20"] - dpr_ret["Recall@20"], 4),
-        }
-    else:
-        hipporag_ret = {}
-        dpr_ret = {}
-        delta_vs_dpr = {}
-
-    metrics: dict[str, Any] = {
-        "hipporag": {
-            "retrieval": hipporag_ret,
-            "qa": qa_metrics,
-        },
-        "standard_dpr": {
-            "retrieval": dpr_ret,
-            "qa": None,
-        },
-        "delta_vs_dpr": delta_vs_dpr,
-        "recognition_memory": {
-            "queries_with_graph_seeds": active_queries,
-            "dpr_fallback_count": fallback_count,
-            "dpr_fallback_rate": round(fallback_count / len(records), 4) if records else 0.0,
-        },
-    }
-    ds_baselines = BASELINES.get(dataset, {})
-    mp = ds_baselines.get("monkeypatched_hipporag")
-    if isinstance(mp, dict):
-        metrics["monkeypatched_hipporag_baseline"] = mp
-        metrics["delta_vs_monkeypatched_hipporag"] = {
-            "Recall@1": (
-                round(hipporag_ret["Recall@1"] - float(mp["Recall@1"]), 4)
-                if "Recall@1" in hipporag_ret and mp.get("Recall@1") is not None
-                else None
-            ),
-            "Recall@2": (
-                round(hipporag_ret["Recall@2"] - float(mp["Recall@2"]), 4)
-                if "Recall@2" in hipporag_ret and mp.get("Recall@2") is not None
-                else None
-            ),
-            "Recall@5": (
-                round(hipporag_ret["Recall@5"] - float(mp["Recall@5"]), 4)
-                if "Recall@5" in hipporag_ret and mp.get("Recall@5") is not None
-                else None
-            ),
-            "ExactMatch": (
-                round(float(qa_metrics["ExactMatch"]) - float(mp["ExactMatch"]), 4)
-                if qa_metrics is not None and mp.get("ExactMatch") is not None
-                else None
-            ),
-            "F1": (
-                round(float(qa_metrics["F1"]) - float(mp["F1"]), 4)
-                if qa_metrics is not None and mp.get("F1") is not None
-                else None
-            ),
-        }
-    paper_baselines = {k: v for k, v in ds_baselines.items() if k != "monkeypatched_hipporag"}
-    if paper_baselines:
-        metrics["paper_baselines"] = paper_baselines
+    metrics = _assemble_benchmark_metrics(
+        dataset,
+        records,
+        ret_lists,
+        dpr_lists,
+        qa_metrics,
+        has_gold_docs=gold_docs is not None,
+        active_queries=active_queries,
+    )
 
     integrity_errors = check_benchmark_integrity(
-        records,
-        report["graph"],
-        expected_doc_count=num_docs,
-        include_qa=include_qa,
+        records, report["graph"], expected_doc_count=num_docs, include_qa=include_qa
     )
     report["integrity"] = {"passed": len(integrity_errors) == 0, "errors": integrity_errors}
     report["evaluation_metrics"] = metrics

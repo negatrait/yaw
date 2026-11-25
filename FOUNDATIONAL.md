@@ -18,30 +18,31 @@ The following remain permanently retired unless controlled benchmarks prove mate
 
 ## 3. Package Boundaries
 
-All production code obeys a strict monotonic layer DAG (`L0`–`L6`, verified by `tests/core/test_architecture.py` with `0` horizontal cross-domain imports, `0` cycles, and `0` `# noqa`/`C901` suppressions):
+All production code obeys a strict monotonic layer DAG (`L0`–`L7`, verified by `tests/core/test_architecture.py` with `0` horizontal cross-domain imports, `0` cycles, and `0` `# noqa`/`C901` suppressions):
 
 ```text
 yaw/
 ├── core/        # L0: __init__.py, config.py, logger.py, types.py (Python stdlib only; 0 ML/DB imports)
-└── ...          # L1 datasets, retrieval/ -> L2 pipeline/, qa -> L3 runtime -> L4 mcp_server, optimize -> L5 cli -> L6 __main__
+└── ...          # L1 datasets, retrieval/ -> L2 pipeline/, qa -> L3 wiki/ -> L4 runtime -> L5 mcp_server, optimize -> L6 cli -> L7 __main__
 ```
 
 - Modules never import another module's `_private` symbols or access foreign `_` attributes.
-- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic; `mcp_server.py` serves Streamable HTTP on loopback `127.0.0.1:13306/mcp` with `/healthz`, `/readyz`, `/status`, `.yaw/control.token`-authenticated `/_internal/stop`, pre-dispatch `Host`/`Origin` `403`, and exact `3` read-only tools (`recall`, `qa`, `daemon_status`).
+- Transport adapters (`cli.py`, `mcp_server.py`) contain zero retrieval or ingestion logic; `mcp_server.py` serves Streamable HTTP on loopback `127.0.0.1:13306/mcp` with `/healthz`, `/readyz`, `/status`, `.yaw/control.token`-authenticated `/_internal/stop`, pre-dispatch `Host`/`Origin` `403`, synced `FastMCP.instructions`, `4` tools (`recall`, `expand_neighbors`, `read_chunk`, `write_wiki`), and `4` resources (`yaw://status`, `yaw://wiki`, `yaw://wiki/{slug*}`, `yaw://chunk/{chunk_id}`); `yaw qa` and `yaw lint` are CLI-only.
 - `cli.py` lazy-imports `optimize.py` inside optimization subcommands so Tier-0 commands run standalone outside a git checkout.
 
 ## 4. System Invariants
 
-1. **Declarative Ingestion (`yaw/pipeline/`):**
-   - Sole writer to `.yaw/yaw.db` via event-driven CocoIndex (`localfs.walk_dir(..., live=live)`), `fingerprint_str`-derived per-`db_path` `app_name`, public CocoIndex `CodeSource`/`RecursiveSplitter`/`render_match` AST chunking (`included_patterns` / `chunk_size` UTF-8 byte cap, populating `(ast_island_start, ast_island_end)` and walk-up enclosing AST heading `title`, defaulting headingless spans to `(sl, el)` and `""`), `"title: <ast-title> | text: ..."` embedding framing, configurable `embed_batch_size` + `embed_max_in_flight`, and persistent content-addressed `.yaw/coco_lmdb` memoization.
+1. **Declarative Ingestion (`yaw/pipeline/`, `yaw/wiki/`):**
+   - Sole writer to `.yaw/yaw.db` via event-driven CocoIndex (`localfs.walk_dir(..., live=live)` over `corpus_root` and optional `wiki_root` with collision-safe `wiki:` `rel_path` prefix), `fingerprint_str`-derived per-`db_path` `app_name`, public CocoIndex `CodeSource`/`RecursiveSplitter`/`render_match` AST chunking (`included_patterns` / `chunk_size` UTF-8 byte cap, populating `(ast_island_start, ast_island_end)` and walk-up enclosing AST heading `title`, defaulting headingless spans to `(sl, el)` and `""`), `"title: <ast-title> | text: ..."` embedding framing, configurable `embed_batch_size` + `embed_max_in_flight`, and persistent content-addressed `.yaw/coco_lmdb` memoization.
    - Publishes the 5-table plain SQLite schema: `chunks` (ROWID via `ChunkRow` / `sqlite.mount_table_target` with `<f2>` `embedding_f16 BLOB`, source line/char/AST-island pointers, AST `title`, and `cocoindex.connectorkits.fingerprint.fingerprint_str` `source_hash`; `0` raw chunk text; `compute_chunk_int_id` in stdlib-only `yaw/core/` stays SHA-256), `chunk_fts` (`unicode61 remove_diacritics 1`, `(title, body)` pairs) + `chunk_vocab` (`fts5vocab` via `_FtsTableHandler`), and single-row `rabitq_index` + `citation_graph` materialized via `reconcile_index_tables` (`IndexArtifacts`, retaining incremental streaming SHA-256 `vec_sha256`/`source_sha256`). Native dataset bundles export directly to `.md` files (`<idx>.md`, `# Title` headings) and index without duplicate JSON-to-text re-staging.
+   - Librarian wiki cards (`yaw/wiki/`) write `# Heading Title` Markdown cards with `pyyaml` provenance metadata under `wiki_root`, verified read-only by `yaw lint` without ever clearing `stale: true` or hashes on pre-/post-reindex drift.
 2. **Pointer-Only Disk Hydration (`yaw/retrieval/`):**
    - `yaw.db` stores 1-indexed `(rel_posix_path, start_line, end_line)`, character offsets `(char_start, char_end)`, enclosing AST island bounds `(ast_island_start, ast_island_end)`, AST `title`, and CocoIndex `fingerprint_str` `source_hash`—never authoritative copies of corpus text (`yaw/retrieval/` permits only exact `cocoindex.connectorkits.fingerprint`; `compute_chunk_int_id`, slip wire `content_hash: "sha256:..."`, and incremental `vec_sha256`/`source_sha256` remain SHA-256).
-   - Exact reads (`hydrate_passage`) return `[start_line, end_line]`; MaxP retrieval hydration (`hydrate_ranked_passages`) deduplicates by effective AST island and expands up to `[ast_island_start, ast_island_end]` (`(path:es-ee)`), verifying `source_hash` via CocoIndex `fingerprint_str` on exact `[start_line, end_line]` (`max_chars=None` uncropped by default, `pool_k = max(top_k * 4, 50)`, zero serde JSON reparsing): missing or hash-mismatched files return `stale_on_disk = True` with `text = ""`.
+   - Exact reads (`hydrate_passage`) return `[start_line, end_line]`; MaxP retrieval hydration (`hydrate_ranked_passages`) routes `wiki:` pointers via `wiki_root`, deduplicates by effective AST island, and expands up to `[ast_island_start, ast_island_end]` (`(path:es-ee)`), verifying `source_hash` via CocoIndex `fingerprint_str` on exact `[start_line, end_line]` (`max_chars=None` uncropped by default, `pool_k = max(top_k * 4, 50)`, zero serde JSON reparsing): missing or hash-mismatched files return `stale_on_disk = True` with `text = ""`.
 3. **Zero-LLM Hybrid Ranking (`yaw/retrieval/`, `yaw/runtime.py`):**
    - Combines 1-bit SoA RaBitQ (`rabitq_index`), `FTS5` (`chunk_fts` / `chunk_vocab`), and tangent-steered cyclic citation + 1-bit PMI diffusion (`CitationGraph`, `DiffusionOperators`) inside `RetrievalIndex` (`build_retrieval_index`, `empty_retrieval_index`, `search_index`, `expand_citation_neighbors`) over `?mode=ro` WAL SQLite connections (`busy_timeout=30000`), swapping outside `index_lock` via reactive CocoIndex sink transitions (`get_retrieval_index`, `reload_retrieval_index`, `0` `PRAGMA data_version` polls).
-4. **Runtime Concurrency & Native Tool Calling (`yaw/runtime.py`, `yaw/qa.py`, `yaw/optimize.py`):**
-   - `arecall` / `recall` run under `L3` `query_sem` (`32`) + `embed_sem` (`0` custom `ThreadPoolExecutor` pools) over `?mode=ro` SQLite connections with zero LM endpoint dependency.
+4. **Runtime Concurrency, Tier-0 Zero-SLM Mode & Native Tool Calling (`yaw/runtime.py`, `yaw/qa.py`, `yaw/optimize.py`):**
+   - `arecall`, `aexpand_neighbors_payload`, `aread_chunk_payload`, `write_wiki_and_sync`, and `yaw lint` run under `L4` `query_sem` (`32`) + `embed_sem` (`0` custom `ThreadPoolExecutor` pools) over `?mode=ro` SQLite connections with zero generative LM endpoint dependency (`qa_model = ""` runs Tier-0 zero-SLM mode with `0` LM calls while background `asyncio.Queue` wiki scouting runs only when `live`, `wiki_root`, and an active LM are configured).
    - Bare `dspy.ReAct` QA and `dspy.GEPA` instruction proposal declare `ProviderDefinition.chat` (`ModelSupport(function_calling=True)`) via `dspy.lm15.register_provider`, enforce `tool_choice="required"`, serialize under `Semaphore(1)`, run student and GEPA reflection at `temperature=1.0` unconditionally, and validate inline `[chunk_id=<int>]` citations strictly against non-`submit` tool observations (`0` SQLite writes during QA).
 
 ## 5. Failure Policy & Acceptance Criteria
@@ -52,4 +53,4 @@ yaw/
 ## 6. Governing Specs
 
 - Governing Sprint & Cutover Ledgers: [bare-bones-replacement-sprint.md](docs/reviews/bare-bones-replacement-sprint.md) (`CS-0`..`CS-6` clean-slate cutover, closed on `3cd3952`); [mdl-dag-sprint.md](docs/reviews/mdl-dag-sprint.md) (`EVAL-0`..`EVAL-5` shipped frozen `M_FINAL_1B` on `dev` at `5c4b115`); [epic-3-librarian-wiki-sprint.md](docs/reviews/epic-3-librarian-wiki-sprint.md) (active Sprints `3.1`–`3.3`: modular DAG governance, unified CocoIndex/FastMCP lifespan, `log_bf` + `coverage` slip, and dual-root Librarian `wiki_root`).
-- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md) *(where historical `## Decisions` preserve pre-cutover rationale verbatim, §§1–5 above govern active production code)*.
+- Epics: [Epic 1](docs/epic-1-hipporag-daemon.md), [Epic 2](docs/epic-2-fastmcp-http.md), [Epic 3](docs/epic-3-performance.md), [Epic 4](docs/epic-4-retrieval-refinements.md) *(where historical `## Decisions` preserve pre-cutover rationale verbatim, §§1–5 above govern active production code)*.

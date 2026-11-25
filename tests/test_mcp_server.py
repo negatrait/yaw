@@ -6,7 +6,6 @@ import ast
 import asyncio
 import hashlib
 import json
-import re
 import socket
 import sys
 import threading
@@ -21,7 +20,8 @@ import numpy as np
 import pytest
 import uvicorn
 from fastmcp import Client
-from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ResourceError, ToolError
+from mcp.shared.exceptions import MCPError
 
 from yaw.core import ChunkPointer, HydratedPassage, YawConfig, YawRuntimeError
 from yaw.mcp_server import create_mcp_app, serve_http
@@ -76,10 +76,13 @@ def _make_cfg(
     api_key: str = "test",
     queue_maxsize: int = 32,
     embed_max_in_flight: int = 2,
+    wiki_root: Path | None = None,
+    qa_model: str = "gemma-4-e4b",
 ) -> YawConfig:
     return YawConfig(
         workspace_root=root,
         corpus_root=root / "corpus",
+        wiki_root=wiki_root,
         db_path=root / ".yaw" / "yaw.db",
         lock_path=root / ".yaw" / "yaw.db.lock",
         state_dir=root / ".yaw" / "coco_lmdb",
@@ -88,6 +91,7 @@ def _make_cfg(
         compiled_program_path=root / ".yaw" / "compiled_program.json",
         base_url=base_url,
         api_key=api_key,
+        qa_model=qa_model,
         chunk_size=140,
         chunk_overlap=20,
         min_chunk_size=20,
@@ -97,6 +101,16 @@ def _make_cfg(
         http_port=http_port if http_port is not None else _free_port(),
         http_path=http_path,
     )
+
+
+async def _read_text_resource(client: Client[Any], uri: str) -> str:
+    items = await client.read_resource(uri)
+    assert len(items) == 1
+    return str(getattr(items[0], "text", ""))
+
+
+async def _read_json_resource(client: Client[Any], uri: str) -> Any:
+    return json.loads(await _read_text_resource(client, uri))
 
 
 def _tool_reply(thought: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -301,16 +315,50 @@ def test_mcp_server_containment_bind_validation_and_tool_inventory(tmp_path: Pat
             async with Client(mcp) as client:
                 tools = await client.list_tools()
                 by_name = {t.name: t for t in tools}
-                assert set(by_name) == {"recall", "qa", "daemon_status"}
-                for name, idem in (("recall", True), ("qa", False), ("daemon_status", True)):
+                assert set(by_name) == {"recall", "expand_neighbors", "read_chunk", "write_wiki"}
+                for name, ro_hint in (
+                    ("recall", True),
+                    ("expand_neighbors", True),
+                    ("read_chunk", True),
+                    ("write_wiki", False),
+                ):
                     ann = by_name[name].annotations
                     assert ann is not None
-                    assert ann.read_only_hint is True
+                    assert ann.read_only_hint is ro_hint
                     assert ann.destructive_hint is False
-                    assert ann.idempotent_hint is idem
+                    assert ann.idempotent_hint is True
                     assert ann.open_world_hint is False
                 assert "query" in by_name["recall"].input_schema.get("properties", {})
-                assert "question" in by_name["qa"].input_schema.get("properties", {})
+                assert "chunk_id" in by_name["expand_neighbors"].input_schema.get("properties", {})
+                assert "chunk_id" in by_name["read_chunk"].input_schema.get("properties", {})
+                assert {"slug", "title", "body"} <= set(by_name["write_wiki"].input_schema.get("properties", {}))
+
+                resources = {str(r.uri): r for r in await client.list_resources()}
+                assert set(resources) == {"yaw://status", "yaw://wiki"}
+                assert resources["yaw://status"].mime_type == "application/json"
+                assert resources["yaw://wiki"].mime_type == "application/json"
+
+                templates = {str(t.uri_template): t for t in await client.list_resource_templates()}
+                assert set(templates) == {"yaw://wiki/{slug*}", "yaw://chunk/{chunk_id}"}
+                assert templates["yaw://wiki/{slug*}"].mime_type == "text/markdown"
+                assert templates["yaw://chunk/{chunk_id}"].mime_type == "application/json"
+
+                instr = client.instructions or ""
+                for token in (
+                    "recall",
+                    "expand_neighbors",
+                    "read_chunk",
+                    "write_wiki",
+                    "yaw://status",
+                    "yaw://wiki",
+                    "yaw://wiki/{slug*}",
+                    "yaw://chunk/{chunk_id}",
+                    "yaw qa",
+                ):
+                    assert token in instr
+            async with Client(mcp, mode="legacy") as legacy:
+                assert legacy.initialize_result is not None
+                assert legacy.initialize_result.instructions == instr
 
         asyncio.run(_inspect())
     finally:
@@ -522,11 +570,201 @@ def _assert_mcp_recall_tool_result(rec_res: Any, *, expected_text: str | None = 
     return rec
 
 
-def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: Path) -> None:
+async def _assert_mcp_happy_tools_and_resources(client: Client[Any], secret_key: str) -> tuple[int, int]:
+    rec_res = await client.call_tool("recall", {"query": "orbital booster", "top_k": 2})
+    rec = _assert_mcp_recall_tool_result(rec_res)
+    assert isinstance(rec["log_bf"], float) and isinstance(rec["coverage"], float)
+    results = rec["results"]
+    assert len(results) == 2
+    assert any(r["source"]["rel_posix_path"] == "multi.json" for r in results)
+    assert len({r["chunk_id"] for r in results}) == 2
+    for rank_i, item in enumerate(results, start=1):
+        assert item["rank"] == rank_i
+        assert type(item["chunk_id"]) is int
+        assert isinstance(item["score"], float)
+        assert "stale" not in item and "stale_on_disk" not in item
+        assert item["content_hash"] == f"sha256:{hashlib.sha256(item['text'].encode('utf-8')).hexdigest()}"
+        expected_source_keys = {"rel_posix_path", "start_line", "end_line"}
+        if item["source"]["rel_posix_path"].endswith(".md"):
+            expected_source_keys.add("title")
+        assert set(item["source"]) == expected_source_keys
+        if item["source"]["rel_posix_path"].endswith(".md"):
+            assert item["source"]["title"] in {"Apollo 11 Mission", "Booster Backup"}
+
+    apollo_rec = _assert_mcp_recall_tool_result(await client.call_tool("recall", {"query": "Apollo 11 commander"}))
+    alpha_cid = next(int(r["chunk_id"]) for r in apollo_rec["results"] if r["source"]["rel_posix_path"] == "alpha.md")
+    first_cid = int(results[0]["chunk_id"])
+
+    read_res = _assert_mcp_recall_tool_result(await client.call_tool("read_chunk", {"chunk_id": alpha_cid}))
+    assert len(read_res["results"]) == 1 and read_res["results"][0]["chunk_id"] == alpha_cid
+    exp_res = _assert_mcp_recall_tool_result(await client.call_tool("expand_neighbors", {"chunk_id": first_cid}))
+    assert isinstance(exp_res["results"], list)
+
+    st = await _read_json_resource(client, "yaw://status")
+    assert st["lifecycle"] == "ready" and st["num_chunks"] >= 7
+    assert secret_key not in json.dumps(st)
+    chunk_res = await _read_json_resource(client, f"yaw://chunk/{alpha_cid}")
+    assert chunk_res["results"][0]["chunk_id"] == alpha_cid
+
+    long_q = "orbital booster " * 80
+    assert len(long_q.encode("utf-8")) > 1024
+    long_rec = (await client.call_tool("recall", {"query": long_q, "top_k": 2})).data
+    assert len(long_rec["results"]) == 2
+    return first_cid, alpha_cid
+
+
+async def _assert_mcp_bad_inputs(client: Client[Any]) -> None:
+    bad_calls = (
+        ("recall", {"query": "ok", "top_k": True}),
+        ("recall", {"query": "ok", "top_k": False}),
+        ("recall", {"query": "ok", "top_k": "5"}),
+        ("recall", {"query": "ok", "top_k": 5.0}),
+        ("recall", {"query": "ok", "top_k": 0}),
+        ("recall", {"query": "ok", "top_k": 21}),
+        ("recall", {"query": ""}),
+        ("recall", {"query": 123}),
+        ("recall", {"query": "ok", "extra": 1}),
+        ("expand_neighbors", {"chunk_id": 0}),
+        ("expand_neighbors", {"chunk_id": -1}),
+        ("expand_neighbors", {"chunk_id": True}),
+        ("expand_neighbors", {"chunk_id": 1, "top_k": 21}),
+        ("read_chunk", {"chunk_id": 0}),
+        ("read_chunk", {"chunk_id": -1}),
+        ("read_chunk", {"chunk_id": "1"}),
+        ("write_wiki", {"slug": "", "title": "T", "body": "B"}),
+        ("write_wiki", {"slug": "ok", "title": "", "body": "B"}),
+        ("write_wiki", {"slug": "ok", "title": "T", "body": ""}),
+        ("write_wiki", {"slug": "ok", "title": "T", "body": "B", "source_chunk_ids": [0]}),
+        ("write_wiki", {"slug": "ok", "title": "T", "body": "B", "source_chunk_ids": [-1]}),
+        ("write_wiki", {"slug": "ok", "title": "T", "body": "B", "source_chunk_ids": [True]}),
+    )
+    for tool_name, bad_args in bad_calls:
+        with pytest.raises(ToolError):
+            await client.call_tool(tool_name, bad_args)
+
+    ws_calls = (
+        ("recall", {"query": "   "}),
+        ("expand_neighbors", {"chunk_id": 999999}),
+        ("read_chunk", {"chunk_id": 999999}),
+        ("write_wiki", {"slug": "../escape", "title": "T", "body": "B"}),
+        ("write_wiki", {"slug": "ok-slug", "title": "   ", "body": "B"}),
+    )
+    for tool_name, ws_args in ws_calls:
+        with pytest.raises(ToolError) as exc_ws:
+            await client.call_tool(tool_name, ws_args)
+        assert str(exc_ws.value).startswith("[INVALID_INPUT]")
+
+    for bad_uri in (
+        "yaw://chunk/abc",
+        "yaw://chunk/0",
+        "yaw://chunk/-1",
+        "yaw://chunk/00",
+        "yaw://chunk/01",
+        "yaw://chunk/999999",
+        "yaw://wiki/missing-card",
+    ):
+        with pytest.raises((ResourceError, MCPError)):
+            await client.read_resource(bad_uri)
+
+
+async def _assert_mcp_not_ready_and_busy(client: Client[Any], rt: Any, gate_embed: threading.Event) -> None:
+    rt.lifecycle = "starting"
+    try:
+        with pytest.raises(ToolError) as exc_prec:
+            await client.call_tool("recall", {"query": "   "})
+        assert str(exc_prec.value).startswith("[INVALID_INPUT]")
+
+        for tool_name, bad_args in (
+            ("expand_neighbors", {"chunk_id": 0}),
+            ("expand_neighbors", {"chunk_id": -1}),
+            ("read_chunk", {"chunk_id": 0}),
+            ("read_chunk", {"chunk_id": -1}),
+            ("write_wiki", {"slug": "card", "title": "Card", "body": "Body", "source_chunk_ids": [0]}),
+        ):
+            with pytest.raises(ToolError) as exc_bad_id:
+                await client.call_tool(tool_name, bad_args)
+            assert not str(exc_bad_id.value).startswith("[NOT_READY]")
+
+        for bad_uri in ("yaw://chunk/0", "yaw://chunk/-1", "yaw://chunk/00"):
+            with pytest.raises((ResourceError, MCPError)) as exc_bad_res:
+                await client.read_resource(bad_uri)
+            assert "[INVALID_INPUT]" in str(exc_bad_res.value)
+
+        st_starting = await _read_json_resource(client, "yaw://status")
+        assert st_starting["lifecycle"] == "starting"
+
+        for tool_name, args in (
+            ("recall", {"query": "valid"}),
+            ("expand_neighbors", {"chunk_id": 1}),
+            ("read_chunk", {"chunk_id": 1}),
+            ("write_wiki", {"slug": "not-ready", "title": "Title", "body": "Body."}),
+        ):
+            with pytest.raises(ToolError) as exc_nr:
+                await client.call_tool(tool_name, args)
+            assert str(exc_nr.value).startswith("[NOT_READY]")
+    finally:
+        rt.lifecycle = "ready"
+
+    gate_embed.clear()
+    busy_task = asyncio.create_task(client.call_tool("recall", {"query": "busy_probe"}))
+    await asyncio.sleep(0.1)
+    try:
+        with pytest.raises(ToolError) as exc_busy:
+            await client.call_tool("recall", {"query": "second caller"})
+        assert str(exc_busy.value).startswith("[BUSY]")
+    finally:
+        gate_embed.set()
+        await busy_task
+
+
+async def _assert_mcp_staleness_and_shutdown(client: Client[Any], rt: Any, alpha_file: Path, alpha_cid: int) -> None:
+    alpha_file.write_text("# Altered\nDisk text changed after indexing.\n", encoding="utf-8")
+    stale_call = await client.call_tool("recall", {"query": "Apollo 11 commander", "top_k": 3})
+    stale_rec = _assert_mcp_recall_tool_result(stale_call)
+    alpha_hits = [r for r in stale_rec["results"] if r["source"]["rel_posix_path"] == "alpha.md"]
+    assert alpha_hits and alpha_hits[0].get("stale") is True and alpha_hits[0]["text"] == ""
+    assert "stale_on_disk" not in alpha_hits[0]
+    assert alpha_hits[0]["content_hash"] == f"sha256:{hashlib.sha256(b'').hexdigest()}"
+    assert "[STALE ON DISK] alpha.md" in getattr(stale_call.content[0], "text", "")
+
+    stale_read = _assert_mcp_recall_tool_result(await client.call_tool("read_chunk", {"chunk_id": alpha_cid}))
+    assert stale_read["results"][0].get("stale") is True
+
+    with pytest.raises(ToolError) as exc_cons:
+        await client.call_tool("expand_neighbors", {"chunk_id": alpha_cid})
+    assert str(exc_cons.value).startswith("[CONSISTENCY_ERROR]")
+
+    with pytest.raises(ToolError) as exc_wiki_cons:
+        await client.call_tool(
+            "write_wiki",
+            {"slug": "stale-ref", "title": "Stale Ref", "body": "Body.", "source_chunk_ids": [alpha_cid]},
+        )
+    assert str(exc_wiki_cons.value).startswith("[CONSISTENCY_ERROR]")
+
+    close_runtime(rt)
+    for tool_name, args in (
+        ("recall", {"query": "after close"}),
+        ("expand_neighbors", {"chunk_id": alpha_cid}),
+        ("read_chunk", {"chunk_id": alpha_cid}),
+        ("write_wiki", {"slug": "after-close", "title": "Closed", "body": "Body."}),
+    ):
+        with pytest.raises(ToolError) as exc_sd:
+            await client.call_tool(tool_name, args)
+        assert str(exc_sd.value).startswith("[SHUTTING_DOWN]")
+
+
+def test_four_tools_four_resources_staleness_and_mcp_error_codes(tmp_path: Path) -> None:
     secret_key = "super-secret-mcp-token"
-    cfg = _make_cfg(tmp_path / "tools", api_key=secret_key, queue_maxsize=1)
-    assert cfg.corpus_root is not None
+    cfg = _make_cfg(
+        tmp_path / "tools",
+        wiki_root=tmp_path / "tools" / "wiki",
+        api_key=secret_key,
+        queue_maxsize=1,
+        qa_model="",
+    )
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
     cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
 
     alpha_file = cfg.corpus_root / "alpha.md"
     alpha_file.write_text(
@@ -545,7 +783,6 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
         encoding="utf-8",
     )
 
-    chat_mode = {"mode": "normal"}
     gate_embed = threading.Event()
     gate_embed.set()
 
@@ -554,189 +791,182 @@ def test_three_tools_passage_dict_staleness_and_all_seven_error_codes(tmp_path: 
             gate_embed.wait(timeout=5.0)
         return _topic_embed(texts)
 
-    def chat_responder(payload: dict[str, Any]) -> str | dict[str, Any]:
-        if chat_mode["mode"] == "secret_garbage":
-            return f"garbage Bearer tok_secret999 {secret_key} sk-secret123456"
-        msgs = payload.get("messages", [])
-        has_tool_obs = any(m.get("role") == "tool" for m in msgs)
-        msgs_blob = json.dumps(msgs)
-        alpha_match = re.search(r"\[chunk_id=(\d+)\]\s+\(alpha\.md:[^)\n]+\)", msgs_blob)
-        cids = re.findall(r"\[chunk_id=(\d+)\]", msgs_blob)
-        if not has_tool_obs or not cids:
-            return _tool_reply(
-                "Search Apollo passages first",
-                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 3}}],
-            )
-        chosen = alpha_match.group(1) if alpha_match is not None else cids[0]
-        return _tool_reply(
-            "Cite retrieved passage",
-            [{"name": "submit", "args": {"answer": f"Neil Armstrong [chunk_id={chosen}]"}}],
-        )
-
-    srv, _ = _start_openai_stub(chat_responder)
-    cfg_lm = _make_cfg(tmp_path / "tools", base_url=f"http://127.0.0.1:{srv.server_port}/v1", api_key=secret_key)
-    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=embed_fn, lm=create_lm(cfg_lm))
+    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=embed_fn, lm=None)
     try:
         mcp, _ = create_mcp_app(rt=rt)
 
         async def _run() -> None:
             async with Client(mcp) as client:
-                rec_res = await client.call_tool("recall", {"query": "orbital booster", "top_k": 2})
-                rec = _assert_mcp_recall_tool_result(rec_res)
-                assert isinstance(rec["log_bf"], float) and isinstance(rec["coverage"], float)
-                results = rec["results"]
-                assert len(results) == 2
-                assert any(r["source"]["rel_posix_path"] == "multi.json" for r in results)
-                assert len({r["chunk_id"] for r in results}) == 2
-                for rank_i, item in enumerate(results, start=1):
-                    assert item["rank"] == rank_i
-                    assert type(item["chunk_id"]) is int
-                    assert isinstance(item["score"], float)
-                    assert "stale" not in item and "stale_on_disk" not in item
-                    assert item["content_hash"] == f"sha256:{hashlib.sha256(item['text'].encode('utf-8')).hexdigest()}"
-                    expected_source_keys = {"rel_posix_path", "start_line", "end_line"}
-                    if item["source"]["rel_posix_path"].endswith(".md"):
-                        expected_source_keys.add("title")
-                    assert set(item["source"]) == expected_source_keys
-                    if item["source"]["rel_posix_path"].endswith(".md"):
-                        assert item["source"]["title"] in {"Apollo 11 Mission", "Booster Backup"}
-
-                qa_res = (await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})).data
-                assert qa_res["question"] == "Who commanded Apollo 11?"
-                assert "Neil Armstrong" in qa_res["answer"]
-                assert qa_res["turns"] >= 2
-                assert 1 <= len(qa_res["citations"]) <= 5
-
-                st = (await client.call_tool("daemon_status", {})).data
-                assert st["lifecycle"] == "ready" and st["num_chunks"] >= 7
-
-                long_q = "orbital booster " * 80
-                assert len(long_q.encode("utf-8")) > 1024
-                long_rec = (await client.call_tool("recall", {"query": long_q, "top_k": 2})).data
-                assert len(long_rec["results"]) == 2
-
-                for tool_name, bad_args in (
-                    ("recall", {"query": "ok", "top_k": True}),
-                    ("recall", {"query": "ok", "top_k": False}),
-                    ("recall", {"query": "ok", "top_k": "5"}),
-                    ("recall", {"query": "ok", "top_k": 5.0}),
-                    ("recall", {"query": "ok", "top_k": 0}),
-                    ("recall", {"query": "ok", "top_k": 21}),
-                    ("recall", {"query": ""}),
-                    ("recall", {"query": 123}),
-                    ("recall", {"query": "ok", "extra": 1}),
-                    ("qa", {"question": ""}),
-                    ("qa", {"question": 42}),
-                    ("daemon_status", {"x": 1}),
-                ):
-                    with pytest.raises(ToolError):
-                        await client.call_tool(tool_name, bad_args)
-
-                for tool_name, ws_args in (("recall", {"query": "   "}), ("qa", {"question": "   "})):
-                    with pytest.raises(ToolError) as exc_ws:
-                        await client.call_tool(tool_name, ws_args)
-                    assert str(exc_ws.value).startswith("[INVALID_INPUT]")
-
-                rt.lifecycle = "starting"
-                with pytest.raises(ToolError) as exc_prec:
-                    await client.call_tool("recall", {"query": "   "})
-                assert str(exc_prec.value).startswith("[INVALID_INPUT]")
-                with pytest.raises(ToolError) as exc_nr:
-                    await client.call_tool("recall", {"query": "valid"})
-                assert str(exc_nr.value).startswith("[NOT_READY]")
-                rt.lifecycle = "ready"
-
-                gate_embed.clear()
-                busy_task = asyncio.create_task(client.call_tool("recall", {"query": "busy_probe"}))
-                await asyncio.sleep(0.1)
-                with pytest.raises(ToolError) as exc_busy:
-                    await client.call_tool("recall", {"query": "second caller"})
-                assert str(exc_busy.value).startswith("[BUSY]")
-                gate_embed.set()
-                await busy_task
-
-                chat_mode["mode"] = "secret_garbage"
-                with pytest.raises(ToolError) as exc_mod:
-                    await client.call_tool("qa", {"question": "What triggers garbage?"})
-                err_txt = str(exc_mod.value)
-                assert err_txt.startswith("[MODEL_ERROR]")
-                for secret in (secret_key, "tok_secret999", "sk-secret123456"):
-                    assert secret not in err_txt
-                chat_mode["mode"] = "normal"
-
-                alpha_file.write_text("# Altered\nDisk text changed after indexing.\n", encoding="utf-8")
-                stale_call = await client.call_tool("recall", {"query": "Apollo 11 commander", "top_k": 3})
-                stale_rec = _assert_mcp_recall_tool_result(stale_call)
-                alpha_hits = [r for r in stale_rec["results"] if r["source"]["rel_posix_path"] == "alpha.md"]
-                assert alpha_hits and alpha_hits[0].get("stale") is True and alpha_hits[0]["text"] == ""
-                assert "stale_on_disk" not in alpha_hits[0]
-                assert alpha_hits[0]["content_hash"] == f"sha256:{hashlib.sha256(b'').hexdigest()}"
-                assert "[STALE ON DISK] alpha.md" in getattr(stale_call.content[0], "text", "")
-
-                with pytest.raises(ToolError) as exc_cons:
-                    await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})
-                assert str(exc_cons.value).startswith("[CONSISTENCY_ERROR]")
-
-                close_runtime(rt)
-                with pytest.raises(ToolError) as exc_sd:
-                    await client.call_tool("recall", {"query": "after close"})
-                assert str(exc_sd.value).startswith("[SHUTTING_DOWN]")
+                _first_cid, alpha_cid = await _assert_mcp_happy_tools_and_resources(client, secret_key)
+                await _assert_mcp_bad_inputs(client)
+                await _assert_mcp_not_ready_and_busy(client, rt, gate_embed)
+                await _assert_mcp_staleness_and_shutdown(client, rt, alpha_file, alpha_cid)
 
         asyncio.run(_run())
     finally:
         gate_embed.set()
         if rt.lifecycle != "stopped":
             close_runtime(rt)
-        srv.shutdown()
 
-    e_cfg = _make_cfg(tmp_path / "empty_tool")
-    assert e_cfg.corpus_root is not None
+    e_cfg = _make_cfg(tmp_path / "empty_tool", wiki_root=tmp_path / "empty_tool" / "wiki", qa_model="")
+    assert e_cfg.corpus_root is not None and e_cfg.wiki_root is not None
     e_cfg.corpus_root.mkdir(parents=True)
-    rt_e = start_runtime(e_cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=create_lm(e_cfg))
+    e_cfg.wiki_root.mkdir(parents=True)
+    rt_e = start_runtime(e_cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=None)
     try:
         mcp_e, _ = create_mcp_app(rt=rt_e)
 
-        async def _empty_qa() -> None:
+        async def _empty_checks() -> None:
             async with Client(mcp_e) as client:
                 empty_call = await client.call_tool("recall", {"query": "Anything?"})
                 empty_rec = _assert_mcp_recall_tool_result(empty_call, expected_text="No matching passages found.")
                 assert empty_rec == {"results": []}
+                assert await _read_json_resource(client, "yaw://wiki") == []
                 with pytest.raises(ToolError) as exc_e:
-                    await client.call_tool("qa", {"question": "Anything?"})
-                assert str(exc_e.value).startswith("[EMPTY_INDEX]")
+                    await client.call_tool("read_chunk", {"chunk_id": 1})
+                assert str(exc_e.value).startswith("[INVALID_INPUT]")
 
-        asyncio.run(_empty_qa())
+        asyncio.run(_empty_checks())
     finally:
         close_runtime(rt_e)
 
 
-async def _verify_qa_nonblocking(
+def test_mcp_write_wiki_resources_expand_read_and_collision_safety(tmp_path: Path) -> None:
+    cfg = _make_cfg(tmp_path / "wiki_mcp", wiki_root=tmp_path / "wiki_mcp" / "wiki", qa_model="")
+    assert cfg.corpus_root is not None and cfg.wiki_root is not None
+    cfg.corpus_root.mkdir(parents=True)
+    cfg.wiki_root.mkdir(parents=True)
+    (cfg.corpus_root / "notes.md").write_text(
+        "# Corpus Notes\nCorpus notes track helium thruster baseline calibration.\n",
+        encoding="utf-8",
+    )
+    (cfg.corpus_root / "alpha.md").write_text(
+        "# Apollo 11\nNeil Armstrong commanded Apollo 11 lunar descent.\n",
+        encoding="utf-8",
+    )
+
+    rt = start_runtime(cfg, live=False, wait_for_ready=True, embed_fn=_topic_embed, lm=None)
+    try:
+        mcp, _ = create_mcp_app(rt=rt)
+
+        async def _verify_wiki_flow() -> None:
+            async with Client(mcp) as client:
+                apollo_rec = _assert_mcp_recall_tool_result(await client.call_tool("recall", {"query": "Apollo 11"}))
+                apollo_cid = next(
+                    int(r["chunk_id"]) for r in apollo_rec["results"] if r["source"]["rel_posix_path"] == "alpha.md"
+                )
+                write_res = (
+                    await client.call_tool(
+                        "write_wiki",
+                        {
+                            "slug": "notes",
+                            "title": "Wiki Notes",
+                            "body": "Synthesized tungsten bridge citing [[alpha.md]] and Apollo 11.",
+                            "source_chunk_ids": [apollo_cid],
+                            "wait_for_sync": True,
+                        },
+                    )
+                ).data
+                assert write_res["changed"] is True
+                assert write_res["synced"] is True
+                assert write_res["card_queued"] is False
+                assert write_res["rel_path"] == "wiki:notes.md"
+
+                entries = await _read_json_resource(client, "yaw://wiki")
+                assert len(entries) == 1 and entries[0]["slug"] == "notes" and entries[0]["title"] == "Wiki Notes"
+                card_md = await _read_text_resource(client, "yaw://wiki/notes")
+                assert "# Wiki Notes" in card_md and "tungsten bridge" in card_md and "rel_path: alpha.md" in card_md
+
+                wiki_rec = _assert_mcp_recall_tool_result(
+                    await client.call_tool("recall", {"query": "tungsten bridge", "top_k": 5})
+                )
+                corpus_rec = _assert_mcp_recall_tool_result(
+                    await client.call_tool("recall", {"query": "helium thruster", "top_k": 5})
+                )
+                assert any(r["source"]["rel_posix_path"] == "wiki:notes.md" for r in wiki_rec["results"])
+                assert any(r["source"]["rel_posix_path"] == "notes.md" for r in corpus_rec["results"])
+
+                wiki_cid = next(
+                    int(r["chunk_id"]) for r in wiki_rec["results"] if r["source"]["rel_posix_path"] == "wiki:notes.md"
+                )
+                read_wiki = _assert_mcp_recall_tool_result(await client.call_tool("read_chunk", {"chunk_id": wiki_cid}))
+                assert read_wiki["results"][0]["source"]["rel_posix_path"] == "wiki:notes.md"
+                res_chunk = await _read_json_resource(client, f"yaw://chunk/{wiki_cid}")
+                assert res_chunk["results"][0]["chunk_id"] == wiki_cid
+
+                neighbors = _assert_mcp_recall_tool_result(
+                    await client.call_tool("expand_neighbors", {"chunk_id": wiki_cid, "top_k": 4})
+                )
+                assert any(r["source"]["rel_posix_path"] == "alpha.md" for r in neighbors["results"])
+
+                nested_res = (
+                    await client.call_tool(
+                        "write_wiki",
+                        {
+                            "slug": "topic/rover-notes",
+                            "title": "Rover Notes",
+                            "body": "Nested rover battery note citing Apollo 11.",
+                            "source_chunk_ids": [apollo_cid],
+                            "wait_for_sync": True,
+                        },
+                    )
+                ).data
+                assert nested_res["slug"] == "topic/rover-notes"
+                assert nested_res["synced"] is True
+                nested_md = await _read_text_resource(client, "yaw://wiki/topic/rover-notes")
+                assert "# Rover Notes" in nested_md and "Nested rover battery note" in nested_md
+                listed_slugs = {entry["slug"] for entry in await _read_json_resource(client, "yaw://wiki")}
+                assert listed_slugs == {"notes", "topic/rover-notes"}
+
+                for bad_uri in (
+                    "yaw://wiki/../secret",
+                    "yaw://wiki/%2e%2e%2fsecret",
+                    "yaw://wiki/topic/%2e%2e/secret",
+                ):
+                    with pytest.raises((ResourceError, MCPError)):
+                        await client.read_resource(bad_uri)
+
+                assert cfg.wiki_root is not None
+                (cfg.wiki_root / "malformed.md").write_text(
+                    "---\nkind: [unterminated\n---\n\n# Bad\n", encoding="utf-8"
+                )
+                with pytest.raises((ResourceError, MCPError)) as exc_bad_yaml:
+                    await client.read_resource("yaw://wiki")
+                assert "[CONSISTENCY_ERROR]" in str(exc_bad_yaml.value)
+
+        asyncio.run(_verify_wiki_flow())
+    finally:
+        close_runtime(rt)
+
+
+async def _verify_status_nonblocking_under_embed_hold(
     c1: Client[Any],
     c2: Client[Any],
     hc: httpx.AsyncClient,
     port: int,
-    qa_started: threading.Event,
-    qa_release: threading.Event,
+    hold_started: threading.Event,
+    embed_gate: threading.Event,
 ) -> None:
-    qa_task = asyncio.create_task(c1.call_tool("qa", {"question": "Who commanded Apollo 11?"}))
+    embed_gate.clear()
+    hold_task = asyncio.create_task(c1.call_tool("recall", {"query": "hold_barrier nonblock"}))
     t0 = time.monotonic()
-    while not qa_started.wait(timeout=0.05):
+    while not hold_started.wait(timeout=0.05):
         if time.monotonic() - t0 > 10.0:
-            pytest.fail("qa task did not enter chat responder in time")
+            pytest.fail("recall task did not enter embed hold in time")
         await asyncio.sleep(0.02)
 
     t_check = time.monotonic()
-    st_blocked = (await c2.call_tool("daemon_status", {})).data
+    st_blocked = await _read_json_resource(c2, "yaw://status")
     hz = await hc.get(f"http://127.0.0.1:{port}/healthz")
     rz = await hc.get(f"http://127.0.0.1:{port}/readyz")
     st_http = await hc.get(f"http://127.0.0.1:{port}/status")
     assert time.monotonic() - t_check < 2.0
     assert hz.status_code == 200 and rz.status_code == 200 and st_http.status_code == 200
-    assert st_blocked["active_op"] == "qa" and st_http.json()["active_op"] == "qa"
+    assert st_blocked["active_op"] == "recall" and st_http.json()["active_op"] == "recall"
 
-    qa_release.set()
-    qa_done = (await qa_task).data
-    assert len(qa_done["citations"]) >= 1
+    embed_gate.set()
+    hold_done = _assert_mcp_recall_tool_result(await hold_task)
+    assert len(hold_done["results"]) >= 1
 
 
 async def _verify_32_slot_saturation_and_cancel(
@@ -751,7 +981,7 @@ async def _verify_32_slot_saturation_and_cancel(
     try:
         sat_deadline = time.monotonic() + 10.0
         while time.monotonic() < sat_deadline:
-            if (await c2.call_tool("daemon_status", {})).data["queue_depth"] == 32:
+            if (await _read_json_resource(c2, "yaw://status"))["queue_depth"] == 32:
                 break
             await asyncio.sleep(0.02)
         else:
@@ -770,7 +1000,7 @@ async def _verify_32_slot_saturation_and_cancel(
         embed_gate.set()
         await asyncio.gather(*held_tasks, return_exceptions=True)
 
-    assert (await c2.call_tool("daemon_status", {})).data["queue_depth"] == 0
+    assert (await _read_json_resource(c2, "yaw://status"))["queue_depth"] == 0
     assert len((await c2.call_tool("recall", {"query": "Apollo commander"})).data["results"]) >= 1
 
     embed_gate.clear()
@@ -788,7 +1018,7 @@ async def _verify_32_slot_saturation_and_cancel(
 
     rel_deadline = time.monotonic() + 10.0
     while time.monotonic() < rel_deadline:
-        if (await c2.call_tool("daemon_status", {})).data["queue_depth"] == 0:
+        if (await _read_json_resource(c2, "yaw://status"))["queue_depth"] == 0:
             break
         await asyncio.sleep(0.05)
     else:
@@ -798,27 +1028,25 @@ async def _verify_32_slot_saturation_and_cancel(
 def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_and_cancellation(
     tmp_path: Path,
 ) -> None:
-    qa_started = threading.Event()
-    qa_release = threading.Event()
     embed_gate = threading.Event()
     embed_gate.set()
+    hold_started = threading.Event()
 
-    def chat_responder(payload: dict[str, Any]) -> dict[str, Any]:
-        msgs = payload.get("messages", [])
-        has_tool_obs = any(m.get("role") == "tool" for m in msgs)
-        cids = re.findall(r"\[chunk_id=(\d+)\]", json.dumps(msgs))
-        if not has_tool_obs or not cids:
-            return _tool_reply(
-                "Look up Apollo",
-                [{"name": "search_passages", "args": {"query": "Apollo 11 commander", "top_k": 2}}],
-            )
-        qa_started.set()
-        qa_release.wait(timeout=15.0)
-        return _tool_reply(
-            "Submit grounded answer", [{"name": "submit", "args": {"answer": f"Armstrong [chunk_id={cids[0]}]"}}]
-        )
+    class _TrackingGate(threading.Event):
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            hold_started.set()
+            return embed_gate.wait(timeout=timeout)
 
-    stub_srv, _ = _start_openai_stub(chat_responder, embed_gate=embed_gate, hold_query_marker="hold_barrier")
+        @override
+        def is_set(self) -> bool:
+            return embed_gate.is_set()
+
+    stub_srv, _ = _start_openai_stub(
+        lambda _p: _tool_reply("done", [{"name": "submit", "args": {"answer": "ok"}}]),
+        embed_gate=_TrackingGate(),
+        hold_query_marker="hold_barrier",
+    )
     port = _free_port()
     cfg = _make_cfg(
         tmp_path / "live_tcp",
@@ -827,6 +1055,7 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
         base_url=f"http://127.0.0.1:{stub_srv.server_port}/v1",
         queue_maxsize=32,
         embed_max_in_flight=32,
+        qa_model="",
     )
     assert cfg.corpus_root is not None and cfg.lock_path is not None
     corpus_root = cfg.corpus_root
@@ -851,7 +1080,8 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
         async def _tcp_suite() -> None:
             mcp_url = f"http://127.0.0.1:{port}/mcp"
             async with Client(mcp_url) as c1, Client(mcp_url) as c2, httpx.AsyncClient() as hc:
-                await _verify_qa_nonblocking(c1, c2, hc, port, qa_started, qa_release)
+                await _verify_status_nonblocking_under_embed_hold(c1, c2, hc, port, hold_started, embed_gate)
+                hold_started.clear()
                 await _verify_32_slot_saturation_and_cancel(c1, c2, hc, port, embed_gate)
 
                 async with Client(mcp_url) as c_fresh:
@@ -890,7 +1120,6 @@ def test_live_tcp_multi_client_nonblocking_status_32_slot_saturation_live_sync_a
         lock.acquire(timeout=0)
         lock.release()
     finally:
-        qa_release.set()
         embed_gate.set()
         if t_srv.is_alive() and control_token_path(cfg).is_file():
             _stop_via_control_token(cfg)
@@ -1084,19 +1313,21 @@ def test_live_post_ready_pipeline_failure_flips_readyz_503_and_not_ready_mcp(tmp
 
         async def _verify_mcp_blocked() -> None:
             async with Client(f"http://127.0.0.1:{port}/mcp") as client:
-                st = (await client.call_tool("daemon_status", {})).data
+                st = await _read_json_resource(client, "yaw://status")
                 assert st["lifecycle"] == "error"
                 assert st["provider_ready"] is False
                 assert st["sync_state"] == "error"
                 assert st["last_error"] is not None
 
-                with pytest.raises(ToolError) as exc_rec:
-                    await client.call_tool("recall", {"query": "Apollo 11"})
-                assert str(exc_rec.value).startswith("[NOT_READY]")
-
-                with pytest.raises(ToolError) as exc_qa:
-                    await client.call_tool("qa", {"question": "Who commanded Apollo 11?"})
-                assert str(exc_qa.value).startswith("[NOT_READY]")
+                for tool_name, args in (
+                    ("recall", {"query": "Apollo 11"}),
+                    ("expand_neighbors", {"chunk_id": 1}),
+                    ("read_chunk", {"chunk_id": 1}),
+                    ("write_wiki", {"slug": "post-err", "title": "Err", "body": "Body."}),
+                ):
+                    with pytest.raises(ToolError) as exc_nr:
+                        await client.call_tool(tool_name, args)
+                    assert str(exc_nr.value).startswith("[NOT_READY]")
 
         asyncio.run(_verify_mcp_blocked())
         assert _stop_via_control_token(cfg).status_code == 200

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
         hydrate_passage,
         hydrate_ranked_passages,
         resolve_hydrated_line_span,
+        verify_source_fingerprint,
     )
     from .index import build_retrieval_index
     from .lexical import lexical_search
@@ -57,6 +58,7 @@ _PUBLIC_API: dict[str, str] = {
     "resolve_hydrated_line_span": ".hydration",
     "sanitize_slip_label": ".slip",
     "search_index": ".search",
+    "verify_source_fingerprint": ".hydration",
 }
 
 __all__ = [
@@ -84,6 +86,7 @@ __all__ = [
     "resolve_hydrated_line_span",
     "sanitize_slip_label",
     "search_index",
+    "verify_source_fingerprint",
 ]
 
 

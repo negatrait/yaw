@@ -109,27 +109,94 @@ def normalize_ast_heading(raw_line: str) -> str:
     return " ".join(head.split())
 
 
+def advance_markdown_fence(raw_line: str, fence: tuple[str, int]) -> tuple[tuple[str, int], bool]:
+    """Advance CommonMark fenced code block state for `raw_line`, returning `(next_fence, is_delimiter)`."""
+    stripped = raw_line.lstrip(" ")
+    if raw_line.startswith("\t") or len(raw_line) - len(stripped) > 3:
+        return fence, False
+    f_ch, f_len = fence
+    if not f_ch and stripped.startswith(("```", "~~~")):
+        ch = stripped[0]
+        return (ch, len(stripped) - len(stripped.lstrip(ch))), True
+    if f_ch and stripped.startswith(f_ch * f_len) and not stripped.strip(f_ch + " \t"):
+        return ("", 0), True
+    return fence, False
+
+
+def leading_frontmatter_end(lines: Sequence[str], max_el: int | None = None) -> int:
+    """Return the 0-based line index immediately after leading YAML frontmatter, or 0 if absent."""
+    limit = len(lines) if max_el is None else min(len(lines), max(0, int(max_el)))
+    first_idx = next((i for i in range(limit) if lines[i].strip()), None)
+    if (
+        first_idx is None
+        or lines[first_idx].strip() != "---"
+        or first_idx + 1 >= limit
+        or not lines[first_idx + 1].strip()
+    ):
+        return 0
+    for j in range(first_idx + 1, limit):
+        s = lines[j].strip()
+        if s in ("---", "..."):
+            return j + 1
+        if s and not (lines[j][0].isspace() or s.startswith(("#", "-")) or ":" in s):
+            return 0
+    return 0
+
+
+def _is_setext_underline(raw_line: str, ch: str) -> bool:
+    stripped = raw_line.lstrip(" ")
+    if raw_line.startswith("\t") or len(raw_line) - len(stripped) > 3:
+        return False
+    u = stripped.strip()
+    return bool(u) and set(u) == {ch}
+
+
+def _is_paragraph_interrupter(raw_line: str) -> bool:
+    stripped = raw_line.lstrip(" ")
+    if raw_line.startswith("\t") or len(raw_line) - len(stripped) > 3:
+        return False
+    if stripped.startswith(("```", "~~~", ">")):
+        return True
+    hashes = len(stripped) - len(stripped.lstrip("#"))
+    if 1 <= hashes <= 6 and (len(stripped) == hashes or stripped[hashes] in (" ", "\t")):
+        return True
+    u = stripped.strip()
+    if u in ("-", "*", "+") or (len(stripped) >= 2 and stripped[0] in ("-", "*", "+") and stripped[1] in (" ", "\t")):
+        return True
+    no_ws = u.replace(" ", "").replace("\t", "")
+    return len(no_ws) >= 3 and len(set(no_ws)) == 1 and no_ws[0] in ("-", "*", "_")
+
+
 def markdown_heading_level(lines: Sequence[str], frame_line: int) -> int | None:
     """Return CommonMark ATX (1..6) or Setext (1..2) heading level for 1-indexed `frame_line`, or None."""
     if frame_line < 1 or frame_line > len(lines):
         return None
     raw = lines[frame_line - 1]
     stripped = raw.lstrip(" ")
-    if raw.startswith("\t") or len(raw) - len(stripped) > 3 or stripped.startswith(("```", "~~~", ">")):
+    if not raw.strip() or raw.startswith("\t") or len(raw) - len(stripped) > 3:
+        return None
+    if stripped.startswith(("```", "~~~", ">")):
+        return None
+    if frame_line <= leading_frontmatter_end(lines):
         return None
     hashes = len(stripped) - len(stripped.lstrip("#"))
     if 1 <= hashes <= 6 and (len(stripped) == hashes or stripped[hashes] in (" ", "\t")):
         return hashes
     if stripped.startswith(("-", "*", "+", "#")) or frame_line >= len(lines):
         return None
+    no_ws0 = stripped.strip().replace(" ", "").replace("\t", "")
+    if len(no_ws0) >= 3 and len(set(no_ws0)) == 1 and no_ws0[0] == "_":
+        return None
     for idx in range(frame_line, min(len(lines), frame_line + 3)):
-        u = lines[idx].strip()
-        if not u:
+        cand = lines[idx]
+        if not cand.strip():
             break
-        if set(u) == {"="}:
+        if _is_setext_underline(cand, "="):
             return 1
-        if set(u) == {"-"}:
+        if _is_setext_underline(cand, "-"):
             return 2
+        if _is_paragraph_interrupter(cand):
+            break
     return None
 
 
@@ -162,6 +229,53 @@ def require_corpus_dir(corpus_root: Path | str) -> Path:
     return resolved
 
 
+WIKI_REL_PREFIX = "wiki:"
+
+
+def is_wiki_rel_path(rel_path: str) -> bool:
+    """Return whether `rel_path` carries the canonical `wiki:` provenance prefix."""
+    return isinstance(rel_path, str) and rel_path.startswith(WIKI_REL_PREFIX)
+
+
+def make_wiki_rel_path(rel_path: str) -> str:
+    """Normalize `\\` to `/` and prefix a validated relative wiki path with `wiki:`."""
+    if not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("Relative wiki path must be a non-empty string.")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in rel_path):
+        raise ValueError(f"Control characters not allowed in wiki path: {rel_path!r}")
+    norm = rel_path.replace("\\", "/")
+    if norm.startswith(WIKI_REL_PREFIX):
+        raise ValueError(f"Wiki path is already prefixed: {rel_path!r}")
+    raw_rel = Path(norm)
+    if raw_rel.is_absolute() or norm.startswith("/") or (len(norm) >= 2 and norm[1] == ":"):
+        raise ValueError(f"Absolute path not allowed: {rel_path!r}")
+    if ".." in norm.split("/") or not raw_rel.parts or norm.endswith("/"):
+        raise ValueError(f"Invalid relative wiki path: {rel_path!r}")
+    return f"{WIKI_REL_PREFIX}{norm}"
+
+
+def strip_wiki_rel_path(rel_path: str) -> str:
+    """Strip the `wiki:` prefix from a wiki relative path, raising ValueError if invalid."""
+    if not isinstance(rel_path, str) or not rel_path.startswith(WIKI_REL_PREFIX):
+        raise ValueError(f"Expected {WIKI_REL_PREFIX!r}-prefixed path, got {rel_path!r}")
+    suffix = rel_path[len(WIKI_REL_PREFIX) :]
+    if not suffix.strip():
+        raise ValueError(f"Wiki path suffix must not be empty: {rel_path!r}")
+    return suffix
+
+
+def resolve_source_path(rel_path: str, corpus_root: Path | str, wiki_root: Path | str | None = None) -> Path:
+    """Resolve a corpus or `wiki:`-prefixed relative path against its configured root."""
+    if is_wiki_rel_path(rel_path):
+        if wiki_root is None:
+            raise YawRuntimeError(
+                "CONSISTENCY_ERROR",
+                f"Cannot resolve wiki path {rel_path!r} when wiki_root is not configured.",
+            )
+        return resolve_corpus_path(wiki_root, strip_wiki_rel_path(rel_path))
+    return resolve_corpus_path(corpus_root, rel_path)
+
+
 @dataclass(frozen=True, slots=True)
 class ChunkPointer:
     """Zero-copy provenance pointer referencing a disk-backed source span."""
@@ -180,6 +294,10 @@ class ChunkPointer:
     @property
     def rel_posix_path(self) -> str:
         return self.rel_path.replace("\\", "/")
+
+    @property
+    def provenance(self) -> Literal["corpus", "wiki"]:
+        return "wiki" if is_wiki_rel_path(self.rel_posix_path) else "corpus"
 
     @property
     def span_label(self) -> str:
@@ -291,17 +409,24 @@ __all__ = [
     "ErrorCode",
     "HydratedPassage",
     "QAResult",
+    "WIKI_REL_PREFIX",
     "YawRuntimeError",
+    "advance_markdown_fence",
     "canonical_chunk_span_key",
     "compute_chunk_int_id",
     "format_doc_for_embedding",
     "format_query_for_embedding",
     "inclusive_end_line",
+    "is_wiki_rel_path",
+    "leading_frontmatter_end",
+    "make_wiki_rel_path",
     "markdown_heading_level",
     "normalize_ast_heading",
     "redact_secrets",
     "render_document_text",
     "require_corpus_dir",
     "resolve_corpus_path",
+    "resolve_source_path",
     "split_lf_lines",
+    "strip_wiki_rel_path",
 ]

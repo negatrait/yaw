@@ -17,6 +17,7 @@ from cocoindex.resources.chunk import Chunk, TextPosition
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 from yaw.core import (
+    WIKI_REL_PREFIX,
     compute_chunk_int_id,
     format_doc_for_embedding,
     inclusive_end_line,
@@ -30,6 +31,7 @@ from .embedder import EMBEDDER, PipelineEmbedder
 from .targets import FTS_MODE, FTS_TABLES, ChunkRow, FtsTableKey, SourceChunk
 
 CORPUS_ROOT = coco.ContextKey[Path]("yaw/pipeline/corpus_root")
+WIKI_ROOT = coco.ContextKey[Path]("yaw/pipeline/wiki_root")
 SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("yaw/pipeline/sqlite_db")
 
 _SPLITTER = RecursiveSplitter()
@@ -351,7 +353,7 @@ async def _compute_chunk_embedding(
     return np.asarray(vec, dtype="<f2").tobytes()
 
 
-@coco.fn(memo=True, version=7)
+@coco.fn(memo=True, version=8)
 async def _process_file(
     file: FileLike[Any],
     chunks_target: sqlite.TableTarget[ChunkRow],
@@ -361,8 +363,10 @@ async def _process_file(
     chunk_overlap: int,
     min_chunk_size: int,
     task_mode: str,
+    rel_prefix: str = "",
 ) -> int:
-    rel_path = file.file_path.as_posix()
+    raw_rel = file.file_path.as_posix()
+    rel_path = f"{rel_prefix}{raw_rel}" if rel_prefix else raw_rel
     raw_text = await file.read_text()
     pieces = chunk_file_content(
         rel_path,
@@ -399,6 +403,27 @@ async def _process_file(
     return len(pieces)
 
 
+def build_wiki_path_matcher(excluded_patterns: Sequence[str] = ()) -> PatternFilePathMatcher:
+    """Build the CocoIndex matcher for `wiki_root` excluding hidden `.*`, `.tmp` dirs, and `.tmp.md` files."""
+    return PatternFilePathMatcher(
+        included_patterns=["*.md"],
+        excluded_patterns=list(
+            dict.fromkeys(
+                [
+                    *excluded_patterns,
+                    ".*",
+                    "*/.*",
+                    "*.tmp",
+                    "*.tmp/**",
+                    "**/*.tmp/**",
+                    "*.tmp.md",
+                    "**/*.tmp.md",
+                ]
+            )
+        ),
+    )
+
+
 @coco.fn
 async def indexing_main(
     included_patterns: tuple[str, ...],
@@ -408,6 +433,7 @@ async def indexing_main(
     min_chunk_size: int,
     task_mode: str,
     live: bool,
+    has_wiki: bool = False,
 ) -> None:
     """Declarative CocoIndex main flow mounting SQLite chunks and FTS5 targets."""
     embedder = coco.use_context(EMBEDDER)
@@ -420,6 +446,7 @@ async def indexing_main(
     )
     files = localfs.walk_dir(CORPUS_ROOT, recursive=True, path_matcher=matcher, live=live)
     mount_handle = await coco.mount_each(
+        coco.ComponentSubpath("corpus"),
         _process_file,
         files.items(),
         chunks_target,
@@ -429,6 +456,26 @@ async def indexing_main(
         chunk_overlap,
         min_chunk_size,
         task_mode,
+        "",
     )
+    wiki_mount = None
+    if has_wiki:
+        wiki_matcher = build_wiki_path_matcher(excluded_patterns)
+        wiki_files = localfs.walk_dir(WIKI_ROOT, recursive=True, path_matcher=wiki_matcher, live=live)
+        wiki_mount = await coco.mount_each(
+            coco.ComponentSubpath("wiki"),
+            _process_file,
+            wiki_files.items(),
+            chunks_target,
+            fts_target,
+            embedder,
+            chunk_size,
+            chunk_overlap,
+            min_chunk_size,
+            task_mode,
+            WIKI_REL_PREFIX,
+        )
     if not live:
         await mount_handle.ready()
+        if wiki_mount is not None:
+            await wiki_mount.ready()

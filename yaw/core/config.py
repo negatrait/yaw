@@ -33,6 +33,7 @@ _DEFAULT_RELATIVE_PATHS: dict[str, str] = {
     "status_path": ".yaw/status.json",
     "compiled_program_path": ".yaw/compiled_program.json",
 }
+_OPTIONAL_PATH_FIELDS: frozenset[str] = frozenset({"wiki_root"})
 _OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
     "datasets": "optimize_datasets",
     "max_queries": "optimize_max_queries",
@@ -40,7 +41,7 @@ _OPTIMIZATION_KEY_ALIASES: dict[str, str] = {
     "auto": "optimize_auto",
 }
 _SECTION_FIELDS: dict[str, tuple[str, ...]] = {
-    "paths": tuple(_DEFAULT_RELATIVE_PATHS),
+    "paths": (*_DEFAULT_RELATIVE_PATHS, "wiki_root"),
     "ingestion": ("included_patterns", "excluded_patterns", "chunk_size")
     + ("chunk_overlap", "min_chunk_size", "embed_batch_size"),
     "inference": ("base_url", "api_key", "provider", "embedding_model", "embedding_task_mode")
@@ -133,12 +134,72 @@ def _normalize_str_tuple(raw: object, default: tuple[str, ...], *, field_name: s
     )
 
 
+def _validate_workspace_root(raw_ws: Any) -> Path:
+    if (
+        isinstance(raw_ws, bool)
+        or not isinstance(raw_ws, (str, Path))
+        or (isinstance(raw_ws, str) and not raw_ws.strip())
+    ):
+        raise _invalid(f"Configuration field 'workspace_root' must be a non-empty path string or Path, got {raw_ws!r}")
+    return Path(raw_ws).resolve()
+
+
+def _resolve_optional_wiki_root(ws: Path, raw_wiki: Any, corpus_root: Path) -> Path | None:
+    if raw_wiki is None:
+        return None
+    if (
+        isinstance(raw_wiki, bool)
+        or not isinstance(raw_wiki, (str, Path))
+        or (isinstance(raw_wiki, str) and not raw_wiki.strip())
+    ):
+        raise _invalid(f"Configuration field 'wiki_root' must be a non-empty path string or Path, got {raw_wiki!r}")
+    val = Path(raw_wiki)
+    wiki = val.resolve() if val.is_absolute() else (ws / val).resolve()
+    if wiki == corpus_root or wiki.is_relative_to(corpus_root) or corpus_root.is_relative_to(wiki):
+        raise _invalid(f"Configuration field 'wiki_root' ({wiki}) must be disjoint from 'corpus_root' ({corpus_root})")
+    return wiki
+
+
+def _validate_int_fields(cfg: YawConfig) -> None:
+    for int_field in _INT_FIELDS:
+        raw_int = getattr(cfg, int_field)
+        if raw_int is None:
+            if int_field not in _OPTIONAL_INT_FIELDS:
+                raise _invalid(f"Configuration field {int_field!r} requires an integer, got None")
+            continue
+        if isinstance(raw_int, bool) or not isinstance(raw_int, int):
+            raise _invalid(f"Configuration field {int_field!r} requires an integer, got {raw_int!r}")
+        if int_field not in ("chunk_overlap", "optimize_query_offset", "max_output_tokens") and raw_int < 1:
+            raise _invalid(f"YawConfig(): {int_field} must be >= 1")
+
+
+def _validate_str_and_bounds(cfg: YawConfig) -> None:
+    for str_field in _STR_FIELDS:
+        if not isinstance(raw_str := getattr(cfg, str_field), str):
+            raise _invalid(f"Configuration field {str_field!r} must be a string, got {raw_str!r}")
+    if not (0 <= cfg.chunk_overlap < cfg.chunk_size):
+        raise _invalid("YawConfig(): chunk_overlap must satisfy 0 <= chunk_overlap < chunk_size")
+    if cfg.max_output_tokens is not None and cfg.max_output_tokens < 1:
+        raise _invalid("YawConfig(): max_output_tokens must be positive")
+    if not (1 <= cfg.http_port <= 65535):
+        raise _invalid(f"YawConfig(): http_port must be in 1..65535, got {cfg.http_port!r}")
+    if not cfg.http_path.startswith("/"):
+        raise _invalid(f"YawConfig(): http_path must start with '/', got {cfg.http_path!r}")
+    if cfg.optimize_query_offset < 0:
+        raise _invalid("YawConfig(): optimize_query_offset must be >= 0")
+    if cfg.optimize_auto not in _AUTO_MODES:
+        raise _invalid(f"YawConfig(): Unsupported optimize_auto: {cfg.optimize_auto!r}")
+    if cfg.embedding_task_mode not in _TASK_MODES:
+        raise _invalid(f"YawConfig(): Unsupported embedding_task_mode: {cfg.embedding_task_mode!r}")
+
+
 @dataclass(slots=True, frozen=True)
 class YawConfig:
     """Immutable daemon, ingestion, inference, runtime, and optimization configuration."""
 
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
     corpus_root: Path | None = None
+    wiki_root: Path | None = None
     db_path: Path | None = None
     lock_path: Path | None = None
     state_dir: Path | None = None
@@ -180,49 +241,15 @@ class YawConfig:
     optimize_auto: Literal["light", "medium", "heavy"] = "light"
 
     def __post_init__(self) -> None:
-        raw_ws: Any = self.workspace_root
-        if (
-            isinstance(raw_ws, bool)
-            or not isinstance(raw_ws, (str, Path))
-            or (isinstance(raw_ws, str) and not raw_ws.strip())
-        ):
-            raise _invalid(
-                f"Configuration field 'workspace_root' must be a non-empty path string or Path, got {raw_ws!r}"
-            )
-        ws = Path(raw_ws).resolve()
+        ws = _validate_workspace_root(self.workspace_root)
         object.__setattr__(self, "workspace_root", ws)
         for attr, default_rel in _DEFAULT_RELATIVE_PATHS.items():
             object.__setattr__(self, attr, _resolve_path(ws, getattr(self, attr), default_rel, field_name=attr))
+        assert self.corpus_root is not None
+        object.__setattr__(self, "wiki_root", _resolve_optional_wiki_root(ws, self.wiki_root, self.corpus_root))
 
-        for int_field in _INT_FIELDS:
-            raw_int = getattr(self, int_field)
-            if raw_int is None:
-                if int_field not in _OPTIONAL_INT_FIELDS:
-                    raise _invalid(f"Configuration field {int_field!r} requires an integer, got None")
-                continue
-            if isinstance(raw_int, bool) or not isinstance(raw_int, int):
-                raise _invalid(f"Configuration field {int_field!r} requires an integer, got {raw_int!r}")
-            if int_field not in ("chunk_overlap", "optimize_query_offset", "max_output_tokens") and raw_int < 1:
-                raise _invalid(f"YawConfig(): {int_field} must be >= 1")
-
-        for str_field in _STR_FIELDS:
-            if not isinstance(raw_str := getattr(self, str_field), str):
-                raise _invalid(f"Configuration field {str_field!r} must be a string, got {raw_str!r}")
-
-        if not (0 <= self.chunk_overlap < self.chunk_size):
-            raise _invalid("YawConfig(): chunk_overlap must satisfy 0 <= chunk_overlap < chunk_size")
-        if self.max_output_tokens is not None and self.max_output_tokens < 1:
-            raise _invalid("YawConfig(): max_output_tokens must be positive")
-        if not (1 <= self.http_port <= 65535):
-            raise _invalid(f"YawConfig(): http_port must be in 1..65535, got {self.http_port!r}")
-        if not self.http_path.startswith("/"):
-            raise _invalid(f"YawConfig(): http_path must start with '/', got {self.http_path!r}")
-        if self.optimize_query_offset < 0:
-            raise _invalid("YawConfig(): optimize_query_offset must be >= 0")
-        if self.optimize_auto not in _AUTO_MODES:
-            raise _invalid(f"YawConfig(): Unsupported optimize_auto: {self.optimize_auto!r}")
-        if self.embedding_task_mode not in _TASK_MODES:
-            raise _invalid(f"YawConfig(): Unsupported embedding_task_mode: {self.embedding_task_mode!r}")
+        _validate_int_fields(self)
+        _validate_str_and_bounds(self)
 
         for attr, default in (
             ("optimize_datasets", ("enterprise_rag_bench",)),
@@ -233,7 +260,9 @@ class YawConfig:
         if not self.optimize_datasets:
             raise _invalid("YawConfig(): optimize_datasets must not be empty")
 
-    def for_optimization(self, db_override: Path | str | None = None) -> YawConfig:
+    def for_optimization(
+        self, db_override: Path | str | None = None, *, wiki_root: Path | str | None = None
+    ) -> YawConfig:
         """Derive an isolated configuration for DSPy prompt optimization."""
         base_dir = (Path(self.db_path) if self.db_path else Path(".yaw/yaw.db")).parent
         if db_override is None:
@@ -249,6 +278,7 @@ class YawConfig:
         return replace(
             self,
             corpus_root=self.workspace_root,
+            wiki_root=wiki_root,
             db_path=opt_db,
             lock_path=Path(f"{opt_db}.lock"),
             status_path=base_dir / status_name,
@@ -267,7 +297,9 @@ _INT_FIELDS: frozenset[str] = (
 _STRING_PATH_FIELDS: frozenset[str] = (
     (frozenset(_FIELD_TO_SECTION) | {"workspace_root"}) - _SEQUENCE_FIELDS - _INT_FIELDS
 )
-_STR_FIELDS: frozenset[str] = _STRING_PATH_FIELDS - _DEFAULT_RELATIVE_PATHS.keys() - {"workspace_root"}
+_STR_FIELDS: frozenset[str] = (
+    _STRING_PATH_FIELDS - _DEFAULT_RELATIVE_PATHS.keys() - _OPTIONAL_PATH_FIELDS - {"workspace_root"}
+)
 
 
 def _strict_toml_value(val_str: str, cleaned: str) -> Any:
@@ -290,6 +322,8 @@ def _parse_config_scalar(val_str: str, field_name: str) -> Any:
             raise _invalid(f"_parse_config_scalar(): {field_name!r} requires a string or list of strings, got {val!r}")
         return val
     if field_name in _STRING_PATH_FIELDS:
+        if field_name in _OPTIONAL_PATH_FIELDS and cleaned.lower() in ("none", "null"):
+            return None
         if len(cleaned) >= 2 and (cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'")):
             return _strict_toml_value(val_str, cleaned)
         return cleaned

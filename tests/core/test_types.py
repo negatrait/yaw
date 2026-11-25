@@ -10,24 +10,31 @@ from typing import Any, cast, get_args
 
 import yaw.core.types as core_types
 from yaw.core.types import (
+    WIKI_REL_PREFIX,
     ChunkPointer,
     DaemonStatus,
     ErrorCode,
     HydratedPassage,
     QAResult,
     YawRuntimeError,
+    advance_markdown_fence,
     canonical_chunk_span_key,
     compute_chunk_int_id,
     format_doc_for_embedding,
     format_query_for_embedding,
     inclusive_end_line,
+    is_wiki_rel_path,
+    leading_frontmatter_end,
+    make_wiki_rel_path,
     markdown_heading_level,
     normalize_ast_heading,
     redact_secrets,
     render_document_text,
     require_corpus_dir,
     resolve_corpus_path,
+    resolve_source_path,
     split_lf_lines,
+    strip_wiki_rel_path,
 )
 
 
@@ -170,6 +177,12 @@ class TypesTests(unittest.TestCase):
         self.assertEqual(normalize_ast_heading("# [RFC-12] Tagged Header — "), "Tagged Header")
         self.assertEqual(markdown_heading_level(["Title", "==="], 1), 1)
         self.assertEqual(markdown_heading_level(["## Sub", "body"], 1), 2)
+        fence, is_delim = advance_markdown_fence("```python", ("", 0))
+        self.assertEqual((fence, is_delim), (("`", 3), True))
+        fence, is_delim = advance_markdown_fence("# Comment Inside Fence", fence)
+        self.assertEqual((fence, is_delim), (("`", 3), False))
+        fence, is_delim = advance_markdown_fence("```", fence)
+        self.assertEqual((fence, is_delim), (("", 0), True))
 
     def test_retired_legacy_types_removed(self):
         expected_all = [
@@ -180,19 +193,26 @@ class TypesTests(unittest.TestCase):
             "ErrorCode",
             "HydratedPassage",
             "QAResult",
+            "WIKI_REL_PREFIX",
             "YawRuntimeError",
+            "advance_markdown_fence",
             "canonical_chunk_span_key",
             "compute_chunk_int_id",
             "format_doc_for_embedding",
             "format_query_for_embedding",
             "inclusive_end_line",
+            "is_wiki_rel_path",
+            "leading_frontmatter_end",
+            "make_wiki_rel_path",
             "markdown_heading_level",
             "normalize_ast_heading",
             "redact_secrets",
             "render_document_text",
             "require_corpus_dir",
             "resolve_corpus_path",
+            "resolve_source_path",
             "split_lf_lines",
+            "strip_wiki_rel_path",
         ]
         self.assertEqual(core_types.__all__, expected_all)
         for retired in (
@@ -235,3 +255,105 @@ class TypesTests(unittest.TestCase):
                 with self.assertRaises(YawRuntimeError) as ctx:
                     require_corpus_dir(bad)
                 self.assertEqual(ctx.exception.code, "CONSISTENCY_ERROR")
+
+    def test_wiki_rel_path_helpers_resolve_source_path_and_provenance(self):
+        self.assertEqual(WIKI_REL_PREFIX, "wiki:")
+        self.assertFalse(is_wiki_rel_path("docs/a.md"))
+        self.assertTrue(is_wiki_rel_path("wiki:cards/a.md"))
+
+        self.assertEqual(make_wiki_rel_path("cards\\topic.md"), "wiki:cards/topic.md")
+        self.assertEqual(make_wiki_rel_path(" spaced name.md"), "wiki: spaced name.md")
+        self.assertEqual(strip_wiki_rel_path("wiki:cards/topic.md"), "cards/topic.md")
+
+        for bad_rel in (
+            "",
+            "   ",
+            "a\nb.md",
+            "a\x00b.md",
+            "/abs.md",
+            "C:\\abs.md",
+            "C:rel.md",
+            "../x.md",
+            "wiki:x.md",
+            ".",
+            "dir/",
+        ):
+            with self.assertRaises(ValueError):
+                make_wiki_rel_path(bad_rel)
+
+        for bad_strip in ("cards/topic.md", "wiki:", "wiki:   "):
+            with self.assertRaises(ValueError):
+                strip_wiki_rel_path(bad_strip)
+
+        corpus_ptr = ChunkPointer(1, "docs/sample.md", "h", 1, 5)
+        wiki_ptr = ChunkPointer(2, "wiki:cards/topic.md", "h", 1, 5)
+        self.assertEqual(corpus_ptr.provenance, "corpus")
+        self.assertEqual(wiki_ptr.provenance, "wiki")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            corpus_root = root / "corpus"
+            wiki_root = root / "wiki"
+            (corpus_root / "docs").mkdir(parents=True)
+            (wiki_root / "cards").mkdir(parents=True)
+            (corpus_root / "docs" / "sample.md").write_text("# Doc\n", encoding="utf-8")
+            (wiki_root / "cards" / "topic.md").write_text("# Topic\n", encoding="utf-8")
+
+            self.assertEqual(
+                resolve_source_path("docs/sample.md", corpus_root),
+                (corpus_root / "docs" / "sample.md").resolve(),
+            )
+            self.assertEqual(
+                resolve_source_path("wiki:cards/topic.md", corpus_root, wiki_root),
+                (wiki_root / "cards" / "topic.md").resolve(),
+            )
+            with self.assertRaises(YawRuntimeError) as exc_ctx:
+                resolve_source_path("wiki:cards/topic.md", corpus_root, None)
+            self.assertEqual(exc_ctx.exception.code, "CONSISTENCY_ERROR")
+            with self.assertRaises(ValueError):
+                resolve_source_path("wiki:../escape.md", corpus_root, wiki_root)
+
+    def test_leading_frontmatter_end_and_markdown_heading_level_edge_cases(self):
+        fm_lines = [
+            "---",
+            "kind: note",
+            "stale: false",
+            "sources: []",
+            "---",
+            "",
+            "First Line",
+            "Second Line",
+            "===",
+            "",
+            "Body text.",
+        ]
+        self.assertEqual(leading_frontmatter_end(fm_lines), 5)
+        self.assertEqual(leading_frontmatter_end(fm_lines, 3), 0)
+        for ln in range(1, 7):
+            self.assertIsNone(markdown_heading_level(fm_lines, ln), f"Line {ln} must not be a heading")
+        self.assertEqual(markdown_heading_level(fm_lines, 7), 1)
+        self.assertEqual(markdown_heading_level(fm_lines, 8), 1)
+        self.assertIsNone(markdown_heading_level(fm_lines, 9))
+        self.assertIsNone(markdown_heading_level(fm_lines, 10))
+
+        # Blank/whitespace lines before === or --- must never be headings.
+        self.assertIsNone(markdown_heading_level(["", "==="], 1))
+        self.assertIsNone(markdown_heading_level(["   ", "---"], 1))
+
+        # Two horizontal rules with non-YAML body must not trigger frontmatter skipping.
+        self.assertEqual(leading_frontmatter_end(["---", "", "# After HR"]), 0)
+        self.assertEqual(markdown_heading_level(["---", "", "# After HR"], 3), 1)
+        self.assertEqual(leading_frontmatter_end(["---", "Plain prose", "---"]), 0)
+
+        # 3-line Setext H1 & H2 supported; 4-line exceeds lookahead.
+        self.assertEqual(markdown_heading_level(["A", "B", "C", "==="], 1), 1)
+        self.assertEqual(markdown_heading_level(["A", "B", "C", "---"], 1), 2)
+        self.assertIsNone(markdown_heading_level(["A", "B", "C", "D", "==="], 1))
+
+        # CommonMark paragraph interrupters stop Setext lookahead.
+        for interrupter in ("# ATX", "## Sub", "```py", "~~~", "> quote", "***", "___", "- item"):
+            self.assertIsNone(markdown_heading_level(["Lead", interrupter, "==="], 1), interrupter)
+        # 4-space indented underline is not a Setext underline.
+        self.assertIsNone(markdown_heading_level(["Lead", "    ===", "Body"], 1))
+        # #tag without space is paragraph continuation, not ATX interrupter.
+        self.assertEqual(markdown_heading_level(["Lead", "#tag", "==="], 1), 1)

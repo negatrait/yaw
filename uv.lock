@@ -2316,6 +2316,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "filelock" },
     { name = "numpy" },
+    { name = "pyyaml" },
     { name = "scipy" },
 ]
 
@@ -2338,6 +2339,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=4.2.0" },
     { name = "filelock", specifier = ">=3.32.7" },
     { name = "numpy", specifier = ">=2.5.4" },
+    { name = "pyyaml", specifier = ">=6.0.4" },
     { name = "scipy", specifier = ">=1.18.1" },
 ]
 

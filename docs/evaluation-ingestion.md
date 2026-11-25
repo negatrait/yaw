@@ -687,3 +687,19 @@ Live-silicon ingestion, SQLite/FTS5 schema, and disk-hydration verification on t
   - Retrieval & MaxP Island Hydration (`search_index` + `hydrate_ranked_passages(..., include_island=True)` + `build_recall_payload` + `format_recall_text`): emitted expanded `(guide.md:11-31)` from sub-chunk `28-31`, `(card.md:9-21)` from sub-chunk `21-21`, and `(worker.py:20-41)` from sub-chunk `30-41` (`STATUS = PASSED`).
 - **Live 7-Dataset Ingestion Throughput During `U4.5` Parity Re-Baseline (`outputs/benchmarks/paper_parity_gate.json`):** Indexed `28,682` Markdown files (`45,138` chunks across `popqa`, `lveval` `22,849` docs / `39,154` chunks, `narrativeqa`, `2wikimultihopqa`, `hotpotqa`, `nq`, `musique`) in `559.93s` cumulative (`0` ingestion/integrity errors, `0` failed vector norms or fingerprint checks).
 - **Offline Gate Verification:** Uncontended `ty check`, `ruff check`, `ruff format --check` (`69` files), `pytest -o addopts=""` (`413 passed`), and `git diff --check` passed cleanly.
+
+---
+
+## 2026-11-25: Sprint `3.3` `U5` & `G5` Dual-Root Reconciliation, `.yaw/coco_lmdb` Memo Isolation & FastMCP `4+4` Probe
+
+Real-substrate `G5` timing and dual-root CocoIndex/FastMCP measurements supporting Sprint `3.3` `U5` ([epic-3-librarian-wiki-sprint.md §6](reviews/epic-3-librarian-wiki-sprint.md#6-capability-gates)):
+
+- **Empirical `reconcile_index_tables(N)` Scaling (`dim=768`, disposable SQLite copies, deterministic `G5` probe):**
+  - `popqa` (`run-popqa-9s4dyhi_`, `100` chunks, `70` docs): `reconcile_s = 0.9634s (changed=True)`, `noop_s = 0.0009s (changed=False)`, `build_retrieval_index_s = 0.0174s`, `db = 458,752 B`, `d_eff = 63.76`, `codes = 9,600 B`, `ip_norm = 400 B`, `mean = 3,072 B`, `doc_titles = 1,651 B`, `graph = 5,497 B`.
+  - `hotpotqa` (`run-hotpotqa-a8fq9ppq`, `376` chunks, `344` docs): `reconcile_s = 4.8831s (changed=True)`, `noop_s = 0.0023s (changed=False)`, `build_retrieval_index_s = 0.0118s`, `db = 1,646,592 B`, `d_eff = 162.52`, `codes = 36,096 B`, `ip_norm = 1,504 B`, `mean = 3,072 B`, `doc_titles = 4,948 B`, `graph = 31,920 B`.
+  - `lveval` (`run-lveval-52xur7t5`, `39,154` chunks, `22,849` docs): `reconcile_s = 266.7320s (changed=True)`, `noop_s = 1.6957s (changed=False)`, `build_retrieval_index_s = 0.6019s`, `db = 134,967,296 B`, `d_eff = 284.16`, `codes = 3,758,784 B`, `ip_norm = 156,616 B`, `mean = 3,072 B`, `doc_titles = 177 B`, `graph = 4,389,684 B`.
+- **Dual-Root `.yaw/coco_lmdb` Zero Corpus Re-Embed Probe (`corpus_root` + `wiki_root`, single `cocoindex.App`):**
+  - Phase A catch-up indexed `4` files (`guide.md`, `notes.md`, `wiki:card.md`, `wiki:notes.md`, `embedded_texts = 4`).
+  - Phase B edited `wiki_root/notes.md` and added `wiki_root/bridge.md`, embedding only `2` wiki files (`0` unchanged `corpus_root` re-embeds).
+  - Phase C (`live=True` single `cocoindex.App`): `initial_live_reembeds = 0`; live edit to `wiki_root/bridge.md` triggered `after_wiki_edit_reembeds = 1` and `fts_tungsten_hit = True`.
+- **FastMCP `4.2.5` (`cocoindex 1.2.0`, `pyyaml 6.0.4`) `4+4` Surface Verification:** `Client.protocol_version = '2026-07-28'`, `Client.instructions` populated directly in `mode="auto"` (`Client.initialize_result` is `None`), `Client(..., mode="legacy").initialize_result.instructions` populated identically; `.mime_type` and `.uri_template` expose `4` tools + `2` static resources + `2` resource templates cleanly.

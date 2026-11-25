@@ -124,6 +124,93 @@ class ProposeInstruction(dspy.Signature):
     improved_instruction: str = dspy.OutputField(desc="Improved concise instruction addressing failure modes.")
 
 
+def _clean_reflective_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    cleaned_rows: list[dict[str, Any]] = []
+    for ex in rows:
+        row = dict(ex)
+        inputs = row.get("Inputs")
+        if isinstance(inputs, Mapping):
+            row["Inputs"] = {k: v for k, v in inputs.items() if k != "tools"}
+        cleaned_rows.append(row)
+    return cleaned_rows
+
+
+def _format_reflective_overview(cleaned_rows: Sequence[Mapping[str, Any]]) -> str:
+    overview: list[dict[str, Any]] = []
+    for idx, row in enumerate(cleaned_rows):
+        entry: dict[str, Any] = {"index": idx, "fields": list(row.keys())}
+        if isinstance(inputs := row.get("Inputs"), Mapping):
+            entry["input_keys"] = list(inputs.keys())
+            if "question" in inputs:
+                entry["question"] = inputs["question"]
+        if isinstance(outputs := row.get("Generated Outputs"), Mapping):
+            entry["output_keys"] = list(outputs.keys())
+        if (score_val := row.get("score", row.get("Score"))) is not None or "score" in row or "Score" in row:
+            entry["score"] = score_val
+        if "Feedback" in row:
+            entry["feedback"] = row["Feedback"]
+        elif "feedback" in row:
+            entry["feedback"] = row["feedback"]
+        overview.append(entry)
+    return json.dumps(overview, ensure_ascii=False, default=str)
+
+
+def _inspect_reflective_example(cleaned_rows: Sequence[Mapping[str, Any]], index: int, field: str = "") -> str:
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TypeError("index must be an integer.")
+    if not isinstance(field, str):
+        raise TypeError("field must be a string.")
+    if index < 0 or index >= len(cleaned_rows):
+        raise IndexError(f"Example index {index} out of range for {len(cleaned_rows)} examples.")
+    row = cleaned_rows[index]
+    if not field:
+        return json.dumps(row, ensure_ascii=False, default=str)
+    if field not in row:
+        raise KeyError(f"Unknown field {field!r}.")
+    val = row[field]
+    return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=str)
+
+
+def _propose_single_component(
+    reflection_lm: dspy.LM,
+    *,
+    comp: str,
+    current: str,
+    rows: Sequence[Mapping[str, Any]],
+    max_chars: int | None,
+    max_iters: int,
+    length_guidance: str,
+) -> str:
+    cleaned_rows = _clean_reflective_rows(rows)
+
+    def list_examples() -> str:
+        """List available reflective example indices, keys, scores, and question/feedback overview."""
+        return _format_reflective_overview(cleaned_rows)
+
+    def inspect_example(index: int, field: str = "") -> str:
+        """Return the full uncropped JSON for one reflective example or a single top-level field."""
+        return _inspect_reflective_example(cleaned_rows, index, field)
+
+    proposer = dspy.ReAct(ProposeInstruction, tools=[list_examples, inspect_example], max_iters=max_iters)
+    proposer.react.update_config(tool_choice="required")
+    with dspy.context(lm=reflection_lm):
+        res = proposer(
+            component_name=comp,
+            current_instruction=current,
+            num_examples=len(cleaned_rows),
+            length_guidance=length_guidance,
+        )
+    termination_reason = getattr(res, "termination_reason", None)
+    if termination_reason is not None and termination_reason not in ("submit", "forced_submit"):
+        raise ValueError(f"Instruction proposer did not submit (termination_reason={termination_reason!r}).")
+    improved = str(getattr(res, "improved_instruction", "") or "").strip()
+    if not improved:
+        raise ValueError("Instruction proposer returned an empty instruction.")
+    if max_chars is not None and len(improved) > max_chars:
+        raise ValueError(f"Proposed instruction length {len(improved)} exceeds max_chars={max_chars}.")
+    return improved
+
+
 def make_react_instruction_proposer(
     reflection_lm: dspy.LM,
     *,
@@ -142,81 +229,21 @@ def make_react_instruction_proposer(
         else "No hard character limit; be concise and clear."
     )
 
-    def propose_component(comp: str, current: str, rows: Sequence[Mapping[str, Any]]) -> str:
-        cleaned_rows: list[dict[str, Any]] = []
-        for ex in rows:
-            row = dict(ex)
-            inputs = row.get("Inputs")
-            if isinstance(inputs, Mapping):
-                row["Inputs"] = {k: v for k, v in inputs.items() if k != "tools"}
-            cleaned_rows.append(row)
-
-        def list_examples() -> str:
-            """List available reflective example indices, keys, scores, and question/feedback overview."""
-            overview: list[dict[str, Any]] = []
-            for idx, row in enumerate(cleaned_rows):
-                entry: dict[str, Any] = {"index": idx, "fields": list(row.keys())}
-                inputs = row.get("Inputs")
-                if isinstance(inputs, Mapping):
-                    entry["input_keys"] = list(inputs.keys())
-                    if "question" in inputs:
-                        entry["question"] = inputs["question"]
-                outputs = row.get("Generated Outputs")
-                if isinstance(outputs, Mapping):
-                    entry["output_keys"] = list(outputs.keys())
-                for score_key in ("score", "Score"):
-                    if score_key in row:
-                        entry["score"] = row[score_key]
-                        break
-                for fb_key in ("Feedback", "feedback"):
-                    if fb_key in row:
-                        entry["feedback"] = row[fb_key]
-                        break
-                overview.append(entry)
-            return json.dumps(overview, ensure_ascii=False, default=str)
-
-        def inspect_example(index: int, field: str = "") -> str:
-            """Return the full uncropped JSON for one reflective example or a single top-level field."""
-            if isinstance(index, bool) or not isinstance(index, int):
-                raise TypeError("index must be an integer.")
-            if not isinstance(field, str):
-                raise TypeError("field must be a string.")
-            if index < 0 or index >= len(cleaned_rows):
-                raise IndexError(f"Example index {index} out of range for {len(cleaned_rows)} examples.")
-            row = cleaned_rows[index]
-            if not field:
-                return json.dumps(row, ensure_ascii=False, default=str)
-            if field not in row:
-                raise KeyError(f"Unknown field {field!r}.")
-            val = row[field]
-            return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False, default=str)
-
-        proposer = dspy.ReAct(ProposeInstruction, tools=[list_examples, inspect_example], max_iters=max_iters)
-        proposer.react.update_config(tool_choice="required")
-        with dspy.context(lm=reflection_lm):
-            res = proposer(
-                component_name=comp,
-                current_instruction=current,
-                num_examples=len(cleaned_rows),
-                length_guidance=length_guidance,
-            )
-        termination_reason = getattr(res, "termination_reason", None)
-        if termination_reason is not None and termination_reason not in ("submit", "forced_submit"):
-            raise ValueError(f"Instruction proposer did not submit (termination_reason={termination_reason!r}).")
-        improved = str(getattr(res, "improved_instruction", "") or "").strip()
-        if not improved:
-            raise ValueError("Instruction proposer returned an empty instruction.")
-        if max_chars is not None and len(improved) > max_chars:
-            raise ValueError(f"Proposed instruction length {len(improved)} exceeds max_chars={max_chars}.")
-        return improved
-
     def propose(
         candidate: dict[str, str],
         reflective_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
         components_to_update: Sequence[str],
     ) -> dict[str, str]:
         return {
-            comp: propose_component(comp, candidate[comp], rows)
+            comp: _propose_single_component(
+                reflection_lm,
+                comp=comp,
+                current=candidate[comp],
+                rows=rows,
+                max_chars=max_chars,
+                max_iters=max_iters,
+                length_guidance=length_guidance,
+            )
             for comp in components_to_update
             if comp in candidate and (rows := reflective_dataset.get(comp)) is not None and bool(rows)
         }
